@@ -3,7 +3,9 @@
 package netboxtest
 
 import (
-	"github.com/ory/dockertest/v3/docker"
+	"context"
+
+	mobyclient "github.com/moby/moby/client"
 
 	"github.com/bluesky-social/slagworks/internal/dockermirror"
 )
@@ -14,7 +16,8 @@ func mirrored(path string) string {
 	return dockermirror.Image(path)
 }
 
-// registryAuth returns dockertest auth creds for the ECR cache.
-func registryAuth() docker.AuthConfiguration {
-	return dockermirror.Auth()
+// pullMirrored pulls repository:tag with the ECR cache creds if the
+// daemon lacks it; see dockermirror.Pull.
+func pullMirrored(ctx context.Context, c *mobyclient.Client, repository, tag string) error {
+	return dockermirror.Pull(ctx, c, repository, tag)
 }

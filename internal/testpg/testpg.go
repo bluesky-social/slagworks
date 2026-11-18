@@ -12,8 +12,8 @@
 // func parameter; this keeps testpg generic.
 //
 // Consuming packages must define a TestMain that calls testpg.Shutdown
-// after m.Run so the container is torn down — dockertest's AutoRemove
-// only fires when the container's main process exits, and Postgres
+// after m.Run so the container is torn down — the container's
+// AutoRemove only fires when its main process exits, and Postgres
 // runs forever.
 //
 // For integration tests that need both Postgres and NetBox, use
@@ -21,6 +21,8 @@
 package testpg
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -30,8 +32,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ory/dockertest/v3"
-	"github.com/ory/dockertest/v3/docker"
+	"github.com/moby/moby/api/types/container"
+	mobyclient "github.com/moby/moby/client"
+	"github.com/ory/dockertest/v4"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -49,8 +52,8 @@ var (
 	db            *gorm.DB
 	dsnStr        atomic.Pointer[string]
 	err           error
-	pool          *dockertest.Pool
-	resource      *dockertest.Resource
+	docker        *mobyclient.Client
+	pool          dockertest.ClosablePool
 	cachedMigrate MigrateFn
 )
 
@@ -84,11 +87,14 @@ func DB(t *testing.T, migrate MigrateFn) *gorm.DB {
 //	    os.Exit(code)
 //	}
 func Shutdown() {
-	if pool == nil || resource == nil {
-		return
+	if pool != nil {
+		_ = pool.Close(context.Background())
+		pool = nil
 	}
-	_ = pool.Purge(resource)
-	resource = nil
+	if docker != nil {
+		_ = docker.Close()
+		docker = nil
+	}
 }
 
 // DSN returns the Postgres connection string for the shared
@@ -102,13 +108,33 @@ func DSN() string {
 	return ""
 }
 
-// DockerEndpoint resolves the docker daemon endpoint. Tries DOCKER_HOST
-// then common socket paths. Returns empty string if nothing works, in
-// which case dockertest will fall back to its own defaults.
-func DockerEndpoint() string {
-	if h := os.Getenv("DOCKER_HOST"); h != "" {
-		return h
+// DockerClient connects to the docker daemon named by DOCKER_HOST or,
+// when that is unset, the first common socket path that accepts a
+// connection (Colima and Docker Desktop do not serve
+// /var/run/docker.sock by default), falling back to the client
+// library's default. dockertest v4 takes no endpoint of its own: hand
+// the client to dockertest.WithMobyClient and close it after the pool.
+func DockerClient(ctx context.Context) (*mobyclient.Client, error) {
+	opts := []mobyclient.Opt{mobyclient.FromEnv}
+	if os.Getenv("DOCKER_HOST") == "" {
+		if sock := localSocket(); sock != "" {
+			opts = append(opts, mobyclient.WithHost(sock))
+		}
 	}
+	c, newErr := mobyclient.New(opts...)
+	if newErr != nil {
+		return nil, newErr
+	}
+	if _, pingErr := c.Ping(ctx, mobyclient.PingOptions{}); pingErr != nil {
+		_ = c.Close()
+		return nil, pingErr
+	}
+	return c, nil
+}
+
+// localSocket returns the first common docker socket path that accepts
+// a connection, as a unix:// URL, or empty string if none does.
+func localSocket() string {
 	home, _ := os.UserHomeDir()
 	for _, path := range []string{
 		"/var/run/docker.sock",
@@ -124,46 +150,92 @@ func DockerEndpoint() string {
 	return ""
 }
 
+// Expire bounds how long a container outlives a test process that dies
+// before its cleanup runs (SIGKILL, a go test timeout): it asks the
+// daemon to stop the container with SIGWINCH, which the container
+// ignores, and a timeout of d, so the daemon kills it once d has passed
+// and AutoRemove then deletes it. The daemon keeps the stop pending
+// after this process exits. This is dockertest v3's Resource.Expire,
+// which v4 dropped.
+func Expire(c *mobyclient.Client, containerID string, d time.Duration) {
+	timeout := int(d / time.Second)
+	go func() {
+		_, _ = c.ContainerStop(context.Background(), containerID, mobyclient.ContainerStopOptions{
+			Signal:  "SIGWINCH",
+			Timeout: &timeout,
+		})
+	}()
+}
+
+// Retry calls fn once a second until it succeeds or the pool's max wait
+// runs out. On timeout the error carries fn's last error as well:
+// pool.Retry alone returns only the context error, which hides why the
+// service never became ready.
+func Retry(ctx context.Context, pool dockertest.Pool, fn func() error) error {
+	var last error
+	retryErr := pool.Retry(ctx, 0, func() error {
+		last = fn()
+		return last
+	})
+	if retryErr == nil || last == nil || errors.Is(retryErr, last) {
+		return retryErr
+	}
+	return fmt.Errorf("%w; last attempt: %w", retryErr, last)
+}
+
 func setup() {
-	pool, err = dockertest.NewPool(DockerEndpoint())
+	ctx := context.Background()
+	docker, err = DockerClient(ctx)
 	if err != nil {
 		err = fmt.Errorf("connect to docker: %w", err)
 		return
 	}
-	pool.MaxWait = 30 * time.Second
+	pool, err = dockertest.NewPool(ctx, "",
+		dockertest.WithMobyClient(docker),
+		dockertest.WithMaxWait(30*time.Second))
+	if err != nil {
+		err = fmt.Errorf("create dockertest pool: %w", err)
+		return
+	}
 
 	// The image comes through SLAGWORKS_DOCKER_HUB_MIRROR when a CI
 	// system sets it (Docker Hub rate-limits anonymous pulls), and from
 	// Docker Hub otherwise.
 	repo := dockermirror.Image("library/postgres")
-	resource, err = pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: repo,
-		Tag:        "18-alpine",
-		Env: []string{
+	const tag = "18-alpine"
+	if err = dockermirror.Pull(ctx, docker, repo, tag); err != nil {
+		err = fmt.Errorf("start postgres: %w", err)
+		return
+	}
+	resource, runErr := pool.Run(ctx, repo,
+		dockertest.WithTag(tag),
+		dockertest.WithEnv([]string{
 			"POSTGRES_PASSWORD=test",
 			"POSTGRES_DB=slagworks_test",
 			"listen_addresses='*'",
-		},
-		Auth: dockermirror.Auth(),
-	}, func(config *docker.HostConfig) {
-		config.AutoRemove = true
-		config.RestartPolicy = docker.NeverRestart()
-	})
-	if err != nil {
-		err = fmt.Errorf("start postgres: %w", err)
+		}),
+		// dockertest otherwise hands back any container of the same
+		// repository:tag this process already started.
+		dockertest.WithoutReuse(),
+		dockertest.WithHostConfig(func(config *container.HostConfig) {
+			config.AutoRemove = true
+			config.RestartPolicy = container.RestartPolicy{Name: container.RestartPolicyDisabled}
+		}))
+	if runErr != nil {
+		err = fmt.Errorf("start postgres: %w", runErr)
 		return
 	}
 
 	// Safety net: if the test process is SIGKILL'd before Shutdown
-	// runs, the daemon stops the container after 1h, then AutoRemove
+	// runs, the daemon kills the container after 1h, then AutoRemove
 	// reaps it. Bounded local leak.
-	_ = resource.Expire(3600)
+	Expire(docker, resource.ID(), time.Hour)
 
 	dsn := fmt.Sprintf("host=localhost port=%s user=postgres password=test dbname=slagworks_test sslmode=disable",
 		resource.GetPort("5432/tcp"))
 	dsnStr.Store(&dsn)
 
-	if retryErr := pool.Retry(func() error {
+	if retryErr := Retry(ctx, pool, func() error {
 		var openErr error
 		db, openErr = gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Discard, TranslateError: true})
 		if openErr != nil {
