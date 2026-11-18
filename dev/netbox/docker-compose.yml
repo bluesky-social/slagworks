@@ -7,13 +7,16 @@
 
 services:
   postgres:
-    image: postgres:16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e
+    image: postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
     environment:
       POSTGRES_DB: netbox
       POSTGRES_USER: netbox
       POSTGRES_PASSWORD: testpass
     volumes:
-      - netbox-pg-data:/var/lib/postgresql/data
+      # Postgres 18 images keep data in a versioned subdirectory and refuse
+      # to start with a mount at /var/lib/postgresql/data. The volume has a
+      # new name so a volume left by the Postgres 16 stack is not reused.
+      - netbox-pg18-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U netbox"]
       interval: 5s
@@ -58,4 +61,4 @@ services:
       GRANIAN_WORKERS: "2"
 
 volumes:
-  netbox-pg-data:
+  netbox-pg18-data:
