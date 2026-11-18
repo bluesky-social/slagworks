@@ -31,7 +31,7 @@ require (
 	github.com/labstack/echo/v5 v5.4.2
 	github.com/mdlayher/arp v0.0.0-20220512170110-6706a2966875
 	github.com/muesli/termenv v0.16.0
-	github.com/ory/dockertest/v3 v3.12.0
+	github.com/ory/dockertest/v4 v4.0.1
 	github.com/pin/tftp/v3 v3.2.0
 	github.com/pressly/goose/v3 v3.27.3
 	github.com/prometheus/client_golang v1.24.1
