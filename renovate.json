@@ -5,16 +5,6 @@
   ],
   "packageRules": [
     {
-      "description": "Held back: newer runc removed libcontainer/user, which dockertest v3 (test containers only) still imports, so `go mod tidy` fails and takes the whole grouped Go update with it. Lift when dockertest moves to v4.",
-      "matchManagers": [
-        "gomod"
-      ],
-      "matchPackageNames": [
-        "github.com/opencontainers/runc"
-      ],
-      "enabled": false
-    },
-    {
       "description": "Held back: newer gofish dropped the redfish and common packages bmclib v2 imports, so `go mod tidy` fails and takes the whole grouped Go update with it. Lift when bmclib supports the new layout.",
       "matchManagers": [
         "gomod"

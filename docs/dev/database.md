@@ -156,11 +156,11 @@ tests that need real Postgres.
   rate limits don't flake the suite. With
   `SLAGWORKS_DOCKER_HUB_MIRROR` unset, pulls go to Docker Hub.
 - Consuming packages must call `testpg.Shutdown()` from `TestMain`
-  so the container is torn down at end of run — dockertest's
-  `AutoRemove` only fires when the container's main process exits,
-  and Postgres runs forever. As a safety net the setup also calls
-  `resource.Expire(3600)` so a SIGKILL'd test process leaves at most
-  an hour of stray container.
+  so the container is torn down at end of run — the container's
+  `AutoRemove` only fires when its main process exits, and Postgres
+  runs forever. As a safety net the setup also calls
+  `testpg.Expire(..., time.Hour)` so a SIGKILL'd test process leaves
+  at most an hour of stray container.
 
 ## Site SQLite
 
