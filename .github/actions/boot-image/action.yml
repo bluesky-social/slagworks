@@ -64,6 +64,10 @@ runs:
     - name: Build image
       shell: bash
       env:
+        # GitHub-hosted runners sit in Azure; its Ubuntu mirror is the fast
+        # one from there. Other mirrors can be slow enough to hit the job
+        # timeout.
+        SLAGWORKS_APT_MIRROR: http://azure.archive.ubuntu.com/ubuntu
         SLAGWORKS_CACHE_DIR: ${{ github.workspace }}/phase-a-cache
         SLAGWORKS_RECOVERY_AUTHORIZED_KEYS: ${{ github.workspace }}/recovery_authorized_keys
       run: bash scripts/image-build/build.sh

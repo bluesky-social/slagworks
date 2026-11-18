@@ -47,7 +47,7 @@
 #   - mksquashfs
 #   - sha256sum / shasum
 #   - assets/initramfs/{scripts,hooks}/slagworks in the repo
-#   - Network access to https://us-east-2.ec2.archive.ubuntu.com/
+#   - Network access to an Ubuntu archive mirror (SLAGWORKS_APT_MIRROR)
 
 set -euo pipefail
 
@@ -138,34 +138,25 @@ fi
 # Apt mirror                                                        #
 #####################################################################
 
-# We previously fetched packages from snapshot.ubuntu.com (date-pinned
-# for content-determinism). It throttles to ~250KB/s from GHA runners
-# and 503s under any meaningful load — pushing 10-minute builds to
-# 25+ minutes when it works at all. The EC2 regional mirror lives on
-# AWS us-east-2, which is intra-region from both ubuntu-latest GHA
-# runners and our own AWS infra: ~3 MB/s on a single connection in
-# practice, no rate limiting, no flakiness.
+# Packages come from an Ubuntu archive mirror, not from
+# snapshot.ubuntu.com: the snapshot service throttles and 503s under load.
+# The tradeoff is that builds are not date-pinned. Reproducibility lives at
+# the output layer instead: a published tarball is content-addressed, so
+# "the same image" means downloading that tarball, not re-running the build.
+# apt-snapshot.txt is informational only (roughly when the pipeline was last
+# verified end to end).
 #
-# Tradeoff: we lose date-pinning. archive.ubuntu.com tracks Ubuntu's
-# current state and superseded .debs vanish over time. Reproducibility
-# is preserved at the *output* layer instead — every published per-SHA
-# tarball is content-addressed in the image bucket, so "rebuilding the
-# same image" means downloading that tarball, not re-running the
-# build. The build itself just produces a deterministic snapshot of
-# whatever Ubuntu is at that moment.
+# The mirror is also written into the image's sources.list, so it is what a
+# deployed machine fetches packages from.
 #
-# apt-snapshot.txt is now informational only (recording roughly when
-# the build pipeline was last verified to work end-to-end). We keep
-# the file so a future re-introduction of pinning has a place to land.
-#
-# SLAGWORKS_APT_MIRROR overrides the mirror wholesale. Primary use: a
-# build host with a local apt-cacher-ng points this at it (e.g.
-# http://127.0.0.1:3142/us-east-2.ec2.archive.ubuntu.com/ubuntu) so
-# repeat builds hit the cache instead of re-downloading the world,
-# and an upstream network outage cannot push the uncached chroot
-# install past a CI job's time limit. Third-party repos
-# (apt-repos.sh) stay direct: they're small and https-pinned.
-APT_MIRROR_BASE="${SLAGWORKS_APT_MIRROR:-https://us-east-2.ec2.archive.ubuntu.com/ubuntu}"
+# SLAGWORKS_APT_MIRROR selects the mirror. Pick one close to the build host:
+# a regional or cloud-provider mirror is often ten times faster than the
+# default, and some regional mirrors throttle clients outside their own
+# network to the point where the build exceeds a CI time limit. A build
+# host with a local apt-cacher-ng can point this at it (for example
+# http://127.0.0.1:3142/archive.ubuntu.com/ubuntu). Third-party repos
+# (apt-repos.sh) stay direct: they are small and https-pinned.
+APT_MIRROR_BASE="${SLAGWORKS_APT_MIRROR:-http://archive.ubuntu.com/ubuntu}"
 
 # Third-party APT repos baked into the DEPLOY chroot (FRR, Tailscale, ...) live
 # in apt-repos.sh as a data table + a shared key-fetch/deb-line/customize-hook

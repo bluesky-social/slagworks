@@ -62,7 +62,7 @@ func bakeRepos(t *testing.T, suite string) (string, string, []bakedRepo) {
 		}
 	}
 
-	base := "deb https://us-east-2.ec2.archive.ubuntu.com/ubuntu " + suite + " main restricted universe multiverse\n"
+	base := "deb http://archive.ubuntu.com/ubuntu " + suite + " main restricted universe multiverse\n"
 	lines := aptRepos(t, "repo_deb_lines", keydir, suite)
 	if err := os.MkdirAll(filepath.Join(chroot, "etc/apt"), 0o755); err != nil {
 		t.Fatal(err)
