@@ -1,0 +1,54 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "local>bluesky-social/.github//renovate/default#v1"
+  ],
+  "packageRules": [
+    {
+      "description": "Held back: newer runc removed libcontainer/user, which dockertest v3 (test containers only) still imports, so `go mod tidy` fails and takes the whole grouped Go update with it. Lift when dockertest moves to v4.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/opencontainers/runc"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Held back: newer gofish dropped the redfish and common packages bmclib v2 imports, so `go mod tidy` fails and takes the whole grouped Go update with it. Lift when bmclib supports the new layout.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/stmcginnis/gofish"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "bubbletea, huh and lipgloss v2 depend on each other and need one code migration, so their major updates arrive as one pull request.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/charmbracelet/**"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": "charmbracelet v2"
+    },
+    {
+      "description": "The QEMU shards stay on the Ubuntu release the boot image is built from: UEFI test VMs do not boot with the next release's QEMU, OVMF and iPXE ROM. This rule also holds the runner of the other jobs in that file; move it by hand.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDatasources": [
+        "github-runners"
+      ],
+      "matchFileNames": [
+        ".github/workflows/test-qemu.yaml"
+      ],
+      "enabled": false
+    }
+  ]
+}

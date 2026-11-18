@@ -1,0 +1,151 @@
+name: release-please
+
+# Release automation via the org reusable workflow
+# (bluesky-social/.github .github/workflows/release-please.yml; design:
+# dot-github docs/plans/2026-10-27-unattended-dependency-releases.md).
+# Push-to-main maintains a standing Release PR. A range made only of merged
+# Renovate/Dependabot PRs merges itself on weekdays 09-16 PT; anything
+# human-authored waits for a human (label `release:manual` to hold one).
+# Merging creates the tag + GitHub release, then the release_created-gated
+# jobs below run.
+#
+# goreleaser runs HERE (there is no tag-triggered release workflow) because
+# the reusable creates tags with GITHUB_TOKEN, which does not trigger another
+# workflow. Don't push tags by hand: that bypasses release-please's manifest.
+# To recover a failed release, re-run this workflow (its failed jobs, or
+# workflow_dispatch).
+#
+# A release is a repository release: one version for slagctl and for the
+# packages and container built from the same tree. goreleaser attaches the
+# slagctl archives to the release and publishes the Homebrew cask; dispatch
+# hands the release commit and tag to the maintainers' build-and-publish
+# pipeline (docs/dev/build-and-release.md).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+  # Hourly across the weekday release window (UTC; covers 09-16 PT in both PST
+  # and PDT) so a dependency range merged overnight ships when it opens.
+  schedule:
+    - cron: '23 16-23 * * 1-5'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Off until the repository variable RELEASE_AUTOMATION is `enabled`: the
+    # release App has to be installed on the repository and its credentials
+    # readable here first. Forks never have either.
+    if: vars.RELEASE_AUTOMATION == 'enabled'
+    uses: bluesky-social/.github/.github/workflows/release-please.yml@v1
+    with:
+      component: slagctl
+    # The release App for public repositories: the org-wide one's credentials
+    # are not readable from a public repository.
+    secrets:
+      RELEASE_APP_ID: ${{ secrets.PUBLIC_RELEASE_APP_ID }}
+      RELEASE_APP_KEY: ${{ secrets.PUBLIC_RELEASE_APP_KEY }}
+
+  goreleaser:
+    needs: release
+    if: needs.release.outputs.release_created == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # append artifacts to the release release-please created
+    steps:
+      - name: Checkout the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release.outputs.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go tooling
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Short-lived release App installation token, scoped to the public tap
+      # (contents write), for GoReleaser's cross-repo cask push.
+      - name: Mint homebrew-tap token
+        id: tap-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.PUBLIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.PUBLIC_RELEASE_APP_KEY }}
+          owner: bluesky-social
+          repositories: homebrew-tap
+          permission-contents: write
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          # --parallelism 2: slagctl's goreleaser build is heavier; cap
+          # concurrent build lanes so the hosted runner doesn't starve.
+          args: release --clean --parallelism 2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Cross-repo cask push to bluesky-social/homebrew-tap; the default
+          # GITHUB_TOKEN can't write to the tap.
+          TAP_GITHUB_TOKEN: ${{ steps.tap-token.outputs.token }}
+
+  # Hands the release to the maintainers' build-and-publish pipeline: the
+  # release commit and its tag, so the pipeline builds and tags the release
+  # and rolls it out. Same App and receiver as build.yaml's dispatch job. The
+  # repository guard keeps a copy of this repository, a fork or a renamed
+  # archive, from dispatching.
+  dispatch:
+    needs: release
+    if: needs.release.outputs.release_created == 'true' && github.repository == 'bluesky-social/slagworks' && vars.DEPLOY_DISPATCH == 'enabled'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    # GITHUB_TOKEN only reads the tag; the dispatch rides the App token.
+    permissions:
+      contents: read
+    steps:
+      # The reusable workflow reports the tag, not its commit. Resolve the
+      # commit as goreleaser does: check out the tag. github.sha is not it on
+      # a scheduled or manual run, or on a re-run after main has moved.
+      - name: Checkout the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release.outputs.tag_name }}
+          persist-credentials: false
+
+      - name: Resolve the release commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Mint deploy-dispatch App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.DEPLOY_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_DISPATCH_APP_KEY }}
+          owner: bluesky-social
+          repositories: deploy
+
+      - name: Dispatch build and publish of ${{ needs.release.outputs.tag_name }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # The one repository the App token above is scoped to.
+          RECEIVER: ${{ github.repository_owner }}/deploy
+          SHA: ${{ steps.commit.outputs.sha }}
+          TAG: ${{ needs.release.outputs.tag_name }}
+        run: |
+          gh api "repos/$RECEIVER/dispatches" \
+            -f event_type=slagworks-build \
+            -f "client_payload[sha]=$SHA" \
+            -f "client_payload[tag]=$TAG"
+          echo "Dispatched slagworks-build for $TAG ($SHA)"

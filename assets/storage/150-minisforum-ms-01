@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+# slagworks:match system_product=Venus Series
+# slagworks:match hostname=/^router1\.pop3$/
+# slagworks:priority 150
+#
+# Minisforum MS-01 storage layout (the pop3 router: router1.pop3).
+#
+#   Boot: RAID1 mirror across the two NVMe drives. No data array — this is a
+#   router, not a storage/compute node.
+#
+# The MS-01 identifies as system_product="Venus Series" (manufacturer "Micro
+# Computer (HK) Tech Limited") in dmidecode — Minisforum doesn't put the model
+# name in SMBIOS. "Venus Series" is a FAMILY string, so the hostname rule is
+# load-bearing (the TNR-family precedent, not the R640 whole-cohort shape):
+# only router1.pop3 is onboarded; any other Venus-Series box fails safe with
+# no storage script until deliberately added.
+#
+# Layout produced by this script:
+#   {boot0}p1, {boot1}p1 -> ESP (512M each; dual ESP so the box still boots if
+#                           one mirror leg dies — only boot0's ESP is mounted
+#                           at /boot/efi, but both are populated by the
+#                           bootloader install, matching the agent's UEFI
+#                           dual-ESP path)
+#   {boot0}p2, {boot1}p2 -> mdroot (RAID1, xfs, /)
+#
+# HISTORY: router1.pop3 was hand-installed (pre-slagworks) onto a single NVMe
+# with the second drive dark. The desired end state (operator, 2026-07-13) is
+# both drives in a boot RAID1, which this script produces on reimage.
+#
+# HARD FAIL (no silent fallback, mirrors the sibling scripts' posture): this
+# script only runs because the host matched the MS-01 SMBIOS identity, so it
+# MUST present exactly two NVMe drives. Any other count means the hardware
+# doesn't match our assumption (a failed drive, an added USB disk, a single
+# survivor) — emitting a guessed layout could wipe the wrong disk, so we exit
+# non-zero and abort the deploy for an operator to look.
+
+import json, os, sys
+
+inv_path = os.environ.get("SLAGWORKS_INVENTORY")
+if not inv_path:
+    print("ERROR: SLAGWORKS_INVENTORY must be set", file=sys.stderr)
+    sys.exit(1)
+
+with open(inv_path) as f:
+    inv = json.load(f)
+
+# Sort by name for a deterministic boot0/boot1 assignment.
+boot = sorted(d["name"] for d in inv["disks"] if d.get("transport") == "nvme")
+if len(boot) != 2:
+    seen = [(d.get("name"), d.get("transport"), d.get("model")) for d in inv["disks"]]
+    print(f"ERROR: expected exactly 2 NVMe drives on this MS-01, found "
+          f"{len(boot)}. Disks seen: {seen}", file=sys.stderr)
+    sys.exit(1)
+
+
+def part_suffix(disk: str) -> str:
+    # nvme/mmc/loop devices name partitions "<disk>p1"; sd*/vd* append the
+    # number directly ("<disk>1"). The MS-01 boots off nvme, but derive it
+    # from the name so the script stays correct if that ever changes.
+    if disk.startswith(("nvme", "mmcblk", "loop")):
+        return "p"
+    return ""
+
+
+def part(disk: str, n: int) -> str:
+    return f"{disk}{part_suffix(disk)}{n}"
+
+
+disk_bytes = next(d["size_bytes"] for d in inv["disks"] if d["name"] == boot[0])
+# Leave 600 MiB of headroom below the ESP for alignment/GPT, same as the
+# sibling scripts; the rest of the disk is the root mirror member.
+root_mib = (disk_bytes - 600 * 1024 * 1024) // (1024 * 1024)
+
+layout = {
+    "layout": {
+        boot[0]: {
+            "type": "disk", "ptable": "gpt", "boot": True,
+            "partitions": [
+                {"name": part(boot[0], 1), "fs": "vfat", "size": "512M", "bootable": True},
+                {"name": part(boot[0], 2), "size": f"{root_mib}M"},
+            ],
+        },
+        boot[1]: {
+            "type": "disk", "ptable": "gpt", "boot": True,
+            "partitions": [
+                {"name": part(boot[1], 1), "fs": "vfat", "size": "512M", "bootable": True},
+                {"name": part(boot[1], 2), "size": f"{root_mib}M"},
+            ],
+        },
+        "mdroot": {
+            "type": "raid", "level": 1,
+            "members": [part(boot[0], 2), part(boot[1], 2)],
+            "fs": "xfs",
+        },
+    },
+    "mounts": {
+        "/": {"device": "mdroot"},
+        "/boot/efi": {"device": part(boot[0], 1)},
+    },
+}
+
+json.dump(layout, sys.stdout, indent=2)

@@ -1,0 +1,508 @@
+package tui
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/bluesky-social/slagworks/internal/model"
+)
+
+// TestSyncedSince_LockstepAcrossAnchors is the bug-2 guard: timers with
+// DIFFERENT sub-second anchor fractions must flip to their next whole second at
+// the SAME instant (when now() crosses a whole-second boundary), not each at
+// its own anchor+0.5 moment. We sweep now() across a second boundary and assert
+// both timers step together.
+func TestSyncedSince_LockstepAcrossAnchors(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	anchorA := base                             // .000 fraction
+	anchorB := base.Add(300 * time.Millisecond) // .300 fraction
+	anchorC := base.Add(900 * time.Millisecond) // .900 fraction
+
+	// now sweeps from base+5.0s to base+6.0s. With naive Round(), A would flip
+	// at x.5, B at x.8, C at x.4 — staggered. With syncedSince all three flip
+	// exactly when now crosses a whole second.
+	prevA := syncedSince(base.Add(5*time.Second), anchorA)
+	prevB := syncedSince(base.Add(5*time.Second), anchorB)
+	prevC := syncedSince(base.Add(5*time.Second), anchorC)
+	for ms := 5000; ms <= 6000; ms += 50 {
+		now := base.Add(time.Duration(ms) * time.Millisecond)
+		a := syncedSince(now, anchorA)
+		b := syncedSince(now, anchorB)
+		c := syncedSince(now, anchorC)
+		// Whenever ANY timer increments from its previous value, ALL must have
+		// incremented by the same step (they share the now-truncation boundary).
+		stepA := a - prevA
+		stepB := b - prevB
+		stepC := c - prevC
+		if stepA != stepB || stepB != stepC {
+			t.Errorf("at %dms timers stepped out of sync: A+%s B+%s C+%s", ms, stepA, stepB, stepC)
+		}
+		prevA, prevB, prevC = a, b, c
+	}
+}
+
+// midDeployFrame builds a frameInput at the mockup's mid-deploy moment:
+// phases 1-6 done, partitioning current at 47s, a handful of log lines, a
+// console pane with some boot output. Deterministic via fixed clock + glyph.
+func midDeployFrame(w, h int) frameInput {
+	lc := newLifecyclePane(model.OpDeploy)
+	lc.Observe("power_cycle", at(0))
+	lc.Observe("pxe_booting", at(2*time.Second))
+	lc.Observe("dhcp_ack", at(16*time.Second))
+	lc.Observe("ipxe_dhcp", at(17*time.Second))
+	lc.Observe("ipxe_loaded", at(19*time.Second))
+	lc.Observe("agent_starting", at(27*time.Second))
+	lc.Observe("partitioning", at(30*time.Second))
+	now := fixedClock(at(30*time.Second + 47*time.Second))
+	lc.now = now
+
+	con := newConsolePane()
+	con.Apply([]byte("slagworks-agent: found 4 disk(s), using nvme0n1\r\n" +
+		"slagworks-agent: storage layout planned (12 commands)\r\n" +
+		"Creating new GPT entries in memory.\r\n"))
+
+	lp := newLogPane(time.UTC)
+	lp.Append(1, mkEnv("agent", at(72*time.Second), "partitioning", "exec",
+		map[string]any{"argv": "sgdisk --zap-all /dev/nvme0n1", "duration_ms": float64(212)}))
+	lp.Append(2, mkEnv("site", at(73*time.Second), "partitioning", "progress report received", nil))
+	lp.Append(3, mkEnv("global", at(74*time.Second), "", "snapshot rebuilt gen=4471", nil))
+
+	return frameInput{
+		opType:    model.OpDeploy,
+		machine:   "kworker-l34-1.pop1",
+		opID:      "8b2e3f1a",
+		command:   "machine deploy kworker-l34-1.pop1 --destructive",
+		worker:    "pop1-sw-2",
+		startedAt: at(0),
+		console:   con,
+		lifecycle: lc,
+		logLines:  lp.Lines(),
+		width:     w,
+		height:    h,
+		spinner:   "⠙",
+		now:       now,
+	}
+}
+
+// headerLine returns the first line of a rendered frame (the header), for
+// assertions that must scope to the header and not the summary box (which now
+// owns the worker).
+func headerLine(frame string) string {
+	return strings.SplitN(frame, "\n", 2)[0]
+}
+
+// TestFrame_MidDeploy goldens the full happy-path frame at the min terminal
+// size. This is the layout's primary golden — header, console box, lifecycle +
+// summary right column, logs box.
+func TestFrame_MidDeploy(t *testing.T) {
+	frame := renderFrame(midDeployFrame(minTermCols, minRows))
+	if !strings.Contains(frame, "serial console") {
+		t.Error("console box title missing")
+	}
+	if !strings.Contains(frame, "lifecycle") {
+		t.Error("lifecycle box title missing")
+	}
+	if !strings.Contains(frame, "⠙ partitioning") {
+		t.Error("current phase not in frame")
+	}
+	// Worker is shown ONCE, in the summary box, not the header.
+	if !strings.Contains(frame, "pop1-sw-2") {
+		t.Error("summary missing worker")
+	}
+	if strings.Contains(headerLine(frame), "pop1-sw-2") {
+		t.Errorf("worker must not appear in the header (shown once, in summary):\n%s", headerLine(frame))
+	}
+	if !strings.Contains(frame, "machine deploy kworker-l34-1.pop1 --destructive") {
+		t.Error("header missing reconstructed command line")
+	}
+	if strings.Contains(frame, "op 8b2e3f1a") {
+		t.Error("header should show the command, not the raw op id, when command is set")
+	}
+	if !strings.Contains(frame, "logs (control plane, SOL excluded)") {
+		t.Error("logs box title missing")
+	}
+	// No row may exceed the terminal width (box alignment guard).
+	for line := range strings.SplitSeq(frame, "\n") {
+		if w := lipgloss.Width(line); w > minTermCols {
+			t.Errorf("frame line exceeds width %d: %d cells\n%q", minTermCols, w, line)
+		}
+	}
+	goldenScreen(t, "frame_mid_deploy", frame)
+}
+
+// TestFrame_SmallTerminal is the O1 path: below the minimum, a single
+// state-aware message, not a degraded layout.
+func TestFrame_SmallTerminal(t *testing.T) {
+	in := midDeployFrame(80, 24)
+	got := renderFrame(in)
+	if strings.Contains(got, "serial console") {
+		t.Errorf("small terminal should not render the 3-pane layout:\n%s", got)
+	}
+	if !strings.Contains(got, "enlarge") {
+		t.Errorf("small terminal message missing enlarge prompt:\n%s", got)
+	}
+	if !strings.Contains(got, "have 80×24") {
+		t.Errorf("small terminal message should report actual size:\n%s", got)
+	}
+}
+
+// TestFrame_SmallTerminalRevealsOutcome guards the O1 state-awareness: a
+// finished op must surface its outcome even when too small to draw, so the
+// operator isn't stuck watching "enlarge" forever.
+func TestFrame_SmallTerminalRevealsOutcome(t *testing.T) {
+	in := midDeployFrame(80, 24)
+	in.done = true
+	in.failed = true
+	in.failReason = "sgdisk exit 2 (device busy?)"
+	got := renderFrame(in)
+	if !strings.Contains(got, "FAILED") {
+		t.Errorf("failed op not surfaced at small size:\n%s", got)
+	}
+	if !strings.Contains(got, "press q to quit") {
+		t.Errorf("no quit affordance at small size:\n%s", got)
+	}
+}
+
+// TestFrame_Failure swaps the logs box to the error pane and pins the cause on
+// top; the header reads "✗ FAILED at <phase>".
+func TestFrame_Failure(t *testing.T) {
+	lc := newLifecyclePane(model.OpDeploy)
+	lc.Observe("power_cycle", at(0))
+	lc.Observe("partitioning", at(30*time.Second))
+	now := fixedClock(at(42 * time.Second))
+	lc.now = now
+	lc.Fail(at(42 * time.Second))
+
+	in := frameInput{
+		opType:     model.OpDeploy,
+		machine:    "kworker-l34-1.pop1",
+		opID:       "8b2e3f1a",
+		startedAt:  at(0),
+		console:    newConsolePane(),
+		lifecycle:  lc,
+		logLines:   []string{"10:14:14 [agent ] FATAL storage: sgdisk → exit 2"},
+		done:       true,
+		failed:     true,
+		failReason: "partitioning failed: sgdisk exit 2 (device busy?)",
+		width:      minTermCols,
+		height:     minRows,
+		spinner:    "⠙",
+		now:        now,
+	}
+	got := renderFrame(in)
+	if !strings.Contains(got, "FAILED at partitioning") {
+		t.Errorf("header should name the failing phase:\n%s", got)
+	}
+	if !strings.Contains(got, "─ error ─") {
+		t.Errorf("logs box should retitle to error:\n%s", got)
+	}
+	if !strings.Contains(got, "partitioning failed: sgdisk exit 2") {
+		t.Errorf("failure cause not pinned:\n%s", got)
+	}
+	if strings.Contains(got, "✗ partitioning") {
+		// the lifecycle column should show the failed phase marker
+	} else {
+		t.Errorf("lifecycle should mark partitioning failed:\n%s", got)
+	}
+	goldenScreen(t, "frame_failure", got)
+}
+
+// TestFrame_ErrorCauseSurvivesLongHistory guards that the pinned failure cause
+// stays visible even when the log history is longer than the error pane's row
+// budget. The error pane tails the history to make room for the cause, so the
+// cause is never chopped off the top (the bug: errorPaneBody prepended the cause
+// and renderLogBody then blindly tailed, dropping it).
+func TestFrame_ErrorCauseSurvivesLongHistory(t *testing.T) {
+	lc := newLifecyclePane(model.OpDeploy)
+	lc.Observe("power_cycle", at(0))
+	lc.Observe("partitioning", at(30*time.Second))
+	now := fixedClock(at(42 * time.Second))
+	lc.now = now
+	lc.Fail(at(42 * time.Second))
+
+	// Far more log lines than any plausible error-pane height.
+	var history []string
+	for i := range 200 {
+		history = append(history, fmt.Sprintf("10:14:%02d [agent ] log line %d", i%60, i))
+	}
+	in := frameInput{
+		opType:     model.OpDeploy,
+		machine:    "kworker-l34-1.pop1",
+		opID:       "8b2e3f1a",
+		startedAt:  at(0),
+		console:    newConsolePane(),
+		lifecycle:  lc,
+		logLines:   history,
+		done:       true,
+		failed:     true,
+		failReason: "partitioning failed: sgdisk exit 2 (device busy?)",
+		width:      minTermCols,
+		height:     minRows,
+		spinner:    "⠙",
+		now:        now,
+	}
+	got := renderFrame(in)
+	if !strings.Contains(got, "partitioning failed: sgdisk exit 2") {
+		t.Errorf("failure cause must survive a long log history (it was tailed off the top):\n%s", got)
+	}
+}
+
+// TestFrame_LongPhaseNamesNotEllipsized is the regression for the
+// fixed-narrow-column bug: the lifecycle/summary boxes were pinned to a
+// hardcoded inner width (24) that couldn't hold the longest phase labels, so
+// installing_bootloader and awaiting_phone_home rendered ellipsized
+// ("installing_bootloa…") even on a wide terminal. The column width is now
+// derived from the longest label + duration column, so at any width >=
+// minTermCols the full names must appear, with no ellipsis anywhere in the
+// frame.
+func TestFrame_LongPhaseNamesNotEllipsized(t *testing.T) {
+	// A deploy mid-installing_bootloader (a long-named phase is current and shows
+	// a running duration in parens — the widest right-column case) and with
+	// awaiting_phone_home still pending in the runway.
+	lc := newLifecyclePane(model.OpDeploy)
+	for _, p := range []struct {
+		name string
+		d    time.Duration
+	}{
+		{"power_cycle", 0}, {"pxe_booting", 2 * time.Second},
+		{"dhcp_ack", 16 * time.Second}, {"ipxe_dhcp", 17 * time.Second},
+		{"ipxe_loaded", 19 * time.Second}, {"agent_starting", 27 * time.Second},
+		{"partitioning", 30 * time.Second}, {"rsyncing_os", 40 * time.Second},
+		{"installing_bootloader", 50 * time.Second},
+	} {
+		lc.Observe(p.name, at(p.d))
+	}
+	now := fixedClock(at(50*time.Second + 87*time.Second)) // installing_bootloader running 1m27s
+	lc.now = now
+
+	in := frameInput{
+		opType:    model.OpDeploy,
+		machine:   "kworker-l34-1.pop1",
+		opID:      "8b2e3f1a",
+		startedAt: at(0),
+		console:   newConsolePane(),
+		lifecycle: lc,
+		logLines:  nil,
+		width:     minTermCols,
+		height:    minRows,
+		spinner:   "⠙",
+		now:       now,
+	}
+
+	// Render across a representative span of widths from the minimum up to a wide
+	// terminal; the derived column is content-sized, so full names must appear at
+	// every width that clears the gate.
+	for _, w := range []int{minTermCols, 140, 200} {
+		in.width = w
+		got := renderFrame(in)
+		if !strings.Contains(got, "installing_bootloader") {
+			t.Errorf("width %d: installing_bootloader truncated/missing:\n%s", w, got)
+		}
+		if !strings.Contains(got, "awaiting_phone_home") {
+			t.Errorf("width %d: awaiting_phone_home truncated/missing:\n%s", w, got)
+		}
+		// The summary "phase" row shows the current phase in full too.
+		if !strings.Contains(got, "phase   installing_bootloader") {
+			t.Errorf("width %d: summary phase row truncated installing_bootloader:\n%s", w, got)
+		}
+		// No ellipsis anywhere — the whole point of the fix.
+		if strings.Contains(got, "…") {
+			t.Errorf("width %d: frame still contains an ellipsis (truncation):\n%s", w, got)
+		}
+		// The current phase's running duration still renders flush.
+		if !strings.Contains(got, "(1m27s)") {
+			t.Errorf("width %d: current-phase running duration missing:\n%s", w, got)
+		}
+	}
+}
+
+// TestFrame_PanesFillWidth is a regression test: the right column
+// (lifecycle + summary) and the logs box must expand to fill the full terminal
+// width, not sit at the content-minimum with a gutter on the right. The console
+// box is the only fixed-width pane (80-col emulator grid). We assert the bottom
+// (logs) box and the right column both reach within a column of the right edge,
+// at several widths above the minimum.
+func TestFrame_PanesFillWidth(t *testing.T) {
+	for _, w := range []int{minTermCols, 140, 200, 250} {
+		in := midDeployFrame(w, minRows)
+		got := renderFrame(in)
+		lines := strings.Split(got, "\n")
+		// The widest rendered row must reach the usable width (width-1; the frame
+		// budgets to width-1 to avoid cursor auto-wrap). Below the minimum the
+		// console is fixed so the top row can't fill, but at/above the minimum the
+		// logs box spans the joined top width and must reach the edge.
+		maxW := 0
+		for _, ln := range lines {
+			if cw := lipgloss.Width(ln); cw > maxW {
+				maxW = cw
+			}
+		}
+		if maxW < w-1 {
+			t.Errorf("width %d: panes do not fill width; widest row is %d cells (want >= %d):\n%s",
+				w, maxW, w-1, got)
+		}
+		// No row may exceed the terminal width.
+		for _, ln := range lines {
+			if cw := lipgloss.Width(ln); cw > w {
+				t.Errorf("width %d: row exceeds width: %d cells\n%q", w, cw, ln)
+			}
+		}
+	}
+}
+
+// TestFrame_NoAutoWrapAtMinWidth pins the width-1 budget invariant at the exact
+// gate minimum: when the right column fills the terminal,
+// the widest rendered row must be width-1, never the full width — writing
+// exactly `width` columns trips cursor auto-wrap on some terminals and injects a
+// blank line. The gate's minW (+5 over the bare pane math) exists precisely so
+// the floored right column still leaves the 1-column margin at the minimum.
+func TestFrame_NoAutoWrapAtMinWidth(t *testing.T) {
+	for _, opType := range []model.OperationType{model.OpDeploy, model.OpCommission} {
+		// The exact gate minimum for this op type (mirrors renderFrame's minW).
+		minW := max(consoleWidth+5+lifecycleColW(opType), minTermCols)
+		lc := newLifecyclePane(opType)
+		lc.now = fixedClock(at(time.Minute))
+		in := frameInput{
+			opType:    opType,
+			machine:   "host.pop1",
+			opID:      "abc123",
+			startedAt: at(0),
+			console:   newConsolePane(),
+			lifecycle: lc,
+			width:     minW,
+			height:    minRows,
+			spinner:   "⠙",
+			now:       fixedClock(at(time.Minute)),
+		}
+		got := renderFrame(in)
+		if strings.Contains(got, "enlarge") {
+			t.Fatalf("%s: width %d should clear the gate, got the placeholder:\n%s", opType, minW, got)
+		}
+		maxW := 0
+		for ln := range strings.SplitSeq(got, "\n") {
+			if cw := lipgloss.Width(ln); cw > maxW {
+				maxW = cw
+			}
+		}
+		if maxW > minW-1 {
+			t.Errorf("%s: widest row %d exceeds the width-1 budget (%d) at the gate minimum:\n%s",
+				opType, maxW, minW-1, got)
+		}
+	}
+}
+
+// TestFrame_WorkerNotTruncatedWhenWide is an acceptance test: a long
+// worker FQDN that doesn't fit the content-minimum summary box must render in
+// full once the terminal is wide enough, because the summary box now grows with
+// the terminal width.
+func TestFrame_WorkerNotTruncatedWhenWide(t *testing.T) {
+	const longWorker = "site-worker-2.a-long-subdomain.internal.example.net"
+	in := midDeployFrame(220, minRows)
+	in.worker = longWorker
+	got := renderFrame(in)
+	if !strings.Contains(got, longWorker) {
+		t.Errorf("wide terminal should render the full worker hostname %q:\n%s", longWorker, got)
+	}
+}
+
+// TestFrame_Success: header reads "✓ completed in Ns", logs box stays "logs".
+func TestFrame_Success(t *testing.T) {
+	in := midDeployFrame(minTermCols, minRows)
+	in.done = true
+	got := renderFrame(in)
+	if !strings.Contains(got, "completed in") {
+		t.Errorf("success header missing:\n%s", got)
+	}
+	if !strings.Contains(got, "logs (control plane") {
+		t.Errorf("success should keep the logs title, not error:\n%s", got)
+	}
+}
+
+// TestHeader_ElapsedNeverTruncated is a regression test: the long worker
+// FQDN used to push elapsed off the end of the header ("elapsed 2m4…"). Worker
+// is gone from the header now, and the command (the long token) is what
+// truncates — never elapsed. Drive a deliberately long command across realistic
+// widths and assert the full elapsed value survives in the header every time.
+func TestHeader_ElapsedNeverTruncated(t *testing.T) {
+	in := midDeployFrame(minTermCols, minRows)
+	in.command = "machine deploy a-really-long-machine-hostname.internal.site2.example.net --destructive --some-extra-flag"
+	for _, w := range []int{minTermCols, 130, 160, 200} {
+		in.width = w
+		hdr := headerLine(renderFrame(in))
+		// elapsed in midDeployFrame is 1m17s; the whole token must be present.
+		if !strings.Contains(hdr, "elapsed 1m17s") {
+			t.Errorf("width %d: elapsed truncated/missing from header:\n%q", w, hdr)
+		}
+		if !strings.Contains(hdr, "[q] quit") {
+			t.Errorf("width %d: quit affordance truncated from header:\n%q", w, hdr)
+		}
+		if lipgloss.Width(hdr) > w {
+			t.Errorf("width %d: header overflows: visible=%d\n%q", w, lipgloss.Width(hdr), hdr)
+		}
+	}
+}
+
+// TestHeader_GlobalSpinner is the guard: a global liveness spinner
+// is the header's lead glyph while the op is non-terminal, independent of phase
+// state — so "UI alive" shows even when no lifecycle phase is current. On a
+// terminal state the lead becomes the ✓/✗ outcome glyph (not the spinner).
+func TestHeader_GlobalSpinner(t *testing.T) {
+	// Non-terminal, and crucially with NO current phase (all pending) — the
+	// case where the per-phase spinner has nowhere to draw. The global spinner
+	// must still show.
+	lc := newLifecyclePane(model.OpCommission)
+	lc.now = fixedClock(at(2 * time.Minute))
+	in := frameInput{
+		opType:    model.OpCommission,
+		machine:   "hot-spare-1.pop2",
+		opID:      "abc123",
+		startedAt: at(0),
+		console:   newConsolePane(),
+		lifecycle: lc,
+		width:     minTermCols,
+		height:    minRows,
+		spinner:   "⠙",
+		now:       fixedClock(at(2 * time.Minute)),
+	}
+	hdr := headerLine(renderFrame(in))
+	if !strings.Contains(hdr, "⠙") {
+		t.Errorf("non-terminal header should carry the global spinner glyph:\n%q", hdr)
+	}
+
+	// Terminal success: lead is ✓, no spinner.
+	in.done = true
+	hdr = headerLine(renderFrame(in))
+	if strings.Contains(hdr, "⠙") {
+		t.Errorf("terminal header should not show the spinner:\n%q", hdr)
+	}
+	if !strings.Contains(hdr, "✓") {
+		t.Errorf("terminal-success header should lead with ✓:\n%q", hdr)
+	}
+}
+
+// TestSummary_LastUpdateAgo is the guard: the summary carries a
+// "last update <N>s ago" staleness field, "—" before any event. midDeployFrame
+// sets lastEventAt to t0+72s (the newest log line's translate would have
+// stamped it; here we set it directly) and reads now at t0+77s -> "5s ago".
+func TestSummary_LastUpdateAgo(t *testing.T) {
+	in := midDeployFrame(minTermCols, minRows)
+	in.lastEventAt = at(72 * time.Second) // last activity 5s before now (77s)
+	got := renderFrame(in)
+	if !strings.Contains(got, "update") {
+		t.Errorf("summary missing the last-update row:\n%s", got)
+	}
+	if !strings.Contains(got, "5s ago") {
+		t.Errorf("summary last-update should read 5s ago:\n%s", got)
+	}
+
+	// No event yet -> em dash, not a bogus "0s ago".
+	in.lastEventAt = time.Time{}
+	got = renderFrame(in)
+	if strings.Contains(got, "ago") {
+		t.Errorf("with no event observed, last-update should be '—', not an age:\n%s", got)
+	}
+}

@@ -1,0 +1,61 @@
+# Dev NetBox stack for local development and testing.
+# Managed via justfile: just netbox-up, netbox-down, netbox-reset, etc.
+#
+# Credentials match the integration test harness so tools work against both.
+# Admin UI: http://localhost:8000 (admin / admin)
+# API: http://localhost:8000/api/ with token below.
+
+services:
+  postgres:
+    image: postgres:16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e
+    environment:
+      POSTGRES_DB: netbox
+      POSTGRES_USER: netbox
+      POSTGRES_PASSWORD: testpass
+    volumes:
+      - netbox-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U netbox"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  netbox:
+    image: netboxcommunity/netbox:v4.5.4-4.0.1@sha256:6e82f34e2c939ff3468e561fffd8fe3763cc0c5116c41fb05a858203b1af2008
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8080"
+    environment:
+      DB_HOST: postgres
+      DB_NAME: netbox
+      DB_USER: netbox
+      DB_PASSWORD: testpass
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ""
+      REDIS_DATABASE: "0"
+      REDIS_CACHE_HOST: redis
+      REDIS_CACHE_PASSWORD: ""
+      REDIS_CACHE_DATABASE: "1"
+      SECRET_KEY: abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop
+      API_TOKEN_PEPPER_1: abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP
+      SUPERUSER_NAME: admin
+      SUPERUSER_PASSWORD: admin
+      SUPERUSER_API_TOKEN: "0123456789abcdef0123456789abcdef01234567"
+      SKIP_SUPERUSER: "false"
+      ALLOWED_HOSTS: "*"
+      GRANIAN_WORKERS: "2"
+
+volumes:
+  netbox-pg-data:

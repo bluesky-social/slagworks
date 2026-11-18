@@ -1,0 +1,20 @@
+name: slagworks-agent
+arch: amd64
+platform: linux
+version: "${VERSION}"
+maintainer: "Bluesky <infra@blueskyweb.xyz>"
+description: "Slagworks deploy agent (standalone)"
+vendor: "Bluesky PBC"
+license: "MIT OR Apache-2.0"
+
+# Pin the inner data archive's compression. apt handles whatever nfpm
+# emits, but pinning gzip avoids surprises if a future nfpm bump
+# silently switches the default.
+deb:
+  compression: gzip
+
+contents:
+  - src: slagworks-agent
+    dst: /usr/bin/slagworks-agent
+    file_info:
+      mode: 0755

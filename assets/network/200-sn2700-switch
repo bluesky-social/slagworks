@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+# slagworks:match device_type=/mellanox-sn2700(-cs2fo)?/
+# slagworks:priority 200
+#
+# Mellanox SN2700-family leaf/spine switch base network config.
+# Site-agnostic: the site= key is intentionally absent. All per-site facts
+# (mgmt IP, gateway) come from the NetBox interface facts that slagworks
+# injects, so one script serves every pop. Replaced the per-pop pop1/pop3
+# clones 2026-07-11 (operator decision: per-site clones added divergence
+# risk, not isolation — preflight + the DHCP fallback keep a bad edit soft).
+#
+# MATCH KEYS: device_type is the SN2700 family. The regex covers
+# BOTH the plain "mellanox-sn2700" slug (pop1 switches incl. leaf-6) and the
+# "mellanox-sn2700-cs2fo" cabling variant (leaf-4) — same SN2700 hardware, same
+# mgmt bootstrap. (The duplicate "msn2700" device-type that leaf-6 used to sit
+# on was consolidated into "mellanox-sn2700" — see the leaf-6
+# migration; both carried identical slagworks_kernel_params=console=ttyS0,115200,
+# so leaf-6's boot params are unchanged.) The SN2410 leaves are a different
+# device-type and intentionally NOT matched here.
+#
+# Unlike the kworker script, this emits ONLY a management netplan.
+# It deliberately does NOT configure the data-plane fabric (FRR/BGP, swp*
+# ports, bonds, br_servers, VXLAN). On these switches the fabric is owned by
+# the site Ansible `switches` + `leaf_l3` / `frr` ansible roles, which converge
+# it post-boot — exactly the same division of labor as the kworkers (slagworks
+# lays down a bootable base OS, ansible converges the role-specific config).
+#
+# Why a script at all, rather than relying on the agent's built-in default
+# DHCP netplan: preflight requires a MATCHED network script whenever ANY
+# network scripts exist site-wide (see internal/snapshot/preflight.go) — the
+# "no scripts at all -> plain-DHCP intent OK" escape doesn't apply once the
+# kworker/hot-spare scripts are present. This script makes the mgmt intent
+# EXPLICIT for SN2700s instead of leaving them to fail the match.
+#
+# MATCH BY MAC, NOT NAME: the earlier version matched
+# `name: "eth*"`, which broke. The mgmt NIC is `eth0` only in the deploy
+# initrd; in the DEPLOYED OS systemd predictable-naming renames it to `eno1`
+# (and `ens6` for the second on-board NIC), and an mlxsw Spectrum fabric port
+# also transiently claims `eth0` before renaming to enp3s0np17 — so `eth*`
+# matches nothing in the booted OS and the switch never gets a mgmt IP / never
+# phones home. We instead pin each on-board mgmt NIC by its NetBox MAC and
+# match-by-MAC (no set-name — see below), exactly like the kworker script's
+# routed-leg match — stable across the initrd->installed-OS rename.
+#
+# PER-NIC RENDERING (static vs DHCP):
+# - If the NIC carries a modeled IP in NetBox: emit a static config with the
+#   pop's oob-gw VIP as gateway and nameserver. The VIP is {a}.{b}.240.1 from
+#   the NIC's IP a.b.c.d/len — the fleet-wide convention (same derivation as
+#   the deploy-window resolver in assets/network/100-pop1-l3-kworker).
+#   A sanity guard: the derived VIP must be inside the NIC's own /22 subnet;
+#   if not, the IP isn't OOB-/22-shaped and the script fails loud rather than
+#   emitting a config with an unreachable gateway.
+# - If the NIC has NO modeled IP: emit DHCP (dhcp4: true) — fallback for
+#   unmodeled switches, keeps preflight satisfied and boxes phone-home-able.
+#   Unmodeled switches that have never had a static OOB IP assigned in NetBox
+#   will use this path until they are properly modeled.
+#
+# Shared plumbing (facts I/O, emit-bundle): slagworks_netlib. The mgmt-NIC
+# selection + safe-yaml-key logic is SN2700-specific and lives here.
+
+import ipaddress
+
+import slagworks_netlib as nl
+
+ifaces = nl.load_facts()
+
+# Select the on-board management NICs. On an SN2700 these are the 1000base-t
+# e1000e ports; the data-plane is the mlxsw Spectrum ASIC (enp<bus>s<slot>np*,
+# named enpNsMnpK by the kernel) plus LAG aggregates, all owned by ansible.
+# The network facts collapse NetBox's 1000base-t/100gbase distinction to
+# type="physical" (see snapshot.classifyInterface), so we discriminate by
+# name: keep physical NICs that are NOT mlxsw fabric ports (enp*/swp*) and not
+# lag/bond aggregates. For leaf-6 that yields eno1 + ens6; the 32 enp3s0np*
+# fabric ports and bond_sp* are left untouched for the post-boot ansible
+# convergence.
+def is_mgmt(i):
+    if i.get("type") != "physical":
+        return False
+    name = i.get("name", "")
+    if name.startswith("enp") or name.startswith("swp") or name.startswith("bond"):
+        return False
+    if not i.get("mac"):
+        return False
+    return True
+
+mgmt = [i for i in ifaces if is_mgmt(i)]
+if not mgmt:
+    # HARD FAIL rather than emit an empty/again-name-based netplan: this
+    # script only runs because the host matched device_type=mellanox-sn2700*,
+    # i.e. it IS an SN2700 and MUST have on-board mgmt NICs in its NetBox
+    # model. None found => the model is incomplete; bringing the switch up with
+    # no mgmt networking would silently strand it (the exact name-match failure
+    # mode, just relocated). Fail loud so the deploy aborts and the operator
+    # fixes the model.
+    names = [i.get("name") for i in ifaces]
+    nl.fail(f"ERROR: no on-board mgmt NIC found in network facts for this SN2700 "
+            f"(physical, non-fabric, with a MAC). Interfaces seen: {names}\n")
+
+# Stable order (by NetBox name) so the emitted stanzas are deterministic.
+mgmt.sort(key=lambda i: i.get("name", ""))
+
+def derive_vip(ip_cidr):
+    """Derive the pop's oob-gw keepalived VIP from an OOB NIC IP.
+
+    The fleet-wide convention: from a.b.c.d/prefix, the pop VIP is a.b.240.1.
+    This is the same derivation the kworker deploy-window resolver uses
+    (assets/network/100-pop1-l3-kworker, nl.vip_nameserver). On a correctly
+    modeled OOB NIC the /22 subnet spans .240.x, so 10.254.240.1 is inside
+    10.254.240.0/22 and L2-reachable without a default route.
+
+    Sanity guard: if the derived VIP is not inside the NIC's own subnet, the
+    addressing isn't OOB-/22-shaped (e.g. a /24 host-only prefix or a
+    mismodeled IP). Fail loud — emitting a config with an unreachable gateway
+    would silently break mgmt connectivity, the exact failure mode we are
+    trying to prevent. Returns (vip_str, iface_obj) for the caller to use in
+    both the netplan stanza and the nameservers entry."""
+    iface_obj = ipaddress.ip_interface(ip_cidr)
+    parts = str(iface_obj.ip).split(".")
+    vip_str = f"{parts[0]}.{parts[1]}.240.1"
+    vip_addr = ipaddress.ip_address(vip_str)
+    if vip_addr not in iface_obj.network:
+        nl.fail(
+            f"ERROR: OOB NIC IP {ip_cidr} gives VIP {vip_str} which is not "
+            f"inside the NIC's own subnet {iface_obj.network} — the IP is not "
+            f"OOB-/22-shaped (expected a /22 spanning the .240.x block, e.g. "
+            f"10.254.240.0/22). Fix the NetBox IP assignment before deploy.\n"
+        )
+    return vip_str
+
+lines = [
+    "# slagworks deploy agent - SN2700 switch base mgmt networking (static-from-NetBox",
+    "# with DHCP fallback). Gateway and DNS = pop oob-gw VIP ({a}.{b}.240.1) by",
+    "# fleet convention. Fabric (FRR/swp*/bonds/VXLAN) is owned by site Ansible",
+    "# roles, applied post-boot. NICs matched by MAC so the eth0->eno1 rename in the",
+    "# deployed OS doesn't lose them.",
+    "network:",
+    "  version: 2",
+    "  renderer: networkd",
+    "  ethernets:",
+]
+
+# Match by MAC but DON'T set-name: the on-board NIC keeps its kernel
+# predictable name (eno1/ens6), which is what the post-boot site Ansible
+# leaf_l3 ansible role's netplan template keys on (ansible_facts[eno1]).
+# A `set-name: mgmtN` here would rename it out from under ansible and break
+# the L3 convergence (object 'dict' has no attribute 'eno1'). The netplan
+# stanza key is the NetBox interface name purely for readability; the match
+# is the MAC, so it applies regardless of the kernel's chosen name.
+#
+# RequiredForOnline / optional: a NIC with a modeled IP is the cabled/in-use
+# port (e.g. leaf-1's eno1 with the static OOB IP); make it RequiredForOnline
+# so network-online.target waits for it and units ordered after it (phone-home,
+# etc.) have mgmt connectivity. NICs with no modeled IP (e.g. an uncabled
+# second on-board port ens6) get optional:true so they don't hold
+# systemd-networkd-wait-online until timeout (~120s/boot). If NONE of the
+# mgmt NICs carry an IP (a switch that has never been modeled with a static
+# IP), every NIC is optional and network-online may fire early — acceptable
+# because the phone-home unit retries until success; we just avoid
+# a guaranteed timeout on the common, known-uncabled-second-port case.
+any_with_ip = any(i.get("ip") for i in mgmt)
+
+def netplan_key(iface):
+    # The netplan stanza key is purely an identifier (the interface is bound
+    # by `match: macaddress`), so it must be a SAFE yaml key, not the raw
+    # NetBox name. Operator-controlled names can contain yaml-significant
+    # chars (':', '#', spaces, '/') AND can be implicit-typed tokens
+    # ('true'/'null'/'123') that an unquoted yaml key resolves to a
+    # bool/null/number. So: keep only alnum/-/_ from the name, ASCII-only,
+    # and ALWAYS prefix "nic-" — the prefix both forces a string scalar and
+    # gives a stable fallback when the name has nothing usable.
+    raw = iface.get("name") or ""
+    safe = "".join(c if (c.isascii() and (c.isalnum() or c in "-_")) else "-" for c in raw).strip("-")
+    return "nic-" + (safe or iface["mac"].replace(":", "").lower())
+
+used_keys = set()
+for i in mgmt:
+    key = netplan_key(i)
+    # Lossy sanitization can collapse two distinct names to one key; a dup
+    # yaml key would drop a NIC's config. On any collision (incl. the
+    # unlikely case where the mac-derived fallback itself collides), append
+    # an incrementing suffix until the key is unique.
+    if key in used_keys:
+        base = "nic-" + i["mac"].replace(":", "").lower()
+        key = base
+        n = 2
+        while key in used_keys:
+            key = f"{base}-{n}"
+            n += 1
+    used_keys.add(key)
+
+    ip = i.get("ip")
+    lines.append(f"    {key}:")
+    lines.append("      match:")
+    lines.append(f'        macaddress: "{i["mac"].lower()}"')
+    if ip:
+        # Static config: derive the oob-gw VIP as gateway + nameserver.
+        # derive_vip exits non-zero if the addressing isn't OOB-/22-shaped.
+        vip = derive_vip(ip)
+        lines.append("      dhcp4: false")
+        lines.append("      dhcp6: false")
+        lines.append("      addresses:")
+        lines.append(f'        - "{ip}"')
+        lines.append("      routes:")
+        lines.append("        - to: default")
+        lines.append(f"          via: {vip}")
+        lines.append("      nameservers:")
+        lines.append("        addresses:")
+        lines.append(f'          - "{vip}"')
+        lines.append('          - "1.1.1.1"')
+    else:
+        # No modeled IP: DHCP fallback. Keeps preflight satisfied and the
+        # switch phone-home-able on first boot before NetBox modeling is
+        # complete.
+        lines.append("      dhcp4: true")
+        lines.append("      dhcp6: false")
+
+    # Required-for-online only if THIS NIC has a modeled IP (or, when none
+    # do, none gate — see above). Otherwise optional so an uncabled or
+    # unmodeled port doesn't block wait-online.
+    if not (any_with_ip and ip):
+        lines.append("      optional: true")
+
+netplan = "\n".join(lines) + "\n"
+
+nl.emit(nl.bundle([
+    nl.file_entry("/etc/netplan/99-slagworks.yaml", netplan, mode="0600"),
+]))

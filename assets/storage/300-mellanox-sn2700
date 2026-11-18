@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+# slagworks:match system_product=/^MSN2700(-CS2FO)?$/
+# slagworks:priority 300
+#
+# MATCH: system_product covers the plain SN2700 (DMI "MSN2700") and the
+# MSN2700-CS2FO SKU (pop1 leaf-4; NetBox type mellanox-sn2700-cs2fo). Checked
+# live 2026-10-23: same BIOS 4.6.5 (legacy boot), CPU, RAM, GPT single disk;
+# CS2FO differs only in board (SA000874 vs VMOD0001) and disk size (29.8G vs
+# 14.9G). The layout below is size-agnostic, so one script serves both.
+#
+# Mellanox SN2700 (MSN2700) Ubuntu+FRR leaf/spine switch. Unlike the
+# kworker/hot-spare chassis (multi-NVMe, RAID1 boot), the SN2700 is an x86
+# switch with a SINGLE small on-board disk (InnoDisk ~15GB eMMC/SSD on
+# /dev/sda). No RAID, no data disks — just one boot+root disk.
+#
+# Layout produced:
+#   {disk}1 -> bios_grub (1M, EF02, unformatted, unmounted)
+#   {disk}2 -> root      (rest of disk, xfs, /)
+#
+# LEGACY/BIOS GPT: the SN2700's AMI BIOS (v4.6.5/2018) boots legacy/BIOS, and
+# getting into firmware to flip it to UEFI requires physical rack access (the
+# serial setup menu is unreachable — no firmware console-redirect-to-setup).
+# Rather than block on a rack visit, slagworks deploys onto the existing
+# firmware: a 1M GPT bios_grub partition holds GRUB's core.img and the agent's
+# legacy bootloader path (installGRUBBIOS, gated on !isUEFI) runs
+# `grub-install --target=i386-pc` here. This mirrors the layout the live leaf-6
+# disk already has (sda1 1M BIOS boot + sda2 root). FRR/netplan/VXLAN fabric
+# config is NOT slagworks' concern — the site Ansible (switches/leaf_l3)
+# roles converge that post-boot, same division of labor as the kworkers.
+
+import json, os, sys
+
+inv_path = os.environ.get("SLAGWORKS_INVENTORY")
+if not inv_path:
+    print("ERROR: SLAGWORKS_INVENTORY must be set", file=sys.stderr)
+    sys.exit(1)
+
+with open(inv_path) as f:
+    inv = json.load(f)
+
+disks = inv["disks"]
+if len(disks) != 1:
+    # The SN2700 has exactly one on-board disk. More than one means the
+    # inventory is unexpected (extra USB/SD media?) — fail loudly rather
+    # than guess which one is the boot target.
+    print(f"ERROR: expected exactly 1 disk on an SN2700, found {len(disks)}: "
+          f"{[d.get('name') for d in disks]}", file=sys.stderr)
+    sys.exit(1)
+
+disk = disks[0]["name"]
+
+# 1M bios_grub (EF02, unformatted), root takes the rest of the disk
+# ("rest" is the planner's fill-remaining sentinel — see
+# internal/storage/plan.go). No ESP: this host boots legacy/BIOS.
+layout = {
+    "layout": {
+        disk: {
+            "type": "disk", "ptable": "gpt", "boot": True,
+            "partitions": [
+                {"name": f"{disk}1", "size": "1M", "bios_grub": True},
+                {"name": f"{disk}2", "size": "rest", "fs": "xfs"},
+            ],
+        },
+    },
+    "mounts": {
+        "/": {"device": f"{disk}2"},
+    },
+}
+
+json.dump(layout, sys.stdout, indent=2)

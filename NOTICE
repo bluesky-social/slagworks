@@ -1,0 +1,17 @@
+Slagworks
+Copyright (c) 2026 Bluesky Social PBC, and Contributors
+
+This product is licensed under the terms of the MIT license OR the Apache
+License, Version 2.0, at your option. See LICENSE.txt, LICENSE-MIT.txt, and
+LICENSE-APACHE.txt.
+
+This product includes third-party software. A full inventory of bundled and
+depended-upon third-party components and their licenses is in
+THIRD-PARTY-LICENSES.md.
+
+Notable third-party components:
+
+- iPXE (https://github.com/ipxe/ipxe), GPL-2.0 with the iPXE permissive
+  exception. The prebuilt boot binaries in assets/ipxe/ are built from upstream
+  iPXE at the tag recorded in assets/ipxe/UPSTREAM-REF. Corresponding source is
+  available from the upstream project at that tag.

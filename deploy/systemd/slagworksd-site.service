@@ -1,0 +1,42 @@
+[Unit]
+Description=Slagworks Site Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/slagworksd site
+# "-" prefix: a missing env file must not make systemd fail the unit
+# with Result=resources (which bypasses RestartPreventExitStatus and
+# restart-loops forever). Instead the daemon starts, detects the
+# missing config, and exits 78.
+EnvironmentFile=-/etc/slagworks/site.env
+# Restart=always (was on-failure) so a clean exit (e.g. after
+# auto-upgrade replaces the binary and the daemon decides to bow out
+# cleanly) brings up the new code. RestartSec=5 is enough to dodge
+# tight crash loops without slowing recovery.
+Restart=always
+RestartSec=5
+# sysexits EX_CONFIG: missing/invalid required config exits 78 and
+# cannot heal by retrying — fail the unit instead of looping. Applies
+# regardless of Restart=always per systemd.service(5).
+RestartPreventExitStatus=78
+# WatchdogSec was 30s — disconnect storms during a global rollout
+# took longer than that and SIGABRT'd the daemon mid-reconnect. We
+# don't have a code path that feeds the watchdog from the read loop,
+# so the watchdog adds risk without value. Removed.
+#
+# Runs as root, deliberately (2026-07-12). The prior User=slagworks setup
+# was root-equivalent with extra steps: per-start setcap for raw-socket
+# DHCP (file caps don't survive the auto-upgrade's rename(2)),
+# NoNewPrivileges=no + sudoers so it could upgrade itself,
+# ReadWritePaths=/usr/bin so it could replace its own binary — and it
+# still couldn't read root-only SMBIOS (/sys/class/dmi/id/product_serial),
+# which the hardware-serial self-identity requires at startup.
+# The daemon owns the box's boot plane (DHCP/TFTP/HTTP, BMC creds in
+# memory, self-upgrade); the non-root posture bought no real containment
+# and broke serial reporting fleet-wide on the P4a rollout. Root deletes
+# the whole workaround pile.
+
+[Install]
+WantedBy=multi-user.target

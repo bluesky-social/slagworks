@@ -1,0 +1,7 @@
+Origin: Bluesky
+Label: Bluesky Slagworks
+Codename: stable
+Architectures: amd64
+Components: main
+Description: Slagworks bare-metal infrastructure packages
+SignWith: default

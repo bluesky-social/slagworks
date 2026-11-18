@@ -1,0 +1,78 @@
+package clientauth
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"golang.org/x/oauth2"
+)
+
+// Identity is the human-readable subset of a token's claims, for `auth whoami`.
+type Identity struct {
+	Subject           string   `json:"sub"`
+	Email             string   `json:"email"`
+	PreferredUsername string   `json:"preferred_username"`
+	Groups            []string `json:"groups"`
+	Expiry            int64    `json:"exp"`
+}
+
+// DecodeIdentity extracts claims from a JWT access token WITHOUT verifying its
+// signature — this is for local display (`whoami`) only, never for trust
+// decisions (the resource server does the real verification). Returns an error
+// if the token isn't a decodable JWT.
+func DecodeIdentity(accessToken string) (*Identity, error) {
+	parts := strings.Split(accessToken, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("not a JWT (cannot decode claims locally)")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		// some encoders pad; tolerate standard base64url with padding
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return nil, fmt.Errorf("decoding JWT payload: %w", err)
+		}
+	}
+	var id Identity
+	if err := json.Unmarshal(payload, &id); err != nil {
+		return nil, fmt.Errorf("parsing JWT claims: %w", err)
+	}
+	return &id, nil
+}
+
+// Logout deletes the cached token (and lock) for the app. Safe to call when no
+// cache exists.
+func Logout(cfg Config) error {
+	path, err := defaultTokenPath(cfg.AppName)
+	if err != nil {
+		return err
+	}
+	return deleteCache(path)
+}
+
+// WriteCachedToken persists a freshly-obtained token to the app's default cache
+// location (used by `auth login`). Bearer() handles caching on its own login
+// path; this is the explicit-login entrypoint.
+func WriteCachedToken(cfg Config, tok *oauth2.Token) error {
+	path, err := defaultTokenPath(cfg.AppName)
+	if err != nil {
+		return err
+	}
+	return writeCache(path, tok)
+}
+
+// CachedIdentity loads the cached access token and decodes its identity for
+// `whoami`, without triggering a login. Returns an error if there's no cache.
+func CachedIdentity(cfg Config) (*Identity, error) {
+	path, err := defaultTokenPath(cfg.AppName)
+	if err != nil {
+		return nil, err
+	}
+	tok, err := readCache(path)
+	if err != nil {
+		return nil, fmt.Errorf("not logged in (no cached token): %w", err)
+	}
+	return DecodeIdentity(tok.AccessToken)
+}

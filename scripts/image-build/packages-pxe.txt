@@ -1,0 +1,47 @@
+# Package list for the PXE chroot.
+#
+# This chroot becomes the kernel + initrd that PXE-boots the
+# candidate during commission/deploy. Smaller than the deploy
+# chroot — only what the slagworks overlay-init needs to bring up
+# networking, fetch the agent, and pivot.
+#
+# Format: same as packages-deploy.txt — one package per line, hash
+# comments and blank lines stripped, inline comments allowed after
+# the package name.
+
+# Kernel + modules-extra + firmware. linux-image-generic transitively
+# pulls in linux-modules-extra-<version>-generic (mlx5/ice/etc.) and
+# linux-firmware via its Depends. Listing those explicitly would
+# require versioned package names (no unversioned metapackage), so
+# we lean on the metapackage's deps.
+#
+# Same kernel version as the deploy chroot (both consume the same
+# apt snapshot pin), so the kernel that boots from disk after deploy
+# is ABI-compatible with the modules from this chroot.
+linux-image-generic
+
+# initramfs-tools generates /boot/initrd.img-* from the chroot's
+# /etc/initramfs-tools/ + /usr/share/initramfs-tools/ layout. Our
+# build script installs the slagworks BOOT hook (assets/initramfs/
+# hooks/slagworks + scripts/slagworks) into that layout and runs
+# `update-initramfs -u`, so stock /init sources our boot=slagworks
+# mountroot at image-build time (no overlay-init overwrite).
+initramfs-tools
+
+# busybox-static gives us shell + the small utilities the slagworks
+# BOOT script uses (test, mount, sleep, etc.). The --static variant has
+# no shared-library deps, which matters for an initramfs.
+busybox-static
+
+# wget is what the slagworks BOOT script uses to fetch the agent +
+# squashfs. initramfs-tools picks it up via its "live" hook when it's
+# present in the chroot.
+wget
+
+# pciutils gives the overlay init `lspci -nnk` for the pci-inventory
+# diagnostic during NIC bring-up. Until networking is up the SOL console
+# is the ONLY debug channel, so a readable vendor/device/driver dump there
+# is high-value when a NIC silently fails to register a netdev. The init
+# also reads /sys/bus/pci directly (tool-free) as the always-available
+# fallback; lspci is the human-readable layer on top.
+pciutils

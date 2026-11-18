@@ -1,0 +1,7 @@
+{
+   "blockdevices": [
+      {"name":"nvme0n1","model":"Samsung SSD 990 PRO 4TB","serial":"S7EVNX0T12345A","size":4000787030016,"tran":"nvme","type":"disk","wwn":"eui.002538db11a012a8","rota":false},
+      {"name":"nvme1n1","model":"Samsung SSD 990 PRO 4TB","serial":"S7EVNX0T12345B","size":4000787030016,"tran":"nvme","type":"disk","wwn":"eui.002538db11a012b9","rota":false},
+      {"name":"loop0","model":null,"serial":null,"size":63832064,"tran":null,"type":"loop","wwn":null,"rota":true}
+   ]
+}

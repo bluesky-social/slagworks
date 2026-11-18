@@ -1,0 +1,101 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - bodyclose
+    - durationcheck
+    - exhaustive
+    - forbidigo
+    - gocritic
+    - gosec
+    - nilerr
+    - sqlclosecheck
+    - misspell
+  settings:
+    forbidigo:
+      # The agent's only remote-visible log surface is slogkit JSON
+      # envelopes (stderr -> SOL capture -> site worker). A stray
+      # fmt.Print* goes to the agent's stdout, which nothing forwards,
+      # so the line is invisible in `slagctl machine logs`. Forbid it in
+      # agent + subsystem code; the stdout-is-product surfaces (CLIs,
+      # qemutest helper daemons, tests) are excluded by path below.
+      forbid:
+        - pattern: ^fmt\.Print.*$
+          msg: use ctx.Log.* (slogkit) instead of fmt.Print*; agent stdout is not forwarded
+    errcheck:
+      check-blank: false
+      exclude-functions:
+        - io.Close
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (net/http.ResponseWriter).Write
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Sscanf
+        - os.Remove
+        - os.MkdirAll
+        - (*encoding/json.Encoder).Encode
+        - (*github.com/spf13/cobra.Command).MarkFlagRequired
+        - (*text/tabwriter.Writer).Flush
+    exhaustive:
+      default-signifies-exhaustive: true
+    gosec:
+      excludes:
+        - G204  # subprocess with variable — expected for system tools (blkid, cpio, unmkinitramfs)
+        - G301  # dir perms > 0750 — system dirs need 0755
+        - G304  # file path from variable — expected for image management
+        - G305  # file traversal in archive extraction — path is validated
+        - G306  # file perms > 0600 — system config files need 0644
+        - G110  # decompression bomb — trusted input from our own image builds
+        - G104  # unhandled errors — covered by errcheck with explicit exclusions
+        - G107  # HTTP with variable URL — all URLs from config/trusted sources
+        - G115  # uint->int overflow — controlled sizes
+        - G120  # form body size — iPXE requests on isolated PXE network
+        - G302  # chmod > 0600 — scripts need execute permission
+        - G704  # SSRF via taint — all HTTP targets from config
+        - G705  # XSS via taint — responses are iPXE scripts/binary, not HTML
+    staticcheck:
+      checks:
+        - all
+        - -SA1019
+        - -ST1000
+        - -QF1002
+        - -QF1008
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - gocritic
+          - forbidigo
+      - text: "ifElseChain"
+        path: cmd/slagctl/cmd/operation\.go
+      # stdout IS the product for these binaries: slagctl (CLI output),
+      # slagworksd's version/worker-id subcommands (operator query
+      # responses), and the qemutest helper daemons (readiness
+      # handshakes the harness Scan()s for). fmt.Print* is correct there.
+      - path: cmd/slagctl/
+        linters:
+          - forbidigo
+      - path: cmd/slagworksd/
+        linters:
+          - forbidigo
+      - path: cmd/qemutest-tftpd/
+        linters:
+          - forbidigo
+      - path: cmd/qemutest-serialrelay/
+        linters:
+          - forbidigo
+    paths:
+      - docs
+      - dev
+      - assets
+
+formatters:
+  enable:
+    - goimports

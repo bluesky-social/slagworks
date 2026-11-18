@@ -1,0 +1,5 @@
+[
+   {"ifindex":1,"ifname":"lo","flags":["LOOPBACK","UP","LOWER_UP"],"address":"00:00:00:00:00:00","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8}]},
+   {"ifindex":2,"ifname":"eth0","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"address":"3c:ec:ef:aa:bb:01","addr_info":[{"family":"inet","local":"10.252.1.10","prefixlen":24},{"family":"inet6","local":"fe80::3eec:efff:feaa:bb01","prefixlen":64}]},
+   {"ifindex":3,"ifname":"eth1","flags":["BROADCAST","MULTICAST"],"address":"3c:ec:ef:aa:bb:02","addr_info":[]}
+]

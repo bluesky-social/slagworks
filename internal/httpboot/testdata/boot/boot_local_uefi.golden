@@ -1,0 +1,5 @@
+#!ipxe
+echo slagworks: boot-local for mac 52:54:00:aa:bb:01
+sanboot --no-describe --drive 0x80 ||
+sanboot --no-describe --drive 0x81 ||
+exit 1

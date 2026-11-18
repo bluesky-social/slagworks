@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+# slagworks:match site=pop2
+# slagworks:match location=pop2-01-005250
+# slagworks:match device_type=/mellanox-sn2700(-cs2fo)?/
+# slagworks:match hostname=/(leaf-[3-6]|spine-[12])\.pop2/
+# slagworks:priority 300
+#
+# POP2 new-cage SN2700 leaf/spine bootstrap networking.
+#
+# This script is intentionally separate from the fleet-generic SN2700 script.
+# The POP2 new cage has its own OOB /23 and gateway convention:
+#
+#   subnet:  10.253.242.0/23
+#   gateway: 10.253.243.252
+#   DNS:     10.253.243.252
+#
+# Switches must be imageable and reachable before any fabric port or BGP
+# session exists, so the installed base OS gets only its static management NIC
+# and an OOB default route. The site Ansible switch/leaf_l3 roles own every fabric
+# interface and FRR after first boot.
+#
+# Scope is deliberately redundant: site + new-cage location + SN2700 family +
+# an explicit leaf3-6/spine1-2 hostname set. leaf1/2.pop2 are in the old cage,
+# use a different device family, and are mission-critical/out of scope.
+#
+# Match the management NIC by MAC, never its kernel name. SN2700 firmware/initrd
+# calls it eth0 while the installed OS normally calls it eno1. Do not set-name:
+# site Ansible uses the predictable installed-OS name when converging the switch.
+
+import ipaddress
+
+import slagworks_netlib as nl
+
+
+OOB_NETWORK = ipaddress.ip_network("10.253.242.0/23")
+OOB_GATEWAY = ipaddress.ip_address("10.253.243.252")
+
+
+def is_mgmt(iface):
+    if iface.get("type") != "physical":
+        return False
+    name = iface.get("name", "")
+    if nl.is_bmc_name(name):
+        return False
+    if name.startswith(("enp", "swp", "bond")):
+        return False
+    return bool(iface.get("mac"))
+
+
+def netplan_key(iface):
+    raw = iface.get("name") or ""
+    safe = "".join(
+        c if c.isascii() and (c.isalnum() or c in "-_") else "-"
+        for c in raw
+    ).strip("-")
+    return "nic-" + (safe or iface["mac"].replace(":", "").lower())
+
+
+ifaces = nl.load_facts()
+mgmt = sorted((iface for iface in ifaces if is_mgmt(iface)), key=lambda i: i.get("name", ""))
+modeled = [iface for iface in mgmt if iface.get("ip")]
+
+if not mgmt:
+    nl.fail(
+        "ERROR: no on-board management NIC found for POP2 new-cage SN2700; "
+        f"interfaces seen: {[i.get('name') for i in ifaces]}\n"
+    )
+
+if len(modeled) != 1:
+    nl.fail(
+        "ERROR: expected exactly one statically modeled management NIC for "
+        f"POP2 new-cage SN2700, found {len(modeled)}: "
+        f"{[(i.get('name'), i.get('ip')) for i in modeled]}\n"
+    )
+
+primary = modeled[0]
+try:
+    primary_addr = ipaddress.ip_interface(primary["ip"])
+except ValueError as exc:
+    nl.fail(f"ERROR: invalid management IP {primary.get('ip')!r}: {exc}\n")
+
+if primary_addr.network != OOB_NETWORK:
+    nl.fail(
+        f"ERROR: POP2 new-cage SN2700 management IP {primary['ip']} is not "
+        f"modeled in the exact OOB prefix {OOB_NETWORK}\n"
+    )
+
+if OOB_GATEWAY not in primary_addr.network:
+    nl.fail(
+        f"ERROR: POP2 new-cage OOB gateway {OOB_GATEWAY} is not reachable "
+        f"from management IP {primary['ip']}\n"
+    )
+
+key = netplan_key(primary)
+netplan = f"""\
+# slagworks deploy agent - POP2 new-cage SN2700 OOB bootstrap.
+# Fabric interfaces and FRR are owned by site Ansible after first boot.
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    {key}:
+      match:
+        macaddress: "{primary['mac'].lower()}"
+      dhcp4: false
+      dhcp6: false
+      addresses:
+        - "{primary['ip']}"
+      routes:
+        - to: default
+          via: {OOB_GATEWAY}
+      nameservers:
+        addresses:
+          - "{OOB_GATEWAY}"
+          - "1.1.1.1"
+"""
+
+nl.emit(
+    nl.bundle(
+        [nl.file_entry("/etc/netplan/99-slagworks.yaml", netplan, mode="0600")]
+    )
+)

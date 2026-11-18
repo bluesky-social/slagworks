@@ -1,0 +1,69 @@
+name: Build or restore the boot image
+description: |
+  Produces noble-pxe.tar.gz in the workspace for the checked-out commit:
+  restored from the build cache when no image input changed, built with
+  scripts/image-build/build.sh otherwise. build-images.yaml builds and
+  smoke-tests this tarball and test-qemu.yaml boots it, so both work from the
+  same bytes whenever the cache key matches.
+
+inputs:
+  recovery-authorized-keys:
+    description: |
+      authorized_keys lines for the image's recovery sshd (the
+      RECOVERY_AUTHORIZED_KEYS repository variable; composite actions cannot
+      read `vars` themselves). They are part of the cache key.
+    required: false
+    default: ''
+  allow-throwaway-key:
+    description: |
+      'true' builds with a generated key when recovery-authorized-keys is
+      empty. Only for images that are never published, which is every image
+      this repository's CI builds: a fork has no access to the variable.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Install build deps
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq mmdebstrap squashfs-tools-ng
+
+    # Recovery sshd keys are a build input, not a tracked file. They are
+    # public keys, so a repository variable holds them.
+    - name: Write recovery keys
+      shell: bash
+      env:
+        RECOVERY_AUTHORIZED_KEYS: ${{ inputs.recovery-authorized-keys }}
+        ALLOW_THROWAWAY: ${{ inputs.allow-throwaway-key }}
+      run: |
+        if [ -n "$RECOVERY_AUTHORIZED_KEYS" ]; then
+          printf '%s\n' "$RECOVERY_AUTHORIZED_KEYS" > recovery_authorized_keys
+        elif [ "$ALLOW_THROWAWAY" = true ]; then
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/recovery_key"
+          cp "$RUNNER_TEMP/recovery_key.pub" recovery_authorized_keys
+        else
+          echo "::error::repository variable RECOVERY_AUTHORIZED_KEYS is empty; set it to the authorized_keys lines for the recovery sshd"
+          exit 1
+        fi
+
+    # The cached outputs (vmlinuz, initrd, initrd-local, root.squashfs) come
+    # out of the chroot build, so the key lists every file that build reads:
+    # package lists, the apt snapshot, the build script and its helpers, the
+    # initramfs hook and boot script baked into the initrd, and the recovery
+    # keys. restore-keys is deliberately absent: a partial hit would ship
+    # stale package versions.
+    - name: Build cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: phase-a-cache
+        key: phase-a-${{ hashFiles('scripts/image-build/packages-pxe.txt', 'scripts/image-build/packages-deploy.txt', 'scripts/image-build/apt-snapshot.txt', 'scripts/image-build/build.sh', 'scripts/image-build/apt-repos.sh', 'scripts/image-build/mdadm.conf', 'assets/initramfs/scripts/slagworks', 'assets/initramfs/hooks/slagworks', 'recovery_authorized_keys') }}
+
+    - name: Build image
+      shell: bash
+      env:
+        SLAGWORKS_CACHE_DIR: ${{ github.workspace }}/phase-a-cache
+        SLAGWORKS_RECOVERY_AUTHORIZED_KEYS: ${{ github.workspace }}/recovery_authorized_keys
+      run: bash scripts/image-build/build.sh

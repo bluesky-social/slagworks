@@ -1,0 +1,98 @@
+name: slagworks
+arch: amd64
+platform: linux
+version: "${VERSION}"
+maintainer: "Bluesky <infra@blueskyweb.xyz>"
+description: "Bare-metal provisioning daemon"
+vendor: "Bluesky PBC"
+license: "MIT OR Apache-2.0"
+
+contents:
+  - src: slagworksd
+    dst: /usr/bin/slagworksd
+    file_info:
+      mode: 0755
+
+  - src: slagctl
+    dst: /usr/bin/slagctl
+    file_info:
+      mode: 0755
+
+  - src: deploy/upgrade/slagworks-upgrade
+    dst: /usr/bin/slagworks-upgrade
+    file_info:
+      mode: 0755
+
+  - src: deploy/sudoers/slagworks-upgrade
+    dst: /etc/sudoers.d/slagworks-upgrade
+    file_info:
+      mode: 0440
+      owner: root
+      group: root
+
+  - src: deploy/systemd/slagworksd-global.service
+    dst: /lib/systemd/system/slagworksd-global.service
+
+  - src: deploy/systemd/slagworksd-site.service
+    dst: /lib/systemd/system/slagworksd-site.service
+
+  - src: deploy/global.env.example
+    dst: /etc/slagworks/global.env.example
+    type: config
+    file_info:
+      mode: 0640
+
+  - src: deploy/site.env.example
+    dst: /etc/slagworks/site.env.example
+    type: config
+    file_info:
+      mode: 0640
+
+  # iPXE boot binaries served over TFTP. snponly.efi is the UEFI NBP
+  # firmware fetches after the DHCP OFFER points to it; undionly.kpxe
+  # is the legacy-BIOS counterpart. Both are vendored in assets/ipxe/
+  # and built from the iPXE upstream pinned in assets/ipxe/UPSTREAM-REF.
+  # /srv/tftp is the slagworksd-site default SLAGWORKS_TFTP_DIR.
+  - src: assets/ipxe/snponly.efi
+    dst: /srv/tftp/snponly.efi
+    file_info:
+      mode: 0644
+  - src: assets/ipxe/undionly.kpxe
+    dst: /srv/tftp/undionly.kpxe
+    file_info:
+      mode: 0644
+  - dst: /srv/tftp
+    type: dir
+    file_info:
+      mode: 0755
+
+  - dst: /var/lib/slagworks
+    type: dir
+    file_info:
+      mode: 0750
+      owner: slagworks
+      group: slagworks
+
+  - dst: /var/lib/slagworks/agent-bins
+    type: dir
+    file_info:
+      mode: 0750
+      owner: slagworks
+      group: slagworks
+
+scripts:
+  postinstall: deploy/postinstall.sh
+  postremove: deploy/postremove.sh
+
+# Pin gzip compression for the inner data archive — see
+# nfpm-agent.yaml.
+deb:
+  compression: gzip
+
+overrides:
+  deb:
+    depends:
+      - systemd-boot-efi
+      - slagworks-agent (= ${VERSION})
+    replaces:
+      - slagworks-agent

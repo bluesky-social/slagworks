@@ -1,0 +1,138 @@
+name: test-integration
+
+# No path filters: discover is a required check, and a required check
+# that never runs leaves a docs-only PR unmergeable.
+on:
+  pull_request:
+  # slagworks pushes direct to main rather than via PR (per CLAUDE.md
+  # push policy), so the integration suite needs a push trigger or it
+  # would never run on the actual landing path.
+  push:
+    branches: [main]
+  # Manual trigger for re-running on main or against branches outside
+  # the PR flow.
+  workflow_dispatch:
+
+# Cancel in-flight runs when a PR gets a new push — keeps the matrix
+# from queueing up multiple full passes per branch.
+concurrency:
+  group: test-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# `shell: bash` switches run steps from the default `bash -e {0}` to
+# `bash --noprofile --norc -eo pipefail {0}` so a failing left side of
+# any pipe (e.g. the `date | tee` instrumentation steps) fails the
+# step instead of being masked by the pipe's last command.
+# The "Run test" step's deliberate `set +e` capture still works — a
+# script block can always relax the defaults it inherits.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  discover:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tests: ${{ steps.list.outputs.tests }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - name: Verify integration tests compile
+        # Without this step, a broken test file makes go test -list fail
+        # for that package inside the discover script, the package drops
+        # out of the matrix, and CI reports success while tests don't
+        # actually run.
+        run: go test -tags integration -run '^$' ./internal/...
+      - id: list
+        # qemutest is hard-coded as skipped inside the discover script
+        # (it needs /dev/kvm; runs in test-qemu.yaml on a kvm runner).
+        #
+        # Two lines, not `echo "tests=$(script)"`: command substitution
+        # inside an argument discards the script's exit status (even
+        # under -e/pipefail), so a failing discover script would emit
+        # an empty matrix instead of failing this step.
+        # A bare assignment propagates the status.
+        run: |
+          tests=$(scripts/ci/list-integration-tests.sh)
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+
+  run-test:
+    needs: discover
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJson(needs.discover.outputs.tests) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+
+      - name: Record job start
+        run: date -u +"%Y-%m-%dT%H:%M:%S.%3NZ" | tee "$RUNNER_TEMP/t_job_start"
+
+      - name: Start container-stat sampler
+        run: |
+          # Sample `docker stats` every 2s into an artifact. Captures
+          # per-container CPU/mem during the test run.
+          (
+            while true; do
+              ts=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+              docker stats --no-stream --format \
+                "{{.Name}},{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}},{{.NetIO}},{{.BlockIO}}" \
+                2>/dev/null | sed "s|^|${ts},|" >> "$RUNNER_TEMP/docker-stats.csv" || true
+              sleep 2
+            done
+          ) &
+          echo $! > "$RUNNER_TEMP/sampler_pid"
+
+      - name: Run test
+        id: test
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%S.%3NZ" > "$RUNNER_TEMP/t_test_start"
+          set +e
+          go test -race -tags integration -run "^${{ matrix.entry.test }}$" -v "${{ matrix.entry.pkg }}"
+          rc=$?
+          set -e
+          date -u +"%Y-%m-%dT%H:%M:%S.%3NZ" > "$RUNNER_TEMP/t_test_end"
+          echo "$rc" > "$RUNNER_TEMP/test_exit"
+          # Don't fail here — let "Stop sampler" and "Upload" run
+          # first, then the final step propagates the exit code.
+
+      - name: Stop sampler
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/sampler_pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/sampler_pid")" 2>/dev/null || true
+          fi
+          date -u +"%Y-%m-%dT%H:%M:%S.%3NZ" > "$RUNNER_TEMP/t_job_end"
+
+      - name: Upload instrumentation artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: instr-${{ matrix.entry.test }}
+          path: |
+            ${{ runner.temp }}/docker-stats.csv
+            ${{ runner.temp }}/t_*
+          if-no-files-found: warn
+
+      - name: Propagate test exit code
+        if: always()
+        run: exit "$(cat "$RUNNER_TEMP/test_exit")"

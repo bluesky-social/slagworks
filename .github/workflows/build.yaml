@@ -1,0 +1,151 @@
+name: build
+# No path filters: test, build and lint are required checks, and a
+# required check that never runs leaves a docs-only PR unmergeable.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Manual trigger re-runs the checks on any branch. It never dispatches:
+  # the dispatch job runs only for pushes to main.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PRs share a group per branch so a new push cancels the stale run. Pushes
+# get a group per commit: the dispatch job hands every main commit to the
+# maintainers' build-and-publish pipeline (site workers upgrade to the exact
+# commit global runs), and a shared group would cancel a queued run, and its
+# dispatch, whenever two more pushes land behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Every job but dispatch runs on GitHub-hosted runners with no credentials,
+  # so all of them are safe for pull requests from forks.
+  test:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      # -race needs cgo; the hosted runner image ships a C toolchain.
+      - run: go test -race ./...
+      - name: Check slagctl reference is current
+        run: |
+          go run ./cmd/slagctl/docgen /tmp/slagctl-reference-check.md
+          diff -u docs/user/slagctl-reference.md /tmp/slagctl-reference-check.md \
+            || { echo "slagctl reference is stale: run 'just gen-cli-docs' and commit"; exit 1; }
+
+  lint:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+
+  # Keeps organization-specific identifiers out of the tree.
+  public-clean:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - run: scripts/ci/public-clean.sh
+
+  security:
+    uses: bluesky-social/.github/.github/workflows/security.yml@v1
+    permissions:
+      contents: read
+
+  # Packaging check: the debs build on every change. Nothing downstream
+  # consumes the artifact; it is kept for a week so reviewers can install a
+  # pull request's packages.
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # build-deb.sh derives the deb version from git describe
+          # (release-please tags); a shallow clone has no tags.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Build .deb
+        run: bash scripts/build-deb.sh
+
+      - name: Upload .deb artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: debs
+          path: |
+            slagworks_*_amd64.deb
+            slagworks-agent_*_amd64.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  # Hands each main commit that passed the checks to the maintainers'
+  # build-and-publish pipeline, which lives outside this repository
+  # (docs/dev/build-and-release.md). The repository guard makes this a no-op
+  # in forks, which have neither the App nor a receiver; pull requests never
+  # reach it.
+  dispatch:
+    needs: [test, lint, build]
+    # Also off until the repository variable DEPLOY_DISPATCH is `enabled`,
+    # which the maintainers set once the dispatch App's credentials are
+    # readable from this repository.
+    if: github.repository == 'bluesky-social/slagworks' && github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_DISPATCH == 'enabled'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    # The dispatch rides the App token below, not GITHUB_TOKEN.
+    permissions: {}
+    steps:
+      - name: Mint deploy-dispatch App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.DEPLOY_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_DISPATCH_APP_KEY }}
+          owner: bluesky-social
+          repositories: deploy
+
+      - name: Dispatch build and publish
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # The one repository the App token above is scoped to.
+          RECEIVER: ${{ github.repository_owner }}/deploy
+          SHA: ${{ github.sha }}
+        run: |
+          gh api "repos/$RECEIVER/dispatches" \
+            -f event_type=slagworks-build \
+            -f "client_payload[sha]=$SHA"
+          echo "Dispatched slagworks-build for $SHA"

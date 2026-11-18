@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+# slagworks:match system_product=PowerEdge R640
+# slagworks:priority 150
+#
+# Dell PowerEdge R640 storage layout (the pop2 new-cage oob-gws: oob-gw-3/4).
+#
+#   Boot: RAID1 mirror across the two SAS boot SSDs. No data array — these are
+#   gateways, not storage/compute nodes.
+#
+# Layout produced by this script:
+#   {boot0}1, {boot1}1 -> ESP (512M each; dual ESP so the box still boots if
+#                          one mirror leg dies — only boot0's ESP is mounted at
+#                          /boot/efi, but both are populated by the bootloader
+#                          install, matching the agent's UEFI dual-ESP path)
+#   {boot0}2, {boot1}2 -> mdroot (RAID1, xfs, /)
+#
+# WHY transport=sas, not a model match: unlike the ASUS script (which keys data
+# vs boot off the Kioxia model string) the R640 oob-gws have a homogeneous pair
+# of boot SSDs behind the LSI SAS3008 HBA, so both report transport "sas". We
+# select exactly those and mirror them. Partition suffixes are bare ("{d}1"),
+# not "p1": SAS/SATA `sd*` devices append the partition number directly, only
+# nvme/mmc/loop use the "p" separator (see partSuffix()).
+#
+# DDF / fossil-RAID note (oob-gw-3/4 ship with Dell IR-firmware DDF metadata on
+# sda — an INACTIVE `external:ddf` container + a degraded "Data" virtual disk
+# left by the factory): this script does NOT clear it. Disk-state teardown is
+# the agent's job (--destructive -> wipeStaleState: `mdadm --stop --scan` +
+# `mdadm --zero-superblock` + `wipefs -a`). `wipefs` recognizes the
+# `ddf_raid_member` signature, so the existing path is expected to erase it; if
+# the inactive DDF container holds the disk open and wipefs hits EBUSY, the
+# agent needs an explicit `mdadm --stop /dev/md12N` for external containers
+# (tracked against the Dell-reimage work). The script's contract is purely the
+# desired end-state layout.
+#
+# HARD FAIL (no silent fallback, mirrors the ASUS/SN2700 loud-fail posture):
+# this script only runs because the host matched system_product=PowerEdge R640,
+# so it IS an R640 and MUST present exactly two SAS boot SSDs. Any other count
+# means the hardware doesn't match our assumption (extra disks, NVMe boot, a
+# single survivor) — emitting a guessed layout could wipe the wrong disk, so we
+# exit non-zero and abort the deploy for an operator to look.
+
+import json, os, sys
+
+inv_path = os.environ.get("SLAGWORKS_INVENTORY")
+if not inv_path:
+    print("ERROR: SLAGWORKS_INVENTORY must be set", file=sys.stderr)
+    sys.exit(1)
+
+with open(inv_path) as f:
+    inv = json.load(f)
+
+# The two on-board boot SSDs sit behind the LSI SAS3008 HBA and report
+# transport "sas". Sort by name for a deterministic boot0/boot1 assignment.
+boot = sorted(d["name"] for d in inv["disks"] if d.get("transport") == "sas")
+if len(boot) != 2:
+    seen = [(d.get("name"), d.get("transport"), d.get("model")) for d in inv["disks"]]
+    print(f"ERROR: expected exactly 2 SAS boot disks on this R640, found "
+          f"{len(boot)}. Disks seen: {seen}", file=sys.stderr)
+    sys.exit(1)
+
+
+def part_suffix(disk: str) -> str:
+    # nvme/mmc/loop devices name partitions "<disk>p1"; sd*/vd* append the
+    # number directly ("<disk>1"). The R640 boot disks are sd*, but derive it
+    # from the name so the script is correct if a future R640 boots off nvme.
+    if disk.startswith(("nvme", "mmcblk", "loop")):
+        return "p"
+    return ""
+
+
+def part(disk: str, n: int) -> str:
+    return f"{disk}{part_suffix(disk)}{n}"
+
+
+disk_bytes = next(d["size_bytes"] for d in inv["disks"] if d["name"] == boot[0])
+# Leave 600 MiB of headroom below the ESP for alignment/GPT, same as the ASUS
+# script; the rest of the disk is the root mirror member.
+root_mib = (disk_bytes - 600 * 1024 * 1024) // (1024 * 1024)
+
+layout = {
+    "layout": {
+        boot[0]: {
+            "type": "disk", "ptable": "gpt", "boot": True,
+            "partitions": [
+                {"name": part(boot[0], 1), "fs": "vfat", "size": "512M", "bootable": True},
+                {"name": part(boot[0], 2), "size": f"{root_mib}M"},
+            ],
+        },
+        boot[1]: {
+            "type": "disk", "ptable": "gpt", "boot": True,
+            "partitions": [
+                {"name": part(boot[1], 1), "fs": "vfat", "size": "512M", "bootable": True},
+                {"name": part(boot[1], 2), "size": f"{root_mib}M"},
+            ],
+        },
+        "mdroot": {
+            "type": "raid", "level": 1,
+            "members": [part(boot[0], 2), part(boot[1], 2)],
+            "fs": "xfs",
+        },
+    },
+    "mounts": {
+        "/": {"device": "mdroot"},
+        "/boot/efi": {"device": part(boot[0], 1)},
+    },
+}
+
+json.dump(layout, sys.stdout, indent=2)

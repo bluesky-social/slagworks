@@ -1,0 +1,216 @@
+name: build-ipxe
+
+# Rebuilds the iPXE binaries shipped at
+# assets/ipxe/{snponly.efi,undionly.kpxe} from the upstream ref pinned
+# in assets/ipxe/UPSTREAM-REF, embedding assets/ipxe/embed.ipxe.
+#
+# Two trigger modes:
+#
+#   1. PR/push that touches a real input — embed.ipxe, UPSTREAM-REF,
+#      scripts/build-ipxe.sh, or this workflow itself. Auto-validates
+#      that the change still builds. The pull_request flavor is
+#      gating: a PR that breaks the iPXE build can't merge silently.
+#
+#   2. workflow_dispatch — operator can rebuild without changing any
+#      files. The optional `ipxe_ref` input overrides UPSTREAM-REF for
+#      one-off experiments without committing the bump first.
+#
+# The build is byte-reproducible: scripts/build-ipxe.sh pins the
+# toolchain (image digest + apt snapshot) and SOURCE_DATE_EPOCH, so a
+# rebuild from unchanged inputs matches the checked-in binaries and
+# commits nothing. Every run builds twice in different directories and
+# fails on any byte difference. That guard matters because the bot's
+# GITHUB_TOKEN push never triggers the required checks on the commit
+# it creates: a nondeterministic build pushes a fresh, unchecked bot
+# commit on every run and the PR can never go green (PR #83). To move
+# the toolchain, bump the pins in the script.
+#
+# In both modes the workflow opens a PR with the rebuilt binaries so
+# the operator gets a reviewable diff. We do NOT push directly to
+# main: the binaries are checked into the tree (site workers serve
+# them as static assets via the slagworks .deb), so changes need to
+# flow through PR review like any other commit.
+
+on:
+  pull_request:
+    paths:
+      - assets/ipxe/embed.ipxe
+      - assets/ipxe/UPSTREAM-REF
+      - scripts/build-ipxe.sh
+      - .github/workflows/build-ipxe.yaml
+  push:
+    branches: [main]
+    paths:
+      - assets/ipxe/embed.ipxe
+      - assets/ipxe/UPSTREAM-REF
+      - scripts/build-ipxe.sh
+      - .github/workflows/build-ipxe.yaml
+  workflow_dispatch:
+    inputs:
+      ipxe_ref:
+        description: "iPXE git ref to build (overrides UPSTREAM-REF; leave empty to use the pinned ref)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ipxe:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: write       # for creating the branch + commit on rebuild PRs
+      pull-requests: write  # for opening the PR
+    steps:
+      # Credentials stay persisted: the commit steps below push with git.
+      - name: Checkout slagworks
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Resolve iPXE ref
+        id: ref
+        # INPUT_IPXE_REF is plumbed via env (not inlined ${{ ... }} in
+        # bash) to avoid GHA expression injection (CWE-94): a malicious
+        # workflow_dispatch input could otherwise break out of the
+        # quoted string and execute arbitrary code on the runner.
+        env:
+          INPUT_IPXE_REF: ${{ inputs.ipxe_ref }}
+        run: |
+          if [[ -n "$INPUT_IPXE_REF" ]]; then
+              ref="$INPUT_IPXE_REF"
+              echo "Using workflow_dispatch override: $ref"
+          else
+              ref=$(tr -d '[:space:]' < assets/ipxe/UPSTREAM-REF)
+              echo "Using pinned UPSTREAM-REF: $ref"
+          fi
+          if [[ -z "$ref" ]]; then
+              echo "ERROR: no iPXE ref resolved" >&2
+              exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout iPXE
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ipxe/ipxe
+          ref: ${{ steps.ref.outputs.ref }}
+          path: ipxe
+          persist-credentials: false
+
+      - name: Build iPXE binaries (twice) and check reproducibility
+        # The UEFI binary is snp--intel.efi, NOT plain snponly.efi: the
+        # combined build carries iPXE's native intel/igc driver family in
+        # addition to the SNP shim. Pure SNP drives the NIC through the
+        # firmware's own UEFI network stack, which wedges indefinitely on
+        # Intel I225/I226 (igc) firmware stacks — observed 2026-07-14 on
+        # the pop3 MS-01 router (I226-V, DHCP+TFTP completed, then iPXE
+        # hung >25min with zero packets). The native driver takes over the
+        # NIC directly on hardware it recognizes and falls back to SNP
+        # elsewhere, so this is a strict superset of the old behavior.
+        # It is still SERVED as "snponly.efi" (the DHCP handler's boot-file
+        # name) to avoid touching the serving path; scripts/build-ipxe.sh
+        # does the rename.
+        #
+        # The check build runs in a different container directory so a
+        # leaked build path shows up as a mismatch too.
+        run: |
+          scripts/build-ipxe.sh ipxe assets/ipxe/embed.ipxe "$RUNNER_TEMP/ipxe-out"
+          scripts/build-ipxe.sh ipxe assets/ipxe/embed.ipxe "$RUNNER_TEMP/ipxe-out-check" /tmp/reprocheck/ipxe
+          for f in snponly.efi undionly.kpxe; do
+              if ! cmp "$RUNNER_TEMP/ipxe-out/$f" "$RUNNER_TEMP/ipxe-out-check/$f"; then
+                  echo "ERROR: $f is not reproducible: two builds from identical inputs differ." >&2
+                  echo "Diff the two outputs (e.g. diffoscope) to find the new nondeterminism source before shipping." >&2
+                  exit 1
+              fi
+          done
+
+      - name: Stage binaries in slagworks tree
+        run: cp "$RUNNER_TEMP"/ipxe-out/{snponly.efi,undionly.kpxe} assets/ipxe/
+
+      # Commit the rebuilt binaries back so source + binaries can't
+      # diverge. Two paths:
+      #
+      # - pull_request: amend the PR's branch directly. The contributor
+      #   pushed embed.ipxe; we add the matching .efi/.kpxe to the same
+      #   branch. Tests on the PR (including qemutest) then exercise
+      #   the new binary, not the stale checked-in one.
+      # - push:main: open a separate PR (we can't force-push to main).
+      #
+      # gh CLI is already provisioned in the runner image; we use it
+      # directly instead of a third-party action.
+      - name: Detect changes
+        id: diff
+        run: |
+          if git diff --quiet -- assets/ipxe/snponly.efi assets/ipxe/undionly.kpxe; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "iPXE binaries unchanged from current tree; nothing to commit"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure git
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # NOTE: this push works for PRs from same-repo branches (which
+      # is how we operate — no fork-based contributions). PRs from
+      # forks would fail the push step (GITHUB_TOKEN can't write to
+      # a fork) and we'd need a different mechanism. Cross that
+      # bridge if/when external contributions happen.
+      - name: Commit binaries to PR branch
+        if: github.event_name == 'pull_request' && steps.diff.outputs.changed == 'true'
+        env:
+          REF: ${{ steps.ref.outputs.ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          # actions/checkout@v6 on pull_request only fetches the
+          # merge commit. Fetch HEAD_REF into a real local branch
+          # ref (refspec form), then force-checkout to discard the
+          # merge commit's working tree, then re-copy the freshly-
+          # built binaries (the same files "Stage binaries" copied).
+          git fetch origin "$HEAD_REF:$HEAD_REF"
+          git checkout -f "$HEAD_REF"
+          cp "$RUNNER_TEMP"/ipxe-out/{snponly.efi,undionly.kpxe} assets/ipxe/
+          git add assets/ipxe/snponly.efi assets/ipxe/undionly.kpxe
+          git commit -m "ipxe: rebuild from $REF"
+          git push origin "$HEAD_REF"
+
+      - name: Open rebuild PR
+        if: github.event_name != 'pull_request' && steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ steps.ref.outputs.ref }}
+          ACTOR: ${{ github.actor }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          branch="ipxe-rebuild/$REF"
+          # If a stale rebuild branch exists (previous run that didn't
+          # get merged), force-update it rather than failing.
+          git checkout -B "$branch"
+          git add assets/ipxe/snponly.efi assets/ipxe/undionly.kpxe
+          git commit -m "ipxe: rebuild from $REF"
+          git push -f origin "$branch"
+          # Create PR if one doesn't already exist for this branch.
+          if ! gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "ipxe: rebuild from $REF" \
+              --body "Rebuilt iPXE binaries from upstream ref \`$REF\`.
+
+          Source: https://github.com/ipxe/ipxe/tree/$REF
+          Embedded script: \`assets/ipxe/embed.ipxe\` (current main).
+
+          Triggered by \`$EVENT\` from @$ACTOR.
+
+          Review the diff on the binary files (size delta should be
+          small for minor version bumps). Merging this PR ships the
+          new iPXE through the normal slagworks .deb pipeline — site
+          workers serve these binaries via HTTP boot."
+          fi

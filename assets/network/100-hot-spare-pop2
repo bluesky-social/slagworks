@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+# slagworks:match site=pop2
+# slagworks:match location=pop2-01-005330
+# slagworks:match hostname=/hot-spare-[12]\.pop2/
+# slagworks:priority 100
+#
+# MATCH KEYS: location=pop2-01-005330 is the OLD cage (the new cage
+# oob-gws/kworkers sit at pop2-01-005250). The hostname regex is kept as a
+# defense-in-depth AND-constraint, not the primary key, so a non-hot-spare
+# old-cage host can't accidentally take this bootstrap.
+#
+# Legacy pop2 leaf1/2 L2 bond network config: a single netplan, no FRR.
+#
+# These hosts (the old pop2 cage spares: hot-spare-1.pop2, hot-spare-2.pop2)
+# are the OLD model, not the L3 routed-NIC fabric the pop1 kworkers run. Two
+# NICs are bonded (LACP / 802.3ad) into one L2 link, dual-homed across an MLAG
+# leaf pair (leaf-1/leaf-2.pop2, shared CLAG system MAC). The host address
+# lives on the bond, on an untagged VLAN. There is no per-NIC /31, no loopback,
+# no host BGP — so unlike the L3 script there is nothing self-describing in the
+# addressing to derive topology from. slagworks ships the bond membership /
+# VLAN / gateway / MTU as facts (model.SnapshotInterface.{LAG,VLAN,Gateway,MTU})
+# and this script renders them. slagworks stays topology-agnostic; the policy
+# (802.3ad, layer3+4 hash, lacp-rate fast) lives here.
+#
+# Driven by the per-host NetBox interface facts in SLAGWORKS_NETWORK_FACTS:
+#
+#   - the bond interface: type=lag, carries the host IP (and gateway/MTU),
+#     no MAC, no lag ref,
+#   - each member NIC: type=physical, lag == the bond interface's name, a MAC
+#     (used to match-by-MAC + set-name in netplan so the kernel binds the
+#     right NIC regardless of enumeration order),
+#   - the gateway: the bond IP's prefix gateway_ip custom field (slagworks
+#     resolved it by longest-prefix-match), used for the default route,
+#   - the untagged VLAN sits the address directly on the bond — NO vlan
+#     subinterface (see the VLAN note in main()).
+#
+# Emits the emit-bundle contract on stdout:
+#   {"files": [{"path","content","mode","owner","group"}], "enable_units": []}
+#
+# HARD FAIL, no DHCP fallback (mirrors the L3 script's loud-fail posture):
+# this script only runs because the host matched site=pop2 + the hot-spare
+# hostname regex, so it is SUPPOSED to be an L2 bond host. If the facts carry
+# no bond IP, no bond interface, no members, or no gateway, the NetBox model is
+# incomplete and the script exits non-zero to abort the deploy. Coming up
+# DHCP-only would silently leave the host with a broken permanent network — the
+# same latent break the L3 script refuses. One member is degraded-but-valid
+# (802.3ad runs with a single active link; an operator may have pulled a dead
+# leg from the LAG awaiting parts): render it and warn, do not hard-fail. Zero
+# members is broken.
+#
+# Netscript contract: docs/dev/extensibility.md.
+# Shared plumbing (facts I/O, VIP resolver, bond/bundle helpers): slagworks_netlib.
+
+import ipaddress
+import sys
+
+import slagworks_netlib as nl
+
+# Default MTU for the old pop2 L2 segment. Unlike the L3 fabric (9000), this
+# cage is a plain 1500 untagged segment with a 1500 gateway — a 9000 MTU here
+# would black-hole traffic to the gateway. Used only when the bond interface's
+# facts carry no modeled MTU.
+DEFAULT_MTU = 1500
+
+
+def render_netplan(bond_name, bond_ip, gateway, mtu, members):
+    """Render the L2 bond netplan YAML.
+
+    members is a list of (set_name, mac) sorted by set_name. bond_ip is the
+    host CIDR on the bond; gateway is the default-route next hop; mtu applies
+    to both the members and the bond.
+    """
+    lines = []
+    lines.append("# slagworks deploy agent - legacy pop2 L2 LACP bond (assets/network/100-hot-spare-pop2).")
+    lines.append("# Two NICs bonded 802.3ad (LACP) into one L2 link, dual-homed across the MLAG")
+    lines.append("# leaf pair; host address on the untagged VLAN sits directly on the bond.")
+    lines.append("# Netscript contract: docs/dev/extensibility.md.")
+    lines.append("network:")
+    lines.append("  version: 2")
+    lines.append("  renderer: networkd")
+    lines.append("  ethernets:")
+    lines.extend(nl.bond_member_lines(members, mtu))
+    # 802.3ad with lacp-rate fast + layer3+4 hash matches the leaf bond34
+    # (IEEE 802.3ad). This host's only egress is the bond, so it carries the
+    # default route + the on-segment resolver (the oob-gw VIP).
+    lines.extend(nl.bond_lines(bond_name, bond_ip, mtu, members,
+                               gateway=gateway,
+                               nameserver=nl.vip_nameserver(gateway)))
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    ifaces = nl.load_facts()
+
+    # Find the bond interface: type=lag with an IP. There should be exactly
+    # one; if more than one is modeled, that's a NetBox modeling error we'd
+    # rather fail loud on than silently pick one.
+    bonds = [i for i in ifaces if i.get("type") == "lag" and i.get("ip")]
+    if len(bonds) != 1:
+        nl.fail(
+            "ERROR: matched the pop2 L2-bond network script but the host does "
+            "not have exactly one bond interface (type=lag with an IP) in its "
+            "NetBox facts: found {}. Expected one bond carrying the host "
+            "address (e.g. bond0 10.253.0.22/22). Fix the NetBox model "
+            "(create/repair the type=lag interface + its IP) and redeploy - "
+            "refusing to bring this host up DHCP-only, which would silently "
+            "leave it with a broken permanent network.\n".format(
+                [b.get("name", "") for b in bonds])
+        )
+    bond = bonds[0]
+    bond_name = bond.get("name", "")
+    bond_ip = bond.get("ip", "")
+    gateway = bond.get("gateway", "")
+
+    if not bond_name:
+        nl.fail("ERROR: bond interface has no name in facts\n")
+
+    # Validate the bond IP parses as a CIDR (netplan needs address/prefixlen).
+    try:
+        ipaddress.ip_interface(bond_ip)
+    except ValueError:
+        nl.fail(
+            f"ERROR: bond interface {bond_name} IP {bond_ip!r} is not a valid "
+            f"CIDR; cannot render netplan. Fix the NetBox IP assignment.\n"
+        )
+
+    if not gateway:
+        # Hard-fail on a missing gateway: with no default route an L2 host can
+        # talk to its local segment but can't reach the deploy-window resolver,
+        # phone home, or be managed - effectively off the network. The gateway
+        # comes from the bond IP's prefix gateway_ip custom field; an empty one
+        # is a NetBox modeling gap (the gateway_ip CF was never set on the
+        # prefix), same loud-fail posture as a missing bond IP.
+        nl.fail(
+            "ERROR: bond interface {} has no gateway in facts. slagworks "
+            "resolves the gateway from the gateway_ip custom field of the "
+            "bond IP's prefix - set gateway_ip on the {}'s prefix in NetBox "
+            "and redeploy. Refusing to bring the host up with no default "
+            "route.\n".format(bond_name, bond_ip)
+        )
+
+    # Members: physical interfaces whose lag == the bond's name, each with a
+    # MAC (we match-by-MAC + set-name so the kernel binds the right NIC
+    # regardless of udev enumeration order). Sorted by name for deterministic
+    # rendering.
+    members = []
+    for i in ifaces:
+        if i.get("lag") != bond_name:
+            continue
+        mac = (i.get("mac") or "").lower()
+        name = i.get("name", "")
+        if not mac:
+            sys.stderr.write(
+                f"WARNING: bond member {name!r} has no MAC in facts; skipping "
+                f"it (cannot match-by-MAC in netplan).\n"
+            )
+            continue
+        members.append((name, mac))
+    members.sort(key=lambda m: m[0])
+
+    if len(members) == 0:
+        # HARD FAIL: a bond with zero members is broken. The host matched the
+        # L2-bond script and has a bond IP but no NICs to carry it - the most
+        # likely cause is the member interfaces' `lag` field was never set in
+        # NetBox (so they don't point at the bond). Bringing the host up
+        # DHCP-only would silently leave it off the network. Fail loud so the
+        # operator fixes the NetBox modeling, same posture as the L3 script's
+        # missing-legs hard-fail.
+        nl.fail(
+            "ERROR: bond {} has no member interfaces in the facts (no "
+            "physical interface has lag={!r}). The member NICs' `lag` field is "
+            "most likely unset in NetBox - point both NICs at the bond and "
+            "redeploy. Refusing to bring this host up DHCP-only.\n".format(
+                bond_name, bond_name)
+        )
+
+    if len(members) == 1:
+        # Degraded but valid: 802.3ad runs with a single active link, and an
+        # operator may have intentionally pulled a dead leg from the NetBox LAG
+        # while awaiting parts. Hard-failing at <2 would drop a working-but-
+        # degraded host off the network entirely. Render it and warn loudly.
+        # The normal dual-homed MLAG host has exactly 2 members.
+        sys.stderr.write(
+            "WARNING: bond {} has only ONE member ({}); the normal dual-homed "
+            "MLAG host has two. Rendering a degraded single-link 802.3ad bond - "
+            "this is operationally valid but check whether a leg is missing "
+            "from the NetBox LAG.\n".format(bond_name, members[0][0])
+        )
+
+    # Use the bond interface's modeled MTU if present, else the L2 default.
+    mtu = bond.get("mtu") or DEFAULT_MTU
+
+    # Untagged VLAN: the host address sits DIRECTLY on the bond, no VLAN
+    # subinterface. NOTE the facts' VLAN field holds the *untagged* VID (e.g.
+    # 1 here), which is non-zero even on a plain untagged segment - so it
+    # CANNOT be used to key tagged-subinterface creation. A tagged-VLAN L2 host
+    # would need a separate tagged_vlans facts field; those hosts are out of
+    # scope (none in the current untagged set). We deliberately do not emit a
+    # vlans: stanza.
+    netplan = render_netplan(bond_name, bond_ip, gateway, mtu, members)
+
+    nl.emit(nl.bundle([
+        # 0600: netplan warns on world-readable config.
+        nl.file_entry("/etc/netplan/99-slagworks.yaml", netplan, mode="0600"),
+    ]))
+
+
+if __name__ == "__main__":
+    main()

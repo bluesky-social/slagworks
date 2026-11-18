@@ -1,0 +1,8 @@
+# Allow the slagworks daemon user to invoke the auto-upgrade helper
+# without a password. The trailing * matches any arguments, so the
+# helper is the privilege gate: it validates its two arguments (global's
+# git SHA and the deb package version of that build) and only then runs
+# an exact-pin apt install in a transient systemd unit.
+#
+# Installed by the slagworks .deb at /etc/sudoers.d/slagworks-upgrade.
+slagworks ALL=(root) NOPASSWD: /usr/bin/slagworks-upgrade *

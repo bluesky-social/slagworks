@@ -1,0 +1,63 @@
+version: 2
+
+builds:
+  - id: slagctl
+    main: ./cmd/slagctl
+    binary: slagctl
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+
+archives:
+  - id: slagctl
+    ids:
+      - slagctl
+    name_template: "slagctl_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  draft: false
+  prerelease: auto
+  # release-please creates the GitHub release + tag on Release-PR merge; this
+  # goreleaser run (gated on release_created in release-please.yml) appends the
+  # built archives + checksums to that existing release rather than trying to
+  # create its own (which would fail: the release already exists). Required for
+  # the release-please composition — see .github/workflows/release-please.yml.
+  mode: keep-existing
+
+# Publish the cask to the public tap (bluesky-social/homebrew-tap) on every
+# release. The release archives are public, so the cask uses Homebrew's
+# standard download from the release URL GoReleaser derives from the release.
+homebrew_casks:
+  - name: slagctl
+    ids: [slagctl]
+    binaries: [slagctl]
+    directory: Casks
+    description: "Slagworks bare-metal provisioning CLI"
+    homepage: https://github.com/bluesky-social/slagworks
+    repository:
+      owner: bluesky-social
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    custom_block: |
+      # Homebrew 7.0 deprecated `postflight`; GoReleaser still emits it from
+      # hooks.post.install (goreleaser/goreleaser#6873). Emit postflight_steps
+      # via custom_block until hooks.post.install_steps ships.
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/slagctl"]
+        end
+      end

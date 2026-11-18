@@ -1,0 +1,40 @@
+ ⠙ deploy  kworker-l34-1.pop1   machine deploy kworker-l34-1.pop1 --destructive   elapsed 1m17s    [q] quit          
+╭─ serial console ───────────────────────────────────────────────────────────────╮╭─ lifecycle ─────────────────────╮
+│slagworks-agent: found 4 disk(s), using nvme0n1                                 ││✓ power_cycle                 2s │
+│slagworks-agent: storage layout planned (12 commands)                           ││✓ pxe_booting                14s │
+│Creating new GPT entries in memory.                                             ││✓ dhcp_ack                    1s │
+│                                                                                ││✓ ipxe_dhcp                   2s │
+│                                                                                ││✓ ipxe_loaded                 8s │
+│                                                                                ││✓ agent_starting              3s │
+│                                                                                ││⠙ partitioning             (47s) │
+│                                                                                ││○ rsyncing_os                    │
+│                                                                                ││○ installing_bootloader          │
+│                                                                                ││○ finalizing                     │
+│                                                                                ││○ bmc_reconcile                  │
+│                                                                                ││○ awaiting_phone_home            │
+│                                                                                ││○ completed                      │
+│                                                                                │╰─────────────────────────────────╯
+│                                                                                │╭─ summary ───────────────────────╮
+│                                                                                ││ phase   partitioning            │
+│                                                                                ││ since   47s                     │
+│                                                                                ││ total   1m17s                   │
+│                                                                                ││ update  —                       │
+│                                                                                ││ worker  pop1-sw-2               │
+│                                                                                │╰─────────────────────────────────╯
+│                                                                                │                                   
+│                                                                                │                                   
+│                                                                                │                                   
+╰────────────────────────────────────────────────────────────────────────────────╯                                   
+╭─ logs (control plane, SOL excluded) ──────────────────────────────────────────────────────────────────────────────╮
+│10:15:12 [agent ] phase=partitioning exec: sgdisk --zap-all /dev/nvme0n1                                           │
+│10:15:13 [site  ] phase=partitioning progress report received                                                      │
+│10:15:14 [global] snapshot rebuilt gen=4471                                                                        │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+│                                                                                                                   │
+╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

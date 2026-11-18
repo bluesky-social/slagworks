@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+# slagworks:match site=pop2
+# slagworks:match location=pop2-01-005330
+# slagworks:match device_type=dell-r640
+# slagworks:match hostname=/oob-gw-[12]\.pop2/
+# slagworks:priority 150
+#
+# pop2 OLD-CAGE oob-gw network config (oob-gw-1.pop2, oob-gw-2.pop2).
+#
+# MATCH KEYS: the cage is the PRIMARY discriminator — location
+# pop2-01-005330 is the OLD cage (the new cage oob-gws sit at pop2-01-005250,
+# served by 150-pop2-newcage-oob-gw). device_type=dell-r640 selects the
+# gateways but not the cage's other hardware (hot-spares/kworkers are
+# supermicro). The hostname regex is a defense-in-depth AND-constraint, not the
+# primary key.
+#
+# STRUCTURAL FABRIC BASELINE AT INSTALL TIME (philosophy per
+# docs/bsky/2026-06-21-oob-gw-fleet-fabric-bringup.md): unlike the new-cage
+# oob-gw script (which brings up only the OOB leg and leaves the fabric to
+# ansible), this script lays down the large, slow-to-change fabric structure —
+# the LACP bond and its members — at OS-install time, so ansible converges from
+# a known-good baseline instead of reshaping a running host's network. It is a
+# HYBRID of two existing shapes:
+#
+#   1. the LACP bond (leafbond), rendered exactly like 100-hot-spare-pop2 (same
+#      old cage, same MLAG leaf-1/leaf-2 pair, same untagged host fabric); and
+#   2. the OOB management leg (eno3), brought up with its static OOB address so
+#      the host phones home — like 150-pop2-newcage-oob-gw.
+#
+# Two legs in, one leg deliberately OUT:
+#
+#   - leafbond (the 25G data fabric): 802.3ad bond over the leaf uplinks, host
+#     address on the untagged VLAN. THE structural baseline this script exists
+#     to establish.
+#   - eno3 (OOB mgmt): static OOB address. The site worker runs on the oob-gw
+#     pair itself and serves DHCP/HTTP on this same OOB /23, so the host is
+#     L2-adjacent to it — phone-home needs NO default route on this leg.
+#   - eno1np0 (WAN): NOT touched. It carries a public /30 and its default-route
+#     policy is owned by FRR (BGP-learned default + per-VPN-tunnel host routes);
+#     a guessed kernel default here would override BGP and pin egress wrong.
+#     Left dark until ansible+FRR converge it — same posture as the new-cage
+#     script's WAN handling.
+#
+# NO DEFAULT ROUTE is emitted by this script. The bond is on the untagged host
+# fabric (off-segment routing is FRR's job once converged), and the OOB leg is
+# L2-adjacent to the site worker. The real default lives on the WAN via FRR,
+# ansible-owned. (Contrast 100-hot-spare-pop2, which DOES put a default on its
+# bond: a hot-spare is a plain L2 host with no WAN/FRR, so its only route out is
+# the bond gateway. An oob-gw is not — it has a WAN leg FRR owns.)
+#
+# Driven by the per-host NetBox interface facts in SLAGWORKS_NETWORK_FACTS
+# (model.SnapshotInterface): the bond is type=lag with an IP; its members are
+# physical with lag==bond name + a MAC; eno3 is the lone physical, non-member,
+# non-BMC NIC carrying a PRIVATE IP. slagworks stays topology-agnostic; the
+# bond policy (802.3ad, layer3+4, lacp-rate fast) lives here.
+#
+# Emits the emit-bundle contract on stdout:
+#   {"files": [{"path","content","mode","owner","group"}], "enable_units": []}
+#
+# HARD FAIL, no DHCP fallback (mirrors the L3/hot-spare/new-cage loud-fail
+# posture): this script only runs because the host matched the old-cage oob-gw
+# keys, so it IS one and MUST have a modeled bond (type=lag + IP + members) and
+# an OOB NIC. A missing bond/members/OOB-IP means the NetBox model is
+# incomplete; coming up DHCP-only would strand the gateway. Exit non-zero to
+# abort the deploy. One bond member is degraded-but-valid (single-link 802.3ad);
+# zero members is broken.
+#
+# Shared plumbing (facts I/O, VIP resolver, BMC/private predicates, bond/OOB
+# helpers): slagworks_netlib.
+
+import ipaddress
+import sys
+
+import slagworks_netlib as nl
+
+# Default MTU for the old pop2 L2 segment. Same as 100-hot-spare-pop2: this
+# cage is a plain 1500 untagged segment (a 9000 MTU would black-hole traffic to
+# the 1500 gateway). Used only when the bond's facts carry no modeled MTU.
+DEFAULT_MTU = 1500
+
+
+def find_bond(ifaces):
+    """The single type=lag interface carrying an IP. Returns the dict or exits
+    non-zero (loud-fail) if not exactly one."""
+    bonds = [i for i in ifaces if i.get("type") == "lag" and i.get("ip")]
+    if len(bonds) != 1:
+        nl.fail(
+            "ERROR: matched the pop2 old-cage oob-gw script but the host does "
+            "not have exactly one bond interface (type=lag with an IP) in its "
+            "NetBox facts: found {}. Expected one bond carrying the fabric "
+            "address (e.g. leafbond 10.253.3.161/22). Fix the NetBox model and "
+            "redeploy - refusing to bring this gateway up DHCP-only.\n".format(
+                [b.get("name", "") for b in bonds])
+        )
+    return bonds[0]
+
+
+def find_members(ifaces, bond_name):
+    """Physical interfaces whose lag == bond_name, each as (name, mac).
+    Skips members with no MAC (can't match-by-MAC). Sorted by name."""
+    members = []
+    for i in ifaces:
+        if i.get("lag") != bond_name:
+            continue
+        mac = (i.get("mac") or "").lower()
+        name = i.get("name", "")
+        if not mac:
+            sys.stderr.write(
+                f"WARNING: bond member {name!r} has no MAC in facts; skipping "
+                f"it (cannot match-by-MAC in netplan).\n"
+            )
+            continue
+        members.append((name, mac))
+    members.sort(key=lambda m: m[0])
+    return members
+
+
+def find_oob_nic(ifaces, bond_name):
+    """The OOB management NIC: physical, NOT a bond member, NOT a BMC port,
+    carrying a PRIVATE IP + a MAC. Exactly one expected (the WAN leg carries a
+    PUBLIC IP and is excluded by the private filter; bond members are excluded
+    by lag; ipmi0 by name). Returns (name, mac, ip) or exits non-zero."""
+    candidates = []
+    for i in ifaces:
+        if i.get("type") != "physical":
+            continue
+        if i.get("lag"):  # a bond member, not the OOB leg
+            continue
+        name = i.get("name", "")
+        if nl.is_bmc_name(name):
+            continue
+        ip = i.get("ip", "")
+        mac = (i.get("mac") or "").lower()
+        if not ip or not mac:
+            continue
+        if not nl.is_private_ip(ip):  # excludes the public WAN leg
+            continue
+        candidates.append((name, mac, ip))
+    if len(candidates) != 1:
+        names = [c[0] for c in candidates]
+        nl.fail(
+            "ERROR: expected exactly one OOB management NIC (physical, "
+            "non-bond-member, non-BMC, private IP) on this old-cage oob-gw; "
+            "found {}. The OOB leg (eno3) must carry a modeled private OOB "
+            "address so the host phones home. Fix the NetBox model and "
+            "redeploy.\n".format(names or "none")
+        )
+    return candidates[0]
+
+
+def main():
+    ifaces = nl.load_facts()
+
+    bond = find_bond(ifaces)
+    bond_name = bond.get("name", "")
+    bond_ip = bond.get("ip", "")
+    if not bond_name:
+        nl.fail("ERROR: bond interface has no name in facts\n")
+    try:
+        ipaddress.ip_interface(bond_ip)
+    except ValueError:
+        nl.fail(
+            f"ERROR: bond {bond_name} IP {bond_ip!r} is not a valid CIDR; "
+            f"cannot render netplan. Fix the NetBox IP assignment.\n"
+        )
+
+    members = find_members(ifaces, bond_name)
+    if len(members) == 0:
+        nl.fail(
+            "ERROR: bond {} has no member interfaces in the facts (no physical "
+            "interface has lag={!r}). The member NICs' `lag` field is most "
+            "likely unset in NetBox - point both leaf NICs at the bond and "
+            "redeploy. Refusing to bring this gateway up DHCP-only.\n".format(
+                bond_name, bond_name)
+        )
+    if len(members) == 1:
+        sys.stderr.write(
+            "WARNING: bond {} has only ONE member ({}); the normal dual-homed "
+            "MLAG gateway has two. Rendering a degraded single-link 802.3ad "
+            "bond - operationally valid but check for a missing leg in the "
+            "NetBox LAG.\n".format(bond_name, members[0][0])
+        )
+
+    oob_name, oob_mac, oob_ip = find_oob_nic(ifaces, bond_name)
+    mtu = bond.get("mtu") or DEFAULT_MTU
+
+    netplan = render_netplan_full(bond_name, bond_ip, mtu, members,
+                                  oob_name, oob_mac, oob_ip)
+
+    nl.emit(nl.bundle([
+        # 0600: netplan warns on world-readable config.
+        nl.file_entry("/etc/netplan/99-slagworks.yaml", netplan, mode="0600"),
+    ]))
+
+
+def render_netplan_full(bond_name, bond_ip, mtu, members, oob_name, oob_mac, oob_ip):
+    """Render the netplan: OOB mgmt leg (eno3) + the LACP bond. NO default
+    route (WAN/FRR owns it, ansible-converged). The OOB leg is L2-adjacent to
+    the site worker so phone-home needs no route."""
+    lines = []
+    lines.append("# slagworks deploy agent - pop2 old-cage oob-gw (assets/network/150-pop2-oldcage-oob-gw).")
+    lines.append("# Structural fabric baseline at install time: the LACP bond (leaf-1/leaf-2 MLAG)")
+    lines.append("# + the OOB mgmt leg for phone-home. WAN + default route + FRR + keepalived are")
+    lines.append("# ansible-owned and converge post-boot. NICs matched by MAC so a rename in the")
+    lines.append("# deployed OS keeps the binding.")
+    lines.append("network:")
+    lines.append("  version: 2")
+    lines.append("  renderer: networkd")
+    lines.append("  ethernets:")
+    # OOB management leg: static OOB address, no default route. On-segment
+    # resolver (the OOB VIP), NOT public DNS: this leg has no default route, so
+    # an off-segment 1.1.1.1 would be unreachable at deploy time. The deploy
+    # itself resolves nothing by name (phone-home targets the site worker by IP
+    # via next-server), but a correct on-segment resolver is the right
+    # steady-state seed and avoids shipping a provably-dead DNS config.
+    lines.extend(nl.oob_leg_lines(oob_name, oob_mac, oob_ip, nl.vip_nameserver(oob_ip)))
+    # Bond members.
+    lines.extend(nl.bond_member_lines(members, mtu))
+    # The bond: no default route, no nameservers (both live on the OOB leg /
+    # ansible-owned WAN).
+    lines.extend(nl.bond_lines(bond_name, bond_ip, mtu, members))
+    return "\n".join(lines) + "\n"
+
+
+if __name__ == "__main__":
+    main()

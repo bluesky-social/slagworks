@@ -1,0 +1,401 @@
+package ws
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/bluesky-social/slagworks/internal/model"
+)
+
+// helloAndDrainSerial is helloAndDrain with an explicit reported hardware
+// serial, so the interlock tests can control c.verifiedSerial (the default
+// noop SerialResolver accepts any non-empty serial and the hub records it).
+func helloAndDrainSerial(t *testing.T, conn *Conn, workerID, serial string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeHello, "", HelloMsg{
+		WorkerID: workerID, LastSeqNum: 1, Proto: OpStreamProto, Serial: serial}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ReadMessage(ctx); err != nil { // snapshot/no_change
+		t.Fatal(err)
+	}
+	if _, err := conn.ReadMessage(ctx); err != nil { // op_resync
+		t.Fatal(err)
+	}
+}
+
+// outletOp builds a pending outlet power op of the given type with a
+// PDURuntime carrying the outlet marker + downstream serial (+ allowSelf).
+func outletOp(t *testing.T, opType model.OperationType, downstreamSerial string, allowSelf bool) *model.Operation {
+	t.Helper()
+	rt := model.PDURuntime{
+		Outlets:          []model.PDUOutlet{{PDUHost: "10.0.0.1", Outlet: 5}},
+		DownstreamSerial: downstreamSerial,
+		Outlet:           true,
+		AllowSelf:        allowSelf,
+	}
+	raw, err := json.Marshal(model.OpParams{PDURuntime: &rt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &model.Operation{
+		ID:        uuid.New(),
+		MachineID: uuid.New(),
+		Type:      opType,
+		Status:    model.OpPending,
+		Params:    raw,
+	}
+}
+
+// claimAndRead sends a claim_op for opID and returns the parsed
+// ClaimOpResponse (and any rpc-level error string). It drains any op_delta
+// that a successful claim fans out.
+func claimAndRead(t *testing.T, conn *Conn, opID uuid.UUID) (ClaimOpResponse, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	reqID := "claim-" + opID.String()
+	if err := conn.WriteTyped(ctx, TypeClaimOp, reqID, ClaimOpMsg{OperationID: opID.String()}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		env, err := conn.ReadMessage(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if env.Type == TypeOpDelta {
+			continue // a successful claim also fans a delta; skip it
+		}
+		if env.Type != TypeClaimOpResp || env.RequestID != reqID {
+			t.Fatalf("unexpected envelope: %+v", env)
+		}
+		var resp RPCResponseMsg
+		if err := unmarshalData(env.Data, &resp); err != nil {
+			t.Fatal(err)
+		}
+		var claimResp ClaimOpResponse
+		if resp.Data != nil {
+			_ = unmarshalData(resp.Data, &claimResp)
+		}
+		return claimResp, resp.Error
+	}
+}
+
+// interlockHub wires a hub whose claimer returns pendingOp for the pre-CAS
+// read AND op for a successful claim, with the given registered-worker set.
+func interlockHub(t *testing.T, pendingOp *model.Operation, registered []model.SiteWorker) (*Hub, *fakeOpClaimer, *httptest.Server) {
+	t.Helper()
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop3", "worker-1")
+	if registered != nil {
+		auth.setSiteWorkers("pop3", registered...)
+	}
+	// A successful claim returns a claimed copy of the pending op.
+	var claimed *model.Operation
+	if pendingOp != nil {
+		cp := *pendingOp
+		cp.Status = model.OpClaimed
+		cp.ClaimedBy = "worker-1"
+		cp.Version = 1
+		claimed = &cp
+	}
+	claimer := &fakeOpClaimer{op: claimed, pendingOp: pendingOp}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, OpClaimer: claimer})
+	// Seed a snapshot so the claim's op_delta fan-out has slug membership
+	// (harmless if the claim is declined — no delta then).
+	if pendingOp != nil {
+		h.Push("pop3", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"},
+			Machines: []model.MachineSnapshot{{ID: pendingOp.MachineID}}})
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	return h, claimer, srv
+}
+
+// TestInterlock_SelfFeedingCycle_SelfDeclined_PartnerAllowed: a self-feeding
+// cycle op is declined for the self-worker (claim stays "already_claimed",
+// ClaimOperation never called), but a DIFFERENT worker's claim passes the
+// gate and reaches the claimer.
+func TestInterlock_SelfFeedingCycle_SelfDeclined_PartnerAllowed(t *testing.T) {
+	op := outletOp(t, model.OpPowerCycle, "SN-SELF", false)
+	_, claimer, srv := interlockHub(t, op, nil)
+
+	// Self-worker (serial == downstream) is declined.
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrainSerial(t, conn, "worker-1", "SN-SELF")
+
+	resp, errStr := claimAndRead(t, conn, op.ID)
+	if errStr != "" {
+		t.Fatalf("declined claim must not be an rpc error, got %q", errStr)
+	}
+	if !resp.AlreadyClaimed {
+		t.Error("self-feeding cycle: expected AlreadyClaimed decline")
+	}
+	if resp.Operation != nil {
+		t.Error("self-feeding cycle: expected nil op on decline")
+	}
+	if n := len(claimer.calls()); n != 0 {
+		t.Errorf("ClaimOperation must NOT be called on interlock decline, got %d", n)
+	}
+
+	// A different worker (serial != downstream) passes the gate and claims.
+	conn2 := dialHub(t, srv, "tok-1")
+	if conn2 == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn2.CloseNow()
+	helloAndDrainSerial(t, conn2, "worker-1", "SN-PARTNER")
+	resp2, errStr2 := claimAndRead(t, conn2, op.ID)
+	if errStr2 != "" {
+		t.Fatalf("partner claim errored: %q", errStr2)
+	}
+	if resp2.Operation == nil {
+		t.Error("partner claim: expected a claimed op, got none")
+	}
+	if n := len(claimer.calls()); n != 1 {
+		t.Errorf("partner claim must reach ClaimOperation exactly once, got %d", n)
+	}
+}
+
+// TestInterlock_SelfFeedingOff_DeclinedForEveryone: off whose downstream is a
+// registered worker is refused for every claimant — including a partner whose
+// serial differs — and even when that registered worker is disconnected
+// (seeded only in ListSiteWorkers, not connected).
+func TestInterlock_SelfFeedingOff_DeclinedForEveryone(t *testing.T) {
+	op := outletOp(t, model.OpPowerOff, "SN-DISCONNECTED-WORKER", false)
+	// The downstream serial belongs to a REGISTERED (disconnected) worker.
+	registered := []model.SiteWorker{{SiteSlug: "pop3", WorkerID: "w-down", Serial: "SN-DISCONNECTED-WORKER"}}
+	_, claimer, srv := interlockHub(t, op, registered)
+
+	// A partner (different serial) still must not serve the off.
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrainSerial(t, conn, "worker-1", "SN-PARTNER")
+	resp, errStr := claimAndRead(t, conn, op.ID)
+	if errStr != "" {
+		t.Fatalf("declined off must not be an rpc error, got %q", errStr)
+	}
+	if !resp.AlreadyClaimed {
+		t.Error("off on registered worker: expected decline for the partner")
+	}
+	if n := len(claimer.calls()); n != 0 {
+		t.Errorf("off on registered worker must never reach ClaimOperation, got %d", n)
+	}
+}
+
+// TestInterlock_EmptySerialClaimant_Declined: an outlet op claimed by a worker
+// whose verified serial is "" (unverified) is declined fail-closed.
+func TestInterlock_EmptySerialClaimant_Declined(t *testing.T) {
+	op := outletOp(t, model.OpPowerCycle, "SN-SOMEWHERE", false)
+	_, claimer, srv := interlockHub(t, op, nil)
+
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrainSerial(t, conn, "worker-1", "") // no verified serial
+
+	resp, errStr := claimAndRead(t, conn, op.ID)
+	if errStr != "" {
+		t.Fatalf("declined claim must not be an rpc error, got %q", errStr)
+	}
+	if !resp.AlreadyClaimed {
+		t.Error("empty-serial claimant: expected fail-closed decline")
+	}
+	if n := len(claimer.calls()); n != 0 {
+		t.Errorf("empty-serial claimant must not reach ClaimOperation, got %d", n)
+	}
+}
+
+// TestInterlock_AllowSelfCycle_SelfAllowed: a self-feeding CYCLE carrying
+// AllowSelf is served by the self-worker (INV-2 override).
+func TestInterlock_AllowSelfCycle_SelfAllowed(t *testing.T) {
+	op := outletOp(t, model.OpPowerCycle, "SN-SELF", true)
+	_, claimer, srv := interlockHub(t, op, nil)
+
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrainSerial(t, conn, "worker-1", "SN-SELF")
+
+	resp, errStr := claimAndRead(t, conn, op.ID)
+	if errStr != "" {
+		t.Fatalf("allow-self cycle errored: %q", errStr)
+	}
+	if resp.Operation == nil {
+		t.Error("allow-self cycle: expected the self-worker to claim")
+	}
+	if n := len(claimer.calls()); n != 1 {
+		t.Errorf("allow-self cycle must reach ClaimOperation once, got %d", n)
+	}
+}
+
+// TestInterlock_AllowSelfOff_StillDeclined: AllowSelf never applies to off —
+// a self-feeding off (downstream is a registered worker) stays declined even
+// with AllowSelf set.
+func TestInterlock_AllowSelfOff_StillDeclined(t *testing.T) {
+	op := outletOp(t, model.OpPowerOff, "SN-SELF", true) // AllowSelf set, but off
+	registered := []model.SiteWorker{{SiteSlug: "pop3", WorkerID: "w-self", Serial: "SN-SELF"}}
+	_, claimer, srv := interlockHub(t, op, registered)
+
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrainSerial(t, conn, "worker-1", "SN-SELF")
+
+	resp, errStr := claimAndRead(t, conn, op.ID)
+	if errStr != "" {
+		t.Fatalf("declined off must not be an rpc error, got %q", errStr)
+	}
+	if !resp.AlreadyClaimed {
+		t.Error("allow-self off: INV-1 must still decline")
+	}
+	if n := len(claimer.calls()); n != 0 {
+		t.Errorf("allow-self off must never reach ClaimOperation, got %d", n)
+	}
+}
+
+// TestInterlock_NonOutletOp_Unaffected: a normal (non-outlet) op — no
+// PDURuntime, or PDURuntime without the Outlet marker — bypasses the interlock
+// and claims as today, even from an empty-serial worker.
+func TestInterlock_NonOutletOp_Unaffected(t *testing.T) {
+	// A plain deploy op with no PDURuntime at all.
+	op := &model.Operation{
+		ID: uuid.New(), MachineID: uuid.New(), Type: model.OpDeploy,
+		Status: model.OpPending,
+	}
+	_, claimer, srv := interlockHub(t, op, nil)
+
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrainSerial(t, conn, "worker-1", "") // unverified — irrelevant for non-outlet
+
+	resp, errStr := claimAndRead(t, conn, op.ID)
+	if errStr != "" {
+		t.Fatalf("non-outlet claim errored: %q", errStr)
+	}
+	if resp.Operation == nil {
+		t.Error("non-outlet op must claim unaffected by the interlock")
+	}
+	if n := len(claimer.calls()); n != 1 {
+		t.Errorf("non-outlet op must reach ClaimOperation once, got %d", n)
+	}
+}
+
+// TestInterlock_NonOutletOpMalformedParams_Unaffected: a NON-outlet op whose
+// params blob won't decode must NOT be stranded by the interlock — it passes
+// through to the normal claim machinery (the applicability probe classifies it
+// as not-an-outlet-op, never fail-closes on a params quirk). Guards the
+// interlock's blast-radius boundary.
+func TestInterlock_NonOutletOpMalformedParams_Unaffected(t *testing.T) {
+	op := &model.Operation{
+		ID: uuid.New(), MachineID: uuid.New(), Type: model.OpDeploy,
+		Status: model.OpPending,
+		// A syntactically-valid object that DecodeParams rejects (bmc_runtime
+		// must be an object, not a number) but that isOutletOp probes as
+		// not-an-outlet-op.
+		Params: json.RawMessage(`{"bmc_runtime": 42}`),
+	}
+	_, claimer, srv := interlockHub(t, op, nil)
+
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrainSerial(t, conn, "worker-1", "SN-PARTNER")
+
+	resp, errStr := claimAndRead(t, conn, op.ID)
+	if errStr != "" {
+		t.Fatalf("non-outlet claim errored: %q", errStr)
+	}
+	if resp.Operation == nil {
+		t.Error("non-outlet op with malformed params must still claim (not stranded by the interlock)")
+	}
+	if n := len(claimer.calls()); n != 1 {
+		t.Errorf("non-outlet op must reach ClaimOperation once, got %d", n)
+	}
+}
+
+// TestInterlock_StoreErrorResolvingRegistered_FailClosed: a store error
+// resolving the registered-serial set for an outlet op declines the claim
+// fail-closed (never falls through to ClaimOperation).
+func TestInterlock_StoreErrorResolvingRegistered_FailClosed(t *testing.T) {
+	op := outletOp(t, model.OpPowerCycle, "SN-SOMEWHERE", false)
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop3", "worker-1")
+	auth.listErr = errors.New("postgres exploded")
+	cp := *op
+	cp.Status = model.OpClaimed
+	claimer := &fakeOpClaimer{op: &cp, pendingOp: op}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, OpClaimer: claimer})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrainSerial(t, conn, "worker-1", "SN-PARTNER")
+
+	resp, errStr := claimAndRead(t, conn, op.ID)
+	if errStr != "" {
+		t.Fatalf("fail-closed decline must not be an rpc error, got %q", errStr)
+	}
+	if !resp.AlreadyClaimed {
+		t.Error("store error resolving registered serials must fail closed (decline)")
+	}
+	if n := len(claimer.calls()); n != 0 {
+		t.Errorf("fail-closed decline must not reach ClaimOperation, got %d", n)
+	}
+}
+
+// TestInterlock_OutletOpEmptyDownstreamSerial_Declined: an outlet op marked
+// Outlet=true but with an empty downstream serial is invalid and declined
+// fail-closed at claim.
+func TestInterlock_OutletOpEmptyDownstreamSerial_Declined(t *testing.T) {
+	op := outletOp(t, model.OpPowerCycle, "", false) // Outlet=true, serial ""
+	_, claimer, srv := interlockHub(t, op, nil)
+
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrainSerial(t, conn, "worker-1", "SN-PARTNER")
+
+	resp, errStr := claimAndRead(t, conn, op.ID)
+	if errStr != "" {
+		t.Fatalf("declined claim must not be an rpc error, got %q", errStr)
+	}
+	if !resp.AlreadyClaimed {
+		t.Error("invalid outlet op (empty downstream serial) must be declined")
+	}
+	if n := len(claimer.calls()); n != 0 {
+		t.Errorf("invalid outlet op must not reach ClaimOperation, got %d", n)
+	}
+}

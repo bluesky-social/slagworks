@@ -1,0 +1,457 @@
+// Package target prepares the deployed OS tree at /target after the
+// storage plan has run: extract the root filesystem, write fstab, seed
+// cloud-init, install the phone-home unit, mask autonomous apt, and
+// drop operator SSH keys.
+package target
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/bluesky-social/slagworks/internal/agent"
+	"github.com/bluesky-social/slagworks/internal/storage"
+)
+
+// MountAndExtract copies the running squashfs root onto /target.
+// The squashfs is already mounted as the overlayfs lower layer at /;
+// rsync avoids needing unsquashfs and avoids double-mounting the
+// squashfs. Tradeoff: any overlayfs upper-layer writes (logs, temp
+// files from earlier commands) will be copied to the target.
+//
+// preserve mountpoints (e.g. /data) are excluded ENTIRELY. The storage plan
+// has already mounted every layout mount under /target BEFORE this runs, so a
+// preserved array is live at /target/<mp>. rsync's --one-file-system limits
+// SOURCE traversal only: the source-root /<mp> is a plain directory (the array
+// is mounted at the destination), so without an explicit exclude rsync would
+// descend into source /<mp> and write image contents -- and even bare
+// directory attrs -- into the preserved filesystem, corrupting the data the
+// whole feature exists to keep. Excluding the mountpoint outright leaves the
+// mounted array root untouched; the deployed OS remounts it from fstab.
+// Created (non-preserve) mounts are deliberately NOT excluded: writing into a
+// freshly-mkfs'd array or the ESP skeleton is the pre-existing, validated
+// extract behavior and is not destructive.
+func MountAndExtract(ctx *agent.Context, layout storage.Layout) error {
+	ctx.Log.Info("extracting root filesystem (rsync)")
+	// -x / --one-file-system prevents crossing mount boundaries (proc, sys, dev, target)
+	// Explicit excludes are belt-and-suspenders in case overlayfs counts as same filesystem
+	args := []string{"-aHAX", "--one-file-system",
+		"--exclude=/proc/*", "--exclude=/sys/*",
+		"--exclude=/dev/*", "--exclude=/run/*", "--exclude=/tmp/*",
+		"--exclude=/target"}
+	for _, mp := range preserveMountpoints(layout) {
+		// Whole-path exclude: neither the dir nor its contents are touched,
+		// so the mounted preserved array root keeps its own attrs.
+		args = append(args, "--exclude="+mp)
+		ctx.Log.Info("extract: preserving mounted data, excluding from rsync", "mountpoint", mp)
+	}
+	args = append(args, "/", "/target/")
+	if err := ctx.Exec.Run("rsync", args...); err != nil {
+		return fmt.Errorf("rsync: %w", err)
+	}
+
+	ctx.Log.Info("extraction complete")
+	return nil
+}
+
+// preserveMountpoints returns the sorted layout mountpoints whose device is a
+// preserve-type device -- the mounts that must be excluded from the OS extract
+// so the preserved data is never overwritten. Sorted for deterministic argv.
+func preserveMountpoints(layout storage.Layout) []string {
+	var mps []string
+	for mp, m := range layout.Mounts {
+		if dev, ok := layout.Devices[m.Device]; ok && dev.Type == "preserve" {
+			mps = append(mps, mp)
+		}
+	}
+	sort.Strings(mps)
+	return mps
+}
+
+// ConfigureRAID writes mdadm.conf and regenerates the initrd if any md
+// arrays are active. Without this, the stock initrd can't assemble the
+// arrays on boot and root=UUID fails.
+func ConfigureRAID(ctx *agent.Context) error {
+	// Check if any md arrays exist. A probe FAILURE is not "no RAID":
+	// a missing/broken mdadm on a RAID-root install would silently skip
+	// mdadm.conf + initramfs regeneration and ship an unbootable host.
+	out, err := ctx.Exec.Output("mdadm", "--detail", "--scan")
+	if err != nil {
+		return fmt.Errorf("mdadm --detail --scan: %w", err)
+	}
+	if out == "" {
+		return nil // no RAID, nothing to do
+	}
+
+	ctx.Log.Info("configuring RAID for local boot")
+	_ = os.MkdirAll("/target/etc/mdadm", 0755)
+	if err := os.WriteFile("/target/etc/mdadm/mdadm.conf", []byte(out+"\n"), 0644); err != nil {
+		return fmt.Errorf("write mdadm.conf: %w", err)
+	}
+
+	// Regenerate initrd so it includes mdadm array assembly
+	// Bind-mount pseudo-filesystems for chroot operations
+	for _, m := range []struct{ src, dst string }{
+		{"/dev", "/target/dev"},
+		{"/proc", "/target/proc"},
+		{"/sys", "/target/sys"},
+	} {
+		_ = os.MkdirAll(m.dst, 0755)
+		_ = ctx.Exec.Run("mount", "--bind", m.src, m.dst)
+	}
+
+	ctx.Log.Info("regenerating initrd with RAID support")
+	if err := ctx.Exec.Run("chroot", "/target", "update-initramfs", "-u"); err != nil {
+		return fmt.Errorf("update-initramfs: %w", err)
+	}
+
+	for _, dst := range []string{"/target/sys", "/target/proc", "/target/dev"} {
+		_ = ctx.Exec.Run("umount", dst)
+	}
+
+	// Copy the regenerated initrd to the ESP (replaces the stock one
+	// downloaded by the bootloader install)
+	matches, _ := filepath.Glob("/target/boot/initrd.img-*")
+	if len(matches) > 0 {
+		espInitrd := "/target/boot/efi/slagworks/initrd.img"
+		if err := ctx.Exec.Run("cp", matches[0], espInitrd); err != nil {
+			return fmt.Errorf("copy initrd to ESP: %w", err)
+		}
+		ctx.Log.Info("installed RAID-aware initrd to ESP", "initrd", filepath.Base(matches[0]))
+	}
+
+	return nil
+}
+
+// fstabEntry is one resolved /etc/fstab row. UUID and FSType come from
+// blkid on the assembled/formatted device (the authoritative source); the
+// caller has already resolved the mount device path and options.
+type fstabEntry struct {
+	Mountpoint string
+	UUID       string
+	FSType     string
+	Opts       string
+	Passno     int
+}
+
+// GenerateFstab renders the target's /etc/fstab from an ordered list of
+// entries. Pure for testability: the caller is responsible for ordering
+// (root first, then depth-sorted) and for having resolved each device's
+// UUID/fstype via blkid. Every entry uses pass 0 for dump.
+func GenerateFstab(entries []fstabEntry) string {
+	var b strings.Builder
+	b.WriteString("# /etc/fstab - generated by slagworks agent\n")
+	for _, e := range entries {
+		fmt.Fprintf(&b, "UUID=%s\t%s\t%s\t%s\t0\t%d\n",
+			e.UUID, e.Mountpoint, e.FSType, e.Opts, e.Passno)
+	}
+	return b.String()
+}
+
+// sortMountPaths orders mount points the way planMounts does: "/" first
+// (shallowest), then by depth, ties broken lexically. Keeping fstab in the
+// same order as the mount sequence makes the two trivially diffable.
+func sortMountPaths(mountDevs map[string]string) []string {
+	paths := make([]string, 0, len(mountDevs))
+	for p := range mountDevs {
+		paths = append(paths, p)
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		di, dj := strings.Count(paths[i], "/"), strings.Count(paths[j], "/")
+		if di != dj {
+			return di < dj
+		}
+		return paths[i] < paths[j]
+	})
+	return paths
+}
+
+// fstabOpts returns the mount options and fs passno for a mount point.
+// Root fscks first (passno 1); the ESP is vfat with a restrictive umask and
+// also passno 1; every other mount (e.g. /data) fscks after root (passno 2)
+// with plain defaults.
+func fstabOpts(mountpoint string) (opts string, passno int) {
+	switch mountpoint {
+	case "/":
+		return "defaults", 1
+	case "/boot/efi":
+		return "umask=0077", 1
+	default:
+		return "defaults", 2
+	}
+}
+
+// WriteFstab resolves every layout mount's device to a UUID + fstype via
+// blkid and writes the target's /etc/fstab. blkid is the authoritative
+// source of each device's fstype; the layout's declared FS is only a
+// cross-check. A preserve (or any) device whose declared FS disagrees with
+// blkid's detected TYPE is FATAL -- a disagreement means the layout
+// describes an array other than the one actually assembled on disk, exactly
+// the wrong-array hazard preserve identity verification guards against.
+//
+// mountDevs is storage.ResolveMountDevices(layout): mountpoint -> resolved
+// /dev path (md devices already resolved to /dev/mdN).
+func WriteFstab(ctx *agent.Context, layout storage.Layout, mountDevs map[string]string) error {
+	ctx.Log.Info("writing fstab")
+
+	var entries []fstabEntry
+	for _, mp := range sortMountPaths(mountDevs) {
+		dev := mountDevs[mp]
+
+		uuid, err := ctx.Exec.Output("blkid", "-s", "UUID", "-o", "value", dev)
+		if err != nil {
+			return fmt.Errorf("blkid UUID for %s (%s): %w", mp, dev, err)
+		}
+		if uuid == "" {
+			return fmt.Errorf("blkid found no UUID on %s (%s); cannot write a stable fstab entry -- was the device formatted/assembled?", mp, dev)
+		}
+		fsType, err := ctx.Exec.Output("blkid", "-s", "TYPE", "-o", "value", dev)
+		if err != nil {
+			return fmt.Errorf("blkid TYPE for %s (%s): %w", mp, dev, err)
+		}
+		if fsType == "" {
+			return fmt.Errorf("could not detect filesystem type on %s (%s)", mp, dev)
+		}
+
+		// Cross-check the layout's declared fs against blkid. blkid wins;
+		// a disagreement is a hard fail because it signals the wrong array
+		// (or wrong partition) was mounted at this point.
+		if declared := storage.DeclaredFS(layout, layout.Mounts[mp].Device); declared != "" && declared != fsType {
+			return fmt.Errorf(
+				"fstab: %s (%s) has filesystem %q per blkid but layout declares %q; "+
+					"refusing to write fstab -- the layout is describing a device other than the one on disk. "+
+					"Check the storage script's fs/array_uuid for %q",
+				mp, dev, fsType, declared, layout.Mounts[mp].Device)
+		}
+
+		opts, passno := fstabOpts(mp)
+		entries = append(entries, fstabEntry{
+			Mountpoint: mp,
+			UUID:       uuid,
+			FSType:     fsType,
+			Opts:       opts,
+			Passno:     passno,
+		})
+	}
+
+	if err := os.WriteFile("/target/etc/fstab", []byte(GenerateFstab(entries)), 0644); err != nil {
+		return fmt.Errorf("write fstab: %w", err)
+	}
+
+	ctx.Log.Info("fstab written", "mounts", len(entries))
+	return nil
+}
+
+// GeneratePhoneHomeUnit renders the first-boot phone-home systemd unit.
+//
+// The unit must RETRY until the POST actually succeeds, and write the
+// `.phoned-home` marker ONLY on an HTTP 2xx. network-online.target is
+// necessary but NOT sufficient on these hosts: an 802.3ad LACP bond
+// (pop2 leaf1/2 hosts) reaches network-online when networkd has set the
+// bond up administratively, but the link still needs several seconds to
+// negotiate LACP with the MLAG leaf pair and pass L3 traffic. A one-shot
+// that fired once at the network-online edge — and touched the marker
+// unconditionally — would lose that race and strand the host in
+// awaiting_phone_home forever even though the box is healthy.
+//
+// So: loop with backoff inside ExecStart, write the marker on success ONLY.
+// Durability across the two failure modes:
+//   - transient POST failure / bond still converging -> the in-loop `until`
+//     keeps retrying within this invocation; the marker is never written
+//     until a 2xx, so we never give up early.
+//   - host reboots mid-loop (before success) -> the marker still doesn't
+//     exist, so ConditionPathExists passes on the next boot and the unit
+//     re-runs via WantedBy=multi-user.target.
+//
+// Once the marker exists (success), the Condition makes the unit a no-op,
+// so a healthy deployed host never phones home twice. We deliberately do
+// NOT set Restart= — Type=oneshot constrains it, and the loop + boot re-run
+// already cover every case.
+//
+// wget exits non-zero on connection failure AND on a 4xx/5xx response
+// (exit 8), so `until wget ...` retries on both. -T 10 bounds each attempt
+// so a black-holed route can't wedge the loop on a single try.
+func GeneratePhoneHomeUnit(server, machineID, operationID string) string {
+	script := fmt.Sprintf(`mkdir -p /var/lib/slagworks; `+
+		`until wget -q -T 10 -O /dev/null `+
+		`--post-data='{"machine_id":"%s","op_id":"%s","event":"phone_home"}' `+
+		`--header='Content-Type: application/json' "http://%s/api/v1/report"; do `+
+		`echo "slagworks: phone-home POST failed, retrying in 5s"; sleep 5; done; `+
+		`touch /var/lib/slagworks/.phoned-home`, machineID, operationID, server)
+
+	return fmt.Sprintf(`[Unit]
+Description=Slagworks first-boot phone home
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/slagworks/.phoned-home
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+# The ExecStart loop is meant to run until the POST succeeds, which on a slow-
+# converging LACP bond (or a briefly-unreachable worker) can exceed systemd's
+# default 90s TimeoutStartSec. Without disabling it, systemd would SIGTERM the
+# loop at 90s and mark the unit failed; with no Restart= it would then only
+# retry on the next reboot — re-opening the exact strand-the-host window this
+# fix closes. infinity lets the until-loop retry as long as it needs.
+TimeoutStartSec=infinity
+ExecStart=/bin/sh -c %s
+
+[Install]
+WantedBy=multi-user.target
+`, shellSingleQuote(script))
+}
+
+// shellSingleQuote wraps s in single quotes for safe use as one argv token in
+// a systemd `ExecStart=/bin/sh -c '<s>'` line, escaping any embedded single
+// quotes via the '\” idiom. machineID/server are slagworks-controlled (UUID +
+// host:port), so this is belt-and-suspenders, not a security boundary.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// WritePhoneHomeService installs and enables the phone-home unit in the
+// target.
+func WritePhoneHomeService(ctx *agent.Context, machineID, operationID string) error {
+	ctx.Log.Info("writing phone-home service")
+
+	unitPath := "/target/etc/systemd/system/slagworks-phone-home.service"
+	if err := os.WriteFile(unitPath, []byte(GeneratePhoneHomeUnit(ctx.Server, machineID, operationID)), 0644); err != nil {
+		return fmt.Errorf("write unit: %w", err)
+	}
+
+	enablePhoneHome(ctx)
+	return nil
+}
+
+func enablePhoneHome(ctx *agent.Context) {
+	// Enable by symlinking into multi-user.target.wants.
+	// Symlink target is absolute inside the target root, not the chroot path.
+	wantsDir := "/target/etc/systemd/system/multi-user.target.wants"
+	os.MkdirAll(wantsDir, 0755)
+	link := filepath.Join(wantsDir, "slagworks-phone-home.service")
+	os.Remove(link) // ignore error if doesn't exist
+	if err := os.Symlink("/etc/systemd/system/slagworks-phone-home.service", link); err != nil {
+		ctx.Log.Warn("could not enable phone-home unit", "err", err)
+	}
+	ctx.Log.Info("phone-home service installed")
+}
+
+// SeedCloudInit writes the cloud-init seed that disables its network
+// rendering and hostname management on the deployed host.
+func SeedCloudInit(ctx *agent.Context) error {
+	ctx.Log.Info("seeding cloud-init")
+
+	dir := "/target/etc/cloud/cloud.cfg.d"
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("mkdir cloud-init dir: %w", err)
+	}
+
+	// network: {config: disabled} stops cloud-init's fallback
+	// network rendering. Without this, cloud-init detects a
+	// carrier-up interface, synthesizes a DHCP netplan, and
+	// races our /etc/netplan/99-slagworks.yaml. The two configs
+	// disagreeing under load is part of what stalled phone-home
+	// at >2 parallel test VMs.
+	//
+	// preserve_hostname: true stops cloud-init's cc_update_hostname
+	// module from rewriting the hostname from the datasource's
+	// local-hostname on every boot. netapply.WriteHostname writes the
+	// real per-machine FQDN to /target/etc/hostname AFTER this seed;
+	// without preserve_hostname, cloud-init clobbered it back to the
+	// seed value on first boot, so a deployed host came up as
+	// "slagworks-node" instead of e.g.
+	// kworker-l34-2.internal.pop1.example.net (observed 2026-06-02).
+	// local-hostname stays only as the pre-WriteHostname fallback for
+	// the rare host with no modeled FQDN.
+	cfg := `# slagworks agent cloud-init seed
+datasource_list: [None]
+datasource:
+  None:
+    metadata:
+      instance-id: slagworks-deploy
+      local-hostname: slagworks-node
+preserve_hostname: true
+network:
+  config: disabled
+`
+	if err := os.WriteFile(dir+"/99-slagworks.cfg", []byte(cfg), 0644); err != nil {
+		return fmt.Errorf("write cloud-init: %w", err)
+	}
+
+	ctx.Log.Info("cloud-init seeded")
+	return nil
+}
+
+// DisableFirstBootApt masks the apt-daily / apt-daily-upgrade /
+// unattended-upgrades systemd units so the deployed system never
+// autonomously contacts archive.ubuntu.com on first boot (or any
+// boot). This is deliberate fleet policy, not a compat shim:
+// slagworks-managed hosts run apt under operator control; background
+// apt activity is pure waste in production and a wedge risk in tests
+// where the upstream mirror is unreachable from a netns'd test bridge.
+//
+// systemctl mask in /target via a chroot-less symlink trick:
+// we point the unit name at /dev/null in /etc/systemd/system,
+// which is what `systemctl mask` would do. Doing it via symlink
+// avoids needing a chroot exec of systemctl during deploy
+// (which itself would race the live PID-1's view of the unit
+// tree).
+func DisableFirstBootApt(ctx *agent.Context) error {
+	ctx.Log.Info("masking apt-daily + unattended-upgrades timers/services")
+	systemd := "/target/etc/systemd/system"
+	if err := os.MkdirAll(systemd, 0755); err != nil {
+		return fmt.Errorf("mkdir systemd: %w", err)
+	}
+	// Each name gets a /dev/null symlink, equivalent to
+	// `systemctl mask`. Mask both the timer and the service so
+	// neither cron-style invocation nor a manual start can fire.
+	masked := []string{
+		"apt-daily.timer",
+		"apt-daily.service",
+		"apt-daily-upgrade.timer",
+		"apt-daily-upgrade.service",
+		"unattended-upgrades.service",
+	}
+	for _, name := range masked {
+		path := filepath.Join(systemd, name)
+		_ = os.Remove(path)
+		if err := os.Symlink("/dev/null", path); err != nil {
+			return fmt.Errorf("mask %s: %w", name, err)
+		}
+	}
+	ctx.Log.Info("apt-daily + unattended-upgrades masked")
+	return nil
+}
+
+// WriteSSHKeys fetches the operator SSH keys from the site worker and
+// installs them at /target/root/.ssh/authorized_keys. A 204 or empty
+// body means no keys are configured — skip without error.
+func WriteSSHKeys(ctx *agent.Context) error {
+	url := fmt.Sprintf("http://%s/boot/ssh-keys", ctx.Server)
+	ctx.Log.Info("fetching SSH keys", "url", url)
+
+	body, err := agent.HTTPGet(url)
+	if err != nil {
+		return fmt.Errorf("fetch ssh keys: %w", err)
+	}
+
+	keys := strings.TrimSpace(string(body))
+	if keys == "" {
+		ctx.Log.Info("no SSH keys configured, skipping")
+		return nil
+	}
+
+	sshDir := "/target/root/.ssh"
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", sshDir, err)
+	}
+	if err := os.WriteFile(sshDir+"/authorized_keys", []byte(keys+"\n"), 0600); err != nil {
+		return fmt.Errorf("write authorized_keys: %w", err)
+	}
+
+	ctx.Log.Info("wrote SSH keys to /root/.ssh/authorized_keys", "count", len(strings.Split(keys, "\n")))
+	return nil
+}

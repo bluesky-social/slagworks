@@ -1,0 +1,298 @@
+name: test-qemu
+# Full-stack QEMU integration suite: real DHCP/TFTP/HTTP boot, the real boot
+# image, the real agent, a simulated BMC, VMs under KVM.
+#
+# Every job runs on a GitHub-hosted runner, so each run starts from a clean
+# machine and holds no credentials:
+#
+#   changes -> image ------.
+#           -> shards ---> shard (matrix) -> qemu
+#
+# - changes decides whether the change can affect the suite at all
+#   (scripts/ci/qemu-relevant.sh: does it touch a package the suite's
+#   binaries are built from, the image, or this workflow). A dependency
+#   bump that only reaches slagctl does not. When it cannot, the other jobs
+#   are skipped
+#   and `qemu` still reports success, so `qemu` can be a required check
+#   without path filters stranding unrelated pull requests.
+# - image restores or builds the boot image through the same action and cache
+#   key as build-images.yaml: the suite boots the bytes that workflow
+#   builds and smoke-tests, and an unchanged image costs a cache restore.
+# - shard runs one slice of the suite. Slices come from
+#   scripts/ci/qemu-shards.sh.
+# - qemu is the single result to gate on.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run:
+        description: |
+          Optional regexp limiting which tests run (e.g.
+          `TestDeployFullLifecycle`). Empty runs everything.
+        required: false
+        default: ''
+      parallel:
+        description: go test -parallel value for each shard.
+        required: false
+        default: ''
+      shards:
+        description: Number of shards.
+        required: false
+        default: ''
+
+# A new push to a pull request replaces its run. Pushes to main each keep
+# their own run: a failure there has to be attributable to one commit.
+concurrency:
+  group: test-qemu-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# bash with pipefail: the suite pipes `go test | tee`, and without pipefail
+# tee's exit status would mask a failing run.
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Sized for the standard hosted runner (2 vCPU, 7 GB): test VMs take 2 to
+  # 4 GB each, so a shard runs one test at a time and the suite spreads over
+  # more shards instead.
+  DEFAULT_SHARDS: '12'
+  DEFAULT_PARALLEL: '1'
+
+jobs:
+  changes:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      relevant: ${{ steps.decide.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Pushes to main and manual runs always run the suite. A pull
+          # request runs it when its diff against the merge base touches
+          # anything the suite can observe.
+          if [ "$EVENT_NAME" != pull_request ]; then
+            relevant=true
+          else
+            relevant=$(scripts/ci/qemu-relevant.sh "$BASE_SHA" "$HEAD_SHA")
+          fi
+          echo "relevant=$relevant" | tee -a "$GITHUB_OUTPUT"
+
+  image:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-26.04
+    # A cache hit takes about a minute; an uncached build 8 to 10.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      # Same keys as build-images.yaml when the variable is readable, so the
+      # two workflows share one cache entry. The suite's recovery test
+      # injects its own keys, so a fork's throwaway key is fine here.
+      - uses: ./.github/actions/boot-image
+        with:
+          recovery-authorized-keys: ${{ vars.RECOVERY_AUTHORIZED_KEYS }}
+          allow-throwaway-key: 'true'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: qemu-boot-image
+          path: noble-pxe.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  shards:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - id: split
+        env:
+          SHARDS: ${{ inputs.shards || env.DEFAULT_SHARDS }}
+          RUN_FILTER: ${{ inputs.run }}
+        run: |
+          matrix=$(scripts/ci/qemu-shards.sh "$SHARDS" "$RUN_FILTER")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "$matrix" | jq -r '.[] | "shard \(.shard): \(.run | split("|") | length) tests"'
+
+  shard:
+    needs: [image, shards]
+    # 24.04, not the 26.04 the other jobs use: it is the release the boot
+    # image is built from, and UEFI test VMs do not get through boot with
+    # 26.04's QEMU 10, OVMF and iPXE ROM (they time out waiting for the
+    # agent). renovate.json holds this runner back. The harness itself
+    # already handles the QEMU 10 option and ROM path differences.
+    runs-on: ubuntu-24.04
+    # A shard takes about 10 minutes; the go test timeout below is the
+    # tighter bound.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.shards.outputs.matrix) }}
+    name: shard ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install the harness's host tools
+        # qemu + OVMF for the VMs, ipxe-qemu for the NIC option ROMs the UEFI
+        # tests point QEMU at (a hard dependency of qemu on 24.04, only
+        # recommended on 26.04), openipmi for ipmi_sim (the simulated
+        # BMC), ipmitool, lvm2 and qemu-utils (qemu-img, qemu-nbd) for the
+        # disk-preservation tests, systemd-boot-efi for the EFI stub the
+        # site worker serves.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+              qemu-system-x86 qemu-utils ovmf ipxe-qemu openipmi ipmitool lvm2 systemd-boot-efi
+
+      - name: Check KVM and load nbd
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing on this runner; the suite needs hardware virtualization"
+            exit 1
+          fi
+          sudo modprobe nbd max_part=16
+          # The harness attaches VMs with `-netdev bridge`, which runs
+          # qemu-bridge-helper; the helper refuses any bridge its ACL file
+          # does not allow. Test bridges are named per run, so allow all.
+          sudo mkdir -p /etc/qemu
+          echo 'allow all' | sudo tee /etc/qemu/bridge.conf >/dev/null
+          nproc; free -g | sed -n 2p
+
+      - name: Download the boot image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: qemu-boot-image
+
+      - name: Stage images and build the test binaries
+        # The harness's DefaultImage is "noble-pxe", one directory holding
+        # the kernel, both initrds and the root squashfs. main.version is
+        # stamped with the commit so the worker/global version handshake
+        # carries a real value.
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          images="$RUNNER_TEMP/images"
+          mkdir -p "$images"
+          tar -xzf noble-pxe.tar.gz -C "$images"
+          rm noble-pxe.tar.gz
+          for f in vmlinuz initrd initrd-local root.squashfs; do
+            [ -f "$images/noble-pxe/$f" ] || { echo "::error::boot image is missing $f"; exit 1; }
+          done
+          cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi "$images/"
+          cp assets/ipxe/snponly.efi assets/ipxe/undionly.kpxe "$images/"
+          # CGO off, as scripts/build-deb.sh builds the shipped agent: the
+          # binary runs inside the booted image, so it must not depend on
+          # this runner's C toolchain or libc.
+          export CGO_ENABLED=0
+          go build -ldflags "-X main.version=$COMMIT" -o "$images/slagworks-agent" ./cmd/slagworks-agent/
+          go build -o "$images/qemutest-tftpd" ./cmd/qemutest-tftpd/
+          go build -o "$images/qemutest-serialrelay" ./cmd/qemutest-serialrelay/
+
+      - name: Run the shard
+        # Root: bridges, network namespaces, nbd and qemu need it. The Go
+        # caches are pointed at per-job directories so root-owned files do
+        # not land in the runner user's cache.
+        env:
+          RUN_REGEXP: ${{ matrix.run }}
+          PARALLEL: ${{ inputs.parallel || env.DEFAULT_PARALLEL }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "GOCACHE=$RUNNER_TEMP/gocache" \
+            "GOMODCACHE=$RUNNER_TEMP/gomodcache" \
+            SLAGWORKS_IMAGES_DIR="$RUNNER_TEMP/images" \
+            SLAGWORKS_TEST_VERSION="$COMMIT" \
+            go test -v -tags integration -parallel "$PARALLEL" -timeout 30m \
+            -run "$RUN_REGEXP" \
+            ./internal/qemutest/... \
+            | tee "$RUNNER_TEMP/results.txt"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: qemu-results-${{ matrix.shard }}
+          path: ${{ runner.temp }}/results.txt
+          if-no-files-found: warn
+
+  # The one result to require. Succeeds when every shard passed, or when the
+  # change was not relevant and nothing needed to run.
+  qemu:
+    needs: [changes, image, shards, shard]
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RELEVANT: ${{ needs.changes.outputs.relevant }}
+          RESULTS: ${{ toJson(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if [ "$RELEVANT" = false ]; then
+            [ "$(echo "$RESULTS" | jq -r '.changes.result')" = success ] || { echo "::error::could not decide relevance"; exit 1; }
+            echo "The change cannot affect the QEMU suite; nothing ran."
+            exit 0
+          fi
+          bad=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success") | .key')
+          if [ -n "$bad" ]; then
+            echo "::error::QEMU suite did not pass: $(echo "$bad" | tr '\n' ' ')"
+            exit 1
+          fi
+
+  # Tell someone when main breaks. The suite went four days without a
+  # passing run on main in November 2026 before anyone noticed. Posts to a
+  # Slack incoming webhook when the CI_ALERT_SLACK_WEBHOOK secret is set, and
+  # says so in the log when it is not.
+  alert:
+    needs: qemu
+    if: failure() && github.event_name == 'push'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - env:
+          WEBHOOK: ${{ secrets.CI_ALERT_SLACK_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "::warning::test-qemu failed on main and CI_ALERT_SLACK_WEBHOOK is not set; nobody was notified"
+            exit 0
+          fi
+          jq -n --arg text "test-qemu failed on main in $REPO at ${COMMIT:0:8}: $RUN_URL" '{text: $text}' \
+            | curl -fsS -m 20 -X POST -H 'Content-Type: application/json' --data @- "$WEBHOOK"

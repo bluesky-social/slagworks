@@ -1,0 +1,3 @@
+#!ipxe
+echo slagworks: ERROR: machine 11111111-2222-3333-4444-555555555555 not commissioned (no system UUID), cannot deploy
+shell

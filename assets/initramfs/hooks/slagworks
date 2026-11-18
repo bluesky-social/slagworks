@@ -1,0 +1,67 @@
+#!/bin/sh -e
+# initramfs-tools hook for slagworks.
+#
+# Bakes into the generated initrd everything the slagworks BOOT hook
+# (/scripts/slagworks) needs at runtime that stock initramfs-tools does not
+# already include:
+#   - the overlay/squashfs/loop + storage/raid/dm kernel modules the agent and
+#     overlay-root mount depend on
+#   - a real wget + chroot (busybox provides applets, but the squashfs is large
+#     and we chroot a full Go binary; use the real tools installed in the PXE
+#     chroot)
+#   - the operator recovery authorized_keys, baked at a known path so
+#     /scripts/slagworks recovery_drop() can install them with no network
+#
+# The BOOT script itself (/usr/share/initramfs-tools/scripts/slagworks) is
+# copied into the initrd automatically by mkinitramfs's boot-script scan; it
+# does NOT need to be added here.
+#
+# configure_networking, udev coldplug, dhcpcd + its /run/net-*.conf lease hook,
+# and klibc ipconfig all come from initramfs-tools-core's own hooks/deps — we
+# inherit them by NOT replacing /init. Nothing to add for networking here.
+
+PREREQS=""
+prereqs() { echo "$PREREQS"; }
+case "$1" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# Kernel modules. udev autoloads NIC/storage drivers by modalias at boot, but
+# these are needed before/independent of a matching device and are cheap to
+# force in:
+#   overlay/squashfs/loop : the overlay-root mount in /scripts/slagworks
+#   nvme/ahci             : storage controllers the agent partitions
+#   md_mod/raid0/1/10     : software-RAID personalities (kworker RAID1 boot);
+#                           mdadm RUN_ARRAY fails without the level's module
+#   dm_mod               : device-mapper foundation (future LVM/dm-crypt)
+for m in overlay squashfs loop \
+         nvme nvme_core ahci libahci \
+         md_mod raid0 raid1 raid10 dm_mod; do
+    manual_add_modules "$m"
+done
+
+# Real wget + chroot for the squashfs/agent download and the agent chroot.
+# copy_exec is a no-op-safe if the binary is missing, but packages-pxe.txt
+# installs wget and chroot is in coreutils (an initramfs-tools-core dep).
+copy_exec /usr/bin/wget /usr/bin
+copy_exec /usr/sbin/chroot /usr/sbin || copy_exec /sbin/chroot /sbin || true
+
+# Bake operator recovery pubkeys into the initrd at the path
+# /scripts/slagworks recovery_drop() reads. The build's PXE customize-hook
+# stages the keyfile into the chroot at /etc/slagworks/recovery_authorized_keys
+# before running update-initramfs; we copy it into the initrd here. If it's
+# absent (a build done without staging keys), ship an empty
+# file so recovery_drop() takes its no-keys SOL-shell path rather than failing.
+mkdir -p "${DESTDIR}/etc/slagworks"
+if [ -f /etc/slagworks/recovery_authorized_keys ]; then
+    cp -p /etc/slagworks/recovery_authorized_keys \
+        "${DESTDIR}/etc/slagworks/recovery_authorized_keys"
+else
+    : > "${DESTDIR}/etc/slagworks/recovery_authorized_keys"
+fi
+chmod 0644 "${DESTDIR}/etc/slagworks/recovery_authorized_keys"

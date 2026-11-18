@@ -1,0 +1,31 @@
+[Unit]
+Description=Slagworks Global API Server
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/slagworksd global
+# "-" prefix: a missing env file must not make systemd fail the unit
+# with Result=resources (which bypasses RestartPreventExitStatus and
+# restart-loops forever — observed at 195k restarts on oob-gw-1.pop1).
+# Instead the daemon starts, detects the missing config, and exits 78.
+EnvironmentFile=-/etc/slagworks/global.env
+Restart=on-failure
+RestartSec=5
+# sysexits EX_CONFIG: the daemon exits 78 on missing/invalid required
+# config, which cannot heal by retrying. Mark the unit failed instead
+# of restart-looping.
+RestartPreventExitStatus=78
+User=slagworks
+Group=slagworks
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

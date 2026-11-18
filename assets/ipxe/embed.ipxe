@@ -1,0 +1,57 @@
+#!ipxe
+# Slagworks embedded boot script (baked into snponly.efi / undionly.kpxe at
+# build time — see .github/workflows/build-ipxe.yaml). Changing this file
+# requires rebuilding the iPXE binaries.
+#
+# Failure mode this guards against: immediately after POST the NIC link and
+# the upstream switch port are still settling, so the first dhcp / chain
+# attempts routinely time out. iPXE's DEFAULT per-connection timeout is long
+# (tens of seconds), so each miss burns a lot of wall-clock before retrying —
+# that's the "Connection timed out" churn seen during imaging. The fix is a
+# short bounded per-attempt timeout plus a capped retry loop, so a settling
+# link costs seconds (not a minute) per miss and a genuinely-dead network
+# drops to a shell instead of looping forever.
+#
+# Structure mirrors iPXE's own bundled src/config/cloud/aws.ipxe (the
+# canonical retry idiom): `set n:int8`, `:label`, `cmd --timeout && goto ok ||`,
+# `inc n`, `iseq ${n} LIMIT || goto label`. Both the DHCP and the chain are
+# wrapped this way. A chain failure re-runs the whole loop from DHCP (cheap and
+# correct — the lease is re-acquired), bounded by the outer attempt counter.
+
+set user-class slagworks-ipxe
+
+set attempt:int8 1
+:retry
+echo slagworks: PXE attempt ${attempt}
+
+# 10s per DHCP attempt; the link may not be up on the first try post-POST.
+dhcp --timeout 10000 || goto next
+
+# Use the URL DHCP gave us (option 67 / `filename`) rather than hardcoding
+# host/port; the slagworks DHCP server supplies the full
+# http://<site>:<port>/boot/ipxe URL, so operators can move the boot port
+# without rebuilding iPXE. mac/uuid ride as query params so the httpboot
+# handler routes to the right machine. Use ${mac} (the iface that DHCP'd),
+# not ${net0/mac}: boot may succeed on net1 if net0's link is down, in which
+# case net0/mac would route to the wrong machine record entirely.
+#
+# platform=${platform} (iPXE: "pcbios" on legacy BIOS, "efi" on UEFI) lets the
+# boot-local handler pick the right local-boot idiom: BIOS gets `exit` (return
+# to firmware -> next BBS device = disk), UEFI keeps `sanboot`. Absent on old
+# iPXE binaries -> handler defaults to UEFI. See
+# docs/user/boot-process.md ("Legacy BIOS vs. UEFI").
+#
+# --timeout 15000 bounds a single fetch to 15s instead of iPXE's long default,
+# so a settling-link miss costs ~15s, not ~60s+, before the next attempt.
+chain --timeout 15000 ${filename}?mac=${mac}&uuid=${uuid}&platform=${platform} && goto done ||
+
+:next
+inc attempt
+# Cap at 20 attempts (~5min worst case at the timeouts above) before dropping
+# to a shell — by then the network is genuinely broken and an operator should
+# look, not have us loop silently forever.
+iseq ${attempt} 20 || goto retry
+echo slagworks: PXE boot failed after ${attempt} attempts; dropping to shell
+shell
+
+:done

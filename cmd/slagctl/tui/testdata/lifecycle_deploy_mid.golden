@@ -1,0 +1,13 @@
+✓ power_cycle        2s
+✓ pxe_booting       14s
+✓ dhcp_ack           1s
+✓ ipxe_dhcp          2s
+✓ ipxe_loaded        8s
+✓ agent_starting     3s
+⠙ partitioning    (47s)
+○ rsyncing_os
+○ installing_bootloader
+○ finalizing
+○ bmc_reconcile
+○ awaiting_phone_home
+○ completed

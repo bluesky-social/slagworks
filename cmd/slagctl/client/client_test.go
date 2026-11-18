@@ -1,0 +1,190 @@
+package client_test
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/bluesky-social/slagworks/cmd/slagctl/client"
+)
+
+func TestGet_Success(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/api/v1/sites" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode([]map[string]string{{"id": "abc", "name": "pop3"}})
+	}))
+	defer ts.Close()
+
+	c := client.New(client.Config{BaseURL: ts.URL, HTTPClient: ts.Client()})
+	var out []map[string]string
+	if err := c.Get(context.Background(), "/api/v1/sites", nil, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || out[0]["name"] != "pop3" {
+		t.Fatalf("unexpected response: %v", out)
+	}
+}
+
+func TestGet_WithQuery(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("state") != "commissioned" {
+			t.Errorf("expected state=commissioned, got %q", r.URL.Query().Get("state"))
+		}
+		w.Write([]byte("[]"))
+	}))
+	defer ts.Close()
+
+	c := client.New(client.Config{BaseURL: ts.URL, HTTPClient: ts.Client()})
+	var out []any
+	q := url.Values{"state": {"commissioned"}}
+	if err := c.Get(context.Background(), "/api/v1/machines", q, &out); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPost_Success(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		json.NewDecoder(r.Body).Decode(&body)
+		if body["name"] != "pop3" {
+			t.Errorf("unexpected body: %v", body)
+		}
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{"id": "123", "name": "pop3"})
+	}))
+	defer ts.Close()
+
+	c := client.New(client.Config{BaseURL: ts.URL, HTTPClient: ts.Client()})
+	var out map[string]string
+	if err := c.Post(context.Background(), "/api/v1/sites", map[string]string{"name": "pop3"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["id"] != "123" {
+		t.Fatalf("unexpected response: %v", out)
+	}
+}
+
+func TestDelete_Success(t *testing.T) {
+	called := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		if r.Method != http.MethodDelete {
+			t.Errorf("expected DELETE, got %s", r.Method)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	c := client.New(client.Config{BaseURL: ts.URL, HTTPClient: ts.Client()})
+	if err := c.Delete(context.Background(), "/api/v1/machines/123"); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("handler not called")
+	}
+}
+
+func TestAPIError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"message": "machine not found"})
+	}))
+	defer ts.Close()
+
+	c := client.New(client.Config{BaseURL: ts.URL, HTTPClient: ts.Client()})
+	err := c.Get(context.Background(), "/api/v1/machines/nope", nil, nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	apiErr, ok := err.(*client.APIError)
+	if !ok {
+		t.Fatalf("expected *client.APIError, got %T: %v", err, err)
+	}
+	if apiErr.StatusCode != 404 {
+		t.Errorf("expected 404, got %d", apiErr.StatusCode)
+	}
+	if apiErr.Message != "machine not found" {
+		t.Errorf("unexpected message: %q", apiErr.Message)
+	}
+}
+
+func TestBearerToken(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer mytoken" {
+			t.Errorf("unexpected auth header: %q", r.Header.Get("Authorization"))
+		}
+		w.Write([]byte("{}"))
+	}))
+	defer ts.Close()
+
+	c := client.New(client.Config{BaseURL: ts.URL, Token: "mytoken", HTTPClient: ts.Client()})
+	var out map[string]any
+	if err := c.Get(context.Background(), "/", nil, &out); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInsecureWarning(t *testing.T) {
+	tests := []struct {
+		url      string
+		wantWarn bool
+	}{
+		{"http://localhost:8081", false},
+		{"http://127.0.0.1:8081", false},
+		{"https://slagworks.example.com", false},
+		{"http://oob-gw-1.example.com:8081", true},
+	}
+	for _, tt := range tests {
+		c := client.New(client.Config{BaseURL: tt.url})
+		warn := c.InsecureWarning()
+		if tt.wantWarn && warn == "" {
+			t.Errorf("url %s: expected warning, got none", tt.url)
+		}
+		if !tt.wantWarn && warn != "" {
+			t.Errorf("url %s: unexpected warning: %q", tt.url, warn)
+		}
+	}
+}
+
+// TestTimeoutErrorIsActionable pins the timeout error rewrite: the
+// operator-facing message must say how long we waited, name the target,
+// and point at the op-list / server-log next steps — not just Go's
+// "context deadline exceeded (Client.Timeout exceeded while awaiting
+// headers)".
+func TestTimeoutErrorIsActionable(t *testing.T) {
+	blocked := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-blocked // hold the response past the client timeout
+	}))
+	defer ts.Close()
+	// LIFO: must release the handler BEFORE ts.Close() waits on it.
+	defer close(blocked)
+
+	hc := ts.Client()
+	hc.Timeout = 50 * time.Millisecond
+	c := client.New(client.Config{BaseURL: ts.URL, HTTPClient: hc})
+	err := c.Post(context.Background(), "/api/v1/machines/x/power", map[string]string{"action": "cycle"}, nil)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	for _, want := range []string{
+		"did not respond within",
+		"POST /api/v1/machines/x/power",
+		"slagctl operation list",
+		"kubectl logs",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q:\n%s", want, err)
+		}
+	}
+}

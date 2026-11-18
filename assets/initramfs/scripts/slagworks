@@ -1,0 +1,398 @@
+# shellcheck shell=sh
+# slagworks BOOT hook for Ubuntu initramfs-tools.
+#
+# This file is sourced by stock /init, not executed, so it has no shebang
+# (same as upstream scripts/local, scripts/casper). This file is NOT a
+# standalone /init. It is sourced by the STOCK Ubuntu
+# initramfs /init via `. /scripts/${BOOT}` when the kernel cmdline carries
+# `boot=slagworks`. By the time mountroot() runs, stock /init has already:
+#   - mounted /proc /sys /dev (devtmpfs) /run, set up /dev symlinks + devpts
+#   - started udevd and coldplugged the bus (udevadm trigger + settle), which
+#     autoloads every NIC and storage driver by modalias
+#   - sourced /scripts/functions (so configure_networking is in scope)
+#   - parsed ip=, BOOTIF=, root=, etc. from the cmdline
+#
+# So we do NOT load drivers, we do NOT hand-roll DHCP, and we do NOT do the
+# PCI/kmsg/InfiniBand diagnostics the old hand-written /init carried. udev +
+# configure_networking own all of that now. Our job is only the three things
+# that are genuinely slagworks-specific:
+#
+#   1. fetch the squashfs root over HTTP and overlay-mount it writable
+#   2. download + chroot-run the slagworks agent (deploy/commission)
+#   3. reboot into the freshly-imaged disk on success, recovery shell on failure
+#
+# We deliberately do NOT return to stock /init (which would `run-init` pivot
+# into the squashfs and make it the permanent system). The squashfs is a
+# disposable toolbox: the agent images the DISK, then we reboot the whole
+# machine. mountroot() runs the agent as its tail and never returns.
+
+# rootmnt, DEVICE, and the configure_networking function are provided by the
+# stock initramfs /init environment that sources this script; shellcheck
+# cannot see them statically.
+# shellcheck disable=SC2154
+
+# STEP markers. Until the agent downloads and starts reporting envelopes, the
+# SOL serial console is the ONLY channel to debug a host that won't boot — no
+# remote log stream, no agent envelopes. So every important step in mountroot()
+# emits a "slagworks: STEP <name>" line; an SOL capture then pinpoints exactly
+# where a boot wedged (which is the difference between a 5-minute diagnosis and
+# a multi-hour one on real hardware). These are cheap to emit and invaluable
+# when a host misbehaves. Driver/DHCP bring-up is now udev + configure_networking
+# (which log to dmesg / their own output), so we no longer hand-roll the
+# PCI/kmsg/InfiniBand dumps — but the high-level progress markers stay.
+_step() { echo "slagworks: STEP $*"; }
+
+# Full command tracing (set -x) is opt-in via slagworks.debug_init on the
+# kernel cmdline. Off by default so a normal boot's SOL stays readable (a
+# traced boot script is a wall of noise that buries the STEP markers); flip it
+# on when a host is misbehaving and you want every command + expansion echoed.
+# PS4 tags traced lines with the line number so they're distinguishable.
+PS4='+ slagworks:$LINENO: '
+# Word-splitting /proc/cmdline is intentional (one token per kernel param).
+# shellcheck disable=SC2013
+for _p in $(cat /proc/cmdline 2>/dev/null); do
+    [ "$_p" = "slagworks.debug_init" ] && { set -x; break; }
+done
+
+# slagworks_panic_shell: last-resort drop to an interactive shell. Stock init's
+# panic() would just loop or reboot; on a host whose only channel is SOL we
+# want a shell to poke at. Mirrors the old /init's `exec /bin/sh` fatals.
+slagworks_panic_shell() {
+    echo "slagworks: FATAL: $*"
+    echo "slagworks: dropping to shell on the console"
+    exec /bin/sh
+}
+
+# slagworks_parse_cmdline: pull the slagworks.* params out of /proc/cmdline.
+# BOOTIF and ip= are already consumed by stock init + configure_networking; we
+# only parse the agent-facing params here. EFIVARFS_MODE defaults to auto.
+slagworks_parse_cmdline() {
+    SLAG_SERVER=""
+    SLAG_IMAGE=""
+    SLAG_MODE="deploy"
+    SLAG_DESTRUCTIVE=""
+    SLAG_WIPE_ALL_DISKS=""
+    SLAG_MACHINE_ID=""
+    SLAG_OP_ID=""
+    SLAG_TRACE_ID=""
+    SLAG_EXPECT_UUID=""
+    SLAG_RECOVERY=""
+    SLAG_FATAL_AT=""
+    SLAG_EFIVARFS_MODE="auto"
+    # Word-splitting /proc/cmdline is intentional: each whitespace-separated
+    # token is one kernel param. This is the same idiom stock init uses.
+    # shellcheck disable=SC2013
+    for param in $(cat /proc/cmdline); do
+        case "$param" in
+            slagworks.server=*)       SLAG_SERVER="${param#slagworks.server=}" ;;
+            slagworks.image=*)        SLAG_IMAGE="${param#slagworks.image=}" ;;
+            slagworks.mode=*)         SLAG_MODE="${param#slagworks.mode=}" ;;
+            slagworks.destructive)    SLAG_DESTRUCTIVE="--destructive" ;;
+            slagworks.wipe_all_disks) SLAG_WIPE_ALL_DISKS="--wipe-all-disks" ;;
+            slagworks.machine=*)      SLAG_MACHINE_ID="${param#slagworks.machine=}" ;;
+            slagworks.op=*)           SLAG_OP_ID="${param#slagworks.op=}" ;;
+            slagworks.trace=*)        SLAG_TRACE_ID="${param#slagworks.trace=}" ;;
+            slagworks.expect-uuid=*)  SLAG_EXPECT_UUID="${param#slagworks.expect-uuid=}" ;;
+            slagworks.recovery)       SLAG_RECOVERY=1 ;;
+            slagworks.fatal_at=*)     SLAG_FATAL_AT="${param#slagworks.fatal_at=}" ;;
+            slagworks.efivarfs=*)     SLAG_EFIVARFS_MODE="${param#slagworks.efivarfs=}" ;;
+        esac
+    done
+    if [ -z "$SLAG_SERVER" ]; then
+        slagworks_panic_shell "no slagworks.server= on kernel command line"
+    fi
+    if [ -z "$SLAG_IMAGE" ]; then
+        SLAG_IMAGE="noble"
+        echo "slagworks: no slagworks.image= on cmdline, defaulting to $SLAG_IMAGE"
+    fi
+    _step "cmdline-parsed server=$SLAG_SERVER image=$SLAG_IMAGE mode=$SLAG_MODE"
+}
+
+# slagworks_mount_efivarfs: efivarfs at /sys/firmware/efi/efivars must be
+# mounted for the agent's `efibootmgr -c` to write UEFI Boot#### entries on
+# AMI Aptio firmware (the pop1 ship-blocker). The stock Noble initrd does not
+# mount it, and the agent runs before any service that would. `slagworks.efivarfs=skip`
+# is a test-only knob the qemutest matrix uses to repro the pre-fix failure.
+# On BIOS hosts /sys/firmware/efi is absent and we skip cleanly.
+slagworks_mount_efivarfs() {
+    case "$SLAG_EFIVARFS_MODE" in
+        skip)
+            echo "slagworks: efivarfs mount skipped by cmdline"
+            ;;
+        *)
+            if [ -d /sys/firmware/efi/efivars ]; then
+                if mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>&1; then
+                    echo "slagworks: efivarfs mounted"
+                else
+                    echo "slagworks: efivarfs mount failed (already mounted or BIOS host)"
+                fi
+            else
+                echo "slagworks: no /sys/firmware/efi (BIOS boot)"
+            fi
+            ;;
+    esac
+}
+
+# slagworks_download: wget with a small retry loop. busybox wget (shipped in
+# the initrd) has no --tries. A timeout/connection-refused while the leaf relay
+# or site worker is briefly unreachable is expected; retry a few times before
+# giving up.
+slagworks_download() {
+    _dest="$1"; _url="$2"; _tries=3
+    _i=1
+    while [ "$_i" -le "$_tries" ]; do
+        if wget -O "$_dest" "$_url" 2>&1; then
+            return 0
+        fi
+        echo "slagworks: download failed (attempt $_i/$_tries), retrying in 2s..."
+        sleep 2
+        _i=$((_i + 1))
+    done
+    echo "slagworks: FATAL: download failed after $_tries attempts: $_url"
+    return 1
+}
+
+# slagworks_recovery_drop: enter recovery mode. Materialize operator
+# authorized_keys baked into the initrd into the chroot, generate ephemeral
+# host keys (tmpfs, fresh per boot), and start sshd in the foreground so an
+# operator can `ssh root@$IP`. Networking stays up because configure_networking
+# only set a lease; there is no daemon to tear it down. Never returns: it execs
+# sshd, and if sshd dies it drops to a shell. We do NOT reboot from recovery;
+# the operator decides when to leave.
+#
+# $rootmnt is the overlay-mounted squashfs (sshd lives in the deploy squashfs:
+# packages-deploy.txt openssh-server). $SLAG_IFACE is set by the caller after
+# configure_networking so the banner can print the host's IP.
+slagworks_recovery_drop() {
+    # set +e for the whole body: a single failed mkdir/chmod must not abort
+    # before the operator-facing banner prints. The function only ever ends in
+    # exec, so this does not leak to a caller.
+    set +e
+    _reason="$1"
+    _authkeys=/etc/slagworks/recovery_authorized_keys
+    if [ ! -s "$_authkeys" ] || \
+       ! grep -qE '^[[:space:]]*[^[:space:]#]' "$_authkeys" 2>/dev/null; then
+        echo "slagworks: ============================================================"
+        echo "slagworks: RECOVERY MODE (no-keys): $_reason"
+        echo "slagworks: no operator pubkeys baked into initrd; sshd would reject"
+        echo "slagworks: all logins. Dropping straight to SOL shell."
+        echo "slagworks: ============================================================"
+        exec /bin/sh
+    fi
+    echo "slagworks: ============================================================"
+    echo "slagworks: RECOVERY MODE: $_reason"
+    echo "slagworks: ============================================================"
+
+    # /dev /proc /sys are already bind-mounted into $rootmnt by the caller.
+    # Add /run for sshd's privsep dir.
+    mkdir -p "$rootmnt/run"
+    mount --bind /run "$rootmnt/run" 2>/dev/null || true
+    mkdir -p "$rootmnt/run/sshd"
+    chmod 0755 "$rootmnt/run/sshd"
+
+    # Install operator pubkeys baked into the initrd at build time.
+    mkdir -p "$rootmnt/root/.ssh"
+    chmod 0700 "$rootmnt/root" "$rootmnt/root/.ssh"
+    # Strip comments + blank lines so sshd only sees real keys. `|| true` is
+    # load-bearing: grep returns 1 on zero matches and would otherwise abort.
+    grep -vE '^[[:space:]]*(#|$)' "$_authkeys" \
+        > "$rootmnt/root/.ssh/authorized_keys" || true
+    chmod 0600 "$rootmnt/root/.ssh/authorized_keys"
+    # Explicit uid 0 ownership: sshd StrictModes refuses the whole key
+    # file if /root, /root/.ssh, or authorized_keys is not owned by the
+    # login uid (root). The initramfs context should write uid 0
+    # already, but the overlay upperdir has produced surprises.
+    chown 0:0 "$rootmnt/root" "$rootmnt/root/.ssh" \
+        "$rootmnt/root/.ssh/authorized_keys" 2>/dev/null || true
+    _nkeys=$(wc -l < "$rootmnt/root/.ssh/authorized_keys" 2>/dev/null || echo 0)
+    echo "slagworks: recovery: installed $_nkeys operator key(s)"
+    # Print each installed key's fingerprint. Two consumers: an operator
+    # can see WHICH keys this sshd will accept before burning time on a
+    # login that was never going to work, and the qemu recovery test
+    # asserts its ephemeral test key's fingerprint appears here BEFORE
+    # dialing — so a broken key-injection path (e.g. the
+    # unaligned-cpio-overlay bug, where the kernel silently dropped the
+    # test key and canonical keys served instead) fails loudly at the
+    # rigging layer instead of masquerading as an sshd auth mystery.
+    chroot "$rootmnt" ssh-keygen -lf /root/.ssh/authorized_keys 2>/dev/null \
+        | sed 's/^/slagworks: recovery: key /' || true
+
+    # Ephemeral host keys (tmpfs, wiped on reboot).
+    chroot "$rootmnt" ssh-keygen -A 2>&1 | sed 's/^/slagworks: recovery: /' || true
+
+    # Key-only recovery sshd config.
+    mkdir -p "$rootmnt/etc/ssh/sshd_config.d"
+    cat > "$rootmnt/etc/ssh/sshd_config.d/00-slagworks-recovery.conf" <<'EOF'
+# slagworks recovery sshd: emergency operator access in deploy initrd.
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+AuthorizedKeysFile /root/.ssh/authorized_keys
+# Auth-level debug logging. Recovery sshd logs to stderr (-e), which is
+# /dev/console = the SOL capture — when a login is refused, the reason
+# (StrictModes bad ownership, no matching key, unreadable file) must
+# land on the serial console; recovery mode has no other diagnostic
+# surface. DEBUG (not DEBUG3) keeps the noise per attempt bounded.
+LogLevel DEBUG
+EOF
+
+    _ip=$(ip -4 addr show "$SLAG_IFACE" 2>/dev/null | awk '/inet /{print $2; exit}')
+    echo "slagworks: ============================================================"
+    echo "slagworks: recovery sshd ready"
+    echo "slagworks:   ssh root@${_ip%/*}"
+    echo "slagworks:   iface=$SLAG_IFACE ip=$_ip"
+    echo "slagworks: ============================================================"
+
+    # Foreground sshd. -D no-fork, -e log to stderr (= /dev/console = SOL).
+    chroot "$rootmnt" /usr/sbin/sshd -D -e
+    _sshd_rc=$?
+    echo "slagworks: recovery: sshd exited rc=$_sshd_rc, dropping to shell"
+    exec /bin/sh
+}
+
+# mountroot: the entrypoint stock /init calls for BOOT=slagworks. Unlike a
+# normal boot script (local/nfs/casper) we never return — the tail runs the
+# agent and reboots / drops to recovery.
+mountroot() {
+    _step "mountroot starting"
+    slagworks_parse_cmdline
+
+    # Networking. configure_networking (from /scripts/functions) honors ip= and
+    # BOOTIF= from the cmdline: it waits for the right NIC to appear (driver
+    # autoloaded by udev), DHCPs via dhcpcd, and writes /run/net-*.conf. This
+    # replaces the entire ~380-line hand-rolled NIC-bringup block of the old
+    # /init. The deploy/commission cmdline passes ip=dhcp + BOOTIF=.
+    _step "configure-networking"
+    configure_networking
+
+    # Discover which iface configure_networking leased on, for the squashfs
+    # download host and recovery banner. configure_networking exports DEVICE
+    # when it knows it (BOOTIF/ip= path); fall back to the first iface with a
+    # global IPv4 lease.
+    SLAG_IFACE="${DEVICE:-}"
+    if [ -z "$SLAG_IFACE" ]; then
+        for _d in /sys/class/net/*; do
+            _i=$(basename "$_d")
+            [ "$_i" = "lo" ] && continue
+            if ip addr show "$_i" 2>/dev/null | grep -q 'inet .*scope global'; then
+                SLAG_IFACE="$_i"
+                break
+            fi
+        done
+    fi
+    if [ -z "$SLAG_IFACE" ] || ! ip addr show "$SLAG_IFACE" 2>/dev/null | grep -q 'inet .*scope global'; then
+        _step "no-lease"
+        echo "slagworks: no global IPv4 lease after configure_networking"
+        ip addr show
+        slagworks_recovery_drop "no network: configure_networking did not lease an IPv4 address"
+    fi
+    SLAG_IP=$(ip addr show "$SLAG_IFACE" | grep 'inet ' | awk '{print $2}')
+    _step "got-ip iface=$SLAG_IFACE ip=$SLAG_IP"
+
+    _step "mount-efivarfs"
+    slagworks_mount_efivarfs
+
+    # Dedicated working tmpfs for the squashfs download + the overlay upper
+    # dir. We do NOT use stock /init's /run: it is mounted at size=10% of RAM
+    # (initramfs-tools default, init.go RUNSIZE), so a ~600MB squashfs onto a
+    # 2GB-RAM host overflows it with "wget: short write: No space left on
+    # device" and the whole boot dead-ends. The old hand-rolled /init dodged
+    # this by mounting its own unbounded tmpfs at /tmp (default 50% of RAM)
+    # and downloading there. Mirror that: a private tmpfs sized at 90% of RAM
+    # holds both the squashfs image and the writable overlay upper, just like
+    # /tmp did before. (The squashfs is read-only and the agent rsyncs to a
+    # real disk, so the upper stays small in practice; the squashfs file
+    # itself is the big consumer.)
+    _step "mount-workfs"
+    mkdir -p /slag
+    if ! mount -t tmpfs -o size=90% tmpfs /slag; then
+        slagworks_recovery_drop "could not mount working tmpfs at /slag"
+    fi
+    mkdir -p /slag/lower /slag/upper /slag/work
+
+    # Fetch + overlay-mount the squashfs root onto $rootmnt. squashfs ro lower +
+    # tmpfs rw upper. overlay/squashfs/loop are baked into the initrd by
+    # hooks/slagworks; udev/modprobe has them available.
+    _step "download-squashfs"
+    slagworks_download /slag/root.squashfs \
+        "http://$SLAG_SERVER/files/images/$SLAG_IMAGE/root.squashfs" \
+        || slagworks_recovery_drop "squashfs download failed"
+    _step "squashfs-downloaded $(du -k /slag/root.squashfs | cut -f1)K"
+
+    modprobe squashfs 2>/dev/null || true
+    modprobe loop 2>/dev/null || true
+    modprobe overlay 2>/dev/null || true
+
+    _step "mount-overlay"
+    if ! mount -t squashfs -o ro /slag/root.squashfs /slag/lower; then
+        slagworks_recovery_drop "squashfs mount failed"
+    fi
+    if ! mount -t overlay overlay \
+        -o lowerdir=/slag/lower,upperdir=/slag/upper,workdir=/slag/work \
+        "$rootmnt"; then
+        slagworks_recovery_drop "overlay mount failed and squashfs is read-only"
+    fi
+    echo "slagworks: root filesystem mounted (overlay) at $rootmnt"
+
+    # Download the agent into the overlay root.
+    _step "download-agent"
+    mkdir -p "$rootmnt/tmp"
+    slagworks_download "$rootmnt/tmp/slagworks-agent" \
+        "http://$SLAG_SERVER/files/bin/slagworks-agent" \
+        || slagworks_recovery_drop "agent download failed"
+    chmod +x "$rootmnt/tmp/slagworks-agent"
+    # "agent ready" is the post-fetch marker the CI smoke test waits for
+    # (scripts/image-build/smoke.sh MARKER): both the squashfs and the agent
+    # are now on disk and the overlay root is mounted.
+    echo "slagworks: agent ready"
+
+    # Bind pseudo-filesystems into the overlay root for the chroot. /sys uses
+    # --rbind so the efivarfs submount at /sys/firmware/efi/efivars propagates
+    # into the chroot (the agent's efibootmgr -c needs it visible inside).
+    _step "bind-pseudofs"
+    mount --bind /dev "$rootmnt/dev"
+    mount --bind /proc "$rootmnt/proc"
+    mount --rbind /sys "$rootmnt/sys"
+
+    # Recovery before the agent, if requested on the cmdline.
+    if [ -n "$SLAG_RECOVERY" ]; then
+        slagworks_recovery_drop "slagworks.recovery on cmdline"
+    fi
+
+    # Run the agent in the chroot. Build the flag list from the parsed params.
+    _step "run-agent mode=$SLAG_MODE"
+    set -- --server="$SLAG_SERVER" --image="$SLAG_IMAGE" --mode="$SLAG_MODE"
+    if [ -n "$SLAG_MACHINE_ID" ]; then
+        set -- "$@" --machine="$SLAG_MACHINE_ID" --op="$SLAG_OP_ID"
+    fi
+    if [ -n "$SLAG_TRACE_ID" ]; then
+        set -- "$@" --trace="$SLAG_TRACE_ID"
+    fi
+    if [ -n "$SLAG_EXPECT_UUID" ]; then
+        set -- "$@" --expect-uuid="$SLAG_EXPECT_UUID"
+    fi
+
+    # SLAGWORKS_FATAL_AT lets the integration suite force a fatal at a named
+    # phase. Production never sets slagworks.fatal_at, so this is a no-op there.
+    if [ -n "$SLAG_FATAL_AT" ]; then
+        env SLAGWORKS_FATAL_AT="$SLAG_FATAL_AT" \
+            chroot "$rootmnt" /tmp/slagworks-agent "$@" $SLAG_DESTRUCTIVE $SLAG_WIPE_ALL_DISKS
+    else
+        chroot "$rootmnt" /tmp/slagworks-agent "$@" $SLAG_DESTRUCTIVE $SLAG_WIPE_ALL_DISKS
+    fi
+    _rc=$?
+
+    _step "agent-exited rc=$_rc"
+    if [ "$_rc" -ne 0 ] && [ -n "$SLAG_OP_ID" ]; then
+        _fail_json="{\"op_id\":\"$SLAG_OP_ID\",\"machine_id\":\"$SLAG_MACHINE_ID\",\"phase\":\"agent_crashed\",\"failed\":true,\"error\":\"agent exited with code $_rc\"}"
+        wget -q -O /dev/null --post-data="$_fail_json" \
+            --header="Content-Type: application/json" \
+            "http://$SLAG_SERVER/api/v1/report" 2>/dev/null || true
+    fi
+    if [ "$_rc" -eq 0 ]; then
+        echo "slagworks: rebooting"
+        reboot -f
+    fi
+    slagworks_recovery_drop "agent exited with code $_rc"
+}

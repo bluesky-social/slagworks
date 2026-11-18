@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+# slagworks:match system_product=RS501A-E12-RS4U
+# slagworks:match hostname=/^cpu\d+\.pop3$/
+# slagworks:priority 150
+#
+# ASUS RS501A-E12-RS4U storage layout — PRESERVE variant.
+#
+# Priority 150 outranks 100-asus-rs501a for any host it also matches, so once
+# a pop3 cpu host is onboarded here, redeploys stop recreating mddata and
+# instead assemble the existing array by its pinned identity. The hostname
+# constraint (cpu*.pop3 only) is what bounds this to the cohort that's had a
+# first deploy already — it does not broaden which RS501A hosts run
+# slagworks; it narrows this priority-150 script off of any RS501A elsewhere
+# (which stays on the 100-asus-rs501a create path).
+#
+# Boot layout is identical to 100-asus-rs501a (same size-derivation logic,
+# copied verbatim): RAID1 across the two smaller NVMe drives, xfs, /.
+#
+# Data: mddata is `type: "preserve"` on the two Kioxia NVMe drives, carrying
+# the SAME array_uuid = uuidv5(system_uuid, "mddata") that 100-asus-rs501a
+# pinned on create — so the agent assembles (never recreates) the existing
+# array. The Kioxia drives are NOT listed as disk-type targets: a preserve
+# member that is also a disk target is a validation FATAL (see
+# internal/storage/validate.go's validatePreserveMemberCollisions and the
+# qemu preserve test's comment on the same point).
+#
+# FIRST deploy of a host whose disks don't hold the derived-UUID array FATALs
+# loudly at assemble time (mdadm --assemble --uuid finds nothing / a mismatch)
+# — this is deliberate: loud-fail beats silent recreate. The operator story
+# for a fresh cohort member is create-first via 100-asus-rs501a (which pins
+# the UUID), THEN this script takes over on the next redeploy.
+#
+# Layout produced by this script:
+#   {boot0}p1, {boot1}p1 -> ESP (512M each, only boot0p1 is mounted)
+#   {boot0}p2, {boot1}p2 -> mdroot (RAID1, xfs, /)
+#   {data0}, {data1}     -> mddata (RAID0, xfs, /data) — PRESERVED, not created
+
+import json, os, re, sys, uuid
+
+inv_path = os.environ.get("SLAGWORKS_INVENTORY")
+if not inv_path:
+    print("ERROR: SLAGWORKS_INVENTORY must be set", file=sys.stderr)
+    sys.exit(1)
+
+with open(inv_path) as f:
+    inv = json.load(f)
+
+nvme = [d for d in inv["disks"] if d.get("transport") == "nvme"]
+
+data = sorted([d["name"] for d in nvme if re.search(r"KCD6XLUL", d.get("model", ""))])
+if len(data) != 2:
+    print(f"ERROR: expected 2 Kioxia data drives, found {len(data)}", file=sys.stderr)
+    sys.exit(1)
+
+boot = sorted([d["name"] for d in nvme if d["name"] not in data])
+if len(boot) != 2:
+    print(f"ERROR: expected 2 boot drives (non-Kioxia NVMe), found {len(boot)}", file=sys.stderr)
+    sys.exit(1)
+
+system_uuid = (inv.get("system") or {}).get("uuid", "")
+if not system_uuid:
+    print("ERROR: system.uuid missing/empty in inventory — cannot derive the "
+          "expected array_uuid for mddata (no basis to identify which array "
+          "to preserve)", file=sys.stderr)
+    sys.exit(1)
+array_uuid = str(uuid.uuid5(uuid.UUID(system_uuid), "mddata"))
+
+disk_bytes = next(d["size_bytes"] for d in inv["disks"] if d["name"] == boot[0])
+root_mib = (disk_bytes - 600 * 1024 * 1024) // (1024 * 1024)
+
+layout = {
+    "layout": {
+        boot[0]: {
+            "type": "disk", "ptable": "gpt", "boot": True,
+            "partitions": [
+                {"name": f"{boot[0]}p1", "fs": "vfat", "size": "512M", "bootable": True},
+                {"name": f"{boot[0]}p2", "size": f"{root_mib}M"},
+            ],
+        },
+        boot[1]: {
+            "type": "disk", "ptable": "gpt", "boot": True,
+            "partitions": [
+                {"name": f"{boot[1]}p1", "fs": "vfat", "size": "512M", "bootable": True},
+                {"name": f"{boot[1]}p2", "size": f"{root_mib}M"},
+            ],
+        },
+        "mdroot": {
+            "type": "raid", "level": 1,
+            "members": [f"{boot[0]}p2", f"{boot[1]}p2"],
+            "fs": "xfs",
+        },
+        "mddata": {
+            "type": "preserve", "level": 0,
+            "members": [data[0], data[1]],
+            "fs": "xfs",
+            "array_uuid": array_uuid,
+        },
+    },
+    "mounts": {
+        "/": {"device": "mdroot"},
+        "/boot/efi": {"device": f"{boot[0]}p1"},
+        "/data": {"device": "mddata"},
+    },
+}
+
+json.dump(layout, sys.stdout, indent=2)

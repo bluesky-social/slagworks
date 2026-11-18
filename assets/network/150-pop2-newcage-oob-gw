@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+# slagworks:match site=pop2
+# slagworks:match location=pop2-01-005250
+# slagworks:match device_type=dell-r640
+# slagworks:match hostname=/oob-gw-[34]\.pop2/
+# slagworks:priority 150
+#
+# pop2 NEW-CAGE oob-gw base network config (oob-gw-3.pop2, oob-gw-4.pop2).
+#
+# These are the Dell R640 gateways slagworks images as part of the new-cage
+# OOB DHCP takeover (docs/bsky/2026-06-20-pop2-new-cage-oob-dhcp-takeover.md).
+# This is the self-reimage target: gw-4's slagworks deploys gw-3 and vice versa.
+#
+# MATCH KEYS: the cage is the PRIMARY discriminator —
+# location=pop2-01-005250 is the new cage (the old cage oob-gw-1/2 sit at
+# pop2-01-005330). device_type=dell-r640 selects the gateways but not the cage's
+# kworkers (verified: the only dell-r640 devices in this cage are the 2 oob-gws;
+# the kworkers are supermicro-as-1115hs-tnr). The hostname regex is kept as a
+# defense-in-depth AND-constraint, NOT the primary key: if an unexpected
+# dell-r640 ever lands in this cage, the host fails safe to DHCP rather than
+# wrongly getting the oob-gw bootstrap. (Was hostname-only when the matcher
+# couldn't key on location; that limitation is gone.)
+#
+# SCOPE — bootstrap minimum, NOT the full gateway config. Like the SN2700
+# switch script, slagworks lays down ONLY enough networking to boot, get an OOB
+# address, and phone home; the site Ansible `netplan` + `keepalived` + `frr` +
+# `aws_vpn` ansible roles converge the rest post-boot (WAN/public IP, leaf
+# uplinks + bonds, VRRP VIP, the VPN tunnels, FRR BGP). Concretely this script
+# brings up ONLY the OOB management NIC (eno3) with its static NetBox address:
+#
+#   - It deliberately does NOT touch the WAN NIC (eno1np0). The WAN carries a
+#     public /30 and its default/route policy is owned by FRR (BGP-learned
+#     default + per-VPN-tunnel host routes); a guessed kernel default here
+#     would override BGP and pin egress to the wrong path. Leave it dark until
+#     ansible+FRR converge it.
+#   - It does NOT touch the leaf uplinks / bonds (data fabric, ansible-owned).
+#   - It does NOT touch the BMC. NOTE the iDRAC interface (ipmi0) on these gws
+#     is modeled mgmt_only=FALSE in NetBox (a known modeling conflation), so the
+#     snapshot classifies it "physical" and it shows up in the facts with an
+#     OOB-subnet IP. We must NOT bring it up as a host NIC — it's the BMC's own
+#     port. We exclude it by name (ipmi*/idrac*/bmc*) AND by the fact that the
+#     deploy agent's host NIC is the one whose MAC the box actually boots from.
+#
+# Writes a STATIC address (not DHCP): the gateway's OOB IP is the anchor of the
+# whole cage's addressing and must be deterministic across the reimage, and
+# during the reimage gw-3's static IP must come up even though gw-4's slagworks
+# DHCP would happily also lease it — static avoids any DHCP round-trip race on
+# the very segment we're taking over. The address + gateway come from NetBox
+# facts (SnapshotInterface.{IP,Gateway}).
+#
+# HARD FAIL (no DHCP fallback, mirrors the L3/SN2700 loud-fail posture): this
+# script only runs because the host matched the new-cage oob-gw hostname, so it
+# IS one and MUST have a modeled OOB NIC with an IP. No qualifying NIC => the
+# NetBox model is incomplete; coming up with no/guessed networking would strand
+# the gateway (and, mid-reimage, the cage). Exit non-zero to abort the deploy.
+#
+# Shared plumbing (facts I/O, BMC/private predicates, emit-bundle): slagworks_netlib.
+
+import slagworks_netlib as nl
+
+ifaces = nl.load_facts()
+
+# The OOB management NIC is the one physical NIC carrying a PRIVATE
+# (RFC1918) IP. Identify it by: type physical, has a MAC, has a private IP,
+# and is NOT a BMC/iDRAC port. We do NOT hardcode "eno3": match the modeled
+# NIC by these properties so a NIC rename or re-cable is handled by the NetBox
+# model, not this script.
+#
+# Why the PRIVATE-IP discriminator (and not just "has an IP"): these gws have a
+# second modeled physical NIC, the WAN uplink (eno1np0), which carries a PUBLIC
+# /30. The WAN's routing/default policy is owned by FRR (BGP + per-VPN-tunnel
+# host routes), so this bootstrap config must NOT bring it up — a guessed
+# kernel default out the WAN would override BGP and break egress. Selecting the
+# private-IP NIC cleanly excludes the public WAN leg without name-matching.
+# (ipmi0, the mis-modeled-mgmt_only=False BMC port, also carries a private OOB
+# IP, so it's excluded by name on top of the private filter.)
+
+
+def is_oob_nic(i):
+    if i.get("type") != "physical":
+        return False
+    if not i.get("mac") or not i.get("ip"):
+        return False
+    if nl.is_bmc_name(i.get("name", "")):
+        return False
+    if not nl.is_private_ip(i["ip"]):
+        return False
+    return True
+
+
+candidates = [i for i in ifaces if is_oob_nic(i)]
+if not candidates:
+    seen = [(i.get("name"), i.get("type"), i.get("mac"), i.get("ip")) for i in ifaces]
+    nl.fail("ERROR: no OOB management NIC found in network facts for this "
+            "new-cage oob-gw (physical, non-BMC, with a MAC and an IP). "
+            f"Interfaces seen: {seen}\n")
+
+# There should be exactly one host NIC carrying an OOB IP (eno3). If NetBox
+# models more than one physical-with-IP non-BMC NIC, the model is ambiguous for
+# a bootstrap-minimum config (we don't know which is the OOB management leg);
+# fail loud rather than guess and risk configuring the WAN as if it were OOB.
+if len(candidates) > 1:
+    names = [i.get("name") for i in candidates]
+    nl.fail("ERROR: more than one candidate OOB NIC carries an IP "
+            f"({names}); the bootstrap config expects exactly one. Refusing to "
+            "guess the management leg.\n")
+
+oob = candidates[0]
+
+# Default route via the OOB segment gateway (the cage OOB VIP, e.g.
+# 10.253.243.252 — the slagworks-oob prefix's gateway_ip CF). This is the
+# TRANSITIONAL egress path for a pre-ansible host: the VIP is held by whichever
+# oob-gw in the cage is keepalived MASTER, and that gw NATs OOB->WAN out its EIA
+# drop (site Ansible oob_wan_egress role), so the freshly-imaged host can reach
+# the public internet (apt, an HWE kernel, and — load-bearing for THIS deploy —
+# login.tailscale.com for the agent's deploy-time tailnet enrollment) before
+# ansible converges the real WAN/FRR default. Phone-home itself needs no default
+# route (the site worker is on this same OOB /23, directly connected); the route
+# exists for off-segment egress. ansible's FRR/netplan roles overwrite this with
+# the production default (BGP-learned via the WAN) on converge.
+#
+# The gateway is resolved by the snapshot's per-interface gateway resolver, which
+# now consults the slagworks-OOB prefixes (not just production) — so an OOB NIC's
+# Gateway is the OOB prefix's gateway_ip. Kept conditional (emit IF resolved) so
+# a cage whose OOB prefix carries no gateway_ip still comes up address-only
+# rather than failing; but for a correctly-modeled new cage the route renders.
+gateway = oob.get("gateway")
+route_block = ""
+if gateway:
+    route_block = f"""      routes:
+        - to: default
+          via: {gateway}
+"""
+
+netplan = f"""# slagworks deploy agent - pop2 new-cage oob-gw bootstrap networking.
+# Brings up the OOB management NIC ({oob['name']}) with its static NetBox
+# address (phone-home: the site worker is on this same OOB /23, directly
+# connected) PLUS a transitional default route via the cage OOB VIP for
+# pre-ansible internet egress (see the route_block rationale above). WAN / leaf
+# uplinks / keepalived VIP / VPN / FRR and the PRODUCTION default route are
+# owned by the site Ansible roles and converge post-boot, overwriting this
+# transitional default. Matched by MAC so an {oob['name']}->predictable
+# -name rename in the deployed OS keeps the binding.
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    nic-oob:
+      match:
+        macaddress: "{oob['mac'].lower()}"
+      dhcp4: false
+      dhcp6: false
+      addresses:
+        - {oob['ip']}
+{route_block}      nameservers:
+        addresses: [1.1.1.1, 1.0.0.1]
+"""
+
+nl.emit(nl.bundle([
+    nl.file_entry("/etc/netplan/99-slagworks.yaml", netplan, mode="0600"),
+]))

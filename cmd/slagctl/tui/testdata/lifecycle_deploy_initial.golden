@@ -1,0 +1,13 @@
+○ power_cycle
+○ pxe_booting
+○ dhcp_ack
+○ ipxe_dhcp
+○ ipxe_loaded
+○ agent_starting
+○ partitioning
+○ rsyncing_os
+○ installing_bootloader
+○ finalizing
+○ bmc_reconcile
+○ awaiting_phone_home
+○ completed

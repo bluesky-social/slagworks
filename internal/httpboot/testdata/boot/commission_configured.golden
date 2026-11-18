@@ -1,0 +1,5 @@
+#!ipxe
+echo slagworks: commission boot for mac 52:54:00:aa:bb:01
+kernel http://${next-server}:8080/files/images/noble-pxe/vmlinuz console=tty0 console=ttyS1,115200n8 BOOTIF=01-${netX/mac:hexhyp} boot=slagworks ip=dhcp slagworks.server=${next-server}:8080 slagworks.image=noble-pxe slagworks.mode=commission slagworks.machine=11111111-2222-3333-4444-555555555555 slagworks.op=66666666-7777-8888-9999-aaaaaaaaaaaa slagworks.trace=bbbbbbbb-cccc-dddd-eeee-ffffffffffff
+initrd http://${next-server}:8080/files/images/noble-pxe/initrd
+boot

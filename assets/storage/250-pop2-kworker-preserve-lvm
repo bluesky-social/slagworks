@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+# slagworks:match system_product=/^AS -(1115HS|1015CS)-TNR$/
+# slagworks:match hostname=/^kworker-l(34|56)-\d+\.pop2$/
+# slagworks:priority 250
+#
+# Pop2 kworker recovery layout. The installed OS is recreated on the two
+# Samsung PM9A3 boot drives, while the eight non-OS NVMes remain byte-for-byte
+# intact so their existing openebs-vg PVs, LVs, and LINSTOR thin pool can be
+# adopted by the replacement k3s cluster.
+#
+# Priority 250 deliberately outranks 200-supermicro-tnr-family for pop2
+# kworkers only. The family script declares every non-boot NVMe as type disk,
+# which makes the deploy agent zap it. This script declares those devices as
+# type retain instead: the planner emits no command for them and
+# --wipe-all-disks treats them as claimed rather than bystanders.
+#
+# The exact eight-disk assertion is a recovery boundary. A missing drive means
+# the VG is incomplete; an extra drive means the model-based boot/data split no
+# longer describes this host. Either case must fail before the boot pair is
+# overwritten.
+
+import json
+import os
+import re
+import sys
+
+inv_path = os.environ.get("SLAGWORKS_INVENTORY")
+if not inv_path:
+    print("ERROR: SLAGWORKS_INVENTORY must be set", file=sys.stderr)
+    sys.exit(1)
+
+with open(inv_path) as f:
+    inv = json.load(f)
+
+nvme = [d for d in inv["disks"] if d.get("transport") == "nvme"]
+
+# QEMU 8.2 (the version on the dedicated integration runner) hardcodes every
+# NVMe controller's model to "QEMU NVMe Ctrl" and has no model_number device
+# property. Permit model-shaped synthetic serials only on a controller whose
+# own model is exactly QEMU's hardcoded value. Real hardware never reaches
+# this branch and must still match the PM9A3 model string below.
+
+
+def is_boot_drive(d):
+    model = (d.get("model") or "").strip()
+    serial = (d.get("serial") or "").strip()
+    return re.search(r"MZ1L23T8HBLA", model) or (
+        model == "QEMU NVMe Ctrl"
+        and serial.startswith("MZ1L23T8HBLA-QEMU-")
+    )
+
+
+boot = sorted(
+    d["name"]
+    for d in nvme
+    if is_boot_drive(d)
+)
+if len(boot) != 2:
+    print(
+        f"ERROR: expected 2 PM9A3 boot drives (model MZ1L23T8HBLA), found {len(boot)}; "
+        f"NVMe candidates: "
+        f"{[(d['name'], d.get('model'), d.get('serial')) for d in nvme]}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+data = sorted(d["name"] for d in nvme if d["name"] not in boot)
+if len(data) != 8:
+    print(
+        f"ERROR: expected 8 retained data drives, found {len(data)}: {data}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+disk_bytes = min(d["size_bytes"] for d in inv["disks"] if d["name"] in boot)
+root_mib = (disk_bytes - 600 * 1024 * 1024) // (1024 * 1024)
+
+layout = {
+    "layout": {
+        boot[0]: {
+            "type": "disk",
+            "ptable": "gpt",
+            "boot": True,
+            "partitions": [
+                {
+                    "name": f"{boot[0]}p1",
+                    "fs": "vfat",
+                    "size": "512M",
+                    "bootable": True,
+                },
+                {"name": f"{boot[0]}p2", "size": f"{root_mib}M"},
+            ],
+        },
+        boot[1]: {
+            "type": "disk",
+            "ptable": "gpt",
+            "boot": True,
+            "partitions": [
+                {
+                    "name": f"{boot[1]}p1",
+                    "fs": "vfat",
+                    "size": "512M",
+                    "bootable": True,
+                },
+                {"name": f"{boot[1]}p2", "size": f"{root_mib}M"},
+            ],
+        },
+        "mdroot": {
+            "type": "raid",
+            "level": 1,
+            "members": [f"{boot[0]}p2", f"{boot[1]}p2"],
+            "fs": "xfs",
+        },
+    },
+    "mounts": {
+        "/": {"device": "mdroot"},
+        "/boot/efi": {"device": f"{boot[0]}p1"},
+    },
+}
+
+for disk in data:
+    layout["layout"][disk] = {"type": "retain"}
+
+json.dump(layout, sys.stdout, indent=2)

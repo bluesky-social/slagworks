@@ -1,0 +1,6 @@
+.git
+docs
+dev
+assets
+*.qcow2
+.claude

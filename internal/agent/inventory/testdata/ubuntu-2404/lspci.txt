@@ -1,0 +1,3 @@
+00:00.0 "Host bridge [0600]" "Advanced Micro Devices, Inc. [AMD] [1022]" "Device [14a4]" -p00 "Advanced Micro Devices, Inc. [AMD] [1022]" "Device [14a4]"
+08:00.0 "3D controller [0302]" "NVIDIA Corporation [10de]" "H100 SXM5 80GB [2330]" -ra1 -p00 "NVIDIA Corporation [10de]" "Device [16c1]"
+41:00.0 "Ethernet controller [0200]" "Mellanox Technologies [15b3]" "MT2910 Family [ConnectX-7] [1021]" -r00 -p00 "Mellanox Technologies [15b3]" "Device [0015]"

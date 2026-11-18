@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+# slagworks:match site=pop1
+# slagworks:match device_type=supermicro-as-1115hs-tnr
+# slagworks:match hostname=/kworker-l(34|56)-\d+\.pop1/
+# slagworks:priority 100
+#
+# MATCH KEYS: pop1 is a whole-site config that co-resides TWO topology
+# families at one location — these L3 kworkers (device_type
+# supermicro-as-1115hs-tnr) AND "el classico" L2 LACP legacy hosts (algo*,
+# appview*, on as-1015cs/2125hs-tnr). So site=pop1 alone is NOT enough; the
+# device_type is the PRIMARY discriminator (the legacy boxes are a different
+# model). The hostname regex is kept as a defense-in-depth AND-constraint, not
+# the primary key: an unexpected non-kworker as-1115hs-tnr in pop1 fails safe to
+# DHCP rather than wrongly getting the L3 bootstrap.
+#
+# pop1 L3 routed-NIC kworker network config: netplan + minimal FRR.
+#
+# Driven by the per-host NetBox interface facts slagworks ships in
+# SLAGWORKS_NETWORK_FACTS. All topology interpretation lives here — slagworks
+# stays network-model-agnostic:
+#
+#   - a /32 on the `lo` interface is the identity loopback,
+#   - a /31 on a physical NIC is a routed P2P leg; its leaf-side next hop is
+#     the other address in the /31 (flip the last bit),
+#   - the /31 subnet identifies the leaf pair, which gives the leaf ASNs
+#     (in-script table — the only pair-dependent, not-derivable fact),
+#   - the deploy-window resolver is the pop's oob-gw VIP at {a}.{b}.240.1.
+#
+# Two outputs, both emitted for a fully L3-modeled host:
+#
+#   netplan (99-slagworks.yaml): two /31 legs (match-by-MAC, set-name legN) +
+#     loopback /32 on lo + the per-leg deploy-window resolver. NO static
+#     default route: frr.service is baked into the image and enabled at first
+#     boot, so FRR owns the default (BGP ECMP when healthy, a distance-250
+#     floating static when BGP is down — both below). A netplan default would
+#     be a kernel `proto static` route at distance 0, which zebra can NEVER
+#     let the distance-20 BGP default displace — so it would pin egress to a
+#     single leg and break ECMP. The fallback lives in FRR instead, mirroring
+#     the leaves. (Historical: earlier images had no baked FRR, so the netplan
+#     static was the only egress until the ansible role ran; that era is over.)
+#
+#   minimal FRR (frr.conf + daemons + multipath sysctl, enable frr.service):
+#     announce the loopback /32 to both leaves (multihop from lo, NH rewritten
+#     to each leg) and learn the ECMP default. This makes the loopback
+#     BGP-routable the moment the host boots, killing the bootstrap
+#     chicken-and-egg (loopback becomes the universal ansible target without a
+#     leg-through-leaf ProxyJump). The heavy kworker_frr ansible role layers on
+#     afterward over the now-routable loopback. Direct port of the validated
+#     site Ansible pop/roles/kworker_frr/templates/frr.conf.j2 (v5 spike config).
+#     frr is baked into root.squashfs at image-build time (the bundle can only
+#     write config + enable a unit, not apt-install) — see build.sh with-frr.
+#
+# Emits the emit-bundle contract on stdout:
+#   {"files": [{"path","content","mode","owner","group"}], "enable_units": []}
+#
+# HARD FAIL, no DHCP fallback: this script only runs because the host matched
+# site=pop1 + the kworker hostname regex, so it is SUPPOSED to be L3. If the
+# facts lack two /31 legs or a loopback /32, the NetBox model is incomplete and
+# the script exits non-zero to abort the deploy (the agent treats a matched-
+# but-failed network script as a hard deploy failure). Coming up DHCP-only
+# would silently leave the host off the L3 fabric — a latent break that cost
+# ~90min of misdiagnosis on l56-3. Loud-fail over silent-wrong-state, same as
+# the storage wrong-disk hard-fail.
+#
+# Netscript contract: docs/dev/extensibility.md.
+# Fabric design: docs/bsky/2026-06-12-pop1-l3-host-fabric.md.
+# Shared plumbing (facts I/O, VIP resolver, CIDR + loopback helpers):
+# slagworks_netlib. The FRR config body + the leaf-pair table are kworker-
+# specific and live here.
+
+import ipaddress
+
+import slagworks_netlib as nl
+
+MTU = 9000  # matches the leaf routed-port MTU
+
+# Floating fallback default: FRR staticd installs these when BGP is down; the
+# distance-20 BGP ECMP default beats them when sessions are healthy. Distance
+# 250 mirrors the leaves (leaf_l3 frr.conf.j2). Replaces the old netplan
+# kernel default (distance 0), which BGP could never displace.
+FALLBACK_DEFAULT_DISTANCE = 250
+
+HOST_ASN = 64513  # every kworker shares the host AS (eBGP to the leaves)
+
+# Cluster pod supernet (k3s cluster-cidr). Each node gets a /24 out of this
+# via host-scope IPAM; FRR advertises that /24 to the leaves so pods are
+# natively routable across the fabric (no overlay). Must match the k3s
+# cluster-cidr in the site Ansible k3s role config.
+POD_SUPERNET = "172.16.0.0/16"
+
+# Leaf-pair facts keyed by /31 subnet. This is the ONE pair-dependent,
+# not-derivable fact (the ASNs aren't modeled in NetBox and aren't computable
+# from the addressing) — so the pop1 topology table lives in the pop1 script,
+# not in slagworks. leaf_a is the lower /31 (host = base+1), leaf_b the higher
+# (host = base+3); matches site Ansible kworker_frr's spec formula.
+LEAF_PAIRS = {
+    "10.254.28": {"a_asn": 65023, "b_asn": 65024, "a_name": "leaf-3", "b_name": "leaf-4"},
+    "10.254.29": {"a_asn": 65025, "b_asn": 65026, "a_name": "leaf-5", "b_name": "leaf-6"},
+}
+
+# Verbatim frr-10.5 /etc/frr/daemons (FRRouting stable/10.5 tools/etc/frr/daemons)
+# with bgpd + bfdd flipped on — the two daemons this host needs. The *_options
+# lines (notably -A 127.0.0.1) are load-bearing for vtysh integrated config;
+# the emit-bundle model writes the whole file, so it must be complete and
+# correct rather than line-edited like the ansible role does.
+FRR_DAEMONS = """\
+# This file tells the frr package which daemons to start.
+#
+# Sample configurations for these daemons can be found in
+# /usr/share/doc/frr/examples/.
+#
+# ATTENTION:
+#
+# When activating a daemon for the first time, a config file, even if it is
+# empty, has to be present *and* be owned by the user and group "frr", else
+# the daemon will not be started by /etc/init.d/frr. The permissions should
+# be u=rw,g=r,o=.
+# When using "vtysh" such a config file is also needed. It should be owned by
+# group "frrvty" and set to ug=rw,o= though. Check /etc/pam.d/frr, too.
+#
+# The watchfrr, zebra and staticd daemons are always started.
+#
+bgpd=yes
+ospfd=no
+ospf6d=no
+ripd=no
+ripngd=no
+isisd=no
+pimd=no
+pim6d=no
+ldpd=no
+nhrpd=no
+eigrpd=no
+babeld=no
+sharpd=no
+pbrd=no
+bfdd=yes
+fabricd=no
+vrrpd=no
+pathd=no
+
+#
+# If this option is set the /etc/init.d/frr script automatically loads
+# the config via "vtysh -b" when the servers are started.
+# Check /etc/pam.d/frr if you intend to use "vtysh"!
+#
+vtysh_enable=yes
+zebra_options="  -A 127.0.0.1 -s 90000000"
+mgmtd_options="  -A 127.0.0.1"
+bgpd_options="   -A 127.0.0.1"
+ospfd_options="  -A 127.0.0.1"
+ospf6d_options=" -A ::1"
+ripd_options="   -A 127.0.0.1"
+ripngd_options=" -A ::1"
+isisd_options="  -A 127.0.0.1"
+pimd_options="   -A 127.0.0.1"
+pim6d_options="  -A ::1"
+ldpd_options="   -A 127.0.0.1"
+nhrpd_options="  -A 127.0.0.1"
+eigrpd_options=" -A 127.0.0.1"
+babeld_options=" -A 127.0.0.1"
+sharpd_options=" -A 127.0.0.1"
+pbrd_options="   -A 127.0.0.1"
+staticd_options="-A 127.0.0.1"
+bfdd_options="   -A 127.0.0.1"
+fabricd_options="-A 127.0.0.1"
+vrrpd_options="  -A 127.0.0.1"
+pathd_options="  -A 127.0.0.1"
+"""
+
+# L4 ECMP hashing for the multipath default (spread egress flows across both
+# legs). Applied automatically at boot by systemd-sysctl reading /etc/sysctl.d.
+MULTIPATH_SYSCTL = """\
+# L3 host fabric: spread egress flows across both legs (slagworks network script)
+net.ipv4.fib_multipath_hash_policy = 1
+"""
+
+
+def render_netplan(legs, loopback):
+    """Render the routed-NIC netplan YAML. legs is a list of
+    (mac, address, gateway) sorted by address; loopback is the /32 CIDR."""
+    lines = []
+    lines.append("# slagworks deploy agent — L3 routed-NIC kworker (assets/network/100-pop1-l3-kworker).")
+    lines.append("# Two /31 P2P legs + identity loopback. NO default route here: FRR owns the")
+    lines.append("# default (BGP ECMP when healthy, distance-250 floating static when down). A")
+    lines.append("# netplan default would be a distance-0 kernel route that shadows BGP's, pinning")
+    lines.append("# egress to one leg. Design: docs/bsky/2026-06-12-pop1-l3-host-fabric.md")
+    lines.append("network:")
+    lines.append("  version: 2")
+    lines.append("  renderer: networkd")
+    lines.append("  ethernets:")
+    lines.extend(nl.loopback_lines(loopback))
+    for i, (mac, address, gateway) in enumerate(legs):
+        lines.append(f"    leg{i}:")
+        lines.append("      match:")
+        lines.append(f'        macaddress: "{mac}"')
+        lines.append(f"      set-name: leg{i}")
+        lines.append(f"      mtu: {MTU}")
+        lines.append("      addresses:")
+        lines.append(f'        - "{address}"')
+        ns = nl.vip_nameserver(gateway)
+        if ns:
+            lines.append("      nameservers:")
+            lines.append("        addresses:")
+            lines.append(f'          - "{ns}"')
+        # No per-leg default route: FRR owns the default (see render_frr_conf's
+        # distance-250 statics + the BGP default). A netplan default would be a
+        # distance-0 kernel route that BGP can't displace, breaking ECMP.
+    return "\n".join(lines) + "\n"
+
+
+def render_frr_conf(legs, loopback):
+    """Render /etc/frr/frr.conf for the L3-fabric kworker. legs is sorted by
+    address: legs[0] = leaf-A leg (lower /31), legs[1] = leaf-B leg. loopback
+    is the /32 CIDR. Direct port of site Ansible kworker_frr/templates/frr.conf.j2.
+
+    Exits non-zero if the /31 subnet isn't a known pop1 leaf pair: a host that
+    matched the pop1 kworker script and has two /31 legs but an unrecognized
+    subnet is a NetBox-modeling inconsistency, and shipping netplan-only would
+    leave the loopback un-routable (no BGP announce) — a latent fabric break.
+    Fail loud, same posture as the storage wrong-disk hard-fail.
+    """
+    lo = nl.addr_only(loopback)
+    leg_a_host = nl.addr_only(legs[0][1])
+    leg_a_leaf = legs[0][2]
+    leg_b_host = nl.addr_only(legs[1][1])
+    leg_b_leaf = legs[1][2]
+
+    subnet = nl.subnet24(legs[0][1])
+    pair = LEAF_PAIRS.get(subnet)
+    if pair is None:
+        nl.fail(
+            f"ERROR: /31 subnet {subnet} is not a known pop1 leaf pair "
+            f"(have {sorted(LEAF_PAIRS)}); cannot derive leaf ASNs for FRR. "
+            f"This host matched the pop1 kworker script with two /31 legs but "
+            f"unrecognized addressing — fix NetBox modeling before deploy.\n"
+        )
+
+    dist = FALLBACK_DEFAULT_DISTANCE
+    pod_supernet = POD_SUPERNET
+    return f"""\
+! Managed by slagworks (assets/network/100-pop1-l3-kworker). Do not edit by
+! hand — the kworker_frr ansible role takes over post-boot and overwrites this.
+! FRR Configuration - L3 host-fabric kworker
+!
+! The host's only routing job: announce its own identity /32 to both leaves
+! and learn the default route from both for ECMP egress. cilium runs its own
+! separate BGP sessions (direct /31-addressed) for service /32s — four
+! sessions per host total, zero speaker interaction.
+! Design + validation: docs/bsky/2026-06-12-pop1-l3-host-fabric.md (v5 spike).
+!
+! Sessions are multihop sourced from the loopback (distinct source IPs from
+! cilium's). The announced /32 carries next-hop REWRITTEN to each session's
+! /31 leg: with default NH semantics (NH = the loopback itself) the route is
+! self-referential on the leaf and flaps — validated live 2026-06-12.
+!
+frr defaults traditional
+log syslog informational
+!
+bfd
+ profile host
+  detect-multiplier 3
+  receive-interval 100
+  transmit-interval 100
+ !
+!
+! OWN_PREFIXES = the node identity /32. POD_CIDR = the Cilium-assigned pod
+! /24 for this node (k3s host-scope IPAM, any /24 within the cluster pod
+! supernet). Cilium installs it as `proto kernel` on cilium_host; FRR
+! redistributes it (REDIST_POD) and advertises it to both leaves with the
+! same per-leg next-hop rewrite as the loopback. Native-routing fabric:
+! pods are reachable across nodes by this BGP route, no overlay.
+ip prefix-list OWN_PREFIXES seq 5 permit {lo}/32
+ip prefix-list POD_CIDR seq 5 permit {pod_supernet} ge 24 le 24
+!
+! redistribute filter: only this node's pod /24 from the kernel table (not
+! the connected /31 legs or other kernel routes).
+route-map REDIST_POD permit 10
+ match ip address prefix-list POD_CIDR
+exit
+route-map REDIST_POD deny 9999
+exit
+!
+! Per-leaf out-maps: rewrite next-hop to this session's /31 leg for BOTH the
+! identity /32 and the pod /24 (default NH = loopback is self-referential on
+! the leaf and flaps — validated 2026-06-12). deny 9999 is the route-leak
+! guard (without it eBGP re-exports the full learned table).
+route-map TO_LEAF_A permit 10
+ match ip address prefix-list OWN_PREFIXES
+ set ip next-hop {leg_a_host}
+exit
+route-map TO_LEAF_A permit 20
+ match ip address prefix-list POD_CIDR
+ set ip next-hop {leg_a_host}
+exit
+route-map TO_LEAF_A deny 9999
+exit
+!
+route-map TO_LEAF_B permit 10
+ match ip address prefix-list OWN_PREFIXES
+ set ip next-hop {leg_b_host}
+exit
+route-map TO_LEAF_B permit 20
+ match ip address prefix-list POD_CIDR
+ set ip next-hop {leg_b_host}
+exit
+route-map TO_LEAF_B deny 9999
+exit
+!
+router bgp {HOST_ASN}
+ bgp router-id {lo}
+ bgp bestpath as-path multipath-relax
+ no bgp ebgp-requires-policy
+ neighbor {leg_a_leaf} remote-as {pair['a_asn']}
+ neighbor {leg_a_leaf} description {pair['a_name']} (multihop from lo, NH-rewrite)
+ neighbor {leg_a_leaf} update-source lo
+ neighbor {leg_a_leaf} ebgp-multihop 2
+ neighbor {leg_a_leaf} bfd profile host
+ neighbor {leg_a_leaf} timers 3 9
+ neighbor {leg_b_leaf} remote-as {pair['b_asn']}
+ neighbor {leg_b_leaf} description {pair['b_name']} (multihop from lo, NH-rewrite)
+ neighbor {leg_b_leaf} update-source lo
+ neighbor {leg_b_leaf} ebgp-multihop 2
+ neighbor {leg_b_leaf} bfd profile host
+ neighbor {leg_b_leaf} timers 3 9
+ !
+ address-family ipv4 unicast
+  network {lo}/32
+  ! Pod /24 is learned from the kernel (cilium_host) post-join, not known at
+  ! render time — redistribute picks it up dynamically when cilium assigns it.
+  redistribute kernel route-map REDIST_POD
+  neighbor {leg_a_leaf} route-map TO_LEAF_A out
+  neighbor {leg_b_leaf} route-map TO_LEAF_B out
+  maximum-paths 2
+ exit-address-family
+exit
+!
+! Floating fallback default routes (distance {dist}) — installed by staticd
+! whenever the BGP default is absent (sessions down). The BGP-learned default
+! arrives at distance 20 with both legs as next-hops (maximum-paths 2) and
+! wins while healthy, giving true ECMP egress; these statics take over only on
+! BGP loss. This is the ONLY default-route source on the host — netplan
+! deliberately writes none (a kernel proto-static default at distance 0 would
+! permanently shadow the BGP default and break ECMP). Mirrors the leaves.
+ip route 0.0.0.0/0 {leg_a_leaf} {dist}
+ip route 0.0.0.0/0 {leg_b_leaf} {dist}
+"""
+
+
+def main():
+    ifaces = nl.load_facts()
+
+    legs = []
+    loopback = ""
+    for iface in ifaces:
+        ip = iface.get("ip", "")
+        name = iface.get("name", "")
+        if not ip:
+            continue
+        if name == "lo" and ip.endswith("/32"):
+            loopback = ip
+            continue
+        if iface.get("type") != "physical":
+            continue
+        if not ip.endswith("/31"):
+            continue
+        mac = iface.get("mac", "").lower()
+        if not mac:
+            continue
+        legs.append((mac, ip, nl.leaf_side_of_31(ip)))
+
+    # Sort NUMERICALLY by host IP, not lexically by the CIDR string: a string
+    # sort puts "10.254.29.11/31" before "10.254.29.9/31" (because '1' < '9'),
+    # which would make the higher leg "leaf-A" and swap the leaf-ASN
+    # assignment in the FRR config — the eBGP session's configured remote-as
+    # would then mismatch the peer's real AS and never establish. legs[0] must
+    # be the lower /31 (leaf-A) to match the kworker_frr spec formula. This
+    # bites exactly the .9/.11 pair, i.e. kworker-l{34,56}-3 — and l56-3 is the
+    # plan's validation host.
+    legs.sort(key=lambda leg: int(ipaddress.ip_interface(leg[1]).ip))
+
+    if len(legs) < 2 or not loopback:
+        # HARD FAIL — do NOT silently fall back to DHCP. This script only runs
+        # because the host matched site=pop1 + the kworker hostname regex, i.e.
+        # it is SUPPOSED to be an L3-fabric kworker. If it has fewer than two
+        # /31 legs or no loopback /32, its NetBox model is incomplete (the
+        # classic case: the `lo` interface + loopback /32 were never created).
+        # Bringing such a host up DHCP-only with no FRR is a latent fabric
+        # break — the loopback never becomes BGP-routable and the host is
+        # silently not on the L3 fabric it's meant to be on. That exact silent
+        # fallback cost ~90min of misdiagnosis on l56-3 (the loopback was
+        # missing from NetBox). Fail loud so the deploy aborts and the operator
+        # fixes the NetBox modeling, same loud-fail-over-silent-wrong-state
+        # posture as the storage wrong-disk hard-fail (resolveStorageLayout).
+        leg_ips = sorted(leg[1] for leg in legs)
+        nl.fail(
+            "ERROR: matched the pop1 L3-kworker network script but the host is "
+            "not fully L3-modeled in NetBox: found {} /31 leg(s) {} and "
+            "loopback={!r} (need >=2 legs and a /32 on lo). Most likely the "
+            "`lo` interface + loopback /32 are missing from this device in "
+            "NetBox. Add them (see docs/bsky/2026-06-12-pop1-l3-netbox-layout.md) "
+            "and redeploy — refusing to bring this host up DHCP-only, which "
+            "would silently leave it off the L3 fabric.\n".format(
+                len(legs), leg_ips, loopback)
+        )
+
+    # Fully L3-modeled host: netplan + minimal FRR.
+    nl.emit(nl.bundle(
+        [
+            # 0600: netplan warns on world-readable config.
+            nl.file_entry("/etc/netplan/99-slagworks.yaml",
+                          render_netplan(legs, loopback), mode="0600"),
+            # frr.conf MUST be owned by frr: the daemons read it after
+            # dropping privileges to the frr user.
+            nl.file_entry("/etc/frr/frr.conf", render_frr_conf(legs, loopback),
+                          mode="0640", owner="frr", group="frr"),
+            nl.file_entry("/etc/frr/daemons", FRR_DAEMONS,
+                          mode="0640", owner="frr", group="frr"),
+            nl.file_entry("/etc/sysctl.d/90-l3-multipath.conf", MULTIPATH_SYSCTL,
+                          mode="0644"),
+        ],
+        enable_units=["frr.service"],
+    ))
+
+
+if __name__ == "__main__":
+    main()

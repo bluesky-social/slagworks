@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+# slagworks:match site=pop3
+# slagworks:match device_type=dell-r640
+# slagworks:match hostname=/oob-gw-1\.pop3/
+# slagworks:priority 150
+#
+# pop3 oob-gw network config (oob-gw-1.pop3). Direct descendant of
+# 150-pop1-oob-gw — same structural-baseline philosophy, one deliberate
+# divergence (the transitional default route, below).
+#
+# MATCH KEYS: device_type=dell-r640 is shared by oob-gws across ALL
+# pops; site=pop3 scopes this to pop3's single gateway. The hostname regex is
+# the defense-in-depth AND-constraint. pop3 has one location (01-412290), so
+# site+device_type+hostname uniquely select the box.
+#
+# STRUCTURAL FABRIC BASELINE AT INSTALL TIME: the two routed /31 leaf legs
+# (10.252.25.1 -> leaf-1, 10.252.25.5 -> leaf-2, dark until the leaves image in
+# Phase 4) + the identity loopback /32 (10.252.31.51) + the OOB mgmt leg
+# (eno3, 10.252.240.11/22).
+# FRR / VIP / WAN / final addressing are all ansible-owned (oob-gw.yaml).
+# Fabric plan: site Ansible docs/plans/2026-07-09-pop3-fabric-bringup.md.
+#
+# DIVERGENCE FROM pop1 — TRANSITIONAL DEFAULT ROUTE + PUBLIC DNS ON eno3:
+# pop1's script emits no default route because FRR owns default-route policy
+# and a netplan kernel default (distance 0) would permanently shadow BGP's.
+# That is the right FINAL state — but this netplan is the *transitional*
+# state between image and ansible-converge, and the deployed OS needs egress
+# during that window (tailscale deploy-enrollment, apt, phone-home beyond the
+# L2 segment). On pop3's OOB /22 the default genuinely routes out through
+# router1 at 10.252.240.23 (its OOB address; router1 source-NATs
+# 10.252.0.0/16 out its EIA legs; the legacy 10.252.1.1 was retired
+# 2026-10-19), and there
+# is no on-segment resolver VIP yet ({a}.{b}.240.1 doesn't exist until this
+# very box's ansible pass creates it) — so we point DNS at public resolvers,
+# mirroring the current live config. The ansible oob-gw role rewrites netplan
+# wholesale at converge, which removes both the default and the public DNS in
+# the same pass that brings up FRR + WAN. If ansible ever stops owning
+# netplan on this host, this default becomes the distance-0 shadowing bug the
+# pop1 comment warns about — the divergence is safe ONLY because converge is
+# mandatory and immediate (the box is useless without the role anyway).
+#
+# HARD FAIL, no DHCP fallback (same posture as every sibling script): >=2 /31
+# legs, a loopback /32, and exactly one OOB NIC or the deploy aborts.
+#
+# Emits the emit-bundle contract on stdout:
+#   {"files": [{"path","content","mode","owner","group"}], "enable_units": []}
+#
+# Shared plumbing: slagworks_netlib.
+
+import ipaddress
+import sys
+
+import slagworks_netlib as nl
+
+MTU = 9000  # matches the leaf routed-port MTU (the L3 fabric)
+
+# Transitional egress (see the divergence note above): default via router1,
+# public resolvers. Both are replaced wholesale by the ansible oob-gw role.
+TRANSITIONAL_GATEWAY = "10.252.240.23"
+TRANSITIONAL_DNS = ["1.1.1.1", "1.0.0.1"]
+
+
+def find_legs(ifaces):
+    """Routed fabric legs: physical NICs carrying a /31, each as (name, mac,
+    cidr). Sorted numerically by host IP. Skips legs with no MAC."""
+    legs = []
+    for i in ifaces:
+        if i.get("type") != "physical":
+            continue
+        ip = i.get("ip", "")
+        if not ip.endswith("/31"):
+            continue
+        mac = (i.get("mac") or "").lower()
+        name = i.get("name", "")
+        if not mac:
+            sys.stderr.write(
+                f"WARNING: routed leg {name!r} has no MAC in facts; skipping "
+                f"it (cannot match-by-MAC in netplan).\n"
+            )
+            continue
+        legs.append((name, mac, ip))
+    legs.sort(key=lambda leg: int(ipaddress.ip_interface(leg[2]).ip))
+    return legs
+
+
+def find_loopback(ifaces):
+    """The identity loopback: a /32 on the `lo` interface."""
+    for i in ifaces:
+        if i.get("name") == "lo" and i.get("ip", "").endswith("/32"):
+            return i["ip"]
+    return ""
+
+
+def find_oob_nic(ifaces):
+    """The OOB management NIC: physical, non-/31, non-BMC, private IP + MAC.
+    Exactly one expected (the WAN carries a public IP; ipmi0 is BMC by name)."""
+    candidates = []
+    for i in ifaces:
+        if i.get("type") != "physical":
+            continue
+        ip = i.get("ip", "")
+        if ip.endswith("/31"):
+            continue
+        name = i.get("name", "")
+        if nl.is_bmc_name(name):
+            continue
+        mac = (i.get("mac") or "").lower()
+        if not ip or not mac:
+            continue
+        if not nl.is_private_ip(ip):
+            continue
+        candidates.append((name, mac, ip))
+    if len(candidates) != 1:
+        names = [c[0] for c in candidates]
+        nl.fail(
+            "ERROR: expected exactly one OOB management NIC (physical, "
+            "non-/31, non-BMC, private IP) on this pop3 oob-gw; found {}. The "
+            "OOB leg (eno3) must carry a modeled private OOB address so the "
+            "host phones home. Fix the NetBox model and redeploy.\n".format(
+                names or "none")
+        )
+    return candidates[0]
+
+
+def render_netplan(legs, loopback, oob_name, oob_mac, oob_ip):
+    """OOB mgmt leg (with the transitional default + public DNS) + routed /31
+    legs + loopback /32. FRR / final addressing are ansible-owned."""
+    lines = []
+    lines.append("# slagworks deploy agent - pop3 oob-gw (assets/network/150-pop3-oob-gw).")
+    lines.append("# TRANSITIONAL config: structural L3 baseline (two /31 leaf legs + identity")
+    lines.append("# loopback) + OOB leg with a default via router1 + public DNS so the box has")
+    lines.append("# egress before ansible converges. The ansible oob-gw role (oob-gw.yaml)")
+    lines.append("# rewrites this file wholesale: final addressing, FRR-owned default, VIP.")
+    lines.append("# Do not treat this as steady state - converge is mandatory.")
+    lines.append("network:")
+    lines.append("  version: 2")
+    lines.append("  renderer: networkd")
+    lines.append("  ethernets:")
+    # OOB management leg: static address + transitional default route.
+    lines.append(f"    {oob_name}:")
+    lines.append("      match:")
+    lines.append(f'        macaddress: "{oob_mac}"')
+    lines.append(f"      set-name: {oob_name}")
+    lines.append("      dhcp4: false")
+    lines.append("      dhcp6: false")
+    lines.append("      addresses:")
+    lines.append(f'        - "{oob_ip}"')
+    lines.append("      routes:")
+    lines.append("        - to: default")
+    lines.append(f"          via: {TRANSITIONAL_GATEWAY}")
+    lines.append("      nameservers:")
+    lines.append(f"        addresses: [{', '.join(TRANSITIONAL_DNS)}]")
+    # Routed fabric legs: match-by-MAC + set-name, /31 address, fabric MTU.
+    # Dark until the leaves are imaged (Phase 4); harmless to carry now.
+    for name, mac, cidr in legs:
+        lines.append(f"    {name}:")
+        lines.append("      match:")
+        lines.append(f'        macaddress: "{mac}"')
+        lines.append(f"      set-name: {name}")
+        lines.append("      dhcp4: false")
+        lines.append("      dhcp6: false")
+        lines.append("      addresses:")
+        lines.append(f'        - "{cidr}"')
+        lines.append(f"      mtu: {MTU}")
+    # Identity loopback /32 on lo. Ansible's FRR uses it as the bgp router-id.
+    lines.extend(nl.loopback_lines(loopback))
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    ifaces = nl.load_facts()
+
+    legs = find_legs(ifaces)
+    loopback = find_loopback(ifaces)
+    if len(legs) < 2 or not loopback:
+        leg_ips = sorted(leg[2] for leg in legs)
+        nl.fail(
+            "ERROR: matched the pop3 oob-gw network script but the host is not "
+            "fully L3-modeled in NetBox: found {} /31 leg(s) {} and "
+            "loopback={!r} (need >=2 legs and a /32 on lo). The leaf1/leaf2 "
+            "/31 uplinks + the lo loopback /32 must be modeled ACTIVE on this "
+            "device (reserved IPs are invisible to the facts). Fix NetBox and "
+            "redeploy - refusing to bring this gateway up DHCP-only.\n".format(
+                len(legs), leg_ips, loopback)
+        )
+
+    oob_name, oob_mac, oob_ip = find_oob_nic(ifaces)
+
+    netplan = render_netplan(legs, loopback, oob_name, oob_mac, oob_ip)
+
+    nl.emit(nl.bundle([
+        # 0600: netplan warns on world-readable config.
+        nl.file_entry("/etc/netplan/99-slagworks.yaml", netplan, mode="0600"),
+    ]))
+
+
+if __name__ == "__main__":
+    main()

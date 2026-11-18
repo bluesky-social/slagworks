@@ -1,0 +1,96 @@
+# Package list for the DEPLOY chroot.
+#
+# This chroot becomes root.squashfs — what the deploy agent rsyncs
+# onto the target disk for the deployed OS to live in. It must
+# contain every binary the deployed OS needs at runtime AND every
+# binary the slagworks deploy agent execs while it's running inside
+# this filesystem during install.
+#
+# To audit which slagworks code requires which package:
+#   grep -E 'exec\.Command|run\(' cmd/slagworks-agent/main.go
+#   grep 'Command{' internal/storage/plan.go
+#
+# Format: one package per line. Hash-prefixed comments and blank
+# lines are stripped. Inline comments after `#` on a package line
+# are also stripped (the package name is the first whitespace-
+# separated token).
+
+# Base OS. ubuntu-server-minimal pulls in the canonical "small server"
+# package set (essentially what `ubuntu-server` is minus desktop bits).
+ubuntu-server-minimal
+
+# Kernel + modules-extra + firmware. linux-image-generic transitively
+# pulls in linux-modules-extra-<version>-generic (mlx5/ice/etc.) and
+# linux-firmware via its Depends — no need to list those separately
+# (and they don't have unversioned package names anyway).
+linux-image-generic
+
+# First-boot config. cloud-init consumes the agent-written seed
+# at /etc/cloud/cloud.cfg.d/99-slagworks.cfg (datasource: None,
+# network rendering disabled). netplan.io applies the
+# agent-written /etc/netplan/99-slagworks.yaml. See
+# cmd/slagworks-agent/main.go seedCloudInit + writeNetplan.
+cloud-init
+netplan.io
+
+# Networking + DNS. systemd-resolved gives consistent DNS resolution;
+# systemd-timesyncd gets the host's clock right after first boot.
+systemd-resolved
+systemd-timesyncd
+
+# Remote access on the deployed OS.
+openssh-server
+
+# Disk partitioning + formatting (deploy agent execs these during install).
+gdisk                          # sgdisk for GPT
+dosfstools                     # mkfs.fat for ESP
+e2fsprogs                      # mkfs.ext4
+xfsprogs                       # mkfs.xfs
+mdadm                          # RAID create/assemble
+
+# Deploy agent: OS installation
+rsync                          # copy rootfs to target
+wget                           # fetch artifacts from worker
+python3                        # execute storage scripts
+
+# Deploy agent: bootloader + fstab
+util-linux                     # blkid, blockdev, mount, mkswap, lsblk
+efibootmgr                     # register UEFI Boot#### entries post-install
+grub-pc-bin                    # i386-pc GRUB modules for legacy/BIOS deploys
+grub2-common                   # grub-install / update-grub for the legacy GRUB path
+zstd                           # initramfs-tools' default compressor on noble; without it update-initramfs warns + falls back to gzip
+
+# Hardware discovery (commission agent execs these too — same image
+# serves both roles when invoked with --mode=commission).
+dmidecode                      # system / BIOS info
+smartmontools                  # disk SMART
+ethtool                        # NIC firmware / speed
+pciutils                       # lspci
+usbutils                       # lsusb
+ipmitool                       # BMC discovery
+lldpd                          # LLDP neighbor discovery
+iproute2                       # ip link / addr
+
+# L3 host-fabric routing. The deployed kworker runs frr (bgpd+bfdd) to
+# announce its loopback /32 and learn the ECMP default — brought up by the
+# pop1 network-config script (assets/network/100-pop1-l3-kworker), which can
+# only write config + enable the unit, not apt-install. Comes from the FRR
+# official repo (frr-10.5 line, baked in via build.sh's with-frr path), NOT
+# noble's archive (which ships 8.4). The frr postinst creates the frr user,
+# satisfying the network script's chown of /etc/frr/frr.conf to frr:frr.
+frr
+
+# Tailscale: deploy-time tailnet enrollment. The deploy agent's enroll step
+# (cmd/slagworks-agent/tailscale.go) runs `tailscale up` with a single-use
+# auth key minted per-op by global, joining the host to the tailnet before
+# first boot — it can only enroll, not apt-install, so the binary must be baked
+# here. From Tailscale's official apt repo (apt-repos.sh), NOT noble's archive
+# (which has no tailscale). The unit ships disabled/unconfigured; the agent
+# enables tailscaled and registers the node.
+tailscale
+
+# General utilities for operator-on-host debugging
+curl
+iputils-ping                   # ping — basic reachability check on a network-bringup image
+less
+vim-tiny

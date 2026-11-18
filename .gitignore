@@ -1,0 +1,18 @@
+/slagworksd
+/slagworks-agent
+/slagworks-worker
+/slagctl
+*.deb
+*-commission.tar.gz
+*-deploy.tar.gz
+.claude/adversary-token
+.claude/settings.local.json
+CHANGELOG.md
+dist/
+.env
+test/integration/harness/prebaked-token
+.worktrees/
+assets/network/__pycache__/
+# Python bytecode from running/importing the config scripts + netlib locally.
+__pycache__/
+*.pyc

@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+# slagworks:match system_product=/^AS -(1115HS|1015CS)-TNR$/
+# slagworks:match hostname=/(kworker-l(34|56)-\d+|hot-spare-[12])\.pop[12]/
+# slagworks:priority 200
+#
+# Supermicro AS-Tx TNR chassis family (kworker / hot-spare generation 1,
+# pop1+pop2). Covers AS -1115HS-TNR (H13SSH-NT) and AS -1015CS-TNR — both
+# take the IDENTICAL layout: a boot RAID1 on the 2x MZ1L23T8HBLA boot pair,
+# all other NVMe left bare. The product string is the only difference between
+# the chassis as far as storage is concerned, so one regex-matched script
+# serves both rather than two byte-identical copies. If a future chassis in
+# this family needs a different layout, split it out then.
+#
+# HOSTNAME SCOPE (defense in depth): the AS-Tx TNR chassis is
+# NOT role-unique — nova/algo/inferno/relay/router/search/vortex/etc. share the
+# exact same system_product AND device_type AND role=server as the kworker /
+# hot-spare hosts we actually image. The model regex alone would match all of
+# them. device_type and role can't separate them; only the hostname does. So
+# the match ANDs a hostname constraint scoping this script to the hosts we've
+# explicitly chosen to deploy. This is the storage analog of the network
+# scripts' fact-key + hostname-backstop pattern. The matcher gets the hostname
+# from the NetBox device name (not commission-time os.Hostname). Onboarding a
+# new TNR-chassis cohort to slagworks means widening this regex (and the
+# allowlist test) on purpose — that gate is the point.
+#   Boot: RAID1 mirror on the two MZ1L23T8HBLA Samsung PM9A3 NVMes
+#         (model substring match — boot pair is consistent across
+#         pop1/pop2/etc. chassis configs, even when the data complement
+#         varies).
+#   Data: every other NVMe is left as a bare GPT-partitioned disk.
+#         No RAID, no /data mount. The pop2 fleet's existing kworkers
+#         (verified live on algo1.pop2) follow this exact contract:
+#         MAAS lays down boot RAID1 only, an operator builds whatever
+#         data RAID/fs makes sense post-deploy. Different chassis
+#         configs in this fleet have anywhere from 2 to 8 data disks
+#         and pre-deciding a RAID level here would force one
+#         opinionated layout onto all of them.
+#
+# Layout produced:
+#   {boot0}p1, {boot1}p1 -> ESP (512M each, only boot0p1 is mounted)
+#   {boot0}p2, {boot1}p2 -> mdroot (RAID1, xfs, /)
+#   data drives           -> bare GPT, no partitions, no filesystem
+
+import json, os, re, sys
+
+inv_path = os.environ.get("SLAGWORKS_INVENTORY")
+if not inv_path:
+    print("ERROR: SLAGWORKS_INVENTORY must be set", file=sys.stderr)
+    sys.exit(1)
+
+with open(inv_path) as f:
+    inv = json.load(f)
+
+nvme = [d for d in inv["disks"] if d.get("transport") == "nvme"]
+
+# MZ1L23T8HBLA = PM9A3 boot pair (3.5TB / 3.84TB, varies by firmware
+# reporting). Always exactly 2 in the H13SSH config. `or ""` guards
+# against a JSON null in the model field — d.get("model", "") returns
+# None when the key is present but null, which would crash re.search.
+boot = sorted([d["name"] for d in nvme if re.search(r"MZ1L23T8HBLA", d.get("model") or "")])
+if len(boot) != 2:
+    print(f"ERROR: expected 2 PM9A3 boot drives (model MZ1L23T8HBLA), found {len(boot)}", file=sys.stderr)
+    sys.exit(1)
+
+# Data drives: everything else NVMe. Don't enforce a count — the H13SSH
+# fleet has chassis configs ranging from 2 to 8 data disks.
+data = sorted([d["name"] for d in nvme if d["name"] not in boot])
+
+# Boot disk size determines root partition size. ESP gets a fixed 512M;
+# the rest of the disk goes to the RAID1 root mirror member. Use the
+# minimum across both boot disks — even nominally-identical drives can
+# differ by a few MiB after overprovisioning / sector remapping, and
+# RAID1 needs both partition members to fit.
+disk_bytes = min(d["size_bytes"] for d in inv["disks"] if d["name"] in boot)
+root_mib = (disk_bytes - 600 * 1024 * 1024) // (1024 * 1024)
+
+layout = {
+    "layout": {
+        boot[0]: {
+            "type": "disk", "ptable": "gpt", "boot": True,
+            "partitions": [
+                {"name": f"{boot[0]}p1", "fs": "vfat", "size": "512M", "bootable": True},
+                {"name": f"{boot[0]}p2", "size": f"{root_mib}M"},
+            ],
+        },
+        boot[1]: {
+            "type": "disk", "ptable": "gpt", "boot": True,
+            "partitions": [
+                {"name": f"{boot[1]}p1", "fs": "vfat", "size": "512M", "bootable": True},
+                {"name": f"{boot[1]}p2", "size": f"{root_mib}M"},
+            ],
+        },
+        "mdroot": {
+            "type": "raid", "level": 1,
+            "members": [f"{boot[0]}p2", f"{boot[1]}p2"],
+            "fs": "xfs",
+        },
+    },
+    "mounts": {
+        "/": {"device": "mdroot"},
+        "/boot/efi": {"device": f"{boot[0]}p1"},
+    },
+}
+
+# Data disks: bare GPT, no partitions, no filesystem. Whole-disk
+# entries with no ptable/partitions are valid (validateDisk in
+# internal/storage/validate.go explicitly allows zero-partition
+# disks). The agent's storage executor `sgdisk --zap-all`s them
+# during partitioning; operator builds whatever they want at a
+# higher layer post-deploy.
+for d in data:
+    layout["layout"][d] = {"type": "disk"}
+
+json.dump(layout, sys.stdout, indent=2)

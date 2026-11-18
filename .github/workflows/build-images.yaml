@@ -1,0 +1,127 @@
+name: build-images
+
+# Proves the boot image builds and boots on every change to its inputs, and
+# warms the build cache test-qemu.yaml shares through
+# .github/actions/boot-image (a cache saved by a push to main is readable
+# from every pull request). Nothing here publishes the image: the tarball is
+# a workflow artifact, and a deployment builds and publishes its own from a
+# commit on main (docs/dev/build-and-release.md).
+#
+# Trigger paths are limited to inputs that actually affect the
+# built image artifact. cmd/slagworks-agent/** and internal/imagepull/** are
+# deliberately NOT triggers: the agent is downloaded at boot from the site
+# worker's packaged binary, and imagepull is worker-side runtime code that
+# doesn't change build output. Treat this filter as part of the build
+# contract: if a future change makes the BOOT hook read state from elsewhere
+# in the repo, add that path here.
+#
+# assets/initramfs/** (the slagworks BOOT hook + initramfs-tools hook)
+# IS a trigger and IS in the Phase A cache key: the hook is installed
+# into the chroot and update-initramfs bakes it into the shipped initrd,
+# so a hook change must rebuild the image.
+
+on:
+  pull_request:
+    paths:
+      - scripts/image-build/**
+      - assets/initramfs/**
+      - .github/workflows/build-images.yaml
+      - .github/actions/boot-image/**
+  push:
+    branches: [main]
+    paths:
+      - scripts/image-build/**
+      - assets/initramfs/**
+      - .github/workflows/build-images.yaml
+      - .github/actions/boot-image/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Per branch on PRs, per commit on pushes: each main commit that touches the
+# image keeps its own run, so a broken image build is attributable to the
+# commit that broke it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# `shell: bash` switches run steps from the default `bash -e {0}` to
+# `bash --noprofile --norc -eo pipefail {0}`, so a failing command on the
+# left of a pipe fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ───────────────────────────────────────────────────────────────
+  # Build the single image tarball. mmdebstrap runs natively on
+  # the hosted x86_64 runner.
+  #
+  # There is no deploy/commission matrix here. The two flavors boot
+  # the byte-identical kernel + initrd and rsync the byte-identical
+  # root.squashfs; the only difference is the slagworks.mode= kernel
+  # cmdline the site worker sets per-operation, not anything baked
+  # into the image.
+  # ───────────────────────────────────────────────────────────────
+  image:
+    runs-on: ubuntu-26.04
+    # Uncached builds run 8-10 min; one took 28 (2026-06-17).
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      # Install deps, write the recovery keys, restore or build. The same
+      # action feeds test-qemu.yaml, so both workflows share one cache.
+      # Nothing built here is published, so a run without the variable (a
+      # fork) builds with a throwaway key; the variable keeps the cache key
+      # stable across runs.
+      - uses: ./.github/actions/boot-image
+        with:
+          recovery-authorized-keys: ${{ vars.RECOVERY_AUTHORIZED_KEYS }}
+          allow-throwaway-key: 'true'
+
+      - name: Upload tarball as workflow artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: noble-pxe.tar.gz
+          path: noble-pxe.tar.gz
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────
+  # Smoke-test the built image: TCG-mode QEMU + stub HTTP server,
+  # validate the userspace boot contract end-to-end. One run — the
+  # image is mode-agnostic, so a per-flavor smoke would boot the
+  # identical artifact twice.
+  # ───────────────────────────────────────────────────────────────
+  smoke:
+    needs: image
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: noble-pxe.tar.gz
+
+      - name: Install smoke deps
+        run: |
+          sudo apt-get update -qq
+          # qemu-system-x86 ships the qemu-system-x86_64 binary;
+          # python3 is already on the hosted runner, docker likewise.
+          # squashfs-tools is pulled inside the container that
+          # builds the stub squashfs.
+          sudo apt-get install -y -qq qemu-system-x86
+
+      - name: Smoke
+        run: bash scripts/image-build/smoke.sh

@@ -1,0 +1,6 @@
+#!ipxe
+echo slagworks: ERROR: no slagworks_kernel_params for mac 52:54:00:aa:bb:01
+echo slagworks: set the NetBox device-type custom field slagworks_kernel_params
+echo slagworks: (a commission determines it automatically -- or set "none" to opt out)
+echo slagworks: refusing to deploy with a guessed console config
+shell

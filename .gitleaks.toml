@@ -1,0 +1,19 @@
+# gitleaks configuration. Extends the default rules and allowlists the
+# known non-secrets in this tree.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Vendored modules: identifier names that look like keys"
+paths = ['''^vendor/''']
+
+[[allowlists]]
+description = "Serial-console capture fixture: firmware and kernel identifiers"
+paths = ['''^cmd/slagctl/tui/testdata/real_sol_capture\.raw$''']
+
+[[allowlists]]
+description = "Fixed tokens for the local dev NetBox and the NetBox test container"
+regexes = [
+    '''0123456789abcdef0123456789abcdef01234567''',
+    '''nbt_x7nkTxVLDuGQ\.B499uwAZ8wNLzovGJZN3jhchee6JnUdnbg7okWhj''',
+]

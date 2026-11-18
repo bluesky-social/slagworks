@@ -1,0 +1,540 @@
+package mirror
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+
+	"github.com/bluesky-social/slagworks/internal/model"
+	"github.com/bluesky-social/slagworks/internal/store"
+)
+
+// fakeStore implements the Store interface. Minimal in-memory impl
+// that mirrors the real store's invariants (unique serial, lookup
+// by device id / serial).
+type fakeStore struct {
+	mu       sync.Mutex
+	machines map[uuid.UUID]*model.Machine
+	bySerial map[string]uuid.UUID
+	byDevice map[int]uuid.UUID
+	configs  map[string]*model.SiteConfig
+
+	// inFlightOps simulates machines with active operations: the
+	// per-machine count is what FailInFlightOpsForMachine "fails"
+	// (returns then zeroes). failedOps records the reasons.
+	inFlightOps map[uuid.UUID]int64
+	failedOps   map[uuid.UUID]string
+}
+
+func newFakeStore() *fakeStore {
+	return &fakeStore{
+		machines:    map[uuid.UUID]*model.Machine{},
+		bySerial:    map[string]uuid.UUID{},
+		byDevice:    map[int]uuid.UUID{},
+		configs:     map[string]*model.SiteConfig{},
+		inFlightOps: map[uuid.UUID]int64{},
+		failedOps:   map[uuid.UUID]string{},
+	}
+}
+
+func (f *fakeStore) FailInFlightOpsForMachine(machineID uuid.UUID, reason string) ([]store.OpOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := f.inFlightOps[machineID]
+	if n == 0 {
+		return nil, nil
+	}
+	f.failedOps[machineID] = reason
+	f.inFlightOps[machineID] = 0
+	// Mirror the real store's shape: each fail returns the failed
+	// post-mutation row + the durable failed state (a claimed/running
+	// lifecycle op pulls the machine to failed).
+	outs := make([]store.OpOutcome, 0, n)
+	for range n {
+		outs = append(outs, store.OpOutcome{
+			Op: model.Operation{
+				ID: uuid.New(), MachineID: machineID,
+				Type: model.OpDeploy, Status: model.OpFailed, Version: 1,
+			},
+			MachineState: model.MachineStateFailed,
+		})
+	}
+	return outs, nil
+}
+
+func (f *fakeStore) CreateMachine(m *model.Machine) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m.NetBoxSerial == "" {
+		return errors.New("NetBoxSerial required")
+	}
+	if _, exists := f.bySerial[m.NetBoxSerial]; exists {
+		return errors.New("duplicate serial")
+	}
+	if m.ID == uuid.Nil {
+		m.ID = uuid.New()
+	}
+	if m.State == "" {
+		m.State = model.MachineStateNew
+	}
+	f.machines[m.ID] = m
+	f.bySerial[m.NetBoxSerial] = m.ID
+	if m.NetBoxDeviceID != nil {
+		f.byDevice[*m.NetBoxDeviceID] = m.ID
+	}
+	return nil
+}
+
+func (f *fakeStore) GetMachine(id uuid.UUID) (*model.Machine, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, ok := f.machines[id]
+	if !ok {
+		return nil, errors.New("not found")
+	}
+	cc := *m
+	return &cc, nil
+}
+
+func (f *fakeStore) GetMachineByNetBoxDeviceID(id int) (*model.Machine, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	uid, ok := f.byDevice[id]
+	if !ok {
+		return nil, gorm.ErrRecordNotFound
+	}
+	cc := *f.machines[uid]
+	return &cc, nil
+}
+
+func (f *fakeStore) GetMachineByNetBoxSerial(serial string) (*model.Machine, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	uid, ok := f.bySerial[serial]
+	if !ok {
+		return nil, gorm.ErrRecordNotFound
+	}
+	cc := *f.machines[uid]
+	return &cc, nil
+}
+
+func (f *fakeStore) UpdateMachine(m *model.Machine) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	existing, ok := f.machines[m.ID]
+	if !ok {
+		return errors.New("not found")
+	}
+	// Rebind the device-id index if it changed.
+	if existing.NetBoxDeviceID != nil {
+		delete(f.byDevice, *existing.NetBoxDeviceID)
+	}
+	cp := *m
+	f.machines[m.ID] = &cp
+	if cp.NetBoxDeviceID != nil {
+		f.byDevice[*cp.NetBoxDeviceID] = m.ID
+	}
+	return nil
+}
+
+// SetMachineNetBoxDeviceID updates ONLY netbox_device_id, leaving every other
+// column untouched — mirroring the real store's column-scoped Update.
+// This is what makes the rebind path safe against clobbering columns the
+// mirror doesn't own.
+func (f *fakeStore) SetMachineNetBoxDeviceID(id uuid.UUID, netboxDeviceID int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	existing, ok := f.machines[id]
+	if !ok {
+		return errors.New("not found")
+	}
+	if existing.NetBoxDeviceID != nil {
+		delete(f.byDevice, *existing.NetBoxDeviceID)
+	}
+	nb := netboxDeviceID
+	existing.NetBoxDeviceID = &nb // mutate in place: all other fields preserved
+	f.byDevice[netboxDeviceID] = id
+	return nil
+}
+
+func (f *fakeStore) DeleteMachine(id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, ok := f.machines[id]
+	if !ok {
+		return errors.New("not found")
+	}
+	delete(f.machines, id)
+	delete(f.bySerial, m.NetBoxSerial)
+	if m.NetBoxDeviceID != nil {
+		delete(f.byDevice, *m.NetBoxDeviceID)
+	}
+	return nil
+}
+
+// AnySiteConfigForNetBoxSite reports whether any config mirrors the given
+// NetBox site. addSite stores a config whose netbox_site equals its slug
+// (the pop1/pop3 shape), so this walks the values matching on NetBoxSite.
+func (f *fakeStore) AnySiteConfigForNetBoxSite(netboxSite string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.configs {
+		if c.NetBoxSite == netboxSite {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *fakeStore) addSite(slug string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.configs[slug] = &model.SiteConfig{
+		Slug: slug, NetBoxSite: slug, EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200",
+	}
+}
+
+// fakeInvalidator records Invalidate calls.
+type fakeInvalidator struct {
+	mu    sync.Mutex
+	calls map[string]int
+}
+
+func (f *fakeInvalidator) Invalidate(slug string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.calls == nil {
+		f.calls = map[string]int{}
+	}
+	f.calls[slug]++
+}
+
+func (f *fakeInvalidator) count(slug string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls[slug]
+}
+
+// Test helpers.
+
+func withSite(t *testing.T) (*fakeStore, *fakeInvalidator, *Mirror) {
+	t.Helper()
+	st := newFakeStore()
+	st.addSite("pop3")
+	inv := &fakeInvalidator{}
+	return st, inv, New(st, inv)
+}
+
+// mkDevice builds a Device as the caller (reconciler/webhook) would hand
+// it to the mirror: claim already resolved, so ConfigSlug is stamped. The
+// helper uses the site slug as the config slug too (the pop1/pop3 shape);
+// tests that need them to differ build the Device literal directly.
+func mkDevice(id int, name, serial string) Device {
+	return Device{ID: id, Name: name, Serial: serial, SiteSlug: "pop3", ConfigSlug: "pop3"}
+}
+
+func TestOnDeviceCreatedEnrollsWithSerial(t *testing.T) {
+	st, inv, m := withSite(t)
+	err := m.OnDeviceCreated(context.Background(), mkDevice(1, "host-a", "SN-A"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetMachineByNetBoxDeviceID(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NetBoxSerial != "SN-A" || got.State != model.MachineStateNew {
+		t.Fatalf("got %+v", got)
+	}
+	if inv.count("pop3") != 1 {
+		t.Fatal("expected pop3 invalidation")
+	}
+}
+
+func TestOnDeviceCreatedRejectsEmptySerial(t *testing.T) {
+	st, inv, m := withSite(t)
+	err := m.OnDeviceCreated(context.Background(), mkDevice(1, "host-a", ""))
+	if !errors.Is(err, ErrSerialRequired) {
+		t.Fatalf("expected ErrSerialRequired, got %v", err)
+	}
+	if _, err := st.GetMachineByNetBoxDeviceID(1); err == nil {
+		t.Fatal("machine should not have been created")
+	}
+	if inv.count("pop3") != 0 {
+		t.Fatal("no invalidation expected")
+	}
+}
+
+// TestOnDeviceCreatedInvalidatesConfigSlugNotSite is the regression for
+// the location-scoping invalidation bug: the mirror must invalidate the
+// config slug (worker identity), NOT the NetBox site slug. For a
+// location-scoped config the two differ (e.g. pop2-old-cage vs pop2);
+// invalidating "pop2" would spin a phantom site-state and never refresh
+// the real worker's snapshot.
+func TestOnDeviceCreatedInvalidatesConfigSlugNotSite(t *testing.T) {
+	st := newFakeStore()
+	inv := &fakeInvalidator{}
+	m := New(st, inv)
+	// Device claimed by config "pop2-old-cage", whose NetBox site is "pop2".
+	d := Device{ID: 1, Name: "host-a", Serial: "SN-A", SiteSlug: "pop2", ConfigSlug: "pop2-old-cage"}
+	if err := m.OnDeviceCreated(context.Background(), d); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetMachineByNetBoxDeviceID(1); err != nil {
+		t.Fatalf("device should have enrolled: %v", err)
+	}
+	if inv.count("pop2-old-cage") != 1 {
+		t.Fatalf("expected invalidation on config slug pop2-old-cage, got %d", inv.count("pop2-old-cage"))
+	}
+	if inv.count("pop2") != 0 {
+		t.Fatalf("must NOT invalidate the NetBox site slug pop2, got %d", inv.count("pop2"))
+	}
+}
+
+// TestOnDeviceCreatedRebindsBySerial covers the "old NetBox device was
+// deleted, operator recreates with a new device id but same serial"
+// case. The mirror should rebind the existing Machine row to the new
+// netbox_device_id without changing its state.
+func TestOnDeviceCreatedRebindsBySerial(t *testing.T) {
+	st, inv, m := withSite(t)
+
+	// Pre-create a machine with serial SN-R, currently unbound (the
+	// old netbox_device_id has been deleted).
+	oldID := uuid.New()
+	if err := st.CreateMachine(&model.Machine{
+		ID: oldID, NetBoxSerial: "SN-R", State: model.MachineStateRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Operator recreates the Device with a new NetBox id but same serial.
+	if err := m.OnDeviceCreated(context.Background(), mkDevice(99, "host-r", "SN-R")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetMachineByNetBoxDeviceID(99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != oldID {
+		t.Fatalf("rebind must preserve UUID; got %s want %s", got.ID, oldID)
+	}
+	// State is preserved across rebind — unlike the old soft-decommission
+	// flow which reset to `new`.
+	if got.State != model.MachineStateRunning {
+		t.Fatalf("state %s, want preserved running", got.State)
+	}
+	if inv.count("pop3") != 1 {
+		t.Fatal("expected pop3 invalidation")
+	}
+}
+
+// TestOnDeviceCreatedRebindPreservesNonOwnedColumns: the reconciler
+// (webhook-loss safety net) re-feeds EVERY already-bound device through
+// OnDeviceCreated on each tick, so the rebind path must write ONLY
+// netbox_device_id. A full-row UpdateMachine(Save) of the loaded `existing`
+// struct would race and revert concurrent writes to columns the mirror
+// doesn't own (it once reverted a freshly written BMC password this way).
+func TestOnDeviceCreatedRebindPreservesNonOwnedColumns(t *testing.T) {
+	st, _, m := withSite(t)
+
+	id := uuid.New()
+	boundDeviceID := 7
+	if err := st.CreateMachine(&model.Machine{
+		ID: id, NetBoxSerial: "SN-KEEP", State: model.MachineStateRunning,
+		NetBoxDeviceID: &boundDeviceID, Locked: true, DesiredOS: "ubuntu-24.04",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reconciler re-feeds the SAME already-bound device (device_id unchanged).
+	if err := m.OnDeviceCreated(context.Background(), mkDevice(7, "host-keep", "SN-KEEP")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetMachineByNetBoxDeviceID(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.MachineStateRunning || !got.Locked || got.DesiredOS != "ubuntu-24.04" {
+		t.Errorf("rebind touched non-owned columns: state=%s locked=%v desired_os=%q",
+			got.State, got.Locked, got.DesiredOS)
+	}
+}
+
+// TestOnDeviceDeletedHardDeletes covers the new hard-delete semantics:
+// when a NetBox device is deleted, the Machine row is removed from the
+// store outright.
+func TestOnDeviceDeletedHardDeletes(t *testing.T) {
+	st, inv, m := withSite(t)
+	id := uuid.New()
+	nbID := 42
+	if err := st.CreateMachine(&model.Machine{
+		ID: id, NetBoxDeviceID: &nbID, NetBoxSerial: "SN-D", State: model.MachineStateRunning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.OnDeviceDeleted(context.Background(), 42, "pop3"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetMachine(id); err == nil {
+		t.Fatal("machine should have been hard-deleted")
+	}
+	if inv.count("pop3") != 1 {
+		t.Fatal("expected pop3 invalidation")
+	}
+}
+
+func TestOnDeviceDeletedUnknownIgnored(t *testing.T) {
+	st, inv, m := withSite(t)
+	// No machine exists for device 99.
+	if err := m.OnDeviceDeleted(context.Background(), 99, "pop3"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := st.GetMachineByNetBoxDeviceID(99); err == nil {
+		t.Fatal("should still not exist")
+	}
+	if inv.count("pop3") != 0 {
+		t.Fatal("no invalidation expected")
+	}
+}
+
+func TestOnSiteUpdatedRejectsManagedSlugRename(t *testing.T) {
+	_, _, m := withSite(t)
+	err := m.OnSiteUpdated(context.Background(), "pop3", "pop3-renamed")
+	if !errors.Is(err, ErrSlugImmutable) {
+		t.Fatalf("expected ErrSlugImmutable, got %v", err)
+	}
+}
+
+func TestOnSiteUpdatedAllowsUnmanagedSlugRename(t *testing.T) {
+	_, _, m := withSite(t) // managed: pop3
+	err := m.OnSiteUpdated(context.Background(), "other-site", "other-renamed")
+	if err != nil {
+		t.Fatalf("unmanaged slug rename should be allowed, got %v", err)
+	}
+}
+
+func TestOnSiteUpdatedNoChangeNoOp(t *testing.T) {
+	_, _, m := withSite(t)
+	err := m.OnSiteUpdated(context.Background(), "pop3", "pop3")
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// --- B7: NetBox drift mid-operation ---
+
+// TestOnDeviceDeletedMidOpFreezesInsteadOfDeleting pins the B7
+// contract for deletes: a NetBox device deletion landing while the
+// machine has in-flight ops fails the ops and RETAINS the row (the
+// evidence), rather than hard-deleting mid-operation. The idle-machine
+// path (TestOnDeviceDeletedHardDeletes) still hard-deletes.
+// fakePublisher records op_removed publishes (the B7 drift paths must
+// drop failed ops on the workers' op stream, not just the DB).
+type fakePublisher struct {
+	mu      sync.Mutex
+	removed []model.Operation
+	states  []model.MachineState
+}
+
+func (p *fakePublisher) PublishOpRemoved(op model.Operation, st model.MachineState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.removed = append(p.removed, op)
+	p.states = append(p.states, st)
+}
+
+func (p *fakePublisher) removedCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.removed)
+}
+
+func TestOnDeviceDeletedMidOpFreezesInsteadOfDeleting(t *testing.T) {
+	st, inv, m := withSite(t)
+	pub := &fakePublisher{}
+	m.SetPublisher(pub)
+	id := uuid.New()
+	nbID := 43
+	if err := st.CreateMachine(&model.Machine{
+		ID: id, NetBoxDeviceID: &nbID, NetBoxSerial: "SN-MIDOP", State: model.MachineStateDeploying,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st.inFlightOps[id] = 1
+
+	if err := m.OnDeviceDeleted(context.Background(), 43, "pop3"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetMachine(id); err != nil {
+		t.Fatal("machine row must be RETAINED when ops were in flight (operator evidence)")
+	}
+	if reason := st.failedOps[id]; reason == "" {
+		t.Fatal("in-flight ops were not failed")
+	}
+	if inv.count("pop3") != 1 {
+		t.Fatal("expected pop3 invalidation")
+	}
+	// The failed op must ALSO leave via the op stream — a DB-only fail
+	// leaves a zombie active op on the worker until reconnect.
+	if pub.removedCount() != 1 {
+		t.Fatalf("expected 1 op_removed publish, got %d", pub.removedCount())
+	}
+	if pub.states[0] != model.MachineStateFailed {
+		t.Fatalf("op_removed machine_state = %q, want failed", pub.states[0])
+	}
+}
+
+// TestOnDeviceExternalDrift: topology drift on a machine with ops in
+// flight fails the ops; drift on an idle machine is a no-op.
+func TestOnDeviceExternalDrift(t *testing.T) {
+	st, inv, m := withSite(t)
+	pub := &fakePublisher{}
+	m.SetPublisher(pub)
+	busy, idle := uuid.New(), uuid.New()
+	busyID, idleID := 50, 51
+	for _, mk := range []struct {
+		id uuid.UUID
+		nb int
+		s  string
+	}{{busy, busyID, "SN-BUSY"}, {idle, idleID, "SN-IDLE"}} {
+		nb := mk.nb
+		if err := st.CreateMachine(&model.Machine{
+			ID: mk.id, NetBoxDeviceID: &nb, NetBoxSerial: mk.s, State: model.MachineStateRunning,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.inFlightOps[busy] = 2
+
+	if err := m.OnDeviceExternalDrift(context.Background(), busyID, []string{"location"}, "pop3"); err != nil {
+		t.Fatal(err)
+	}
+	if st.failedOps[busy] == "" {
+		t.Fatal("busy machine's in-flight ops were not failed on drift")
+	}
+	if inv.count("pop3") != 1 {
+		t.Fatal("expected invalidation after failing ops")
+	}
+	// Both failed ops published as op_removed carrying the durable state.
+	if pub.removedCount() != 2 {
+		t.Fatalf("expected 2 op_removed publishes, got %d", pub.removedCount())
+	}
+
+	if err := m.OnDeviceExternalDrift(context.Background(), idleID, []string{"location"}, "pop3"); err != nil {
+		t.Fatal(err)
+	}
+	if st.failedOps[idle] != "" {
+		t.Fatal("idle machine must be untouched by drift")
+	}
+	if pub.removedCount() != 2 {
+		t.Fatal("idle-machine drift must publish nothing")
+	}
+	// Unknown device: also a clean no-op.
+	if err := m.OnDeviceExternalDrift(context.Background(), 999, []string{"site"}, "pop3"); err != nil {
+		t.Fatal(err)
+	}
+}

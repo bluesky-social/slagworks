@@ -1,0 +1,3 @@
+#!ipxe
+echo slagworks: boot-local (BIOS exit to firmware) for mac 52:54:00:aa:bb:01
+exit

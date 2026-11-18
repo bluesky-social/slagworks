@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# slagworks-upgrade <git-sha> <package-version>
+#
+# Upgrades the slagworks packages to <package-version>, the deb build of
+# <git-sha>, via apt with an exact version pin. Replaces the old
+# raw-binary swap (which left dpkg lying about the running version and
+# never moved the agent — the tailscale-enroll split-brain class).
+#
+# Both arguments come from global: <git-sha> is its build SHA
+# (main.version) and <package-version> the deb version
+# scripts/build-deb.sh stamped into the same binary
+# (main.packageVersion). One apt transaction moves slagworks
+# (slagworksd + slagctl + this helper) and slagworks-agent together;
+# the package postinst restarts slagworksd-site.
+#
+# Invoked by the site daemon via sudo when SLAGWORKS_AUTO_UPGRADE=1
+# and the global reports a different SHA than ours. The sudoers entry
+# in /etc/sudoers.d/slagworks-upgrade lets the slagworks user run this
+# exact path with any arguments, so this script is the privilege gate:
+# it validates both arguments itself before they reach apt.
+#
+# The apt work runs in a transient systemd unit (systemd-run), NOT in
+# this script's own process: this script is a descendant of
+# slagworksd-site (daemon -> sudo -> us), and the postinst's
+# `systemctl restart slagworksd-site` kills every process in the
+# service cgroup — an in-cgroup apt would die mid-transaction and
+# wedge dpkg. The transient unit lives in its own cgroup and survives
+# the restart. --wait means apt failures (repo unreachable, version
+# not in the pool, dpkg lock timeout) propagate back here and out to
+# the daemon's log; on success the restart kills US mid-wait, which is
+# fine — the daemon we report to is gone too, and the new one sees
+# matching versions.
+#
+# Idempotent on re-runs of the same SHA: the version check
+# short-circuits before apt runs.
+set -euo pipefail
+
+if [ "$#" -ne 2 ]; then
+    echo "usage: slagworks-upgrade <git-sha> <package-version>" >&2
+    echo "  Installs the slagworks and slagworks-agent packages at <package-version>," >&2
+    echo "  the build of <git-sha>. The site daemon passes both from global." >&2
+    exit 64
+fi
+
+SHA="$1"
+DEB_VERSION="$2"
+
+# SHA must be hex, 7-64 chars. Anything else and we don't trust the
+# call site enough to feed it to apt.
+if ! [[ "$SHA" =~ ^[0-9a-f]{7,64}$ ]]; then
+    echo "ERROR: invalid git sha '${SHA}': want 7-64 lowercase hex characters." >&2
+    echo "  Pass global's build SHA, as its /readyz reports it." >&2
+    exit 65
+fi
+
+# We control the version scheme end to end (build-deb.sh): X.Y.Z on a
+# release commit, X.Y.Z+git.N.g<sha> snapshot otherwise. Keep the gate
+# tight and change it here when the scheme changes.
+if ! [[ "$DEB_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\+git\.[0-9]+\.g[0-9a-f]+)?$ ]]; then
+    echo "ERROR: invalid package version '${DEB_VERSION}': want X.Y.Z or X.Y.Z+git.N.g<sha>." >&2
+    echo "  Pass the deb version scripts/build-deb.sh built global's SHA as; if" >&2
+    echo "  build-deb.sh's version scheme changed, update this check to match." >&2
+    exit 67
+fi
+
+# If we're already on this SHA, no-op. Re-runs of slagworks-upgrade
+# with the same args are expected during reconnect storms.
+if /usr/bin/slagworksd version 2>/dev/null | grep -qE "(^|[[:space:]])${SHA}([[:space:]]|$)"; then
+    echo "slagworks-upgrade: already on ${SHA}, no-op"
+    exit 0
+fi
+
+echo "slagworks-upgrade: ${SHA} -> slagworks ${DEB_VERSION} via apt"
+
+# --allow-downgrades: rolling global back re-advertises an older SHA,
+# whose deb version sorts lower — the fleet must follow it down, not
+# just up. DPkg::Lock::Timeout rides out unattended-upgrades holding
+# the lock instead of failing instantly.
+exec systemd-run --collect --wait \
+    --unit "slagworks-apt-upgrade-${SHA:0:12}" \
+    --description "slagworks auto-upgrade to ${DEB_VERSION} (${SHA:0:12})" \
+    /bin/bash -c "
+        set -euo pipefail
+        apt-get -qq update
+        apt-get install -y --allow-downgrades \
+            -o DPkg::Lock::Timeout=120 \
+            slagworks=${DEB_VERSION} \
+            slagworks-agent=${DEB_VERSION}
+    "
