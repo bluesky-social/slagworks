@@ -50,7 +50,9 @@ file: filters hide panics and the context around a failure.
   commit to the maintainers' deployment run only on `main`
   (`docs/dev/build-and-release.md`).
 - Dependencies are updated by Renovate. Don't bump them in an unrelated pull
-  request.
+  request. A change that adds or removes a vendored module also needs
+  `just gen-licenses`; a test fails until `THIRD-PARTY-LICENSES.md` matches
+  `vendor/`, and the generator refuses a license outside its allowed list.
 
 ## Hardware support
 
