@@ -25,10 +25,6 @@ charm.land/lipgloss/v2
 # dario.cat/mergo v1.0.1
 ## explicit; go 1.13
 dario.cat/mergo
-# github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c
-## explicit; go 1.16
-github.com/Azure/go-ansiterm
-github.com/Azure/go-ansiterm/winterm
 # github.com/Jeffail/gabs/v2 v2.7.0
 ## explicit; go 1.16
 github.com/Jeffail/gabs/v2
@@ -42,9 +38,6 @@ github.com/Microsoft/go-winio/internal/fs
 github.com/Microsoft/go-winio/internal/socket
 github.com/Microsoft/go-winio/internal/stringbuffer
 github.com/Microsoft/go-winio/pkg/guid
-# github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5
-## explicit
-github.com/Nvveen/Gotty
 # github.com/VictorLowther/simplexml v0.0.0-20180716164440-0bff93621230
 ## explicit
 github.com/VictorLowther/simplexml/dom
@@ -212,9 +205,9 @@ github.com/bmc-toolbox/common/config
 # github.com/catppuccin/go v0.3.0
 ## explicit; go 1.19
 github.com/catppuccin/go
-# github.com/cenkalti/backoff/v4 v4.3.0
-## explicit; go 1.18
-github.com/cenkalti/backoff/v4
+# github.com/cenkalti/backoff/v5 v5.0.3
+## explicit; go 1.23
+github.com/cenkalti/backoff/v5
 # github.com/cespare/xxhash/v2 v2.3.0
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
@@ -261,9 +254,6 @@ github.com/coder/websocket/internal/bpool
 github.com/coder/websocket/internal/errd
 github.com/coder/websocket/internal/util
 github.com/coder/websocket/internal/wsjs
-# github.com/containerd/continuity v0.4.5
-## explicit; go 1.21
-github.com/containerd/continuity/pathdriver
 # github.com/containerd/errdefs v1.0.0
 ## explicit; go 1.20
 github.com/containerd/errdefs
@@ -284,21 +274,8 @@ github.com/cyphar/filepath-securejoin/internal/consts
 # github.com/distribution/reference v0.6.0
 ## explicit; go 1.20
 github.com/distribution/reference
-# github.com/docker/cli v29.2.0+incompatible
-## explicit
-github.com/docker/cli/cli/compose/interpolation
-github.com/docker/cli/cli/compose/loader
-github.com/docker/cli/cli/compose/schema
-github.com/docker/cli/cli/compose/template
-github.com/docker/cli/cli/compose/types
-github.com/docker/cli/internal/lazyregexp
-github.com/docker/cli/internal/volumespec
-github.com/docker/cli/opts
-github.com/docker/cli/opts/swarmopts
-github.com/docker/cli/pkg/kvfile
 # github.com/docker/go-connections v0.7.0
 ## explicit; go 1.23
-github.com/docker/go-connections/nat
 github.com/docker/go-connections/sockets
 github.com/docker/go-connections/tlsconfig
 # github.com/docker/go-units v0.5.0
@@ -331,16 +308,9 @@ github.com/go-logr/logr/funcr
 # github.com/go-logr/stdr v1.2.2
 ## explicit; go 1.16
 github.com/go-logr/stdr
-# github.com/go-viper/mapstructure/v2 v2.4.0
-## explicit; go 1.18
-github.com/go-viper/mapstructure/v2
-github.com/go-viper/mapstructure/v2/internal/errors
 # github.com/gofrs/flock v0.13.1
 ## explicit; go 1.25.0
 github.com/gofrs/flock
-# github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
-## explicit; go 1.13
-github.com/google/shlex
 # github.com/google/uuid v1.6.0
 ## explicit
 github.com/google/uuid
@@ -445,6 +415,8 @@ github.com/mitchellh/hashstructure/v2
 github.com/moby/docker-image-spec/specs-go/v1
 # github.com/moby/moby/api v1.55.0
 ## explicit; go 1.24
+github.com/moby/moby/api/pkg/authconfig
+github.com/moby/moby/api/pkg/stdcopy
 github.com/moby/moby/api/types
 github.com/moby/moby/api/types/blkiodev
 github.com/moby/moby/api/types/build
@@ -469,13 +441,6 @@ github.com/moby/moby/client/internal
 github.com/moby/moby/client/internal/mod
 github.com/moby/moby/client/internal/timestamp
 github.com/moby/moby/client/pkg/versions
-# github.com/moby/sys/user v0.4.1
-## explicit; go 1.18
-github.com/moby/sys/user
-# github.com/moby/term v0.5.2
-## explicit; go 1.18
-github.com/moby/term
-github.com/moby/term/windows
 # github.com/muesli/cancelreader v0.2.2
 ## explicit; go 1.17
 github.com/muesli/cancelreader
@@ -492,34 +457,10 @@ github.com/opencontainers/go-digest
 ## explicit; go 1.18
 github.com/opencontainers/image-spec/specs-go
 github.com/opencontainers/image-spec/specs-go/v1
-# github.com/opencontainers/runc v1.3.6
-## explicit; go 1.23.0
-github.com/opencontainers/runc/libcontainer/user
-# github.com/ory/dockertest/v3 v3.12.0
-## explicit; go 1.22
-github.com/ory/dockertest/v3
-github.com/ory/dockertest/v3/docker
-github.com/ory/dockertest/v3/docker/opts
-github.com/ory/dockertest/v3/docker/pkg/archive
-github.com/ory/dockertest/v3/docker/pkg/fileutils
-github.com/ory/dockertest/v3/docker/pkg/homedir
-github.com/ory/dockertest/v3/docker/pkg/idtools
-github.com/ory/dockertest/v3/docker/pkg/ioutils
-github.com/ory/dockertest/v3/docker/pkg/jsonmessage
-github.com/ory/dockertest/v3/docker/pkg/longpath
-github.com/ory/dockertest/v3/docker/pkg/mount
-github.com/ory/dockertest/v3/docker/pkg/pools
-github.com/ory/dockertest/v3/docker/pkg/stdcopy
-github.com/ory/dockertest/v3/docker/pkg/system
-github.com/ory/dockertest/v3/docker/types
-github.com/ory/dockertest/v3/docker/types/blkiodev
-github.com/ory/dockertest/v3/docker/types/container
-github.com/ory/dockertest/v3/docker/types/filters
-github.com/ory/dockertest/v3/docker/types/mount
-github.com/ory/dockertest/v3/docker/types/network
-github.com/ory/dockertest/v3/docker/types/registry
-github.com/ory/dockertest/v3/docker/types/strslice
-github.com/ory/dockertest/v3/docker/types/versions
+# github.com/ory/dockertest/v4 v4.0.1
+## explicit; go 1.25.5
+github.com/ory/dockertest/v4
+github.com/ory/dockertest/v4/internal/client
 # github.com/pierrec/lz4/v4 v4.1.27
 ## explicit; go 1.17
 github.com/pierrec/lz4/v4
@@ -582,9 +523,6 @@ github.com/satori/go.uuid
 # github.com/sethvargo/go-retry v0.4.0
 ## explicit; go 1.25
 github.com/sethvargo/go-retry
-# github.com/sirupsen/logrus v1.9.3
-## explicit; go 1.13
-github.com/sirupsen/logrus
 # github.com/spf13/cobra v1.10.2
 ## explicit; go 1.15
 github.com/spf13/cobra
@@ -605,15 +543,6 @@ github.com/u-root/uio/uio
 # github.com/vishvananda/netns v0.0.5
 ## explicit; go 1.17
 github.com/vishvananda/netns
-# github.com/xeipuuv/gojsonpointer v0.0.0-20190905194746-02993c407bfb
-## explicit
-github.com/xeipuuv/gojsonpointer
-# github.com/xeipuuv/gojsonreference v0.0.0-20180127040603-bd5ef7bd5415
-## explicit
-github.com/xeipuuv/gojsonreference
-# github.com/xeipuuv/gojsonschema v1.2.0
-## explicit
-github.com/xeipuuv/gojsonschema
 # github.com/xo/terminfo v1.3.1
 ## explicit; go 1.25
 github.com/xo/terminfo
@@ -662,9 +591,6 @@ go.opentelemetry.io/otel/trace/noop
 # go.uber.org/multierr v1.11.0
 ## explicit; go 1.19
 go.uber.org/multierr
-# go.yaml.in/yaml/v3 v3.0.5
-## explicit; go 1.16
-go.yaml.in/yaml/v3
 # golang.org/x/crypto v0.59.0
 ## explicit; go 1.26.0
 golang.org/x/crypto/blowfish

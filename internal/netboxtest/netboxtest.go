@@ -31,8 +31,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ory/dockertest/v3"
-	"github.com/ory/dockertest/v3/docker"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	mobynetwork "github.com/moby/moby/api/types/network"
+	mobyclient "github.com/moby/moby/client"
+	"github.com/ory/dockertest/v4"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -62,10 +65,46 @@ type Env struct {
 	t            *testing.T
 	namespace    string
 	defaults     *envDefaults // lazy NetBox object cache; see seed.go
-	pool         *dockertest.Pool
-	netboxRes    *dockertest.Resource
-	workerRes    *dockertest.Resource
+	docker       *mobyclient.Client
+	netboxRes    dockertest.Resource
+	workerRes    dockertest.Resource
 	receiverHost string
+}
+
+// stack is the Docker plumbing every container of one test's
+// environment shares.
+type stack struct {
+	pool    dockertest.Pool
+	docker  *mobyclient.Client
+	network dockertest.Network
+}
+
+// run starts a fresh container from repository:tag on the stack's
+// network, pulling the image with the mirror's creds first. extraHosts
+// adds /etc/hosts entries. The pool removes the container when the test
+// ends; Expire bounds its life if the test process dies first.
+func (s *stack) run(ctx context.Context, repository, tag string, extraHosts []string, opts ...dockertest.RunOption) (dockertest.Resource, error) {
+	if err := pullMirrored(ctx, s.docker, repository, tag); err != nil {
+		return nil, err
+	}
+	opts = append(opts,
+		dockertest.WithTag(tag),
+		// dockertest otherwise hands back any container of the same
+		// repository:tag this process already started, so both Postgres
+		// containers would be one.
+		dockertest.WithoutReuse(),
+		dockertest.WithHostConfig(func(config *container.HostConfig) {
+			config.NetworkMode = container.NetworkMode(s.network.Inspect().Name)
+			config.ExtraHosts = extraHosts
+			config.AutoRemove = true
+			config.RestartPolicy = container.RestartPolicy{Name: container.RestartPolicyDisabled}
+		}))
+	res, err := s.pool.Run(ctx, repository, opts...)
+	if err != nil {
+		return nil, err
+	}
+	testpg.Expire(s.docker, res.ID(), 20*time.Minute)
+	return res, nil
 }
 
 // New brings up the baseline fixture: fresh NetBox + Postgres + Redis
@@ -114,21 +153,28 @@ func newWithFixture(t *testing.T, fixture string, withWebhookWorker bool) *Env {
 	log := slog.New(slog.NewTextHandler(&testLogWriter{t: t},
 		&slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	pool, err := dockertest.NewPool(testpg.DockerEndpoint())
+	docker, err := testpg.DockerClient(t.Context())
 	if err != nil {
 		t.Fatalf("netboxtest: connect to docker: %v", err)
 	}
-	pool.MaxWait = 3 * time.Minute
+	// Registered before the pool so it runs after the pool's cleanup has
+	// removed the containers and the network (t.Cleanup is LIFO).
+	t.Cleanup(func() { _ = docker.Close() })
+	// NewPoolT removes every container and network the pool created when
+	// the test ends, containers first.
+	pool := dockertest.NewPoolT(t, "",
+		dockertest.WithMobyClient(docker),
+		dockertest.WithMaxWait(3*time.Minute))
 
 	safeName := sanitize(t.Name())
 
 	// Per-test bridge network so NetBox can talk to its postgres/redis
 	// over stable DNS names without colliding with other parallel tests.
-	network, err := pool.CreateNetwork("netboxtest-" + safeName)
+	network, err := pool.CreateNetwork(t.Context(), "netboxtest-"+safeName, nil)
 	if err != nil {
 		t.Fatalf("netboxtest: create network: %v", err)
 	}
-	t.Cleanup(func() { _ = network.Close() })
+	s := &stack{pool: pool, docker: docker, network: network}
 
 	dumpPath, err := fixtureDumpPath(fixture)
 	if err != nil {
@@ -136,7 +182,7 @@ func newWithFixture(t *testing.T, fixture string, withWebhookWorker bool) *Env {
 	}
 
 	// --- slagworks Postgres (this test's Store backing) ---
-	slagPG := mustRunPG(t, pool, "slagpg-"+safeName, network, nil)
+	slagPG := mustRunPG(t, s, "slagpg-"+safeName, nil)
 	slagDSN := fmt.Sprintf("host=localhost port=%s user=postgres password=test dbname=slagworks_test sslmode=disable",
 		slagPG.GetPort("5432/tcp"))
 	slagDB := mustConnect(t, pool, slagDSN)
@@ -146,31 +192,21 @@ func newWithFixture(t *testing.T, fixture string, withWebhookWorker bool) *Env {
 	st := store.New(slagDB)
 
 	// --- NetBox Postgres (dump pre-loaded) ---
-	nbPG := mustRunPG(t, pool, "nbpg-"+safeName, network, map[string]string{
+	nbPG := mustRunPG(t, s, "nbpg-"+safeName, map[string]string{
 		"POSTGRES_DB":       "netbox",
 		"POSTGRES_USER":     "netbox",
 		"POSTGRES_PASSWORD": "testpass",
 	})
-	if err := restoreDump(pool, nbPG, dumpPath); err != nil {
+	if err := restoreDump(t.Context(), s, nbPG, dumpPath); err != nil {
 		t.Fatalf("netboxtest: restore dump: %v", err)
 	}
 
 	// --- Redis ---
-	redis, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: mirrored("library/redis"),
-		Tag:        "7-alpine",
-		Name:       "nbredis-" + safeName,
-		NetworkID:  network.Network.ID,
-		Auth:       registryAuth(),
-	}, func(config *docker.HostConfig) {
-		config.AutoRemove = true
-		config.RestartPolicy = docker.NeverRestart()
-	})
+	redis, err := s.run(t.Context(), mirrored("library/redis"), "7-alpine", nil,
+		dockertest.WithName("nbredis-"+safeName))
 	if err != nil {
 		t.Fatalf("netboxtest: start redis: %v", err)
 	}
-	t.Cleanup(func() { _ = pool.Purge(redis) })
-	_ = redis.Expire(1200)
 
 	// --- NetBox ---
 	pgIP := nbPG.GetIPInNetwork(network)
@@ -198,31 +234,23 @@ func newWithFixture(t *testing.T, fixture string, withWebhookWorker bool) *Env {
 		"GRANIAN_WORKERS=1",
 	}
 
-	nb, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository:   mirrored("netboxcommunity/netbox"),
-		Tag:          netboxTag,
-		Name:         "nbapp-" + safeName,
-		NetworkID:    network.Network.ID,
-		ExposedPorts: []string{"8080/tcp"},
-		Cmd:          []string{"/opt/netbox/launch-netbox.sh"},
-		Env:          netboxEnv,
-		Auth:         registryAuth(),
-	}, func(config *docker.HostConfig) {
-		config.AutoRemove = true
-		config.RestartPolicy = docker.NeverRestart()
-	})
+	nb, err := s.run(t.Context(), mirrored("netboxcommunity/netbox"), netboxTag, nil,
+		dockertest.WithName("nbapp-"+safeName),
+		dockertest.WithContainerConfig(func(config *container.Config) {
+			config.ExposedPorts = mobynetwork.PortSet{mobynetwork.MustParsePort("8080/tcp"): {}}
+		}),
+		dockertest.WithCmd([]string{"/opt/netbox/launch-netbox.sh"}),
+		dockertest.WithEnv(netboxEnv))
 	if err != nil {
 		t.Fatalf("netboxtest: start netbox: %v", err)
 	}
-	t.Cleanup(func() { _ = pool.Purge(nb) })
-	_ = nb.Expire(1200)
 
 	netboxURL := fmt.Sprintf("http://localhost:%s", nb.GetPort("8080/tcp"))
-	if err := waitForNetBox(pool, netboxURL); err != nil {
+	if err := waitForNetBox(t.Context(), pool, netboxURL); err != nil {
 		t.Fatalf("netboxtest: wait for netbox: %v", err)
 	}
 
-	var worker *dockertest.Resource
+	var worker dockertest.Resource
 	var workerHost string
 	if withWebhookWorker {
 		// --- NetBox RQ worker ---
@@ -236,31 +264,20 @@ func newWithFixture(t *testing.T, fixture string, withWebhookWorker bool) *Env {
 		// migrated, so the entrypoint's migration/superuser steps are unneeded.
 		workerExtraHosts := []string(nil)
 		workerHost, workerExtraHosts = receiverRoute(network)
-		worker, err = pool.RunWithOptions(&dockertest.RunOptions{
-			Repository: mirrored("netboxcommunity/netbox"),
-			Tag:        netboxTag,
-			Name:       "nbrq-" + safeName,
-			NetworkID:  network.Network.ID,
-			Cmd: []string{
+		worker, err = s.run(t.Context(), mirrored("netboxcommunity/netbox"), netboxTag, workerExtraHosts,
+			dockertest.WithName("nbrq-"+safeName),
+			dockertest.WithCmd([]string{
 				"/opt/netbox/venv/bin/python",
 				"/opt/netbox/netbox/manage.py",
 				"rqworker", "default",
-			},
-			Env:        netboxEnv,
-			ExtraHosts: workerExtraHosts,
-			Auth:       registryAuth(),
-		}, func(config *docker.HostConfig) {
-			config.AutoRemove = true
-			config.RestartPolicy = docker.NeverRestart()
-		})
+			}),
+			dockertest.WithEnv(netboxEnv))
 		if err != nil {
 			t.Fatalf("netboxtest: start netbox rq worker: %v", err)
 		}
-		t.Cleanup(func() { _ = pool.Purge(worker) })
-		_ = worker.Expire(1200)
-		if err := waitForWorker(pool, redis, redisIP); err != nil {
+		if err := waitForWorker(t.Context(), pool, redis, redisIP); err != nil {
 			t.Fatalf("netboxtest: wait for netbox rq worker: %v\nworker logs:\n%s",
-				err, containerLogs(pool, worker))
+				err, containerLogs(docker, worker))
 		}
 	}
 
@@ -293,7 +310,7 @@ func newWithFixture(t *testing.T, fixture string, withWebhookWorker bool) *Env {
 		t:            t,
 		namespace:    namespaceFor(t.Name()),
 		defaults:     &envDefaults{},
-		pool:         pool,
+		docker:       docker,
 		netboxRes:    nb,
 		workerRes:    worker,
 		receiverHost: workerHost,
@@ -320,7 +337,7 @@ func sanitize(s string) string {
 	return string(out)
 }
 
-func mustRunPG(t *testing.T, pool *dockertest.Pool, name string, network *dockertest.Network, extraEnv map[string]string) *dockertest.Resource {
+func mustRunPG(t *testing.T, s *stack, name string, extraEnv map[string]string) dockertest.Resource {
 	t.Helper()
 	env := []string{"POSTGRES_PASSWORD=test"}
 	if extraEnv == nil {
@@ -332,29 +349,19 @@ func mustRunPG(t *testing.T, pool *dockertest.Pool, name string, network *docker
 		}
 	}
 
-	res, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: mirrored("library/postgres"),
-		Tag:        "18-alpine",
-		Name:       name,
-		NetworkID:  network.Network.ID,
-		Env:        env,
-		Auth:       registryAuth(),
-	}, func(config *docker.HostConfig) {
-		config.AutoRemove = true
-		config.RestartPolicy = docker.NeverRestart()
-	})
+	res, err := s.run(t.Context(), mirrored("library/postgres"), "18-alpine", nil,
+		dockertest.WithName(name),
+		dockertest.WithEnv(env))
 	if err != nil {
 		t.Fatalf("netboxtest: start %s: %v", name, err)
 	}
-	t.Cleanup(func() { _ = pool.Purge(res) })
-	_ = res.Expire(1200)
 	return res
 }
 
-func mustConnect(t *testing.T, pool *dockertest.Pool, dsn string) *gorm.DB {
+func mustConnect(t *testing.T, pool dockertest.Pool, dsn string) *gorm.DB {
 	t.Helper()
 	var db *gorm.DB
-	if err := pool.Retry(func() error {
+	if err := testpg.Retry(t.Context(), pool, func() error {
 		var openErr error
 		db, openErr = gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Discard})
 		if openErr != nil {
@@ -371,10 +378,10 @@ func mustConnect(t *testing.T, pool *dockertest.Pool, dsn string) *gorm.DB {
 	return db
 }
 
-func restoreDump(pool *dockertest.Pool, pg *dockertest.Resource, dumpPath string) error {
+func restoreDump(ctx context.Context, s *stack, pg dockertest.Resource, dumpPath string) error {
 	// Wait for the netbox database to accept queries.
-	if err := pool.Retry(func() error {
-		return execCheck(pool, pg, "psql", "-U", "netbox", "-d", "netbox", "-c", "SELECT 1")
+	if err := testpg.Retry(ctx, s.pool, func() error {
+		return execCheck(ctx, pg, "psql", "-U", "netbox", "-d", "netbox", "-c", "SELECT 1")
 	}); err != nil {
 		return fmt.Errorf("wait for netbox db: %w", err)
 	}
@@ -385,9 +392,9 @@ func restoreDump(pool *dockertest.Pool, pg *dockertest.Resource, dumpPath string
 	}
 	defer f.Close()
 
-	// pg_restore streams stdin
-	exec, err := pool.Client.CreateExec(docker.CreateExecOptions{
-		Container:    pg.Container.ID,
+	// pg_restore streams stdin. dockertest's Resource.Exec attaches no
+	// stdin, so this exec goes through the Docker client directly.
+	exec, err := s.docker.ExecCreate(ctx, pg.ID(), mobyclient.ExecCreateOptions{
 		Cmd:          []string{"pg_restore", "-U", "netbox", "-d", "netbox", "--no-owner", "--no-acl"},
 		AttachStdin:  true,
 		AttachStdout: true,
@@ -396,15 +403,26 @@ func restoreDump(pool *dockertest.Pool, pg *dockertest.Resource, dumpPath string
 	if err != nil {
 		return fmt.Errorf("create pg_restore exec: %w", err)
 	}
-	var out strings.Builder
-	if err := pool.Client.StartExec(exec.ID, docker.StartExecOptions{
-		InputStream:  f,
-		OutputStream: &out,
-		ErrorStream:  &out,
-	}); err != nil {
+	attach, err := s.docker.ExecAttach(ctx, exec.ID, mobyclient.ExecAttachOptions{})
+	if err != nil {
 		return fmt.Errorf("pg_restore: %w", err)
 	}
-	inspect, err := pool.Client.InspectExec(exec.ID)
+	defer attach.Close()
+	sent := make(chan error, 1)
+	go func() {
+		_, copyErr := io.Copy(attach.Conn, f)
+		// Closing the write side is pg_restore's end of input.
+		if closeErr := attach.CloseWrite(); copyErr == nil {
+			copyErr = closeErr
+		}
+		sent <- copyErr
+	}()
+	var out strings.Builder
+	if _, err := stdcopy.StdCopy(&out, &out, attach.Reader); err != nil {
+		return fmt.Errorf("pg_restore: read output: %w", err)
+	}
+	sendErr := <-sent
+	inspect, err := s.docker.ExecInspect(ctx, exec.ID, mobyclient.ExecInspectOptions{})
 	if err != nil {
 		return fmt.Errorf("inspect pg_restore: %w", err)
 	}
@@ -413,39 +431,20 @@ func restoreDump(pool *dockertest.Pool, pg *dockertest.Resource, dumpPath string
 	if inspect.ExitCode > 1 {
 		return fmt.Errorf("pg_restore failed (exit %d): %s", inspect.ExitCode, out.String())
 	}
-	return nil
-}
-
-func execCheck(pool *dockertest.Pool, res *dockertest.Resource, cmd ...string) error {
-	exec, err := pool.Client.CreateExec(docker.CreateExecOptions{
-		Container:    res.Container.ID,
-		Cmd:          cmd,
-		AttachStdout: true,
-		AttachStderr: true,
-	})
-	if err != nil {
-		return err
-	}
-	var out strings.Builder
-	if err := pool.Client.StartExec(exec.ID, docker.StartExecOptions{
-		OutputStream: &out,
-		ErrorStream:  &out,
-	}); err != nil {
-		return err
-	}
-	inspect, err := pool.Client.InspectExec(exec.ID)
-	if err != nil {
-		return err
-	}
-	if inspect.ExitCode != 0 {
-		return fmt.Errorf("%v exit %d: %s", cmd, inspect.ExitCode, out.String())
+	if sendErr != nil {
+		return fmt.Errorf("pg_restore: send dump: %w: %s", sendErr, out.String())
 	}
 	return nil
 }
 
-func waitForNetBox(pool *dockertest.Pool, url string) error {
-	return pool.Retry(func() error {
-		req, err := http.NewRequest("GET", url+"/api/status/", nil)
+func execCheck(ctx context.Context, res dockertest.Resource, cmd ...string) error {
+	_, err := execOutput(ctx, res, cmd...)
+	return err
+}
+
+func waitForNetBox(ctx context.Context, pool dockertest.Pool, url string) error {
+	return testpg.Retry(ctx, pool, func() error {
+		req, err := http.NewRequestWithContext(ctx, "GET", url+"/api/status/", nil)
 		if err != nil {
 			return err
 		}
@@ -525,7 +524,7 @@ func (e *Env) ReceiverHost() string {
 // NetBoxLogs returns the trailing combined log output of the NetBox web
 // container, for wiring into timeout diagnostics.
 func (e *Env) NetBoxLogs() string {
-	return containerLogs(e.pool, e.netboxRes)
+	return containerLogs(e.docker, e.netboxRes)
 }
 
 // WorkerLogs returns the trailing combined log output of the NetBox RQ
@@ -534,14 +533,14 @@ func (e *Env) WorkerLogs() string {
 	if e.workerRes == nil {
 		return "(rq worker not started)"
 	}
-	return containerLogs(e.pool, e.workerRes)
+	return containerLogs(e.docker, e.workerRes)
 }
 
 // receiverRoute computes, for the given platform and bridge gateway, the
 // host address the RQ worker container should use to reach the in-process
 // webhook receiver, plus any extra_hosts entries the worker needs to
 // resolve it. See Env.ReceiverHost for the per-environment rationale.
-func receiverRoute(network *dockertest.Network) (host string, extraHosts []string) {
+func receiverRoute(network dockertest.Network) (host string, extraHosts []string) {
 	if runtime.GOOS == "linux" {
 		if gw := networkGateway(network); gw != "" {
 			return gw, nil
@@ -553,13 +552,13 @@ func receiverRoute(network *dockertest.Network) (host string, extraHosts []strin
 // networkGateway returns the IPv4 gateway of the first IPAM config on the
 // given bridge network. On Linux this gateway is an address on the host,
 // reachable from every container on that network.
-func networkGateway(network *dockertest.Network) string {
-	if network == nil || network.Network == nil {
+func networkGateway(network dockertest.Network) string {
+	if network == nil {
 		return ""
 	}
-	for _, cfg := range network.Network.IPAM.Config {
-		if cfg.Gateway != "" {
-			return cfg.Gateway
+	for _, cfg := range network.Inspect().IPAM.Config {
+		if cfg.Gateway.IsValid() {
+			return cfg.Gateway.String()
 		}
 	}
 	return ""
@@ -569,9 +568,9 @@ func networkGateway(network *dockertest.Network) string {
 // proving the worker process connected to the queue the web process
 // enqueues webhook jobs on (django-rq 'default', Redis DB 0). Checks the
 // rq:worker:* keyspace through the shared Redis container's redis-cli.
-func waitForWorker(pool *dockertest.Pool, redis *dockertest.Resource, redisIP string) error {
-	return pool.Retry(func() error {
-		out, err := execOutput(pool, redis, "redis-cli", "-h", redisIP, "-n", "0", "keys", "rq:worker:*")
+func waitForWorker(ctx context.Context, pool dockertest.Pool, redis dockertest.Resource, redisIP string) error {
+	return testpg.Retry(ctx, pool, func() error {
+		out, err := execOutput(ctx, redis, "redis-cli", "-h", redisIP, "-n", "0", "keys", "rq:worker:*")
 		if err != nil {
 			return fmt.Errorf("query rq workers: %w", err)
 		}
@@ -584,49 +583,37 @@ func waitForWorker(pool *dockertest.Pool, redis *dockertest.Resource, redisIP st
 
 // execOutput runs a command inside a container and returns its combined
 // output alongside any non-zero-exit error (execCheck discards the output;
-// this variant keeps it for diagnostics and readiness predicates).
-func execOutput(pool *dockertest.Pool, res *dockertest.Resource, cmd ...string) (string, error) {
-	exec, err := pool.Client.CreateExec(docker.CreateExecOptions{
-		Container:    res.Container.ID,
-		Cmd:          cmd,
-		AttachStdout: true,
-		AttachStderr: true,
-	})
+// this variant keeps it for diagnostics and readiness predicates). The
+// output is stdout followed by stderr.
+func execOutput(ctx context.Context, res dockertest.Resource, cmd ...string) (string, error) {
+	result, err := res.Exec(ctx, cmd)
+	out := result.StdOut + result.StdErr
 	if err != nil {
-		return "", err
+		return out, err
 	}
-	var out strings.Builder
-	if err := pool.Client.StartExec(exec.ID, docker.StartExecOptions{
-		OutputStream: &out,
-		ErrorStream:  &out,
-	}); err != nil {
-		return out.String(), err
+	if result.ExitCode != 0 {
+		return out, fmt.Errorf("%v exit %d: %s", cmd, result.ExitCode, out)
 	}
-	inspect, err := pool.Client.InspectExec(exec.ID)
-	if err != nil {
-		return out.String(), err
-	}
-	if inspect.ExitCode != 0 {
-		return out.String(), fmt.Errorf("%v exit %d: %s", cmd, inspect.ExitCode, out.String())
-	}
-	return out.String(), nil
+	return out, nil
 }
 
 // containerLogs returns the trailing combined stdout/stderr of a container
 // (best-effort; a log-read failure yields an empty string). Used to make
 // webhook-delivery timeouts diagnosable instead of a bare channel timeout.
-func containerLogs(pool *dockertest.Pool, res *dockertest.Resource) string {
-	if pool == nil || res == nil || res.Container == nil {
+func containerLogs(c *mobyclient.Client, res dockertest.Resource) string {
+	if c == nil || res == nil {
 		return ""
 	}
-	var buf strings.Builder
-	_ = pool.Client.Logs(docker.LogsOptions{
-		Container:    res.Container.ID,
-		OutputStream: &buf,
-		ErrorStream:  &buf,
-		Stdout:       true,
-		Stderr:       true,
-		Tail:         "200",
+	logs, err := c.ContainerLogs(context.Background(), res.ID(), mobyclient.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       "200",
 	})
+	if err != nil {
+		return ""
+	}
+	defer logs.Close()
+	var buf strings.Builder
+	_, _ = stdcopy.StdCopy(&buf, &buf, logs)
 	return buf.String()
 }
