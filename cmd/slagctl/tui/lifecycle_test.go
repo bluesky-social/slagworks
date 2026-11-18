@@ -6,8 +6,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/charmbracelet/lipgloss"
-	"github.com/muesli/termenv"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/colorprofile"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 )
@@ -33,7 +33,7 @@ func at(d time.Duration) time.Time { return t0.Add(d) }
 func TestLifecycle_DeploySpineFull(t *testing.T) {
 	l := newLifecyclePane(model.OpDeploy)
 	l.now = fixedClock(t0)
-	got := l.Render(lifecycleWidth, "⠙")
+	got := plain(l.Render(lifecycleWidth, "⠙"))
 
 	if n := strings.Count(got, "\n"); n != len(deploySpine)-1 {
 		t.Errorf("got %d newlines, want %d (one row per spine phase)", n, len(deploySpine)-1)
@@ -65,7 +65,7 @@ func TestLifecycle_MidDeploy(t *testing.T) {
 	l.Observe("partitioning", at(30*time.Second))
 	l.now = fixedClock(at(30*time.Second + 47*time.Second))
 
-	got := l.Render(lifecycleWidth, "⠙")
+	got := plain(l.Render(lifecycleWidth, "⠙"))
 	if !strings.Contains(got, "✓ power_cycle") {
 		t.Errorf("power_cycle not done:\n%s", got)
 	}
@@ -95,12 +95,12 @@ func TestLifecycle_Backfill(t *testing.T) {
 	l.Observe("finalizing", at(0))
 	l.Observe("awaiting_phone_home", at(4*time.Second))
 
-	if !strings.Contains(l.Render(lifecycleWidth, "⠙"), "— bmc_reconcile") {
-		t.Errorf("bmc_reconcile not marked skipped:\n%s", l.Render(lifecycleWidth, "⠙"))
+	if !strings.Contains(plain(l.Render(lifecycleWidth, "⠙")), "— bmc_reconcile") {
+		t.Errorf("bmc_reconcile not marked skipped:\n%s", plain(l.Render(lifecycleWidth, "⠙")))
 	}
 	// Everything before finalizing also backfills skipped (we joined late).
-	if !strings.Contains(l.Render(lifecycleWidth, "⠙"), "— power_cycle") {
-		t.Errorf("earlier phases not backfilled skipped:\n%s", l.Render(lifecycleWidth, "⠙"))
+	if !strings.Contains(plain(l.Render(lifecycleWidth, "⠙")), "— power_cycle") {
+		t.Errorf("earlier phases not backfilled skipped:\n%s", plain(l.Render(lifecycleWidth, "⠙")))
 	}
 }
 
@@ -119,7 +119,7 @@ func TestLifecycle_Fail(t *testing.T) {
 	l.Observe("partitioning", at(30*time.Second))
 	l.Fail(at(42 * time.Second)) // 12s into partitioning
 
-	got := l.Render(lifecycleWidth, "⠙")
+	got := plain(l.Render(lifecycleWidth, "⠙"))
 	if !strings.Contains(got, "✗ partitioning") {
 		t.Errorf("partitioning not marked failed:\n%s", got)
 	}
@@ -145,7 +145,7 @@ func TestLifecycle_Completed(t *testing.T) {
 		l.Observe(p, at(base))
 		base += 5 * time.Second
 	}
-	got := l.Render(lifecycleWidth, "⠙")
+	got := plain(l.Render(lifecycleWidth, "⠙"))
 	if strings.Contains(got, "⠙") {
 		t.Errorf("nothing should spin after completion:\n%s", got)
 	}
@@ -166,7 +166,7 @@ func TestLifecycle_Completed(t *testing.T) {
 func TestLifecycle_CommissionSpine(t *testing.T) {
 	l := newLifecyclePane(model.OpCommission)
 	l.now = fixedClock(t0)
-	got := l.Render(lifecycleWidth, "⠙")
+	got := plain(l.Render(lifecycleWidth, "⠙"))
 	if !strings.Contains(got, "○ collecting_inventory") {
 		t.Errorf("commission spine missing collecting_inventory:\n%s", got)
 	}
@@ -185,7 +185,7 @@ func TestLifecycle_CommissionSpine(t *testing.T) {
 func TestLifecycle_BMCReconcileSpine(t *testing.T) {
 	l := newLifecyclePane(model.OpBMCReconcile)
 	l.now = fixedClock(t0)
-	got := l.Render(lifecycleWidth, "⠙")
+	got := plain(l.Render(lifecycleWidth, "⠙"))
 	if !strings.Contains(got, "bmc_reconcile") {
 		t.Errorf("bmc_reconcile spine missing its phase:\n%s", got)
 	}
@@ -211,7 +211,7 @@ func TestLifecycle_CommissionBootPrefixAnimates(t *testing.T) {
 	l.Observe("ipxe_loaded", at(19*time.Second))
 	l.now = fixedClock(at(25 * time.Second))
 
-	got := l.Render(lifecycleWidth, "⠙")
+	got := plain(l.Render(lifecycleWidth, "⠙"))
 	if !strings.Contains(got, "✓ power_cycle") {
 		t.Errorf("power_cycle not done on commission spine:\n%s", got)
 	}
@@ -291,7 +291,7 @@ func TestLifecycle_LayoutWidth(t *testing.T) {
 	l.now = fixedClock(at(time.Minute))
 	l.Observe("installing_bootloader", at(0))
 	l.now = fixedClock(at(11 * time.Second))
-	got := l.Render(lifecycleWidth, "⠙")
+	got := plain(l.Render(lifecycleWidth, "⠙"))
 	for line := range strings.SplitSeq(got, "\n") {
 		if w := len([]rune(line)); w > lifecycleWidth {
 			t.Errorf("row exceeds width %d: %q (%d cells)", lifecycleWidth, line, w)
@@ -331,18 +331,15 @@ const amberSGR = "38;5;208"
 // TestLifecycle_StuckPhaseTurnsAmber is the guard: a current phase
 // running past stuckPhaseFloor (5m) renders amber, a cheap "something may be
 // wrong" cue well before the op timeout. A phase under the floor stays the
-// normal active color. Asserted under the 256-color profile (the goldens run
-// colorless, so this is the only place color is observable) and restored after
-// so it can't bleed into other tests' snapshots.
+// normal active color. Asserted as a 256-color terminal receives it (the
+// goldens compare stripped text, so this is the only place color is
+// observable).
 func TestLifecycle_StuckPhaseTurnsAmber(t *testing.T) {
-	lipgloss.SetColorProfile(termenv.ANSI256)
-	defer lipgloss.SetColorProfile(termenv.Ascii)
-
 	// Fresh: partitioning current for 30s (< 5m floor) — not amber.
 	fresh := newLifecyclePane(model.OpDeploy)
 	fresh.now = fixedClock(at(30 * time.Second))
 	fresh.Observe("partitioning", at(0))
-	if got := fresh.Render(lifecycleWidth, "⠙"); strings.Contains(got, amberSGR) {
+	if got := downsample(t, fresh.Render(lifecycleWidth, "⠙"), colorprofile.ANSI256); strings.Contains(got, amberSGR) {
 		t.Errorf("phase under the stuck floor should not be amber:\n%q", got)
 	}
 
@@ -350,7 +347,7 @@ func TestLifecycle_StuckPhaseTurnsAmber(t *testing.T) {
 	stuck := newLifecyclePane(model.OpDeploy)
 	stuck.now = fixedClock(at(6 * time.Minute))
 	stuck.Observe("partitioning", at(0))
-	got := stuck.Render(lifecycleWidth, "⠙")
+	got := downsample(t, stuck.Render(lifecycleWidth, "⠙"), colorprofile.ANSI256)
 	if !strings.Contains(got, amberSGR) {
 		t.Errorf("phase past the stuck floor should render amber:\n%q", got)
 	}

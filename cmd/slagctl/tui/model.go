@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
@@ -220,7 +220,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -334,7 +334,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// failure): an interactive operator explicitly quits with q, so the
 		// screen holds on ANY terminal state and does not vanish on its own.
 		// Non-interactive invocations auto-exit so scripts don't hang. The
-		// held screen stays up until the KeyMsg case Quits.
+		// held screen stays up until the KeyPressMsg case Quits.
 		if m.holdOnTerminal {
 			return m, nil
 		}
@@ -417,8 +417,18 @@ func (m *tuiModel) markEventAt(t time.Time) {
 	}
 }
 
-func (m *tuiModel) View() string {
-	return renderFrame(m.frameInput())
+// View renders the frame on the alternate screen. MouseMode stays at its zero
+// value (MouseModeNone): the reducer consumes no mouse events, and mouse
+// reporting would suppress the terminal's native click-drag text selection, so
+// the operator couldn't copy a MAC, op id or error line out of the TUI. If
+// scrollback is added and wants drag-to-scroll on the log/console panes,
+// enable mouse capture behind a keybind toggle (app-owns-mouse vs
+// terminal-owns-mouse) rather than unconditionally, so selection still works
+// on demand.
+func (m *tuiModel) View() tea.View {
+	v := tea.NewView(renderFrame(m.frameInput()))
+	v.AltScreen = true
+	return v
 }
 
 // frameInput projects the model into the pure render input. Split out from

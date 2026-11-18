@@ -5,8 +5,8 @@ import (
 	"net/url"
 	"os"
 
+	"charm.land/huh/v2"
 	"github.com/aymanbagabas/go-udiff"
-	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
