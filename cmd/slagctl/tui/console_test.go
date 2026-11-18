@@ -9,8 +9,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
+
+// plain strips the styling from rendered output. Lip Gloss emits full-color
+// escape codes on every Render (the terminal-facing downsampling is Bubble
+// Tea's), so the goldens and the text assertions pin the visible layout of the
+// stripped string, and color_test asserts the styling itself.
+func plain(s string) string { return ansi.Strip(s) }
 
 // updateGolden regenerates the committed golden frames:
 //
@@ -186,11 +193,10 @@ func TestStaticScreen_NoSignal(t *testing.T) {
 	}
 
 	// Shape: exactly consoleHeight rows of consoleWidth visible columns. The
-	// dim-gray style strips on a non-TTY (forceNoColor), so measure visible
-	// width with lipgloss.Width, not len.
-	forceNoColor()
-	snow := staticScreen(seed, consoleWidth, consoleHeight)
-	lines := strings.Split(snow, "\n")
+	// dim-gray style wraps each row in escape codes, so measure visible width
+	// with lipgloss.Width, not len.
+	styled := staticScreen(seed, consoleWidth, consoleHeight)
+	lines := strings.Split(styled, "\n")
 	if got := len(lines); got != consoleHeight {
 		t.Errorf("static has %d rows, want %d", got, consoleHeight)
 	}
@@ -201,6 +207,7 @@ func TestStaticScreen_NoSignal(t *testing.T) {
 	}
 	// Content: it must actually be snow (contain block-shade chars), not the
 	// blank box it replaced, and not a single solid fill.
+	snow := plain(styled)
 	if strings.TrimSpace(snow) == "" {
 		t.Error("static screen is blank — the empty box it was meant to replace")
 	}

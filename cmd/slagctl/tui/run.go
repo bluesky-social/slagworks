@@ -5,7 +5,7 @@ import (
 	"os"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
@@ -114,9 +114,9 @@ type RunResult struct {
 
 // Run builds the model, starts the program, wires the stream goroutines, and
 // returns how the run ended (for the caller's exit code AND its one-line exit
-// summary) plus any program error. tea.Program is created with the
-// alt-screen only — no mouse capture, so native terminal text selection keeps
-// working. The hold policy is applied by translating success into an
+// summary) plus any program error. The model's View asks for the alt-screen
+// only — no mouse capture, so native terminal text selection keeps working
+// (see tuiModel.View). The hold policy is applied by translating success into an
 // auto-Quit (the reducer already does this) and leaving failure on screen until
 // q when decideHold says so.
 func Run(ctx context.Context, cfg RunConfig) (result RunResult, err error) {
@@ -151,30 +151,21 @@ func Run(ctx context.Context, cfg RunConfig) (result RunResult, err error) {
 	// Render to stderr (tea.WithOutput): the watch monitor is status output, and
 	// the caller gates interactivity on stderr being a TTY (interactiveStderr in
 	// cmd/tui_run.go), printing its one-line exit summary to stderr too. Bubble
-	// Tea otherwise defaults its output to os.Stdout and derives BOTH the initial
-	// terminal size AND the SIGWINCH resize watcher from that output's TTY
-	// (tea.checkResize / handleResize key off p.ttyOutput). When stdout is piped
-	// or redirected while stderr stays a TTY (a normal operator pipeline), that
-	// default leaves ttyOutput nil: no WindowSizeMsg is ever sent (width/height
-	// stay 0, so the view is stuck on the "please enlarge" placeholder forever),
-	// resize is never observed, and the alt-screen escape codes scribble into the
-	// redirect target instead of the terminal the operator is looking at — which
-	// is exactly the reported min-size dead-end / no resize, and the keys that
-	// appear dead because no coherent frame ever repaints. Pinning output
-	// to the stderr TTY we already verified makes size detection, SIGWINCH
-	// resize, key handling, and the heartbeat repaint all land where they should.
-	// Input stays on os.Stdin (Bubble Tea falls back to /dev/tty when stdin isn't
-	// a TTY), which is correct.
-	//
-	// No tea.WithMouseCellMotion(): the Update loop consumes no mouse events
-	// (only WindowSizeMsg + KeyMsg), and enabling mouse reporting puts the
-	// terminal into a mode that suppresses native click-drag text selection —
-	// so the operator can't copy a MAC/op-id/error line out of the TUI.
-	// If scrollback is added and wants drag-to-scroll on the
-	// log/console panes, reintroduce mouse capture behind a keybind toggle
-	// (app-owns-mouse vs terminal-owns-mouse) rather than unconditionally, so
-	// selection still works on demand.
-	p := tea.NewProgram(m, tea.WithContext(ctx), tea.WithAltScreen(), tea.WithOutput(os.Stderr))
+	// Tea otherwise defaults its output to os.Stdout and derives the initial
+	// terminal size, the SIGWINCH resize watcher (both key off p.ttyOutput) AND
+	// the color profile it downsamples the frame to from that output. When stdout
+	// is piped or redirected while stderr stays a TTY (a normal operator
+	// pipeline), that default leaves ttyOutput nil: no WindowSizeMsg is ever sent
+	// (width/height stay 0, so the view is stuck on the "please enlarge"
+	// placeholder forever), resize is never observed, and the alt-screen escape
+	// codes scribble into the redirect target instead of the terminal the
+	// operator is looking at — which is exactly the reported min-size dead-end /
+	// no resize, and the keys that appear dead because no coherent frame ever
+	// repaints. Pinning output to the stderr TTY we already verified makes size
+	// detection, SIGWINCH resize, color, key handling, and the heartbeat repaint
+	// all land where they should. Input stays on os.Stdin (Bubble Tea falls back
+	// to /dev/tty when stdin isn't a TTY), which is correct.
+	p := tea.NewProgram(m, tea.WithContext(ctx), tea.WithOutput(os.Stderr))
 
 	// Stream goroutines. Each sends messages into the program; they exit when
 	// ctx is cancelled (the defer above cancels it when Run returns).

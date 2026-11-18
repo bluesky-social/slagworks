@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 )
@@ -99,7 +99,7 @@ func headerLine(frame string) string {
 // size. This is the layout's primary golden — header, console box, lifecycle +
 // summary right column, logs box.
 func TestFrame_MidDeploy(t *testing.T) {
-	frame := renderFrame(midDeployFrame(minTermCols, minRows))
+	frame := plain(renderFrame(midDeployFrame(minTermCols, minRows)))
 	if !strings.Contains(frame, "serial console") {
 		t.Error("console box title missing")
 	}
@@ -138,7 +138,7 @@ func TestFrame_MidDeploy(t *testing.T) {
 // state-aware message, not a degraded layout.
 func TestFrame_SmallTerminal(t *testing.T) {
 	in := midDeployFrame(80, 24)
-	got := renderFrame(in)
+	got := plain(renderFrame(in))
 	if strings.Contains(got, "serial console") {
 		t.Errorf("small terminal should not render the 3-pane layout:\n%s", got)
 	}
@@ -158,7 +158,7 @@ func TestFrame_SmallTerminalRevealsOutcome(t *testing.T) {
 	in.done = true
 	in.failed = true
 	in.failReason = "sgdisk exit 2 (device busy?)"
-	got := renderFrame(in)
+	got := plain(renderFrame(in))
 	if !strings.Contains(got, "FAILED") {
 		t.Errorf("failed op not surfaced at small size:\n%s", got)
 	}
@@ -193,7 +193,7 @@ func TestFrame_Failure(t *testing.T) {
 		spinner:    "⠙",
 		now:        now,
 	}
-	got := renderFrame(in)
+	got := plain(renderFrame(in))
 	if !strings.Contains(got, "FAILED at partitioning") {
 		t.Errorf("header should name the failing phase:\n%s", got)
 	}
@@ -245,7 +245,7 @@ func TestFrame_ErrorCauseSurvivesLongHistory(t *testing.T) {
 		spinner:    "⠙",
 		now:        now,
 	}
-	got := renderFrame(in)
+	got := plain(renderFrame(in))
 	if !strings.Contains(got, "partitioning failed: sgdisk exit 2") {
 		t.Errorf("failure cause must survive a long log history (it was tailed off the top):\n%s", got)
 	}
@@ -298,7 +298,7 @@ func TestFrame_LongPhaseNamesNotEllipsized(t *testing.T) {
 	// every width that clears the gate.
 	for _, w := range []int{minTermCols, 140, 200} {
 		in.width = w
-		got := renderFrame(in)
+		got := plain(renderFrame(in))
 		if !strings.Contains(got, "installing_bootloader") {
 			t.Errorf("width %d: installing_bootloader truncated/missing:\n%s", w, got)
 		}
@@ -329,7 +329,7 @@ func TestFrame_LongPhaseNamesNotEllipsized(t *testing.T) {
 func TestFrame_PanesFillWidth(t *testing.T) {
 	for _, w := range []int{minTermCols, 140, 200, 250} {
 		in := midDeployFrame(w, minRows)
-		got := renderFrame(in)
+		got := plain(renderFrame(in))
 		lines := strings.Split(got, "\n")
 		// The widest rendered row must reach the usable width (width-1; the frame
 		// budgets to width-1 to avoid cursor auto-wrap). Below the minimum the
@@ -378,7 +378,7 @@ func TestFrame_NoAutoWrapAtMinWidth(t *testing.T) {
 			spinner:   "⠙",
 			now:       fixedClock(at(time.Minute)),
 		}
-		got := renderFrame(in)
+		got := plain(renderFrame(in))
 		if strings.Contains(got, "enlarge") {
 			t.Fatalf("%s: width %d should clear the gate, got the placeholder:\n%s", opType, minW, got)
 		}
@@ -403,7 +403,7 @@ func TestFrame_WorkerNotTruncatedWhenWide(t *testing.T) {
 	const longWorker = "site-worker-2.a-long-subdomain.internal.example.net"
 	in := midDeployFrame(220, minRows)
 	in.worker = longWorker
-	got := renderFrame(in)
+	got := plain(renderFrame(in))
 	if !strings.Contains(got, longWorker) {
 		t.Errorf("wide terminal should render the full worker hostname %q:\n%s", longWorker, got)
 	}
@@ -413,7 +413,7 @@ func TestFrame_WorkerNotTruncatedWhenWide(t *testing.T) {
 func TestFrame_Success(t *testing.T) {
 	in := midDeployFrame(minTermCols, minRows)
 	in.done = true
-	got := renderFrame(in)
+	got := plain(renderFrame(in))
 	if !strings.Contains(got, "completed in") {
 		t.Errorf("success header missing:\n%s", got)
 	}
@@ -432,7 +432,7 @@ func TestHeader_ElapsedNeverTruncated(t *testing.T) {
 	in.command = "machine deploy a-really-long-machine-hostname.internal.site2.example.net --destructive --some-extra-flag"
 	for _, w := range []int{minTermCols, 130, 160, 200} {
 		in.width = w
-		hdr := headerLine(renderFrame(in))
+		hdr := headerLine(plain(renderFrame(in)))
 		// elapsed in midDeployFrame is 1m17s; the whole token must be present.
 		if !strings.Contains(hdr, "elapsed 1m17s") {
 			t.Errorf("width %d: elapsed truncated/missing from header:\n%q", w, hdr)
@@ -468,14 +468,14 @@ func TestHeader_GlobalSpinner(t *testing.T) {
 		spinner:   "⠙",
 		now:       fixedClock(at(2 * time.Minute)),
 	}
-	hdr := headerLine(renderFrame(in))
+	hdr := headerLine(plain(renderFrame(in)))
 	if !strings.Contains(hdr, "⠙") {
 		t.Errorf("non-terminal header should carry the global spinner glyph:\n%q", hdr)
 	}
 
 	// Terminal success: lead is ✓, no spinner.
 	in.done = true
-	hdr = headerLine(renderFrame(in))
+	hdr = headerLine(plain(renderFrame(in)))
 	if strings.Contains(hdr, "⠙") {
 		t.Errorf("terminal header should not show the spinner:\n%q", hdr)
 	}
@@ -491,7 +491,7 @@ func TestHeader_GlobalSpinner(t *testing.T) {
 func TestSummary_LastUpdateAgo(t *testing.T) {
 	in := midDeployFrame(minTermCols, minRows)
 	in.lastEventAt = at(72 * time.Second) // last activity 5s before now (77s)
-	got := renderFrame(in)
+	got := plain(renderFrame(in))
 	if !strings.Contains(got, "update") {
 		t.Errorf("summary missing the last-update row:\n%s", got)
 	}
@@ -501,7 +501,7 @@ func TestSummary_LastUpdateAgo(t *testing.T) {
 
 	// No event yet -> em dash, not a bogus "0s ago".
 	in.lastEventAt = time.Time{}
-	got = renderFrame(in)
+	got = plain(renderFrame(in))
 	if strings.Contains(got, "ago") {
 		t.Errorf("with no event observed, last-update should be '—', not an age:\n%s", got)
 	}
