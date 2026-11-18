@@ -13,9 +13,9 @@ require (
 	github.com/bluesky-social/beyond v0.0.0-20260820152054-e0927a9f4341
 	github.com/bmc-toolbox/bmclib/v2 v2.3.5
 	github.com/bmc-toolbox/common v0.0.1
-	github.com/charmbracelet/bubbletea v1.3.10
-	github.com/charmbracelet/huh v1.0.0
-	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
+	github.com/charmbracelet/bubbletea/v2 v2.1.1
+	github.com/charmbracelet/huh/v2 v2.0.3
+	github.com/charmbracelet/lipgloss/v2 v2.1.1
 	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/charmbracelet/x/vt v0.0.0-20260527151214-009e6338d40d
 	github.com/coder/websocket v1.8.15
