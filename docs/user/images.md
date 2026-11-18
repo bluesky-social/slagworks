@@ -122,9 +122,11 @@ smoke or a real-hardware deploy attempt.
 package lists. Comments and inline `# why` annotations are stripped
 before being handed to `apt-get`.
 
-The apt mirror is pinned to the regional EC2 Ubuntu mirror
-(`https://us-east-2.ec2.archive.ubuntu.com/ubuntu`) for build speed;
-`apt-snapshot.txt` is informational only. Reproducibility is preserved
+Packages come from `http://archive.ubuntu.com/ubuntu` unless
+`SLAGWORKS_APT_MIRROR` names another mirror. Set it to one close to the
+build host: the build downloads several hundred packages, and the same
+mirror is written into the image's `sources.list`, so deployed machines
+use it too. `apt-snapshot.txt` is informational only. Reproducibility is preserved
 at the output layer: every build produces a content-addressed tarball
 pinned in object storage, so "rebuild the same image" means downloading
 that tarball, not re-running the build.
