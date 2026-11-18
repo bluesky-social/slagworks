@@ -60,6 +60,10 @@ check-cli-docs:
     diff -q /tmp/slagctl-reference-check.md docs/user/slagctl-reference.md \
       || { echo "slagctl reference is stale: run 'just gen-cli-docs' and commit"; exit 1; }
 
+# Regenerate THIRD-PARTY-LICENSES.md from vendor/ (run after any dependency change)
+gen-licenses:
+    go run ./scripts/licenses
+
 # Build the PXE+squashfs image (requires Linux host or Docker).
 # SLAGWORKS_RECOVERY_AUTHORIZED_KEYS must name the recovery sshd's keys file.
 image-build:

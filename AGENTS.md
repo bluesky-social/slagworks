@@ -35,6 +35,7 @@ other contributors' rebases and operators' upgrades fail loudly.
 | `just lint` | golangci-lint |
 | `just build` | Compile check |
 | `just gen-cli-docs` | Regenerate `docs/user/slagctl-reference.md` |
+| `just gen-licenses` | Regenerate `THIRD-PARTY-LICENSES.md` from `vendor/` |
 
 Run `just --list` for the full set.
 

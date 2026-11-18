@@ -102,6 +102,7 @@ just test                  # Unit + component tests
 just lint                  # golangci-lint
 just build                 # Compile check
 just gen-cli-docs          # Regenerate docs/user/slagctl-reference.md
+just gen-licenses          # Regenerate THIRD-PARTY-LICENSES.md after a dependency change
 ```
 
 Full-stack QEMU integration tests run in CI on GitHub-hosted runners; see [docs/dev/testing.md](docs/dev/testing.md) for the tiers and how
