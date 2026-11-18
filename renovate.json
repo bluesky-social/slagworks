@@ -15,11 +15,12 @@
       "enabled": false
     },
     {
-      "description": "bubbletea, huh and lipgloss v2 depend on each other and need one code migration, so their major updates arrive as one pull request.",
+      "description": "bubbletea, huh and lipgloss (charm.land since v2) depend on each other and need one code migration, so their major updates arrive as one pull request.",
       "matchManagers": [
         "gomod"
       ],
       "matchPackageNames": [
+        "charm.land/**",
         "github.com/charmbracelet/**"
       ],
       "matchUpdateTypes": [

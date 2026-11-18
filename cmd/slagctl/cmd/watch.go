@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -38,7 +38,7 @@ func watchable(cmd *cobra.Command) *cobra.Command {
 			return watchPlainList(c.Context(), fetch)
 		}
 		m := newListWatchModel(fetch)
-		p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(c.Context()))
+		p := tea.NewProgram(m, tea.WithContext(c.Context()))
 		_, err := p.Run()
 		return err
 	}
@@ -89,8 +89,8 @@ func (m listWatchModel) Init() tea.Cmd {
 
 func (m listWatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		if msg.Type == tea.KeyCtrlC || msg.String() == "q" {
+	case tea.KeyPressMsg:
+		if msg.String() == "ctrl+c" || msg.String() == "q" {
 			return m, tea.Quit
 		}
 	case listFetchedMsg:
@@ -107,17 +107,20 @@ func (m listWatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m listWatchModel) View() string {
+func (m listWatchModel) View() tea.View {
 	ts := "..."
 	if !m.updated.IsZero() {
 		ts = m.updated.Format("15:04:05")
 	}
 	header := fmt.Sprintf("Every %.0fs — %s  (q to quit)\n\n",
 		watchInterval.Seconds(), ts)
+	body := m.content
 	if m.fetchErr != nil {
-		return header + fmt.Sprintf("error: %v\n", m.fetchErr)
+		body = fmt.Sprintf("error: %v\n", m.fetchErr)
 	}
-	return header + m.content
+	v := tea.NewView(header + body)
+	v.AltScreen = true
+	return v
 }
 
 func listDoFetch(fetch func() (string, error)) tea.Cmd {

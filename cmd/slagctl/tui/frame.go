@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 
@@ -90,9 +90,11 @@ func lifecycleColW(opType model.OperationType) int {
 // only the side boxes would make the console text flush while everything else
 // is inset, which reads worse than a consistent flush layout, so nothing pads.
 func box(title, content string, innerW int) string {
-	rendered := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		Width(innerW).
+	style := lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
+	// Lip Gloss sizes the whole block, border included, so add the border cells
+	// to the inner width.
+	rendered := style.
+		Width(innerW + style.GetHorizontalBorderSize()).
 		Render(content)
 	return embedTitle(rendered, title)
 }
@@ -164,8 +166,8 @@ var staticWeights = []int{15, 25, 30, 20, 10}
 // so it flickers in a live TUI — the 10Hz heartbeat advances now each frame and
 // re-rolls the snow — but a test's fixed clock pins the seed, keeping golden
 // snapshots byte-stable. Colored dim-gray via styleDim so it reads as snow on a
-// TTY and strips to plain block chars on a non-TTY (golden-safe, like the rest
-// of the palette).
+// color terminal; the color is a wrap around plain block chars, so the
+// ANSI-stripped golden pins the snow itself (like the rest of the palette).
 func staticScreen(now time.Time, w, h int) string {
 	r := rand.New(rand.NewSource(now.UnixNano())) //nolint:gosec // G404: TV-snow animation seed, not a security context; deterministic seeding is required for golden-snapshot tests
 	var total int

@@ -84,19 +84,17 @@ Counts (vendored Go modules):
 - gopkg.in/yaml.v2
 
 #### MIT
-- github.com/aymanbagabas/go-osc52/v2
+- charm.land/bubbles/v2
+- charm.land/bubbletea/v2
+- charm.land/huh/v2
+- charm.land/lipgloss/v2
 - github.com/beorn7/perks
 - github.com/catppuccin/go
 - github.com/cenkalti/backoff/v5
 - github.com/cespare/xxhash/v2
-- github.com/charmbracelet/bubbles
-- github.com/charmbracelet/bubbletea
 - github.com/charmbracelet/colorprofile
-- github.com/charmbracelet/huh
-- github.com/charmbracelet/lipgloss
 - github.com/charmbracelet/ultraviolet
 - github.com/charmbracelet/x/ansi
-- github.com/charmbracelet/x/cellbuf
 - github.com/charmbracelet/x/exp/ordered
 - github.com/charmbracelet/x/exp/strings
 - github.com/charmbracelet/x/term
@@ -107,7 +105,6 @@ Counts (vendored Go modules):
 - github.com/clipperhouse/uax29/v2
 - github.com/creack/pty
 - github.com/dustin/go-humanize
-- github.com/erikgeiser/coninput
 - github.com/felixge/httpsnoop
 - github.com/glebarez/sqlite/License
 - github.com/jackc/pgpassfile
@@ -132,9 +129,7 @@ Counts (vendored Go modules):
 - github.com/mfridman/interpolate
 - github.com/Microsoft/go-winio
 - github.com/mitchellh/hashstructure/v2
-- github.com/muesli/ansi
 - github.com/muesli/cancelreader
-- github.com/muesli/termenv
 - github.com/ncruces/go-strftime
 - github.com/pin/tftp/v3
 - github.com/pressly/goose/v3
