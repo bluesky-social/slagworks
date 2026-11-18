@@ -47,18 +47,15 @@ Counts (vendored Go modules):
 - github.com/aws/smithy-go
 - github.com/bmc-toolbox/bmclib/v2
 - github.com/bmc-toolbox/common
-- github.com/containerd/continuity
 - github.com/containerd/errdefs
 - github.com/containerd/errdefs/pkg
 - github.com/coreos/go-oidc/v3
 - github.com/distribution/reference
-- github.com/docker/cli
 - github.com/docker/go-connections
 - github.com/docker/go-units
 - github.com/go-jose/go-jose/v4
 - github.com/go-logr/logr
 - github.com/go-logr/stdr
-- github.com/google/shlex
 - github.com/inconshreveable/mousetrap
 - github.com/jacobweinstock/iamt/internal/wsman
 - github.com/jacobweinstock/registrar
@@ -66,12 +63,9 @@ Counts (vendored Go modules):
 - github.com/moby/docker-image-spec
 - github.com/moby/moby/api
 - github.com/moby/moby/client
-- github.com/moby/sys/user
-- github.com/moby/term
 - github.com/opencontainers/go-digest
 - github.com/opencontainers/image-spec
-- github.com/opencontainers/runc
-- github.com/ory/dockertest/v3
+- github.com/ory/dockertest/v4
 - github.com/prometheus/client_golang
 - github.com/prometheus/client_model
 - github.com/prometheus/common
@@ -81,9 +75,6 @@ Counts (vendored Go modules):
 - github.com/VictorLowther/simplexml
 - github.com/VictorLowther/soap
 - github.com/vishvananda/netns
-- github.com/xeipuuv/gojsonpointer
-- github.com/xeipuuv/gojsonreference
-- github.com/xeipuuv/gojsonschema
 - go.opentelemetry.io/auto/sdk
 - go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp
 - go.opentelemetry.io/otel
@@ -94,10 +85,9 @@ Counts (vendored Go modules):
 
 #### MIT
 - github.com/aymanbagabas/go-osc52/v2
-- github.com/Azure/go-ansiterm
 - github.com/beorn7/perks
 - github.com/catppuccin/go
-- github.com/cenkalti/backoff/v4
+- github.com/cenkalti/backoff/v5
 - github.com/cespare/xxhash/v2
 - github.com/charmbracelet/bubbles
 - github.com/charmbracelet/bubbletea
@@ -120,7 +110,6 @@ Counts (vendored Go modules):
 - github.com/erikgeiser/coninput
 - github.com/felixge/httpsnoop
 - github.com/glebarez/sqlite/License
-- github.com/go-viper/mapstructure/v2
 - github.com/jackc/pgpassfile
 - github.com/jackc/pgservicefile
 - github.com/jackc/pgx/v5
@@ -151,13 +140,11 @@ Counts (vendored Go modules):
 - github.com/pressly/goose/v3
 - github.com/rivo/uniseg
 - github.com/satori/go.uuid
-- github.com/sirupsen/logrus
 - github.com/valyala/bytebufferpool
 - github.com/valyala/fasttemplate
 - github.com/xo/terminfo
 - go.uber.org/multierr
 - go.yaml.in/yaml/v2
-- go.yaml.in/yaml/v3
 - gopkg.in/yaml.v2
 - gorm.io/driver/postgres/License
 - gorm.io/gorm
@@ -175,8 +162,6 @@ Counts (vendored Go modules):
 - github.com/google/uuid
 - github.com/insomniacslk/dhcp
 - github.com/munnerz/goautoneg
-- github.com/Nvveen/Gotty
-- github.com/ory/dockertest/v3/docker
 - github.com/pierrec/lz4/v4
 - github.com/pkg/errors
 - github.com/prometheus/client_golang/internal/github.com/golang/gddo
