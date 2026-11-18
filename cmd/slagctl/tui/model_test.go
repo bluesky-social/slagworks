@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
@@ -26,6 +26,11 @@ func newTestModel(now func() time.Time) *tuiModel {
 	m := newModel(model.OpDeploy, "kworker-l34-1.pop1", "8b2e3f1a", time.UTC, now)
 	m = send(m, tea.WindowSizeMsg{Width: minTermCols, Height: minRows})
 	return m
+}
+
+// viewText is the visible text of the model's rendered View.
+func viewText(m *tuiModel) string {
+	return plain(m.View().Content)
 }
 
 // TestModel_MidDeployFrame drives the model with the same scripted phase /
@@ -68,7 +73,7 @@ func TestModel_MidDeployFrame(t *testing.T) {
 			"slagworks-agent: storage layout planned (12 commands)\r\n" +
 			"Creating new GPT entries in memory.\r\n")})
 
-	view := m.View()
+	view := viewText(m)
 	if !strings.Contains(view, spinnerFrames[0]+" partitioning") {
 		t.Errorf("current phase missing from View:\n%s", view)
 	}
@@ -95,7 +100,7 @@ func TestModel_CatchUpPlaceholder(t *testing.T) {
 	m := newTestModel(fixedClock(at(time.Second)))
 	// Fresh model assumes a backfill until told otherwise: catchingUp=true.
 	m = send(m, consoleBatchMsg{data: []byte("partial boot output"), fromBackfill: true})
-	view := m.View()
+	view := viewText(m)
 	if !strings.Contains(view, "catching up") {
 		t.Errorf("expected catch-up placeholder during backfill:\n%s", view)
 	}
@@ -109,7 +114,7 @@ func TestModel_CatchUpPlaceholder(t *testing.T) {
 
 	// Live edge reached and buffer drained -> placeholder clears.
 	m = send(m, consoleBackfillDoneMsg{})
-	view = m.View()
+	view = viewText(m)
 	if strings.Contains(view, "catching up") {
 		t.Errorf("placeholder should clear once backfill done + drained:\n%s", view)
 	}
@@ -140,7 +145,7 @@ func TestModel_CommissionAwaitingReport(t *testing.T) {
 		m = send(m, phaseMsg{phase: p.name, at: at(p.d)})
 	}
 
-	view := m.View()
+	view := viewText(m)
 	if !strings.Contains(view, "awaiting agent report") {
 		t.Errorf("summary should surface awaiting-agent-report state:\n%s", view)
 	}
@@ -255,8 +260,8 @@ func TestModel_TerminalSuccessNonInteractiveExits(t *testing.T) {
 	if cmd == nil {
 		t.Error("non-interactive success should auto-exit (Quit cmd)")
 	}
-	if !strings.Contains(m.View(), "completed in") {
-		t.Errorf("success header missing:\n%s", m.View())
+	if !strings.Contains(viewText(m), "completed in") {
+		t.Errorf("success header missing:\n%s", viewText(m))
 	}
 }
 
@@ -289,7 +294,7 @@ func TestModel_TerminalFailureHolds(t *testing.T) {
 	if cmd != nil {
 		t.Error("holdOnTerminal failure should hold (no auto-Quit)")
 	}
-	view := m.View()
+	view := viewText(m)
 	if !strings.Contains(view, "FAILED at partitioning") {
 		t.Errorf("failure header missing failing phase:\n%s", view)
 	}
@@ -354,8 +359,8 @@ func TestModel_ElapsedAdvancesOnHeartbeat(t *testing.T) {
 	m.startedAt = at(0)
 
 	clockT = at(2*time.Minute + 44*time.Second)
-	if !strings.Contains(m.View(), "elapsed 2m44s") {
-		t.Fatalf("setup: expected elapsed 2m44s:\n%s", m.View())
+	if !strings.Contains(viewText(m), "elapsed 2m44s") {
+		t.Fatalf("setup: expected elapsed 2m44s:\n%s", viewText(m))
 	}
 	// Heartbeat fires with the clock advanced 10s and NO other message; the
 	// heartbeat must reschedule (keeping the loop alive) and the rendered
@@ -365,8 +370,8 @@ func TestModel_ElapsedAdvancesOnHeartbeat(t *testing.T) {
 	if cmd == nil {
 		t.Error("heartbeat must reschedule while running, or elapsed freezes")
 	}
-	if !strings.Contains(m.View(), "elapsed 2m54s") {
-		t.Errorf("elapsed should advance on the heartbeat with no other input:\n%s", m.View())
+	if !strings.Contains(viewText(m), "elapsed 2m54s") {
+		t.Errorf("elapsed should advance on the heartbeat with no other input:\n%s", viewText(m))
 	}
 }
 
@@ -536,8 +541,8 @@ func TestModel_FrozenClockOnDone(t *testing.T) {
 	m = send(m, opTerminalMsg{failed: false, at: at(2 * time.Minute)})
 	// Advance the wall clock well past endTime; the frame must still read 2m0s.
 	clockT = at(10 * time.Minute)
-	if !strings.Contains(m.View(), "2m0s") {
-		t.Errorf("elapsed should freeze at endTime (2m0s):\n%s", m.View())
+	if !strings.Contains(viewText(m), "2m0s") {
+		t.Errorf("elapsed should freeze at endTime (2m0s):\n%s", viewText(m))
 	}
 }
 
@@ -569,7 +574,7 @@ func TestModel_ElapsedAnchorsOnOpStart(t *testing.T) {
 	m = send(m, phaseMsg{phase: "pxe_booting", at: at(2 * time.Second)})
 	m = send(m, phaseMsg{phase: "dhcp_ack", at: at(3*time.Minute + 51*time.Second)})
 
-	view := m.View()
+	view := viewText(m)
 
 	// The finalized pxe_booting phase shows 3m49s.
 	if !strings.Contains(view, "3m49s") {
@@ -613,10 +618,10 @@ func isQuit(cmd tea.Cmd) bool {
 func TestModel_Quit(t *testing.T) {
 	for _, key := range []struct {
 		name string
-		msg  tea.KeyMsg
+		msg  tea.KeyPressMsg
 	}{
-		{"q", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")}},
-		{"ctrl+c", tea.KeyMsg{Type: tea.KeyCtrlC}},
+		{"q", tea.KeyPressMsg{Code: 'q', Text: "q"}},
+		{"ctrl+c", tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}},
 	} {
 		m := newTestModel(fixedClock(at(time.Second)))
 		_, cmd := m.Update(key.msg)
@@ -633,16 +638,16 @@ func TestModel_Quit(t *testing.T) {
 func TestModel_QuitWorksAtSmallSize(t *testing.T) {
 	for _, key := range []struct {
 		name string
-		msg  tea.KeyMsg
+		msg  tea.KeyPressMsg
 	}{
-		{"q", tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")}},
-		{"ctrl+c", tea.KeyMsg{Type: tea.KeyCtrlC}},
+		{"q", tea.KeyPressMsg{Code: 'q', Text: "q"}},
+		{"ctrl+c", tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl}},
 	} {
 		m := newModel(model.OpDeploy, "kworker-l34-1.pop1", "8b2e3f1a", time.UTC, fixedClock(at(time.Second)))
 		// Below the minimum: the View is the enlarge placeholder.
 		m = send(m, tea.WindowSizeMsg{Width: 80, Height: 24})
-		if !strings.Contains(m.View(), "enlarge") {
-			t.Fatalf("setup: expected the small-terminal placeholder:\n%s", m.View())
+		if !strings.Contains(viewText(m), "enlarge") {
+			t.Fatalf("setup: expected the small-terminal placeholder:\n%s", viewText(m))
 		}
 		_, cmd := m.Update(key.msg)
 		if !isQuit(cmd) {
@@ -661,20 +666,20 @@ func TestModel_ResizeRecoversFromSmall(t *testing.T) {
 
 	// Too small: enlarge placeholder, no 3-pane layout.
 	m = send(m, tea.WindowSizeMsg{Width: 80, Height: 24})
-	if !strings.Contains(m.View(), "enlarge") {
-		t.Fatalf("below the minimum should show the enlarge placeholder:\n%s", m.View())
+	if !strings.Contains(viewText(m), "enlarge") {
+		t.Fatalf("below the minimum should show the enlarge placeholder:\n%s", viewText(m))
 	}
-	if strings.Contains(m.View(), "serial console") {
-		t.Fatalf("below the minimum should not draw the 3-pane layout:\n%s", m.View())
+	if strings.Contains(viewText(m), "serial console") {
+		t.Fatalf("below the minimum should not draw the 3-pane layout:\n%s", viewText(m))
 	}
 
 	// Resize past the gate: the layout must appear, placeholder gone.
 	m = send(m, tea.WindowSizeMsg{Width: minTermCols, Height: minRows})
-	if strings.Contains(m.View(), "enlarge") {
-		t.Errorf("after a resize past the minimum the enlarge placeholder must be gone:\n%s", m.View())
+	if strings.Contains(viewText(m), "enlarge") {
+		t.Errorf("after a resize past the minimum the enlarge placeholder must be gone:\n%s", viewText(m))
 	}
-	if !strings.Contains(m.View(), "serial console") {
-		t.Errorf("after a resize past the minimum the 3-pane layout must render:\n%s", m.View())
+	if !strings.Contains(viewText(m), "serial console") {
+		t.Errorf("after a resize past the minimum the 3-pane layout must render:\n%s", viewText(m))
 	}
 }
 
@@ -690,7 +695,7 @@ func TestModel_TerminalStateIsUnambiguous(t *testing.T) {
 	m = send(m, phaseMsg{phase: "partitioning", at: at(30 * time.Second)})
 	m = send(m, opTerminalMsg{failed: true, reason: "sgdisk exit 2 (device busy?)", at: at(2 * time.Minute)})
 
-	v := m.View()
+	v := viewText(m)
 	if !strings.Contains(v, "FAILED at partitioning") {
 		t.Errorf("terminal failure frame must name the failed phase unambiguously:\n%s", v)
 	}
@@ -712,40 +717,41 @@ func TestModel_ReconnectBanner(t *testing.T) {
 	m := newTestModel(fixedClock(at(time.Second)))
 	m = send(m, consoleBackfillDoneMsg{})
 	m = send(m, consoleReconnectMsg{reconnecting: true})
-	if !strings.Contains(m.View(), "reconnecting") {
-		t.Errorf("reconnect banner missing:\n%s", m.View())
+	if !strings.Contains(viewText(m), "reconnecting") {
+		t.Errorf("reconnect banner missing:\n%s", viewText(m))
 	}
 	m = send(m, consoleReconnectMsg{reconnecting: false})
-	if strings.Contains(m.View(), "reconnecting") {
-		t.Errorf("reconnect banner should clear:\n%s", m.View())
+	if strings.Contains(viewText(m), "reconnecting") {
+		t.Errorf("reconnect banner should clear:\n%s", viewText(m))
 	}
 }
 
 // TestModel_IgnoresMouse guards the invariant that justifies running the
-// program WITHOUT tea.WithMouseCellMotion(): the reducer consumes no
-// mouse input, so capturing the mouse buys nothing and only breaks native
-// terminal text selection. A mouse event must be an inert no-op — no Quit, no
-// observable state change in the rendered view. If a future change starts
-// handling mouse events (e.g. drag-scroll), this test will fail,
-// flagging that mouse capture must be reintroduced (behind a keybind toggle)
-// alongside the handler.
-//
-// Note: we assert on the model's behavior, not on the tea.Program option slice
-// directly. tea.ProgramOption is an opaque func(*Program) whose effect lands in
-// unexported Program state with no public getter, so "mouse capture is absent"
-// is not assertable through bubbletea's public API. The behavioral invariant
-// here is the load-bearing contract anyway.
+// program WITHOUT mouse capture: the reducer consumes no mouse input, so
+// capturing the mouse buys nothing and only breaks native terminal text
+// selection. The View must request the alt-screen and no mouse mode, and a
+// mouse event must be an inert no-op — no Quit, no observable state change in
+// the rendered view. If a future change starts handling mouse events (e.g.
+// drag-scroll), this test will fail, flagging that mouse capture must be
+// reintroduced (behind a keybind toggle) alongside the handler.
 func TestModel_IgnoresMouse(t *testing.T) {
 	m := newTestModel(fixedClock(at(time.Second)))
-	before := m.View()
-	next, cmd := m.Update(tea.MouseMsg{Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft})
+	v := m.View()
+	if !v.AltScreen {
+		t.Error("View must request the alt-screen")
+	}
+	if v.MouseMode != tea.MouseModeNone {
+		t.Errorf("View must not capture the mouse (MouseMode = %v): it breaks native text selection", v.MouseMode)
+	}
+	before := v.Content
+	next, cmd := m.Update(tea.MouseMotionMsg{Button: tea.MouseLeft})
 	// Do not invoke cmd here: a tea.Cmd is a func() tea.Msg that may block
 	// (timers, I/O). This branch only runs when the test is already failing, so
 	// flag the regression without executing the stray command.
 	if cmd != nil {
 		t.Errorf("mouse event should produce no command, got a non-nil tea.Cmd")
 	}
-	if got := next.(*tuiModel).View(); got != before {
+	if got := next.(*tuiModel).View().Content; got != before {
 		t.Errorf("mouse event must not change the rendered view\nbefore:\n%s\nafter:\n%s", before, got)
 	}
 }
