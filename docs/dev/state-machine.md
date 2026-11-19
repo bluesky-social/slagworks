@@ -300,6 +300,11 @@ invoked by the site worker's WebSocket RPC (`ws/messages.go:197`
 `ClaimOpMsg`; hub side `ws/hub.go:962` `handleClaimOp`; client side
 `internal/worker/wsconn.go:200` `ClaimOp`).
 
+Before the store call, the hub reads the op and declines the claim
+(answering `already_claimed`, writing nothing) when the op's machine is not
+in the claiming worker's site, or when the PDU-outlet self-power interlock
+refuses this worker. See [Op transport](#op-transport-the-op-event-stream-tier-2-phase-2).
+
 The store implementation:
 
 - Locks the operation row `FOR UPDATE` (`store.go:377`), then locks
@@ -462,7 +467,10 @@ Confidentiality scoping: `Operation.Params` carries per-site credentials
 (BMC/PDU passwords, tailnet auth keys), so `op_delta` and `op_resync` are
 slug-scoped — the hub sends them only to workers whose cached per-slug
 snapshot contains the op's machine (`Hub.machineInSlug`), preserving the
-pre-cutover baseline where ops rode the per-slug snapshot. `op_removed`
+pre-cutover baseline where ops rode the per-slug snapshot. The claim reply
+carries the op too, so `handleClaimOp` applies the same check before the
+claim CAS: a `claim_op` for an op whose machine is not in the worker's
+snapshot is answered `already_claimed` and the op stays pending. `op_removed`
 fans fleet-wide, unfiltered: it carries no params (no secrets) and must
 survive membership loss (a machine deleted from NetBox is in no snapshot,
 but its drift-failed op must still be dropped on the worker driving it).

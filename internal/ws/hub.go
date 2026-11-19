@@ -137,10 +137,11 @@ type OpClaimer interface {
 	ClaimOperation(opID uuid.UUID, workerID string) (*model.Operation, error)
 	// GetOperationIfExists reads an op row by ID, returning (nil, nil) when
 	// no row matches (never a not-found sentinel — keeps the ws package free
-	// of a gorm import). The P4b outlet-op interlock reads the pending op's
-	// Params (PDURuntime.Outlet/DownstreamSerial/AllowSelf) and Type BEFORE
-	// the claim CAS to decide eligibility. This is a plain read outside any
-	// txn — the eligibility gate holds no DB lock (see handleClaimOp). A real
+	// of a gorm import). handleClaimOp reads the pending op BEFORE the claim
+	// CAS: its MachineID for the site-scope gate, and its Params
+	// (PDURuntime.Outlet/DownstreamSerial/AllowSelf) and Type for the P4b
+	// outlet-op interlock. This is a plain read outside any txn — the gates
+	// hold no DB lock (see handleClaimOp). A real
 	// store error (nil, err) fails the claim CLOSED: nothing is granted and
 	// the worker gets a retryable rpc error. *store.Store satisfies it.
 	GetOperationIfExists(opID uuid.UUID) (*model.Operation, error)
@@ -156,9 +157,9 @@ func (noopOpClaimer) ClaimOperation(_ uuid.UUID, _ string) (*model.Operation, er
 }
 
 // GetOperationIfExists on the noop claimer returns (nil, nil): no op found,
-// so the interlock treats it as a non-outlet op and lets the claim proceed
-// to the (noop) CAS, which returns already-claimed. Tests that exercise the
-// interlock wire a real/fake claimer.
+// so both pre-CAS gates let the claim proceed to the (noop) CAS, which
+// returns already-claimed. Tests that exercise the gates wire a real/fake
+// claimer.
 func (noopOpClaimer) GetOperationIfExists(_ uuid.UUID) (*model.Operation, error) {
 	return nil, nil
 }
@@ -1652,7 +1653,9 @@ func (c *workerConn) handleCastResume(parent context.Context, env Envelope) {
 //
 // Response shape:
 //   - success: rpc_response{ data: {operation: <op>} }
-//   - already-claimed (store returned nil/nil):
+//   - already-claimed (store returned nil/nil, or a pre-CAS gate
+//     declined: the op's machine is not in this worker's site, or the
+//     outlet interlock refused this worker):
 //     rpc_response{ data: {already_claimed: true} } — structured,
 //     NOT an error, so the worker counts it as a lost race
 //     (metrics outcome "lost") instead of a claim failure.
@@ -1698,17 +1701,50 @@ func (c *workerConn) handleClaimOp(parent context.Context, env Envelope) {
 	defer cancel()
 	_ = ctx // store doesn't take ctx today; reserved for future deadline plumbing
 
+	// Both pre-CAS gates below decide from the op row, read once here with
+	// no db lock. A failed read is a hard error, not a decline: nothing is
+	// granted (fail-closed), and the worker rolls the op back to pending and
+	// retries, where already_claimed would make it drop an op that is still
+	// pending. A genuinely absent op (nil, nil) passes both gates and the CAS
+	// reports already-claimed.
+	row, err := c.hub.cfg.OpClaimer.GetOperationIfExists(opID)
+	if err != nil {
+		c.log.Warn("claim_op pre-claim read failed; claim not granted",
+			"op_id", opID, "worker_id", c.workerID, "err", err)
+		resp.Error = fmt.Sprintf("claim failed: read op before claim: %v; nothing was claimed, retry the claim", err)
+		return
+	}
+
+	// Site scope: a worker may claim only ops on its own site's machines.
+	// The claim reply carries the op's params unredacted, and those hold
+	// per-site credentials, so this is the op stream's confidentiality gate
+	// (machineInSlug, see PublishOpDelta) applied to the reply; it also stops
+	// a worker that cannot reach the machine from taking the op from the site
+	// that can. A correct worker never trips it: it claims only ops the
+	// slug-scoped op stream sent it. The decline answers already_claimed, as
+	// the interlock does, so the worker moves on and the op stays pending for
+	// its own site. Checking before the CAS leaves no race: an op's machine
+	// never changes.
+	if row != nil && !c.hub.machineInSlug(c.slug, row.MachineID) {
+		c.log.Warn("claim_op declined: the op's machine is not in this worker's site",
+			"op_id", opID, "machine_id", row.MachineID, "worker_id", c.workerID, "slug", c.slug)
+		out, mErr := json.Marshal(ClaimOpResponse{AlreadyClaimed: true})
+		if mErr != nil {
+			resp.Error = fmt.Sprintf("marshal response: %v", mErr)
+			return
+		}
+		resp.Data = out
+		return
+	}
+
 	// P4b self-power interlock: BEFORE the store CAS, decide whether THIS
 	// worker may serve THIS op. Only outlet ops (PDURuntime.Outlet==true) are
 	// gated; everything else passes through unaffected. A declined claim
 	// returns the SAME already-claimed response a lost race produces, so the
 	// worker moves on and the op stays pending for a partner (INV-3
-	// decline-not-handoff). The gate holds no db lock — it does a plain op
-	// read (params) + a registered-serial-set read. A failed read is a hard
-	// error, not a decline: nothing is granted (fail-closed), and the worker
-	// rolls the op back to pending and retries, where already_claimed would
-	// make it drop an op that is still pending.
-	eligible, reason, err := c.outletClaimEligible(opID)
+	// decline-not-handoff). Beyond the op read above, the gate does a
+	// registered-serial-set read; a failure there is a hard error too.
+	eligible, reason, err := c.outletClaimEligible(row)
 	if err != nil {
 		c.log.Warn("claim_op interlock read failed; claim not granted",
 			"op_id", opID, "worker_id", c.workerID, "err", err)
@@ -1771,25 +1807,20 @@ func (c *workerConn) handleClaimOp(parent context.Context, env Envelope) {
 }
 
 // outletClaimEligible is the workerConn-scoped wrapper around the P4b
-// interlock (outletClaimEligibility). It reads the pending op and, for an
-// outlet op, the registered site-worker serial set for this conn's slug, then
-// applies the eligibility invariants. Returns (eligible, reason, err); reason
-// is a log-only diagnostic when ineligible.
+// interlock (outletClaimEligibility). Given the op row handleClaimOp read, it
+// reads, for an outlet op, the registered site-worker serial set for this
+// conn's slug, then applies the eligibility invariants. Returns (eligible,
+// reason, err); reason is a log-only diagnostic when ineligible.
 //
-// A store failure on either read returns err, and the caller grants nothing
-// (a hard-AC-cut primitive must never fail open). It is deliberately not a
-// decline: the op read runs before the op is known to be an outlet op, and a
-// decline tells the worker another worker owns the op, so a transient store
-// error would strand every op type, deploys included. An err is answered as a
-// retryable rpc error instead. A genuinely-absent op (nil, nil from
-// GetOperationIfExists) is treated as eligible so the claim proceeds to the
-// CAS, which reports already-claimed — the interlock never fabricates a
-// decline for an op that simply raced away.
-func (c *workerConn) outletClaimEligible(opID uuid.UUID) (bool, string, error) {
-	op, err := c.hub.cfg.OpClaimer.GetOperationIfExists(opID)
-	if err != nil {
-		return false, "", fmt.Errorf("read op before claim: %w", err)
-	}
+// A store failure on that read returns err, and the caller grants nothing (a
+// hard-AC-cut primitive must never fail open). It is deliberately not a
+// decline: every worker on the slug would hit the same failing read, and a
+// decline tells the worker another worker owns the op, so the op would sit
+// pending with nothing left to claim it. An err is answered as a retryable
+// rpc error instead. A genuinely-absent op (nil) is treated as eligible so
+// the claim proceeds to the CAS, which reports already-claimed — the
+// interlock never fabricates a decline for an op that simply raced away.
+func (c *workerConn) outletClaimEligible(op *model.Operation) (bool, string, error) {
 	if op == nil {
 		// Op is gone; let the CAS report already-claimed.
 		return true, "", nil
