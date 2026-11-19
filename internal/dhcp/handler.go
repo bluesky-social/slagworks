@@ -528,6 +528,18 @@ func (h *Handler) HandlePacketOn(req *dhcpv4.DHCPv4, iface string) *dhcpv4.DHCPv
 
 	h.cfg.Metrics.countRequest(frameType)
 
+	// RFC 2131 / RFC 951: a server acts only on op=BOOTREQUEST. The socket
+	// layer hands over any datagram that parses, and option 53 alone does
+	// not make a packet a client request: answering an op=BOOTREPLY (or
+	// junk-op) DISCOVER would allocate a lease and emit an OFFER that the
+	// reply builder stamps op=BOOTREQUEST. Checked before the MAC filter
+	// because it holds on every segment, promiscuous or not.
+	if req.OpCode != dhcpv4.OpcodeBootRequest {
+		log.Warn("dropping DHCP packet that is not a BOOTREQUEST", "op", uint8(req.OpCode))
+		h.cfg.Metrics.drop(DropNotBootRequest)
+		return nil
+	}
+
 	view := h.viewForIface(iface)
 	if !view.pools.Promiscuous && h.cfg.KnownMACs != nil && !h.cfg.KnownMACs(mac.String()) {
 		log.Debug("dropping DHCP request from unregistered MAC")

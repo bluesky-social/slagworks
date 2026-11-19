@@ -69,6 +69,9 @@ a machine ever gets booted:
   `RangeStart` (reservations-only segment) still serves the full reservation
   set; a non-reserved MAC on such a segment gets no offer, which is what
   lets a slice-owning peer answer in an active/active split-pool cage.
+- **Client requests only.** A packet whose BOOTP op is not BOOTREQUEST is
+  dropped on every segment, whatever its option 53 says (RFC 2131), and
+  counted under the `not_bootrequest` drop reason.
 - **Known-MAC filter.** When a segment is non-promiscuous and `KnownMACs` is
   set, an unregistered MAC's DHCP is silently dropped at debug level
   (`handler.go:424-428`). A promiscuous segment (typical for OOB where you
