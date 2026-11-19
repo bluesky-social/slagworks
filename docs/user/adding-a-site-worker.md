@@ -21,12 +21,21 @@ The worker authenticates to global with a **per-worker bearer token**:
   its sha256 hash** in the `site_workers` Postgres table, and returns the
   plaintext **exactly once**.
 - The worker reads the plaintext from `SLAGWORKS_TOKEN` in
-  `/etc/slagworks/site.env`. The WS hub rejects a `hello` whose `worker_id`
+  `/etc/slagworks/site.env` and sends it in the WebSocket upgrade's
+  `Authorization: Bearer` header, never in the URL, so it stays out of
+  request and proxy logs. A proxy in front of global must pass that
+  header through. The WS hub rejects a `hello` whose `worker_id`
   doesn't match the registration the token was minted for.
 - Re-registering the same `(slug, worker_id)` pair **rotates** the token
   (mints a fresh one, invalidates the old). The plaintext is unrecoverable
   after mint — Postgres holds only the hash — so if you lose it, you
   re-register.
+- The token is as sensitive as the site's device credentials: global sends
+  a connected worker every operation for its site with the BMC, PDU, AMT
+  and monitor passwords and the tailnet auth key in it. When
+  `SLAGWORKS_OIDC_CREDENTIAL_GROUPS` is set, registering (and rotating)
+  needs one of those groups as well as an operator group, the same as
+  `slagctl machine creds`.
 
 Because the plaintext is shown once, persist it somewhere your config
 management can template it into `site.env` reproducibly (a secrets manager

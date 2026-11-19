@@ -239,3 +239,33 @@ func TestOperationStatusLabel(t *testing.T) {
 		}
 	}
 }
+
+// TestUntrusted pins how host-controlled text is made safe for the terminal:
+// every C0 control, DEL, C1 control and invalid UTF-8 byte becomes visible
+// text, a tab becomes a space, and printable text (Unicode included) passes
+// through unchanged.
+func TestUntrusted(t *testing.T) {
+	tests := []struct {
+		name, in, want string
+	}{
+		{"plain", "sgdisk --zap-all /dev/nvme0n1", "sgdisk --zap-all /dev/nvme0n1"},
+		{"empty", "", ""},
+		{"unicode", "exit 2 → retry «sdb» 界", "exit 2 → retry «sdb» 界"},
+		{"osc52 clipboard", "ok\x1b]52;c;cHduZWQ=\x07done", `ok\x1b]52;c;cHduZWQ=\x07done`},
+		{"osc8 hyperlink st", "\x1b]8;;http://x/\x1b\\click", `\x1b]8;;http://x/\x1b\click`},
+		{"csi erase", "a\x1b[2Jb", `a\x1b[2Jb`},
+		{"line breaks", "one\r\ntwo\n", `one\r\ntwo\n`},
+		{"tab", "a\tb", "a b"},
+		{"nul and del", "a\x00b\x7f", `a\x00b\x7f`},
+		{"c1 csi rune", "a\u009b2Jb", `a\u009b2Jb`},
+		{"c1 osc rune", "\u009d52;c;x\u009c", `\u009d52;c;x\u009c`},
+		{"invalid utf8 byte", "a\x9b2Jb\xff", `a\x9b2Jb\xff`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := format.Untrusted(tt.in); got != tt.want {
+				t.Errorf("Untrusted(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

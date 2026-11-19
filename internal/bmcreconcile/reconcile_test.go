@@ -30,10 +30,10 @@ func TestParseUserList(t *testing.T) {
 4   monitor          true    false      true       USER
 `,
 			want: []User{
-				{Slot: 1, Name: "", Privilege: PrivAdmin, Enabled: true},
-				{Slot: 2, Name: "ADMIN", Privilege: PrivAdmin, Enabled: true},
-				{Slot: 3, Name: "slagworks", Privilege: PrivOperator, Enabled: true},
-				{Slot: 4, Name: "monitor", Privilege: PrivUser, Enabled: true},
+				{Slot: 1, Name: "", Privilege: PrivAdmin, Enabled: true, LANAccess: false},
+				{Slot: 2, Name: "ADMIN", Privilege: PrivAdmin, Enabled: true, LANAccess: true},
+				{Slot: 3, Name: "slagworks", Privilege: PrivOperator, Enabled: true, LANAccess: true},
+				{Slot: 4, Name: "monitor", Privilege: PrivUser, Enabled: true, LANAccess: false},
 			},
 		},
 		{
@@ -43,8 +43,24 @@ func TestParseUserList(t *testing.T) {
 2   ADMIN            true    true       true       ADMINISTRATOR
 `,
 			want: []User{
-				{Slot: 1, Name: "", Privilege: 0, Enabled: false},
-				{Slot: 2, Name: "ADMIN", Privilege: PrivAdmin, Enabled: true},
+				{Slot: 1, Name: "", Privilege: 0, Enabled: false, LANAccess: false},
+				{Slot: 2, Name: "ADMIN", Privilege: PrivAdmin, Enabled: true, LANAccess: true},
+			},
+		},
+		{
+			// LANAccess needs all three channel-access columns true; each
+			// one false on its own clears it.
+			name: "channel access columns",
+			in: userListHeader +
+				userRow(3, "all-on", true, true, true, "USER") +
+				userRow(4, "callin-off", false, true, true, "USER") +
+				userRow(5, "linkauth-off", true, false, true, "USER") +
+				userRow(6, "ipmimsg-off", true, true, false, "USER"),
+			want: []User{
+				{Slot: 3, Name: "all-on", Privilege: PrivUser, Enabled: true, LANAccess: true},
+				{Slot: 4, Name: "callin-off", Privilege: PrivUser, Enabled: true, LANAccess: false},
+				{Slot: 5, Name: "linkauth-off", Privilege: PrivUser, Enabled: true, LANAccess: false},
+				{Slot: 6, Name: "ipmimsg-off", Privilege: PrivUser, Enabled: true, LANAccess: false},
 			},
 		},
 		{
@@ -60,9 +76,9 @@ func TestParseUserList(t *testing.T) {
 				ipmitoolUserRow(5, "", "true", "false", "false", "NO ACCESS"),
 			want: []User{
 				{Slot: 1, Name: "", Privilege: PrivAdmin, Enabled: true},
-				{Slot: 2, Name: "Administrator", Privilege: PrivAdmin, Enabled: true},
-				{Slot: 3, Name: "monitor", Privilege: PrivUser, Enabled: true},
-				{Slot: 4, Name: "ipmi-exporter-ro", Privilege: PrivOperator, Enabled: true},
+				{Slot: 2, Name: "Administrator", Privilege: PrivAdmin, Enabled: true, LANAccess: true},
+				{Slot: 3, Name: "monitor", Privilege: PrivUser, Enabled: true, LANAccess: true},
+				{Slot: 4, Name: "ipmi-exporter-ro", Privilege: PrivOperator, Enabled: true, LANAccess: true},
 				{Slot: 5, Name: "", Privilege: 0, Enabled: false},
 			},
 		},
@@ -304,6 +320,78 @@ func TestReconcile_WrongPriv_FixedInPlace_NoPasswordRewrite(t *testing.T) {
 	}
 }
 
+// userListHeader is the header of ipmitool's `user list` table, with the
+// columns at the offsets userRow prints them.
+const userListHeader = "ID  Name             Callin  Link Auth  IPMI Msg   Channel Priv Limit\n"
+
+// userRow renders one `user list` row the way ipmitool does
+// (lib/ipmi_user.c, dump_user_access: "%-4d%-17s%-8s%-11s%-11s%-s"), with
+// the Callin, Link Auth and IPMI Msg flags spelled out.
+func userRow(slot int, name string, callin, linkAuth, ipmiMsg bool, priv string) string {
+	return fmt.Sprintf("%-4d%-17s%-8t%-11t%-11t%-s\n", slot, name, callin, linkAuth, ipmiMsg, priv)
+}
+
+// TestReconcile_NoLANAccess_FixedInPlace_NoPasswordRewrite: an enabled
+// monitor at the right privilege whose channel-1 access is off (any of the
+// Callin, Link Auth and IPMI Msg columns false) cannot be used over the
+// LAN, which is where ipmi_exporter scrapes it. A run that stopped between
+// `user priv` and `channel setaccess` leaves exactly that row, and the
+// in-band reconcile (no Password, no Rotate) is what the next deploy runs.
+// It must re-apply priv/channel access/enabled in place, as for a wrong
+// privilege, without writing a password; it must not report the account
+// compliant on its privilege alone.
+func TestReconcile_NoLANAccess_FixedInPlace_NoPasswordRewrite(t *testing.T) {
+	cases := []struct {
+		name                     string
+		callin, linkAuth, ipmiOn bool
+	}{
+		{"link auth and ipmi msg off", true, false, false},
+		{"link auth off", true, false, true},
+		{"ipmi msg off", true, true, false},
+		{"callin off", false, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeIPMITool(t)
+			fake.queueOutput("user list 1", userListHeader+
+				userRow(1, "", true, false, false, "ADMINISTRATOR")+
+				userRow(2, "ADMIN", true, true, true, "ADMINISTRATOR")+
+				userRow(4, MonitorUser, tc.callin, tc.linkAuth, tc.ipmiOn, "USER"))
+			queueFixInPlace(fake)
+			fake.queueOutput("chassis bootparam set bootflag force_pxe options=PEF,timestamp,reset_persistence", "")
+			fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+
+			// The in-band deploy path's options (cmd/slagworks-agent
+			// inBandReconcileOptions): provision once, no Password or Rotate.
+			res, err := Reconcile(context.Background(), Options{
+				IPMITool:      fake.path,
+				IPMIInterface: "open",
+				Desired:       []DesiredUser{{Name: MonitorUser, Privilege: PrivUser}},
+				AdminUser:     "ADMIN",
+			})
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			calls := fake.calls()
+			for _, want := range []string{
+				"user priv 4 2 1",
+				"channel setaccess 1 4 callin=on ipmi=on link=on privilege=2",
+				"user enable 4",
+			} {
+				if countCalls(calls, want) != 1 {
+					t.Errorf("monitor without LAN channel access was treated as compliant: no %q; calls: %+v", want, calls)
+				}
+			}
+			if n := countCalls(calls, "user set password"); n != 0 {
+				t.Errorf("an enabled monitor keeps its working password; got %d password writes", n)
+			}
+			if len(res.CreatedOrUpdated) != 0 {
+				t.Errorf("no password was written, but CreatedOrUpdated = %+v", res.CreatedOrUpdated)
+			}
+		})
+	}
+}
+
 // TestReconcile_PartialCreate_DisabledUser_GetsFreshPassword guards the
 // partial-create recovery path: create does NO ACCESS -> set-name ->
 // set-password -> priv -> ENABLE, so a crash after set-name (but before the
@@ -510,6 +598,144 @@ func TestReconcile_LeftoverNameClearRefused_StillDisablesAll(t *testing.T) {
 	}
 	if got := strings.Join(res.NamesNotCleared, ","); got != "fwupd,maas" {
 		t.Errorf("NamesNotCleared = %q, want fwupd,maas", got)
+	}
+}
+
+// TestReconcile_NoEmptySlot_TakesOverLeftover: every non-reserved slot
+// holds a stray named account (maas, olduser), so there is no empty slot
+// for monitor. Reconcile must still converge: monitor takes over the first
+// leftover's slot and the other leftover is disabled as usual. The taken
+// slot is disabled and set to NO ACCESS before it is renamed, so a run
+// that dies before the password write leaves a slot `user list` shows as
+// disabled (re-provisioned next run), never one that reads as an enabled
+// `monitor` still carrying the stray's password. Reconcile used to refuse
+// with "need 1 free slots, found 0" before any write, on every run,
+// leaving both strays enabled.
+func TestReconcile_NoEmptySlot_TakesOverLeftover(t *testing.T) {
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "maas", "ADMINISTRATOR"},
+		[3]string{"4", "olduser", "OPERATOR"},
+	))
+	want := []string{
+		"user list 1",
+		"user disable 3",
+		"user priv 3 15 1",
+		"user set name 3 monitor",
+		"user set password 3 *",
+		"user priv 3 2 1",
+		"channel setaccess 1 3 callin=on ipmi=on link=on privilege=2",
+		"user enable 3",
+		"user disable 4",
+		"user set name 4 ",
+		"user list 1",
+	}
+	for _, cmd := range want[1 : len(want)-1] {
+		fake.queueOutput(cmd, "")
+	}
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "monitor", "USER"},
+		[3]string{"4", "", ""},
+	))
+
+	opt := RemoteOptions(LANTarget{Host: "192.0.2.10", Username: "ADMIN", Password: "adminpw!"}, "")
+	opt.IPMITool = fake.path
+	res, err := Reconcile(context.Background(), opt)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Name != MonitorUser || res.CreatedOrUpdated[0].Slot != 3 ||
+		len(res.CreatedOrUpdated[0].Password) != passwordLength {
+		t.Fatalf("expected monitor provisioned at slot 3 with a generated password, got %+v", res.CreatedOrUpdated)
+	}
+	if !slices.Equal(res.LeftoversDisabled, []string{"maas", "olduser"}) {
+		t.Errorf("LeftoversDisabled = %v, want [maas olduser]", res.LeftoversDisabled)
+	}
+	var got []string
+	for _, c := range fake.calls() {
+		cmd := strings.TrimPrefix(c.Args, "-I lanplus -H 192.0.2.10 -U ADMIN -C 17 -E ")
+		if strings.HasPrefix(cmd, "user set password 3 ") {
+			cmd = "user set password 3 *"
+		}
+		got = append(got, cmd)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("ipmitool calls:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestReconcile_TakeoverSparesDesiredAccounts: only leftovers are taken
+// over. A desired account that needs no write (slagworks, already
+// compliant at slot 3) is never a candidate, even though it comes first;
+// monitor takes the maas slot. With no leftover to take, reconcile refuses
+// before any write and names the account it has no slot for.
+func TestReconcile_TakeoverSparesDesiredAccounts(t *testing.T) {
+	desired := []DesiredUser{
+		{Name: "slagworks", Privilege: PrivOperator},
+		{Name: "monitor", Privilege: PrivUser},
+	}
+
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "slagworks", "OPERATOR"},
+		[3]string{"4", "maas", "ADMINISTRATOR"},
+	))
+	for _, cmd := range []string{
+		"user disable 4",
+		"user priv 4 15 1",
+		"user set name 4 monitor",
+		"user set password 4 *",
+		"user priv 4 2 1",
+		"channel setaccess 1 4 callin=on ipmi=on link=on privilege=2",
+		"user enable 4",
+	} {
+		fake.queueOutput(cmd, "")
+	}
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "slagworks", "OPERATOR"},
+		[3]string{"4", "monitor", "USER"},
+	))
+	res, err := Reconcile(context.Background(), Options{IPMITool: fake.path, Desired: desired, SkipBootOrder: true})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Slot != 4 {
+		t.Errorf("expected monitor provisioned at slot 4 (the maas slot), got %+v", res.CreatedOrUpdated)
+	}
+	if !slices.Equal(res.LeftoversDisabled, []string{"maas"}) {
+		t.Errorf("LeftoversDisabled = %v, want [maas]", res.LeftoversDisabled)
+	}
+	for _, c := range fake.calls() {
+		for _, slot3 := range []string{"user disable 3", "user set name 3", "user set password 3", "user priv 3", "setaccess 1 3", "user enable 3"} {
+			if strings.Contains(c.Args, slot3) {
+				t.Errorf("the compliant slagworks account at slot 3 must not be touched: %q", c.Args)
+			}
+		}
+	}
+
+	full := newFakeIPMITool(t)
+	full.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "slagworks", "OPERATOR"},
+	))
+	res, err = Reconcile(context.Background(), Options{IPMITool: full.path, Desired: desired, SkipBootOrder: true})
+	if err == nil || res != nil {
+		t.Fatalf("expected a refusal with a nil Result, got res=%+v err=%v", res, err)
+	}
+	if !strings.Contains(err.Error(), `"monitor"`) {
+		t.Errorf("error should name the account it has no slot for: %v", err)
+	}
+	if calls := full.calls(); len(calls) != 1 {
+		t.Errorf("expected only the user list before refusing, got %d calls: %+v", len(calls), calls)
 	}
 }
 
@@ -1353,7 +1579,9 @@ func TestReconcile_StoredPassword_LostWriteResponse_Confirmed(t *testing.T) {
 // When that slot already holds it (an un-named slot that kept a previous
 // monitor's password), MegaRAC refuses the write with 0x19. The test after
 // the refusal finds the password in place, so the account is created
-// rather than the run failing on a write that had nothing to change.
+// rather than the run failing on a write that had nothing to change. The
+// create drops the slot to NO ACCESS before naming it, as every create does;
+// that leaves the password alone, so the test still finds it.
 func TestReconcile_StoredPassword_CreateIntoSlotAlreadyHoldingIt(t *testing.T) {
 	fake := newFakeIPMITool(t)
 	fake.queueOutput("user list 1", userTable(
@@ -1361,6 +1589,7 @@ func TestReconcile_StoredPassword_CreateIntoSlotAlreadyHoldingIt(t *testing.T) {
 		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
 		[3]string{"3", "", ""},
 	))
+	fake.queueOutput("user priv 3 15 1", "")
 	fake.queueOutput("user set name 3 monitor", "")
 	for range 3 {
 		fake.queueFailure("user set password 3 "+storedMonitorPW, megaRACRefusal("3"), 1)

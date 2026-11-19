@@ -369,11 +369,16 @@ type LogStreamSubscribeMsg struct {
 	MinLevel    string   `json:"min_level,omitempty"`
 
 	// SinceTimestamp seeds the tail with envelopes whose ts is at or
-	// after this point. Empty disables backfill.
+	// after this point. Empty disables backfill. Past the backfill, the
+	// live tail admits an envelope when its ts or the time global
+	// received it is at or after this point, so an emitter whose clock
+	// runs behind still streams.
 	SinceTimestamp string `json:"since,omitempty"`
 
 	// LastSeenID resumes after a given log_envelopes.id. Used on
-	// reconnect; takes precedence over SinceTimestamp when set.
+	// reconnect; takes precedence over SinceTimestamp when set: the
+	// stream skips the ts-bounded backfill and continues the live tail
+	// past this id.
 	LastSeenID int64 `json:"last_seen_id,omitempty"`
 }
 

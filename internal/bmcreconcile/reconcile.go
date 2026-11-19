@@ -106,6 +106,11 @@ type User struct {
 	Name      string
 	Enabled   bool
 	Privilege PrivLevel
+	// LANAccess is true when the row's Callin, Link Auth and IPMI Msg
+	// columns all read true: the channel-1 access applyPrivAndEnable grants
+	// (callin=on link=on ipmi=on). Without it the account cannot be used
+	// over the LAN, whatever its privilege.
+	LANAccess bool
 }
 
 // DesiredUser describes a user we want present after reconcile. Name
@@ -159,7 +164,9 @@ type Result struct {
 	// neither the managed account for a desired name nor reserved
 	// (vendor admin at slot 2, anonymous slot 1). The reconciler
 	// disabled each and cleared its name where the BMC allowed it (see
-	// NamesNotCleared); the names are reported back for audit.
+	// NamesNotCleared), or, when no empty slot was left for a missing
+	// desired account, renamed the slot to that account; the names are
+	// reported back for audit.
 	LeftoversDisabled []string
 
 	// NamesNotCleared lists leftovers that were disabled but whose name
@@ -319,7 +326,9 @@ var reservedSlots = map[int]bool{
 //  2. With AdminUser set, refuse (before any write) unless it is the
 //     slot-2 account.
 //  3. Add any user in Options.Desired that's missing (and re-password the
-//     ones that exist when they carry a Password or Rotate).
+//     ones that exist when they carry a Password or Rotate), in an empty
+//     slot or, when none is left, in a leftover's slot (disabled and set
+//     to NO ACCESS first).
 //  4. Disable + clear name on any user that's not the managed account
 //     for a Desired name and not in a reserved slot (slot 1 anon, slot 2
 //     vendor admin). A second account sharing a Desired name is a
@@ -379,14 +388,12 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 		}
 	}
 
-	// Plan: which Desired entries need a write? managedSlot records the
-	// slot each Desired name ends up owning, so the leftover pass spares
-	// exactly that account.
-	desiredSet := map[string]bool{}
-	managedSlot := map[string]int{}
+	// Plan: which Desired entries need a write? managed records the slot
+	// each Desired name ends up owning, so slot allocation and the leftover
+	// pass spare exactly those accounts.
+	managed := map[int]bool{}
 	var plans []plan
 	for _, d := range opt.Desired {
-		desiredSet[strings.ToLower(d.Name)] = true
 		if existing, ok := byName[strings.ToLower(d.Name)]; ok {
 			// Refuse to update a user that lives in a reserved slot,
 			// even if the name happens to match a Desired entry. The
@@ -401,7 +408,7 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 					"slot 2 is the bmc-creds-admin account; remove it from Options.Desired",
 					existing.Slot, existing.Name)
 			}
-			managedSlot[strings.ToLower(d.Name)] = existing.Slot
+			managed[existing.Slot] = true
 			if d.Password != "" || d.Rotate {
 				// Re-assert the caller's password, or rotate: write it
 				// whatever state the account is in.
@@ -413,7 +420,12 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 				})
 				continue
 			}
-			if existing.Privilege == d.Privilege && existing.Enabled {
+			// Compliant only when everything applyPrivAndEnable writes that
+			// `user list` shows is already in place: the privilege limit and
+			// the channel access. A run that stopped between `user priv` and
+			// `channel setaccess` leaves the right privilege without LAN
+			// access, which is not compliant.
+			if existing.Privilege == d.Privilege && existing.Enabled && existing.LANAccess {
 				continue // nothing to do
 			}
 			// An existing-but-DISABLED user is treated as not-yet-fully-
@@ -426,8 +438,9 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			// never received. Without needsPassword we'd "fix" such a slot to enabled
 			// at the right priv with an unknown password and never report a
 			// cred — a stranded account (idempotency-of-partial-retry
-			// break). An ENABLED user with merely the wrong privilege is a
-			// genuine in-place priv fix: leave its working password alone.
+			// break). An ENABLED user with merely the wrong privilege or no
+			// LAN channel access is a genuine in-place fix: leave its
+			// working password alone.
 			plans = append(plans, plan{
 				desired:       d,
 				slot:          existing.Slot,
@@ -439,20 +452,28 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 		}
 	}
 
-	// Allocate slots for the new users. We need slots that are
-	// either unused on the BMC OR were the slot of an existing
-	// user we're updating.
+	// Allocate slots for the new users: empty slots first, then slots
+	// holding a leftover (see freeSlots).
 	if needAlloc := countSlots(plans); needAlloc > 0 {
-		free := freeSlots(current, needAlloc, plans)
+		free := freeSlots(current, needAlloc, managed)
 		if len(free) < needAlloc {
-			return nil, fmt.Errorf("bmcreconcile: need %d free slots, found %d (total slots: %d)",
-				needAlloc, len(free), len(current))
+			var names []string
+			for _, p := range plans {
+				if p.slot == -1 {
+					names = append(names, strconv.Quote(p.desired.Name))
+				}
+			}
+			return nil, fmt.Errorf("bmcreconcile: need a user slot for each of %s, but only %d slot(s) outside the reserved "+
+				"slots 1 and 2 hold no desired account (total slots: %d); the BMC's user table is too small for the desired "+
+				"accounts: remove an entry from Options.Desired, or provision this BMC's accounts by hand",
+				strings.Join(names, ", "), len(free), len(current))
 		}
 		i := 0
 		for j := range plans {
 			if plans[j].slot == -1 {
-				plans[j].slot = free[i]
-				managedSlot[strings.ToLower(plans[j].desired.Name)] = free[i]
+				plans[j].slot = free[i].Slot
+				plans[j].replaces = strings.TrimSpace(free[i].Name)
+				managed[free[i].Slot] = true
 				i++
 			}
 		}
@@ -461,9 +482,9 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 	// Apply each plan. For a Desired user with neither Password nor Rotate
 	// this is PROVISION ONCE, NEVER ROTATE: a password is generated and
 	// written ONLY when CREATING an absent user. For a user that already
-	// exists but has the wrong privilege or is disabled, we fix the
-	// privilege/channel-access/enabled state IN PLACE and leave its password
-	// untouched — so the monitor cred already stored in
+	// exists but has the wrong privilege, lacks LAN channel access, or is
+	// disabled, we fix the privilege/channel-access/enabled state IN PLACE
+	// and leave its password untouched — so the monitor cred already stored in
 	// pop/<pop>/bmc-creds-monitor stays valid. Regenerating on every deploy
 	// made the cred a moving target that drifted whenever a deploy half-ran.
 	// The remote path instead always asserts a password: the stored one
@@ -485,6 +506,18 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			// written is reported before its priv/enable writes, so a
 			// named-but-misconfigured slot with a known password is still
 			// reported when those fail.
+			if p.replaces != "" {
+				// Taking over a leftover's slot: disable it before the
+				// rename, so the leftover's password stops authenticating
+				// now. The NO ACCESS write below is what makes a run that
+				// dies before the password write leave a slot the next run
+				// reads as disabled and re-provisions as a partial create.
+				if err := runIPMIToolVoid(ctx, opt, "user", "disable", strconv.Itoa(p.slot)); err != nil {
+					return res, fmt.Errorf("bmcreconcile: disable leftover slot %d (%s) to reuse it for %s: %w",
+						p.slot, p.replaces, p.desired.Name, err)
+				}
+				res.LeftoversDisabled = append(res.LeftoversDisabled, p.replaces)
+			}
 			if !p.exists {
 				// Drop the slot to NO ACCESS before naming it, so a run that
 				// stops before the priv write leaves a remnant the next run
@@ -536,11 +569,12 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			continue
 		}
 		// UPDATE IN PLACE: the user exists, is ENABLED (so it has a working
-		// password slagworksd already holds), but its privilege is wrong. Fix
-		// priv + channel access + enabled WITHOUT touching the password. No
-		// CreatedOrUpdated entry: the password is unchanged, so there is
-		// nothing new to phone home and global keeps the cred it has.
-		// (provision-once: never rotate a working cred.)
+		// password slagworksd already holds), but its privilege is wrong or it
+		// lacks LAN channel access. Fix priv + channel access + enabled
+		// WITHOUT touching the password. No CreatedOrUpdated entry: the
+		// password is unchanged, so there is nothing new to phone home and
+		// global keeps the cred it has. (provision-once: never rotate a
+		// working cred.)
 		if err := applyPrivAndEnable(ctx, opt, p.slot, p.desired.Privilege); err != nil {
 			return res, err
 		}
@@ -548,19 +582,15 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 
 	// Disable any user that's not the managed account for a desired name
 	// and not in a reserved slot. Reading from the pre-write `current`
-	// list is fine: a slot we just provisioned is the managed slot for
-	// its name, and the reserved slots are excluded by slot number
-	// regardless of current name.
+	// list is fine because both exclusions go by slot number, whatever
+	// name `current` shows there: a slot we just provisioned (including a
+	// leftover's slot we took over) is a managed slot.
 	for _, u := range current {
-		if reservedSlots[u.Slot] {
+		if reservedSlots[u.Slot] || managed[u.Slot] {
 			continue
 		}
 		name := strings.TrimSpace(u.Name)
 		if name == "" {
-			continue
-		}
-		lower := strings.ToLower(name)
-		if desiredSet[lower] && managedSlot[lower] == u.Slot {
 			continue
 		}
 		// Disable first so an in-flight session can't auth, then
@@ -740,9 +770,11 @@ func ListUsers(ctx context.Context, opt Options) ([]User, error) {
 // as printed.
 //
 // We capture the start of "Name" and the start of "Callin" — those
-// bracket the Name field. The privilege string is everything from
-// "Channel" onwards (the right edge varies but the privilege token
-// starts at that column, so right-trimmed slice is fine).
+// bracket the Name field. "Callin", "Link Auth", "IPMI Msg" and
+// "Channel" likewise bracket the three channel-access flags (LANAccess).
+// The privilege string is everything from "Channel" onwards (the right
+// edge varies but the privilege token starts at that column, so
+// right-trimmed slice is fine).
 func parseUserList(s string) ([]User, error) {
 	lines := strings.Split(s, "\n")
 	var headerLine string
@@ -766,9 +798,14 @@ func parseUserList(s string) ([]User, error) {
 
 	nameStart := strings.Index(headerLine, "Name")
 	callinStart := strings.Index(headerLine, "Callin")
+	linkStart := strings.Index(headerLine, "Link Auth")
+	ipmiStart := strings.Index(headerLine, "IPMI Msg")
 	channelStart := strings.Index(headerLine, "Channel")
-	if nameStart < 0 || callinStart < 0 || channelStart < 0 {
+	if nameStart < 0 || callinStart < 0 || linkStart < 0 || ipmiStart < 0 || channelStart < 0 {
 		return nil, fmt.Errorf("user list header missing expected columns: %q", headerLine)
+	}
+	flag := func(line string, start, end int) bool {
+		return strings.TrimSpace(safeSlice(line, start, end)) == "true"
 	}
 
 	var users []User
@@ -796,6 +833,9 @@ func parseUserList(s string) ([]User, error) {
 			Name:      name,
 			Enabled:   enabled,
 			Privilege: priv,
+			LANAccess: flag(line, callinStart, linkStart) &&
+				flag(line, linkStart, ipmiStart) &&
+				flag(line, ipmiStart, channelStart),
 		})
 	}
 	if len(users) == 0 {
@@ -849,33 +889,28 @@ func parsePriv(s string) PrivLevel {
 	}
 }
 
-// freeSlots returns up to `n` slot numbers that aren't currently
-// occupied by a named user AND aren't already claimed by an existing
-// plan entry (so we don't double-allocate). Reserved slots (1, 2) are
-// always excluded.
-func freeSlots(users []User, n int, plans []plan) []int {
-	taken := map[int]bool{}
-	for _, p := range plans {
-		if p.slot > 0 {
-			taken[p.slot] = true
-		}
-	}
-	var free []int
+// freeSlots returns up to n slots for new accounts, never a reserved slot
+// (1, 2) or a managed one (a desired account's): empty slots first, then
+// slots holding a leftover, which the leftover pass would disable anyway.
+// Falling back to a leftover's slot is what lets a BMC whose every
+// non-reserved slot is named (strays on an inherited host, or Supermicro
+// leftovers disabled earlier whose names the BMC refused to clear)
+// converge instead of refusing on every run until an operator deletes an
+// account by hand.
+func freeSlots(users []User, n int, managed map[int]bool) []User {
+	var empty, leftovers []User
 	for _, u := range users {
-		if reservedSlots[u.Slot] {
-			continue
-		}
-		if taken[u.Slot] {
+		if reservedSlots[u.Slot] || managed[u.Slot] {
 			continue
 		}
 		if strings.TrimSpace(u.Name) == "" {
-			free = append(free, u.Slot)
-			if len(free) == n {
-				break
-			}
+			empty = append(empty, u)
+		} else {
+			leftovers = append(leftovers, u)
 		}
 	}
-	return free
+	empty = append(empty, leftovers...)
+	return empty[:min(n, len(empty))]
 }
 
 // countSlots returns how many plans still need a slot allocated.
@@ -889,17 +924,22 @@ func countSlots(plans []plan) int {
 	return n
 }
 
-// plan is a private alias inside this package to keep the count/free
-// helpers' signatures stable across refactors.
+// plan is the write one Desired entry needs.
 type plan struct {
 	desired DesiredUser
 	slot    int
 	exists  bool
+	// replaces is the leftover account whose slot this new account takes
+	// over because no empty slot was left ("" for an empty slot or an
+	// existing account). It is disabled and set to NO ACCESS before the
+	// rename, and reported in LeftoversDisabled.
+	replaces string
 	// needsPassword is true when this slot must get a password written: an
 	// absent user, an existing-but-disabled slot left by a partial create,
 	// or any existing user whose Desired entry carries a Password or Rotate.
 	// False for an enabled existing user whose only problem is the wrong
-	// privilege — provision-once leaves its working password untouched.
+	// privilege or missing LAN channel access — provision-once leaves its
+	// working password untouched.
 	needsPassword bool
 }
 
