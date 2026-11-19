@@ -43,24 +43,6 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 			},
 		},
 		{
-			name:    "subscribe",
-			msgType: TypeSubscribe,
-			data: SubscribeMsg{
-				MachineID:   "machine-1",
-				OperationID: "op-1",
-				Cursor:      42,
-			},
-		},
-		{
-			name:    "op_status",
-			msgType: TypeOpStatus,
-			data: OpStatusMsg{
-				OperationID: "op-1",
-				Status:      "running",
-				Phase:       "rsyncing_os",
-			},
-		},
-		{
 			name:    "subscribed",
 			msgType: TypeSubscribed,
 			data:    SubscribedMsg{},

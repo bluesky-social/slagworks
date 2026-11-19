@@ -28,6 +28,7 @@ func TestSystemSerial_Normalization(t *testing.T) {
 		{"to be filled lowercase", "to be filled by o.e.m.", ""},
 		{"default string", "Default string", ""},
 		{"system serial number placeholder", "System Serial Number", ""},
+		{"unprogrammed supermicro serial", "0123456789", ""},
 		{"not specified", "Not Specified", ""},
 		{"none", "None", ""},
 		{"zero", "0", ""},

@@ -1,7 +1,10 @@
 package snapshot
 
 import (
+	"maps"
 	"net"
+	"net/netip"
+	"slices"
 	"strings"
 
 	"github.com/bluesky-social/slagworks/internal/model"
@@ -46,19 +49,28 @@ func leafSideOf31(hostCIDR string) string {
 // exactly one offerable address: the host side. Gateway = the leaf side
 // (it IS the host's next hop on that link).
 //
-// Only host-side /31s produce pools; the leaf-side addresses live on leaf
-// devices, which have no Machine row and never reach this path's callers.
-// Filtering by parity here would couple us to the layout formula, so each
-// /31 instead produces a pool keyed by its own subnet — duplicates
-// collapse by construction because both sides share the subnet and the
-// host side is derived, not read.
+// The records cover every scoped device, not only hosts, so a leaf
+// modeled in the same site contributes the leaf end of a /31 alongside
+// the host end. Filtering by parity would couple us to the layout
+// formula, so each /31 instead produces one pool keyed by its own subnet,
+// and both ends collapse into it. When only one end is present it is
+// taken as the host side. When both are present the records do not say
+// which is the host, so the higher address is kept: the host under the
+// usual host-odd layout, and the same answer whichever record NetBox
+// listed first.
+//
+// The result is sorted by subnet. NetBox's list order shifts when
+// unrelated objects change, and the snapshot content hash covers these
+// pools, so an order-dependent result would push a new snapshot for data
+// that did not change. The worker derives both ends of any /31 pool from
+// giaddr (dhcp.relayPoolForRequest), so the host-side choice changes what
+// the snapshot records, never a DHCP answer.
 func l3LegRelayPools(ifaces []netbox.Interface, ips []netbox.IPAddress) []model.RelayPool {
 	ifaceByID := make(map[int]*netbox.Interface, len(ifaces))
 	for i := range ifaces {
 		ifaceByID[ifaces[i].ID] = &ifaces[i]
 	}
-	seen := make(map[string]bool)
-	var pools []model.RelayPool
+	hostByLink := make(map[netip.Prefix]netip.Addr)
 	for _, ip := range ips {
 		if !strings.HasSuffix(ip.Address, "/31") || ip.AssignedObjectID == nil || !ip.IsActive() {
 			continue
@@ -67,26 +79,26 @@ func l3LegRelayPools(ifaces []netbox.Interface, ips []netbox.IPAddress) []model.
 		if !ok || classifyInterface(*iface) != "physical" {
 			continue
 		}
-		hostAddr, _, err := net.ParseCIDR(ip.Address)
-		if err != nil {
+		p, err := netip.ParsePrefix(ip.Address)
+		if err != nil || !p.Addr().Is4() {
 			continue
 		}
-		leafSide := leafSideOf31(ip.Address)
-		if leafSide == "" {
-			continue
+		link := p.Masked()
+		if prev, ok := hostByLink[link]; !ok || p.Addr().Compare(prev) > 0 {
+			hostByLink[link] = p.Addr()
 		}
-		// Normalize to the /31 network for the pool subnet.
-		_, ipnet, _ := net.ParseCIDR(ip.Address)
-		subnet := ipnet.String()
-		if seen[subnet] {
-			continue
-		}
-		seen[subnet] = true
+	}
+	links := slices.SortedFunc(maps.Keys(hostByLink), func(a, b netip.Prefix) int {
+		return a.Addr().Compare(b.Addr())
+	})
+	pools := make([]model.RelayPool, 0, len(links))
+	for _, link := range links {
+		host := hostByLink[link]
 		pools = append(pools, model.RelayPool{
-			Subnet:     subnet,
-			RangeStart: hostAddr.String(),
-			RangeEnd:   hostAddr.String(),
-			Gateway:    leafSide,
+			Subnet:     link.String(),
+			RangeStart: host.String(),
+			RangeEnd:   host.String(),
+			Gateway:    leafSideOf31(netip.PrefixFrom(host, 31).String()),
 		})
 	}
 	return pools
