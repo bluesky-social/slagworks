@@ -199,6 +199,34 @@ func TestResolveMachine_ExactMatchIsCaseInsensitive(t *testing.T) {
 	}
 }
 
+// TestResolveMachine_ExactHostnameSharedIsAmbiguous: NetBox enforces
+// device-name uniqueness per site, not globally, so two machines in
+// different sites can carry the same hostname. Typing that hostname must
+// be refused with both UUIDs listed, not resolved to whichever row the
+// API returned first.
+func TestResolveMachine_ExactHostnameSharedIsAmbiguous(t *testing.T) {
+	a, b := uuid.New(), uuid.New()
+	f := &resolverFixture{
+		machines: []model.Machine{
+			{ID: a, NetBoxSerial: "S-1", Hostname: "node-1.rack"},
+			{ID: b, NetBoxSerial: "S-2", Hostname: "node-1.rack"},
+		},
+	}
+	cl := slclient.New(slclient.Config{BaseURL: testHTTPServer(t, f.handler(t))})
+	r, err := cmd.ResolveMachine(context.Background(), cl, "node-1.rack")
+	if err == nil {
+		t.Fatalf("two machines are named node-1.rack, want an ambiguity error; resolved to %s", r.ID)
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("expected 'ambiguous' in error, got: %v", err)
+	}
+	for _, want := range []string{a.String(), b.String()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("expected candidate UUID %s in error, got: %v", want, err)
+		}
+	}
+}
+
 func TestResolveMachine_NoMatch(t *testing.T) {
 	f := &resolverFixture{machines: nil}
 	cl := slclient.New(slclient.Config{BaseURL: testHTTPServer(t, f.handler(t))})

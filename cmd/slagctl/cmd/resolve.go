@@ -39,7 +39,8 @@ func (r ResolvedMachine) Slot() string { return r.ID.String() }
 //     whose name equals arg (NetBox `name__ic` is substring, so the
 //     equality check happens client-side).
 //  4. unique substring → same call, exactly one match.
-//  5. ambiguous → error listing the candidate hostnames.
+//  5. ambiguous → error listing the candidate hostnames, or their UUIDs
+//     when several machines carry the exact hostname.
 //  6. miss → "no machine matches".
 //
 // The Label is "hostname (uuid-prefix)" when a hostname is known,
@@ -96,15 +97,31 @@ func resolveMachine(ctx context.Context, c *slclient.Client, arg string) (Resolv
 	if len(hits) == 0 {
 		return ResolvedMachine{}, fmt.Errorf("no machine matches %q", arg)
 	}
-	// Exact-name win: any row whose Hostname equals arg (case-
+	// Exact-name win: a row whose Hostname equals arg (case-
 	// insensitive — NetBox device names are case-insensitive at the
 	// API layer via `name__ic`, so a typed `CPU1.pop1` should match a
 	// stored `cpu1.pop1` exactly even when other substring hits would
-	// otherwise force an ambiguous error).
+	// otherwise force an ambiguous error). NetBox enforces name
+	// uniqueness only within a site, so several rows can match exactly;
+	// those are listed by UUID, since their hostnames are identical.
+	var exact []model.Machine
 	for _, m := range hits {
 		if strings.EqualFold(m.Hostname, arg) {
-			return ResolvedMachine{ID: m.ID, Label: hostLabel(m)}, nil
+			exact = append(exact, m)
 		}
+	}
+	if len(exact) == 1 {
+		return ResolvedMachine{ID: exact[0].ID, Label: hostLabel(exact[0])}, nil
+	}
+	if len(exact) > 1 {
+		ids := make([]string, len(exact))
+		for i, m := range exact {
+			ids[i] = m.ID.String()
+		}
+		sort.Strings(ids)
+		return ResolvedMachine{}, fmt.Errorf(
+			"ambiguous: hostname %q names %d machines: %s; pass one of these UUIDs instead",
+			arg, len(exact), strings.Join(ids, ", "))
 	}
 	if len(hits) == 1 {
 		return ResolvedMachine{ID: hits[0].ID, Label: hostLabel(hits[0])}, nil

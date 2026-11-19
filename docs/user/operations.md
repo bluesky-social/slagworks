@@ -15,7 +15,9 @@ server saved by `slagctl auth login`).
 
 Every command that names a machine accepts the same shapes: the
 slagworks UUID, the NetBox serial, the exact hostname, or a unique
-hostname substring. Non-UUID inputs resolve through global. The
+hostname substring. Non-UUID inputs resolve through global. NetBox
+keeps hostnames unique only within a site, so a hostname two machines
+share is refused with both UUIDs listed; pass one of them. The
 `operation watch` command also accepts a machine identifier and
 resolves it to that machine's most recent active operation.
 

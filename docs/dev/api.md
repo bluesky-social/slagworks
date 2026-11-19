@@ -65,7 +65,9 @@ origin gets 403.
 - Machine identifiers: every `/machines/:id` route except `netbox-diff`
   accepts either the slagworks machine UUID or the NetBox device name
   (anything containing a `.`, e.g. `kworker-l34-1.pop1`). Name lookup
-  needs NetBox; without it a name returns 503.
+  needs NetBox; without it a name returns 503. NetBox enforces device
+  names as unique only within a site, so a name several devices carry
+  returns 409 listing each one's NetBox id and site; pass the UUID.
 - Operation-creating routes return `201` with the new operation row. An
   operation row includes `params`, which names the transport resolved at
   creation (`bmc_runtime`, `pdu_runtime`, `amt_runtime`, `monitor_runtime`,
@@ -125,7 +127,7 @@ no BMC.
 |---|---|---|---|
 | GET | `/pdus/:ident/outlet/:n/power/resolve` | read | `?verb=cycle\|on\|off`. Resolve outlet `n` (1-based) of a PDU, trace its cable in NetBox, and classify the downstream device's feeds. Returns `{"pdu_name","pdu_mgmt_ip","pdu_serial","outlet","connected","downstream_device","downstream_serial","downstream_port","classification","warning","preflight_token"}`; `classification` is `unconnected`, `sole` or `redundant_unverified`. The token is issued only for a connected outlet, is valid for 5 minutes, and is bound to the operator, verb, PDU, outlet, downstream serial and classification. |
 | POST | `/pdus/:ident/outlet/:n/power` | admin | Body `{"verb","preflight_token","allow_self"}`. Re-resolves the outlet and creates a power operation on the PDU's own machine row. 409 when the token is invalid, expired, for another verb or operator, or the topology changed; 422 for an unconnected outlet, for `off` on an outlet feeding a registered site worker, or for `cycle`/`on` of a worker's feed when no other eligible worker is connected (`allow_self` overrides this last case; it is rejected with `off`). |
-| GET | `/devices/:ident/creds` | creds | Return the `pop/<pop>/bmc-creds-admin` entry for any NetBox device. `:ident` is a NetBox device id, name or serial, tried in that order. Returns `{"device","netbox_id","serial","pop","kind","mgmt_ip","username","password","extra_config"}`; `kind` is the entry's own value (`bmc`, `amt`, `pdu`, `serial`, `serial-server`). 409 when a serial matches several devices; 503 without NetBox or the secret store. |
+| GET | `/devices/:ident/creds` | creds | Return the `pop/<pop>/bmc-creds-admin` entry for any NetBox device. `:ident` is a NetBox device id, name or serial, tried in that order. Returns `{"device","netbox_id","serial","pop","kind","mgmt_ip","username","password","extra_config"}`; `kind` is the entry's own value (`bmc`, `amt`, `pdu`, `serial`, `serial-server`). 409 when a name or serial matches several devices; 503 without NetBox or the secret store. The PDU outlet routes resolve `:ident` the same way. |
 
 Preflight tokens are signed with a key derived from
 `SLAGWORKS_WEBHOOK_SECRET`, or a random per-process key when that is unset;
