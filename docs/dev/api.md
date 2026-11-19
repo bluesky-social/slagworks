@@ -111,7 +111,7 @@ All paths are under `/api/v1`.
 | POST | `/machines/:id/lock` | admin | Set `locked=true`. Returns the machine. |
 | POST | `/machines/:id/unlock` | admin | Set `locked=false`. |
 | POST | `/machines/:id/activate` | admin | Set `pxe_eligible=true`. 409 when locked. |
-| POST | `/machines/:id/deactivate` | admin | Set `pxe_eligible=false`. 409 when locked. |
+| POST | `/machines/:id/deactivate` | admin | Set `pxe_eligible=false`. Allowed on a locked machine. |
 | POST | `/machines/:id/abort` | admin | Fail the machine's active operations and return the machine. |
 
 `via` selects the power transport. Omitted, it is `amt` when the device's

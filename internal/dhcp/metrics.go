@@ -28,12 +28,13 @@ type Metrics struct {
 // Drop reasons (DropsTotal label values). Enumerated so the handler
 // and dashboards agree on spelling.
 const (
-	DropUnknownMAC    = "unknown_mac"     // KnownMACs filter rejected
-	DropNoPool        = "no_pool"         // relayed giaddr matched no pool / cold start
-	DropExhausted     = "pool_exhausted"  // no free IP in the matched pool
-	DropOtherServer   = "other_server_id" // REQUEST named the other worker (RFC 2131 silence)
-	DropUnhandledType = "unhandled_type"  // RELEASE / unexpected message type
-	DropNAK           = "nak"             // REQUEST refused via NAK (peer slice, unknown dynamic addr on an unsliced segment, lease/reservation mismatch, out-of-subnet)
+	DropNotBootRequest = "not_bootrequest" // BOOTP op is not BOOTREQUEST: not a client request (RFC 2131 / RFC 951)
+	DropUnknownMAC     = "unknown_mac"     // KnownMACs filter rejected
+	DropNoPool         = "no_pool"         // relayed giaddr matched no pool / cold start
+	DropExhausted      = "pool_exhausted"  // no free IP in the matched pool
+	DropOtherServer    = "other_server_id" // REQUEST named the other worker (RFC 2131 silence)
+	DropUnhandledType  = "unhandled_type"  // RELEASE / unexpected message type
+	DropNAK            = "nak"             // REQUEST refused via NAK (peer slice, unknown dynamic addr on an unsliced segment, lease/reservation mismatch, out-of-subnet)
 )
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -55,7 +56,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 
 		DropsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "slagworks_site_dhcp_drops_total",
-			Help: "DHCP packets received but not answered, by reason (unknown_mac | no_pool | pool_exhausted | other_server_id | unhandled_type | nak).",
+			Help: "DHCP packets received but not answered, by reason (not_bootrequest | unknown_mac | no_pool | pool_exhausted | other_server_id | unhandled_type | nak).",
 		}, []string{"reason"}),
 
 		PoolSize: prometheus.NewGaugeVec(prometheus.GaugeOpts{
