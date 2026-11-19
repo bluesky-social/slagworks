@@ -400,7 +400,9 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 		if err := w.checkReplyProto(ws.TypeSnapshot, env.Data); err != nil {
 			return false, err
 		}
-		if err := w.applySnapshot(env.Data); err != nil {
+		// The first snapshot on a connection is global's current view of
+		// the site: adopt it even when its SeqNum is lower than ours.
+		if err := w.applySnapshot(env.Data, true); err != nil {
 			return false, err
 		}
 	case ws.TypeNoChange:
@@ -462,7 +464,7 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 
 		switch env.Type {
 		case ws.TypeSnapshot:
-			if err := w.applySnapshot(env.Data); err != nil {
+			if err := w.applySnapshot(env.Data, false); err != nil {
 				return true, err
 			}
 		case ws.TypeNoChange:
@@ -596,16 +598,24 @@ func (w *WSConn) applyOpRemoved(data json.RawMessage) {
 	w.cache.ApplyOpRemoved(msg.OperationID, msg.MachineID, msg.Version, msg.MachineState)
 }
 
-// applySnapshot decodes a snapshot message, applies it to the cache,
-// and persists the new SeqNum via LocalDB. Also triggers an
-// auto-upgrade check if the global advertises a different build SHA.
-func (w *WSConn) applySnapshot(data json.RawMessage) error {
+// applySnapshot decodes a snapshot message and applies it to the cache:
+// with adopt (the first snapshot on a connection) via Cache.AdoptSnapshot,
+// otherwise via Cache.ApplySnapshot, which drops one older than the
+// cache's. Persists the new SeqNum via LocalDB when the snapshot was
+// applied. Also triggers an auto-upgrade check if the global advertises
+// a different build SHA.
+func (w *WSConn) applySnapshot(data json.RawMessage, adopt bool) error {
 	var msg ws.SnapshotMsg
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return fmt.Errorf("decode snapshot: %w", err)
 	}
-	w.cache.ApplySnapshot(&msg.Snapshot)
-	if w.localDB != nil {
+	applied := true
+	if adopt {
+		w.cache.AdoptSnapshot(&msg.Snapshot)
+	} else {
+		applied = w.cache.ApplySnapshot(&msg.Snapshot)
+	}
+	if applied && w.localDB != nil {
 		w.localDB.SetSyncCursor(msg.Snapshot.SeqNum)
 	}
 	w.checkVersion(globalBuild{SHA: msg.Version, PackageVersion: msg.PackageVersion})

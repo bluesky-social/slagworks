@@ -486,7 +486,7 @@ func TestApplyReplies_HandHelperGlobalBuild(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := w.applySnapshot(data); err != nil {
+		if err := w.applySnapshot(data, false); err != nil {
 			t.Fatalf("applySnapshot: %v", err)
 		}
 		receiveTarget(t, targets, want)
