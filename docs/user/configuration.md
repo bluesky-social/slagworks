@@ -339,8 +339,10 @@ Fields:
   pool. Required, IPv4, start no greater than end.
 - **`relay_pools`** — pools for subnets reached through a DHCP relay,
   selected by the relay's `giaddr`. Each is
-  `{"subnet","range_start","range_end","gateway"}`; the range and gateway
-  must be IPv4 inside the subnet.
+  `{"subnet","range_start","range_end","gateway"}`. The subnet must be an
+  IPv4 CIDR in dotted-quad form (`10.254.27.0/24`, not IPv6 or
+  IPv4-mapped notation such as `::ffff:10.254.27.0/120`); the range and
+  gateway must be IPv4 inside the subnet.
 - **`promiscuous`** — when `true`, the fabric DHCP server answers MACs it
   does not know and TFTP stops requiring a lease. Default `false`.
 - **`last_snapshot_seq`**, **`last_snapshot_hash`**, **`created_at`** —

@@ -76,6 +76,14 @@ func (p RelayPool) Validate() error {
 	if err != nil {
 		return fmt.Errorf("subnet %q: %w", p.Subnet, err)
 	}
+	// ParseCIDR returns a 4-byte mask only for dotted-quad input. Checking
+	// subnet.IP.To4() is not enough: IPv4-mapped IPv6 notation
+	// (::ffff:10.254.27.0/120) converts to IPv4 but carries a 16-byte
+	// mask, which the DHCPv4 subnet-mask option truncates to
+	// 255.255.255.255.
+	if len(subnet.Mask) != net.IPv4len {
+		return fmt.Errorf("subnet %q must be an IPv4 CIDR in dotted-quad form, such as 10.254.27.0/24", p.Subnet)
+	}
 	start := net.ParseIP(p.RangeStart).To4()
 	end := net.ParseIP(p.RangeEnd).To4()
 	gw := net.ParseIP(p.Gateway).To4()
