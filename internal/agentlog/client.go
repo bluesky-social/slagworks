@@ -72,7 +72,8 @@ func (c *Client) Push(env slogkit.Envelope) {
 
 // Run drains the ring and POSTs batches until ctx is done. Failures
 // drop the batch — no retry. The drop counter is surfaced as a
-// synthetic envelope on the next successful POST.
+// synthetic envelope on the next successful POST: a failed POST puts
+// its count back so the following batch reports it again.
 func (c *Client) Run(ctx context.Context) {
 	const batchMax = 64
 	for {
@@ -80,7 +81,8 @@ func (c *Client) Run(ctx context.Context) {
 		if batch == nil {
 			return
 		}
-		if dropped := c.dropped.Swap(0); dropped > 0 {
+		dropped := c.dropped.Swap(0)
+		if dropped > 0 {
 			batch = append(batch, slogkit.Envelope{
 				TS:     time.Now(),
 				Level:  slogkit.LevelWarn,
@@ -88,7 +90,9 @@ func (c *Client) Run(ctx context.Context) {
 				Msg:    fmt.Sprintf("dropped %d log lines due to local backpressure", dropped),
 			})
 		}
-		_ = c.postBatch(ctx, batch)
+		if err := c.postBatch(ctx, batch); err != nil && dropped > 0 {
+			c.dropped.Add(dropped)
+		}
 	}
 }
 

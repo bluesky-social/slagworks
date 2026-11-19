@@ -129,6 +129,22 @@ func isNotFound(err error) bool {
 	return errors.As(err, &se) && se.status == http.StatusNotFound
 }
 
+// unansweredError is a PATCH that got no readable response: it timed out,
+// the connection dropped, ctx ended, or the body could not be read. The
+// request may have reached the BMC, so it may have been applied.
+type unansweredError struct{ err error }
+
+func (e *unansweredError) Error() string { return e.err.Error() }
+func (e *unansweredError) Unwrap() error { return e.err }
+
+// mayHaveApplied reports whether err is from a PATCH the BMC may have
+// applied anyway (unansweredError). Any other patch error is a write the
+// BMC never received (the ETag read failed) or refused with a status.
+func mayHaveApplied(err error) bool {
+	var ue *unansweredError
+	return errors.As(err, &ue)
+}
+
 // get reads path into out and returns the resource's ETag: the ETag
 // header, else the body's @odata.etag, else "".
 func (c *redfishClient) get(ctx context.Context, path string, out any) (string, error) {
@@ -163,6 +179,9 @@ func (c *redfishClient) get(ctx context.Context, path string, out any) (string, 
 // fail. That is the Task resource (/redfish/v1/TaskService/Tasks/N), which
 // keeps its final state, not the Location TaskMonitor, which stops
 // answering with the Task once it ends.
+//
+// An error does not always mean not applied either: a PATCH with no
+// readable response is an unansweredError (see mayHaveApplied).
 func (c *redfishClient) patch(ctx context.Context, path string, body any) (task string, err error) {
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -179,7 +198,7 @@ func (c *redfishClient) patch(ctx context.Context, path string, body any) (task 
 		}
 		status, _, resp, err := c.do(ctx, http.MethodPatch, path, raw, etag)
 		if err != nil {
-			return "", err
+			return "", &unansweredError{err: err}
 		}
 		switch {
 		case status == http.StatusOK || status == http.StatusAccepted || status == http.StatusNoContent:

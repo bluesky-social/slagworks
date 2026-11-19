@@ -70,7 +70,10 @@ The current shape is 00001 minus what 00011 dropped, plus everything
 added through 00025. Read the migration files if you need column-level
 detail; this is the map.
 
-- `meta(instance_id text)` — one row, generated at first-boot. Site
+- `meta(instance_id text)` — one row, a random UUID that migration 00032
+  inserts the first time `Migrate` runs against an empty database; a
+  database that already holds a row keeps it. Reported as `instance_id`
+  by `/healthz`, `/readyz` and `slagctl version`. Site
   workers refuse to reuse a local cache if the global's instance_id
   doesn't match (see `LocalDB.ResetSyncState`).
 - `machines(id uuid, netbox_serial text, netbox_device_id bigint,

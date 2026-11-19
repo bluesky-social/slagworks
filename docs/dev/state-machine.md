@@ -568,8 +568,15 @@ worker, the executor's pending-op wake fires (or its 5s backstop tick),
 
 - `verifyChassisSerial` gate (guards against acting on the wrong
   physical host).
-- `BootManager.SetBootOverride(pxe)` on Supermicro, `SetBootDevice`
-  via IPMI on other vendors, so the next boot lands on PXE.
+- `Controller.SetBootDevice(pxe)`, so the next boot lands on PXE: a
+  one-time UEFI PXE override on the BMC (SMCIPMITool
+  `bootoption 14 0` on Supermicro, bmclib elsewhere, Intel AMT's
+  one-time PXE on AMT hosts) and nothing at all through a PDU, whose
+  devices must keep the network first in their firmware boot order.
+  The override is not read back, and it does not outrank an armed
+  BootNext, which is why the agent arms BootNext only for a deploy the
+  site worker has accepted as complete (see
+  [the latch](#the-awaiting_phone_home-latch)).
 - Emit phase `power_cycle`.
 - Call the power controller's `PowerCycle` (or `PowerOn` when off).
 - Emit phase `pxe_booting`.
@@ -643,7 +650,7 @@ Path depends on the op type.
 `Store.FailOperation` (`store.go:772`) is the funnel. Four callers:
 
 - Worker `op_update{status=failed}` — the agent's `fatal` path
-  (`cmd/slagworks-agent/main.go:228`) POSTs
+  (`runControl.fatal`, `cmd/slagworks-agent/control.go`) POSTs
   `ProgressReport{Failed: true, Phase: X, Error: msg}`; the site
   worker sets phase to `failed` (`cache.go:1504`) and queues an
   op-update with status failed. Failure surfaces immediately with
@@ -696,9 +703,12 @@ whole claimed/running window from `claimed_at` to `awaiting_phone_home`;
 `PhoneHomeTimeout` covers the window after.
 
 Phase failure is not timeout-driven. When the agent's `fatal` runs
-(`cmd/slagworks-agent/main.go:228`), it POSTs a failure report; the
-site worker marks the op failed immediately. The timeout sweeps
-exist only for the "agent died silently" case.
+(`runControl.fatal`, `cmd/slagworks-agent/control.go`), it POSTs a
+failure report; the site worker marks the op failed immediately. The
+timeout sweeps exist only for the "agent died silently" case. An agent
+that is still alive when a sweep fails its op stops at its next report,
+the same way it does after an abort (see
+[What an abort does on the host](#what-an-abort-does-on-the-host)).
 
 The worker's local failure holds until global's `op_removed` for the op.
 Global applies the failure as separate writes, and each phase write
@@ -764,16 +774,112 @@ uniformly:
 There is no state precondition on `AbortMachine`. It is a no-op
 that returns the current row if no ops are active.
 
+### What an abort does on the host
+
+Abort writes rows in global and sends nothing to the host: it does not
+power the host off (the operator follows with `machine power off` for
+that) and the worker takes no BMC action when an op is removed. An
+agent that is still running finds out from its own reports.
+
+Once the worker has applied the `op_removed`, `opState.validateReportBinding`
+(`internal/worker/opstate_cache.go`) refuses every report for that op with
+an error matching `model.ErrOperationNotActive`, and `POST /api/v1/report`
+answers it with 410 Gone (`reportRejectionStatus`,
+`internal/httpboot/handler.go`). The same answer covers every other way
+an op ends: a timeout sweep, a failure the agent or the boot hook
+reported, completion. The worker gives it only when it knows the op is
+over: it holds the op with a terminal status, it holds the op's
+tombstone, or the op is absent from a set that has been resynced since
+the worker started. Every other rejection stays 409 Conflict, including
+"operation state is not synchronized" from a worker that restarted
+mid-deploy, where the op may be healthy.
+
+The agent acts on 410 on every report path (`agentReporter.send`,
+`cmd/slagworks-agent/reporter.go`): phase reports, log flushes, failure
+reports and the final `deploy_complete` / `commission_report`. Its flush
+loop also sends an empty report every 5 seconds as a liveness check, so
+an agent in the middle of a long phase learns of an abort within that
+interval rather than at its next phase. On the first 410 the agent
+halts (`runControl.halt`, `cmd/slagworks-agent/control.go`): it kills
+the processes it has started together with their children
+(`execkit.Group.Stop`: the commands in flight, a config script, the
+tailscale daemon and client of an enrollment in progress), starts
+nothing further, and exits with status 3.
+It does not register a boot entry it had not yet registered, does not
+reconcile the BMC, does not report `deploy_complete` and does not
+reboot. The boot hook treats the nonzero exit like any agent failure
+and holds the host in the recovery environment (recovery sshd, or a
+console shell when the image carries no keys) until an operator or the
+next operation's power cycle takes it from there. Disks are left as the
+interrupted step left them, so after an abort that landed once
+partitioning had begun the next deploy of that machine needs
+`--destructive`.
+
+A 410 that arrives after the worker accepted the agent's final report
+is the expected result of that report and is ignored: global completes
+a commission as soon as it has the inventory, while the agent still has
+the console probe and its reboot ahead of it.
+
+Tests: `TestHandleProgressReport_OperationOverIsFinal` and
+`TestHandleProgressReport_UnsynchronizedIsNotFinal`
+(`internal/worker/report_final_test.go`),
+`TestReportEndpoint_OperationOverIsGone` (`internal/httpboot/handler_test.go`),
+`TestRunDeploy_StopsWhenOperationIsNoLongerActive`
+(`cmd/slagworks-agent/control_test.go`) and the `TestReporter_*` tests
+(`cmd/slagworks-agent/reporter_test.go`).
+
+Two limits follow from the agent finding out by asking. An agent that
+cannot reach the site worker never hears the 410; it runs on until its
+final report fails, and then drops to recovery through the fatal path.
+And what is not a tracked process can still finish in the moment
+between the 410 and the exit: a file being written into the target, or
+one of the short probes the agent runs directly (`modprobe`, a single
+in-band `ipmitool` call of the BMC reconcile).
+
 ## The `awaiting_phone_home` latch
 
 The deploy pipeline has a delicate moment: the agent has finished
 writing the OS, has emitted `deploy_complete`, and is about to
 reboot the target. On the first boot after that reboot the target's
-firmware will do another PXE (because the boot order still has PXE
-first — that is a MAAS-era invariant we have preserved). Without a
-latch, that PXE would land back in `Cache.BootActionForMAC` while
-the machine was still `deploying`, get `BootDeploy` again, and the
-agent would wipe the disk it just wrote.
+firmware may do another PXE: slagworks is built for hosts that
+network-boot first (the MAAS-era arrangement, kept by the BMC's
+persistent PXE flag where the in-band reconcile wrote one, or by
+firmware that puts the network ahead of what the OS wrote to
+BootOrder). Without a latch, that PXE would land back in
+`Cache.BootActionForMAC` while the machine was still `deploying`,
+get `BootDeploy` again, and the agent would wipe the disk it just
+wrote.
+
+Whether that PXE happens depends on the firmware. On a UEFI host the
+agent registers a `Slagworks` boot entry while it installs the
+bootloader (`bootloader.RegisterEFIBootEntry`; `efibootmgr -c` also
+puts the entry first in BootOrder, which some firmware keeps and some
+re-sorts), and, once the site worker has accepted `deploy_complete`,
+sets BootNext to that entry (`bootloader.SetBootNextToInstalledOS`,
+called from `completeDeploy` in `cmd/slagworks-agent/deploy.go`).
+Firmware that honors BootNext boots the installed disk directly and the
+latch is never consulted; firmware that network-boots anyway reaches the
+latch. Both end at the installed OS.
+
+BootNext is set last, after `deploy_complete` is accepted and
+immediately before the reboot, because firmware honors it ahead of
+everything else, the one-shot PXE override `runLifecycleOp` arms on the
+BMC included. While it is armed the host's next boot is the installed
+disk whatever the next operation asks of the BMC. A deploy that is
+aborted, fails or times out before its completion is accepted therefore
+leaves BootNext unset, and the next deploy's power cycle reaches PXE.
+(Set during the bootloader step, as it used to be, it stayed armed
+through the rest of the deploy: a deploy aborted in `finalizing`
+followed by a new deploy booted the aborted install off the disk, and
+the new operation waited out `OpTimeout` at `pxe_booting`.) Tests:
+`TestRegisterEFIBootEntry_DoesNotArmBootNext`
+(`internal/agent/bootloader/bootnext_test.go`),
+`TestCompleteDeploy_BootNextOnlyAfterDeployCompleteAccepted`
+(`cmd/slagworks-agent/deploy_complete_test.go`) and the QEMU test
+`TestAbortThenRedeployReachesPXE`. One window remains: between a
+completed deploy's BootNext write and the firmware consuming it on the
+reboot that follows, a new operation's power cycle still boots the
+installed disk once.
 
 The fix is a clobber guard on the op's phase.
 

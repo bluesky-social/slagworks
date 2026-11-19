@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/agent"
+	"github.com/bluesky-social/slagworks/internal/agent/bootloader"
 	"github.com/bluesky-social/slagworks/internal/agent/execkit"
 	"github.com/bluesky-social/slagworks/internal/agentlog"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
@@ -145,19 +146,38 @@ func main() {
 	}
 	log := newAgentLogger(*traceID, *machineID, *opID, logSink)
 	slog.SetDefault(log)
+	// flushLogs gives the envelopes queued so far a short, bounded chance to
+	// reach the site worker. Only the halt path uses it: its explanation of
+	// why the agent stopped has no report to ride on, and the process exits
+	// right behind it.
+	var flushLogs func()
 	if logSinkClient != nil {
 		// Drainer goroutine: lives for the agent's lifetime. Logging
 		// is non-blocking on the caller path; this loop owns all
 		// network I/O for log shipping.
-		go logSinkClient.Run(context.Background())
+		drained := make(chan struct{})
+		go func() {
+			logSinkClient.Run(context.Background())
+			close(drained)
+		}()
+		flushLogs = func() {
+			logSinkClient.Close()
+			select {
+			case <-drained:
+			case <-time.After(time.Second):
+			}
+		}
 	}
 
 	// The agent context every subsystem receives: the structured logger
 	// (the only output surface), the exec seam, and the site worker
 	// address. Exec.Tee is wired below once the deploy-path collector
 	// exists; the stdout/inventory modes run with the default tee.
-	ek := &execkit.Exec{Log: log}
-	ctx := &agent.Context{Log: log, Exec: ek, Server: *server}
+	// procs is the one group every process the agent starts runs in, so
+	// that halting the run (control.go) ends all of them at once.
+	procs := &execkit.Group{}
+	ek := &execkit.Exec{Log: log, Procs: procs}
+	ctx := &agent.Context{Log: log, Exec: ek, Server: *server, Procs: procs}
 
 	if *mode == "stdout" {
 		runCommissionStdout(ctx)
@@ -190,8 +210,25 @@ func main() {
 	done := make(chan struct{})
 	var reporter *agentReporter
 
+	// ctl carries the run's ways out: setPhase, fatal and halt (control.go).
+	// SLAGWORKS_FATAL_AT is the test-only knob documented on fatalAtPhase;
+	// the env var is opt-in and silent when unset, so leaving the hook in
+	// shipping binaries costs nothing.
+	ctl := &runControl{
+		log:          log,
+		stopProcs:    procs.Stop,
+		flushLogs:    flushLogs,
+		done:         done,
+		fatalAtPhase: os.Getenv("SLAGWORKS_FATAL_AT"),
+		exit:         os.Exit,
+	}
+
 	if *machineID != "" && *opID != "" {
 		reporter = newAgentReporter(log, *server, *opID, *machineID, collector)
+		// Wired before the flush loop starts: its liveness report is one of
+		// the reports that can learn the operation is over.
+		reporter.onInactive = ctl.halt
+		ctl.reporter = reporter
 		go startDmesgReader(log, collector, done)
 		go reporter.RunFlushLoop(done)
 	}
@@ -200,38 +237,7 @@ func main() {
 	// long-running commands stay visible mid-run in both feeds.
 	ek.Tee = &teeWriter{w: os.Stdout, collector: collector, source: "cmd"}
 
-	// SLAGWORKS_FATAL_AT is a TEST-ONLY knob. When set to a phase name
-	// (e.g. "installing_bootloader"), the agent fatal()s the moment
-	// setPhase enters that phase. The integration test suite uses this
-	// to exercise the recovery-sshd hook against a deliberately failed
-	// late-stage agent without needing to engineer a real fault. There
-	// is no production use; the env var is opt-in and silent when
-	// unset, so leaving the hook in shipping binaries costs nothing.
-	fatalAtPhase := os.Getenv("SLAGWORKS_FATAL_AT")
-
-	setPhase := func(phase string) {
-		if reporter != nil {
-			reporter.ReportPhase(phase)
-		}
-		if fatalAtPhase != "" && phase == fatalAtPhase {
-			log.Error(fmt.Sprintf("SLAGWORKS_FATAL_AT=%s honored, exiting non-zero", phase))
-			if reporter != nil {
-				reporter.ReportFailure(phase, "SLAGWORKS_FATAL_AT="+phase)
-			}
-			close(done)
-			os.Exit(1)
-		}
-	}
-
-	fatal := func(stage string, err error) {
-		msg := fmt.Sprintf("%s: %v", stage, err)
-		log.Error("FATAL during "+stage, "err", err)
-		if reporter != nil {
-			reporter.ReportFailure(stage, msg)
-		}
-		close(done)
-		os.Exit(1)
-	}
+	setPhase, fatal := ctl.setPhase, ctl.fatal
 
 	log.Info("agent starting")
 	log.Info("agent config", "server", *server, "mode", *mode)
@@ -259,6 +265,8 @@ func main() {
 		fatal:         fatal,
 		done:          done,
 		checkIdentity: verifyIdentity,
+		armBootNext:   bootloader.SetBootNextToInstalledOS,
+		reboot:        rebootInto,
 	})
 }
 
