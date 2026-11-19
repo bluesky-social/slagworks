@@ -108,15 +108,19 @@ func (s *Server) handleLogsStream(c *echo.Context) error {
 		// page), apply the watermark for subsequent live polls.
 		// Backfill from --since reads committed history that's
 		// already past any reordering window; only live-tail past
-		// the cursor needs the lag.
+		// the cursor needs the lag. The live tail also stops bounding
+		// since on the emitter's ts alone: the cursor already bounds
+		// what is new, and a line from an emitter whose clock runs
+		// behind must stream once global has received it.
 		results, err := s.logStore.Query(ctx, filter)
 		if err != nil {
 			writeErr(ctx, conn, "query_error", err.Error())
 			return nil
 		}
 		if len(results) == 0 {
-			// Apply watermark for live-tail and sleep before the next poll.
+			// Switch to live tail and sleep before the next poll.
 			filter.LiveTailWatermark = liveTailWatermark
+			filter.SinceOrReceived = true
 			select {
 			case <-ctx.Done():
 				return nil
@@ -142,6 +146,9 @@ func buildFilter(sub ws.LogStreamSubscribeMsg) (logstore.QueryFilter, error) {
 		Sources:     normalizeSources(sub.Sources),
 		MinLevel:    strings.ToLower(sub.MinLevel),
 		LastSeenID:  sub.LastSeenID,
+		// A resume continues the live tail past the client's cursor, so
+		// it bounds since the way the live tail does.
+		SinceOrReceived: sub.LastSeenID > 0,
 	}
 	if sub.TraceID != "" {
 		id, err := uuid.Parse(sub.TraceID)
