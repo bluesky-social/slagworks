@@ -90,7 +90,12 @@ detail; this is the map.
   1:1 op ↔ trace binding. `phase_entered_at` (00014) drives per-phase
   timeouts (phone-home in particular). The unique partial index
   `idx_one_active_op_per_machine` guarantees at most one pending /
-  claimed / running op per machine.
+  claimed / running op per machine. `result` and
+  `machines.commission_data` hold text from outside slagworks (script
+  stderr, BMC error bodies, tool output), so the store writes them
+  through `jsonbSafe`, which replaces the two escapes jsonb refuses
+  (`\u0000` and an unpaired UTF-16 surrogate) with U+FFFD instead of
+  letting the write fail.
 - `images(id uuid, name, version, arch, sha256, url, created_at)`.
   Collapsed to one PXE image row by 00022 — deploy and
   commission boot the same bytes and differ only by the

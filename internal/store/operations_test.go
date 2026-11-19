@@ -753,6 +753,50 @@ func TestFailOperation_DeployFailureGoesToFailed(t *testing.T) {
 	}
 }
 
+// A worker-reported failure whose error text contains a NUL byte is valid
+// JSON (json.Marshal writes the NUL as \u0000), but a jsonb column refuses
+// that escape. The error text carries outside bytes verbatim: a config
+// script's stderr, a BMC's Redfish error body, ipmitool output. The fail
+// must still land, with the NUL replaced, instead of rolling back:
+// op_update is fire-and-forget, so a rolled-back fail leaves the op
+// claimed and the machine deploying until the 30-minute stuck sweep
+// replaces the cause with "operation timed out".
+func TestFailOperation_RecordsAFailureWhoseMessageContainsNUL(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-nul-result", State: model.MachineStateCommissioned, PXEEligible: true}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOperation(op.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	result := model.OpResult{Error: "storage script failed: exit status 1; script stderr:\nbad label \x00 on /dev/sda", Phase: "partitioning"}.Marshal()
+	out, err := st.FailOperationOutcome(op.ID, result)
+	if err != nil || out == nil {
+		t.Errorf("FailOperationOutcome: outcome set=%v err=%v; want the failure recorded", out != nil, err)
+	}
+	got, _ := st.GetOperation(op.ID)
+	gotM, _ := st.GetMachine(m.ID)
+	if got.Status != model.OpFailed {
+		t.Errorf("op is still %s after the worker reported it failed", got.Status)
+	}
+	if gotM.State != model.MachineStateFailed {
+		t.Errorf("machine is still %s; want failed", gotM.State)
+	}
+	res, err := got.DecodeResult()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "storage script failed: exit status 1; script stderr:\nbad label \uFFFD on /dev/sda"; res.Error != want {
+		t.Errorf("stored error = %q; want %q (the cause, with the NUL replaced)", res.Error, want)
+	}
+}
+
 // TestAbortMachine_RoutesViaFailOperation verifies AbortMachine's
 // per-op-status branching: an aborted pending op leaves machine
 // state alone; an aborted claimed op pulls state down per the
