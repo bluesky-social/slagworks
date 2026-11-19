@@ -757,6 +757,11 @@ func (s *Server) SetLogger(l *slog.Logger) {
 // successful ingest, 503 if the sink isn't wired, 400 on malformed
 // body. Validation is intentionally minimal — the OOB-net trust
 // boundary makes auth out of scope for v0 (see plan).
+//
+// Every envelope is stamped source=agent whatever the body claims: the
+// agent is this endpoint's only producer, and the site ring is relayed
+// to global as the worker's log_batch, where a source=global envelope
+// would pass for one of global's own op-lifecycle events.
 func (s *Server) handleLogsIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -778,6 +783,7 @@ func (s *Server) handleLogsIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	for _, env := range msg.Envelopes {
+		env.Source = slogkit.SourceAgent
 		// Stamp received_at if the producer didn't.
 		if env.ReceivedAt == nil {
 			t := now
