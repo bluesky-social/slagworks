@@ -189,6 +189,61 @@ func TestPagination(t *testing.T) {
 	}
 }
 
+// TestPaginationUnderBasePath covers a NETBOX_URL with a path component
+// ("https://host/netbox"). NetBox builds its next link from the absolute
+// request URI, so where NetBox itself runs under BASE_PATH the link carries
+// the prefix; where a reverse proxy strips the prefix in front of a
+// root-mounted NetBox it does not. Every page must be requested under the
+// configured base exactly once in both shapes. The BASE_PATH case used to
+// request page 2 at /netbox/netbox/api/... and fail the whole List with a
+// 404.
+func TestPaginationUnderBasePath(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		nextPrefix string // path prefix NetBox puts on its next links
+	}{
+		{name: "netbox BASE_PATH", nextPrefix: "/netbox"},
+		{name: "prefix-stripping proxy", nextPrefix: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var paths []string
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				http.NotFound(w, r)
+			})
+			mux.HandleFunc("/netbox/api/dcim/devices/", func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				if r.URL.Query().Get("site") != "s1" {
+					t.Errorf("request %s lost the site filter", r.URL)
+				}
+				if r.URL.Query().Get("offset") == "" {
+					next := "http://" + r.Host + tc.nextPrefix + "/api/dcim/devices/?limit=1&offset=1&site=s1"
+					_, _ = w.Write([]byte(`{"count":2,"next":"` + next + `","results":[{"id":1}]}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"count":2,"next":null,"results":[{"id":2}]}`))
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+			c := NewClient(ClientConfig{BaseURL: srv.URL + "/netbox/", Token: "t"})
+
+			var got []Device
+			q := url.Values{"limit": {"1"}, "site": {"s1"}}
+			if err := c.List(context.Background(), "/api/dcim/devices/", q, &got); err != nil {
+				t.Fatalf("List under base path /netbox: %v (requested paths %v)", err, paths)
+			}
+			if len(got) != 2 || got[0].ID != 1 || got[1].ID != 2 {
+				t.Fatalf("got %+v, want devices 1 and 2", got)
+			}
+			want := []string{"/netbox/api/dcim/devices/", "/netbox/api/dcim/devices/"}
+			if fmt.Sprint(paths) != fmt.Sprint(want) {
+				t.Errorf("requested paths %v, want %v", paths, want)
+			}
+		})
+	}
+}
+
 // TestLargeBodyNotTruncated is the regression guard for the pop1
 // snapshot freeze: a list response larger than 1MB must decode fully,
 // not get silently truncated mid-JSON (which surfaced as the misleading
