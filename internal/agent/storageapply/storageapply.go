@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,7 +26,16 @@ import (
 // udev's probe finish and the disk free up (observed clearing within ~1-2s on
 // the Dell R640 oob-gws). Only rereadpt is retried — every other
 // storage command stays fail-fast so a real error isn't masked by retries.
+//
+// A failed `mdadm --create` is explained by raidCreateError; every other
+// failure is returned as is.
 func RunCommand(ctx *agent.Context, cmd storage.Command) error {
+	if level, ok := raidCreateLevel(cmd); ok {
+		if err := ctx.Exec.Run(cmd.Name, cmd.Args...); err != nil {
+			return raidCreateError(ctx, cmd.Args[1], level, err)
+		}
+		return nil
+	}
 	isRereadpt := cmd.Name == "blockdev" && len(cmd.Args) >= 1 && cmd.Args[0] == "--rereadpt"
 	if !isRereadpt {
 		return ctx.Exec.Run(cmd.Name, cmd.Args...)
@@ -46,6 +56,55 @@ func RunCommand(ctx *agent.Context, cmd storage.Command) error {
 		time.Sleep(time.Second)
 	}
 	return fmt.Errorf("blockdev --rereadpt still failing after %d attempts: %w", maxAttempts, err)
+}
+
+// raidCreateLevel returns the RAID level of a planned
+// `mdadm --create <md> --level=N ...` command, and false for any other
+// command.
+func raidCreateLevel(cmd storage.Command) (int, bool) {
+	if cmd.Name != "mdadm" || len(cmd.Args) < 2 || cmd.Args[0] != "--create" {
+		return 0, false
+	}
+	for _, a := range cmd.Args[2:] {
+		if v, ok := strings.CutPrefix(a, "--level="); ok {
+			level, err := strconv.Atoi(v)
+			return level, err == nil
+		}
+	}
+	return 0, false
+}
+
+// raidCreateError explains a failed `mdadm --create`. The way a level the
+// planner accepts fails in practice is a boot image whose deploy initrd
+// lacks the level's md personality module: the kernel loads it by running
+// modprobe in the initramfs, not in the agent's chroot, and mdadm reports
+// only "RUN_ARRAY failed: Invalid argument". The kernel log names the cause
+// outright: md_run requests module md-level-N and, when no personality
+// registers, logs "md: personality for level N is not loaded!". The
+// Personalities line of /proc/mdstat cannot stand in for it, because
+// personalities load lazily and a create that failed before RUN_ARRAY
+// never asked for one. Either way the member disks are already
+// repartitioned, so the retry needs --destructive.
+func raidCreateError(ctx *agent.Context, mdDev string, level int, err error) error {
+	const retry = "redeploy with --destructive: the member disks were already repartitioned and may hold partial md superblocks"
+	module, known := storage.RAIDModule(level)
+	if !known {
+		// Plan rejects every level RAIDModule does not know.
+		return fmt.Errorf("mdadm --create %s (RAID %d): %w", mdDev, level, err)
+	}
+	notLoaded := fmt.Sprintf("md: personality for level %d is not loaded", level)
+	kernelLog, readErr := ctx.Exec.Output("dmesg")
+	if readErr == nil && strings.Contains(kernelLog, notLoaded) {
+		return fmt.Errorf("mdadm --create %s (RAID %d): %w; the kernel logged %q: it could not load module %s "+
+			"from the boot image's deploy initrd. Rebuild the image with %s in assets/initramfs/hooks/slagworks, then %s",
+			mdDev, level, err, notLoaded, module, module, retry)
+	}
+	unread := ""
+	if readErr != nil {
+		unread = fmt.Sprintf(" (the kernel log could not be read to check for a missing %s module: %v)", module, readErr)
+	}
+	return fmt.Errorf("mdadm --create %s (RAID %d): %w; mdadm's stderr in the exec log entry before this one names "+
+		"the cause. Fix it, then %s%s", mdDev, level, err, retry, unread)
 }
 
 // Inventory returns the list of physical block devices suitable for
