@@ -649,12 +649,16 @@ func (s *Store) failOperationGuarded(opID uuid.UUID, result []byte, guard func(*
 	return outcome, nil
 }
 
-// failOpBatch routes each op through FailOperation, continuing past
-// per-op errors so one transient failure (deadlock retry, PG hiccup)
-// doesn't strand the rest of a stuck set until the next sweep tick.
+// failOpBatch routes each op through failOperationGuarded, continuing
+// past per-op errors so one transient failure (deadlock retry, PG
+// hiccup) doesn't strand the rest of a stuck set until the next sweep
+// tick. A timeout sweep passes the predicate it selected ops with as
+// guard, so each fail re-checks it under the op row lock and skips an
+// op that moved on after the unlocked SELECT (a worker claimed it, its
+// phase advanced). nil fails any op that is still non-terminal.
 // Returns the post-mutation outcomes (one per op that actually
 // transitioned) for the op-event publisher, and the joined errors.
-func (s *Store) failOpBatch(ops []model.Operation, reason string) ([]OpOutcome, error) {
+func (s *Store) failOpBatch(ops []model.Operation, reason string, guard func(*gorm.DB) *gorm.DB) ([]OpOutcome, error) {
 	// json.Marshal, not string concat: reason is a free-form param and
 	// a quote/backslash in it would corrupt the result column's JSON.
 	result, err := json.Marshal(map[string]string{"error": reason})
@@ -664,7 +668,7 @@ func (s *Store) failOpBatch(ops []model.Operation, reason string) ([]OpOutcome, 
 	var outcomes []OpOutcome
 	var errs []error
 	for _, op := range ops {
-		out, err := s.failOperationGuarded(op.ID, result, nil)
+		out, err := s.failOperationGuarded(op.ID, result, guard)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("op %s: %w", op.ID, err))
 			continue
@@ -731,26 +735,32 @@ func (s *Store) ExpireOrphanedClaims(grace time.Duration) ([]OpOutcome, error) {
 // (longer) deadline anchored on phase_entered_at, swept by
 // ExpirePhoneHomeOperations. Without this exclusion a deploy that
 // hits awaiting_phone_home near the OpTimeout would fail-sweep
-// before phone-home ever has a chance to land.
+// before phone-home ever has a chance to land. The predicate is
+// re-checked inside each fail (see failOpBatch), so an op that enters
+// awaiting_phone_home after the SELECT is spared too.
 //
 // Returns the count of expired ops.
 func (s *Store) ExpireStuckOperations(timeout time.Duration) ([]OpOutcome, error) {
 	cutoff := time.Now().Add(-timeout)
+	stuck := func(q *gorm.DB) *gorm.DB {
+		return q.Where("status IN ? AND claimed_at < ? AND phase <> ?",
+			[]model.OperationStatus{model.OpClaimed, model.OpRunning},
+			cutoff, "awaiting_phone_home")
+	}
 	var stuckOps []model.Operation
-	if err := s.db.Where("status IN ? AND claimed_at < ? AND phase <> ?",
-		[]model.OperationStatus{model.OpClaimed, model.OpRunning},
-		cutoff, "awaiting_phone_home").
-		Find(&stuckOps).Error; err != nil {
+	if err := stuck(s.db).Find(&stuckOps).Error; err != nil {
 		return nil, err
 	}
-	return s.failOpBatch(stuckOps, "operation timed out")
+	return s.failOpBatch(stuckOps, "operation timed out", stuck)
 }
 
 // ExpirePendingOperations sweeps operations that have been pending
 // (never claimed by a worker) past the cutoff and routes each through
 // FailOperation. Pending ops have not advanced machine state, so
 // FailOperation's rule 1 leaves machine state untouched — the machine
-// stays in its prior resting state.
+// stays in its prior resting state. The predicate is re-checked inside
+// each fail (see failOpBatch), so an op a worker claims after the
+// SELECT stays claimed instead of being failed under that worker.
 //
 // Default tier: 24h. The motivation is operator hygiene: if a worker
 // is offline at op-create time and never picks it up, the op should
@@ -758,13 +768,14 @@ func (s *Store) ExpireStuckOperations(timeout time.Duration) ([]OpOutcome, error
 // scheduled (idx_one_active_op_per_machine).
 func (s *Store) ExpirePendingOperations(timeout time.Duration) ([]OpOutcome, error) {
 	cutoff := time.Now().Add(-timeout)
+	pending := func(q *gorm.DB) *gorm.DB {
+		return q.Where("status = ? AND created_at < ?", model.OpPending, cutoff)
+	}
 	var stuckOps []model.Operation
-	if err := s.db.Where("status = ? AND created_at < ?",
-		model.OpPending, cutoff).
-		Find(&stuckOps).Error; err != nil {
+	if err := pending(s.db).Find(&stuckOps).Error; err != nil {
 		return nil, err
 	}
-	return s.failOpBatch(stuckOps, "pending op timed out")
+	return s.failOpBatch(stuckOps, "pending op timed out", pending)
 }
 
 // ExpirePhoneHomeOperations sweeps deploy operations stuck in phase
@@ -778,17 +789,20 @@ func (s *Store) ExpirePendingOperations(timeout time.Duration) ([]OpOutcome, err
 // Default tier: 30 min. Tight enough to surface real "OS won't boot"
 // failures fast; loose enough not to flap on slow hardware (POST +
 // PXE chain to disk + systemd + cloud-init can run 8-15 minutes on
-// older Supermicro/AMI hosts).
+// older Supermicro/AMI hosts). The predicate is re-checked inside each
+// fail (see failOpBatch).
 func (s *Store) ExpirePhoneHomeOperations(timeout time.Duration) ([]OpOutcome, error) {
 	cutoff := time.Now().Add(-timeout)
+	waiting := func(q *gorm.DB) *gorm.DB {
+		return q.Where("status IN ? AND phase = ? AND phase_entered_at < ?",
+			[]model.OperationStatus{model.OpClaimed, model.OpRunning},
+			"awaiting_phone_home", cutoff)
+	}
 	var stuckOps []model.Operation
-	if err := s.db.Where("status IN ? AND phase = ? AND phase_entered_at < ?",
-		[]model.OperationStatus{model.OpClaimed, model.OpRunning},
-		"awaiting_phone_home", cutoff).
-		Find(&stuckOps).Error; err != nil {
+	if err := waiting(s.db).Find(&stuckOps).Error; err != nil {
 		return nil, err
 	}
-	return s.failOpBatch(stuckOps, "phone-home timed out")
+	return s.failOpBatch(stuckOps, "phone-home timed out", waiting)
 }
 
 // AbortMachine cancels any active operations on a machine. Each op is
@@ -845,7 +859,9 @@ func (s *Store) FailInFlightOpsForMachine(machineID uuid.UUID, reason string) ([
 		Find(&active).Error; err != nil {
 		return nil, err
 	}
-	return s.failOpBatch(active, reason)
+	// No guard: "still active" is exactly the non-terminal check every
+	// fail already makes under the op row lock.
+	return s.failOpBatch(active, reason, nil)
 }
 
 // CreateMachineOp inserts a pending lifecycle op against a machine.

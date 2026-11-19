@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 )
@@ -906,6 +907,185 @@ func TestExpirePhoneHomeOperations_FailsStuckDeploys(t *testing.T) {
 	gotM, _ := st.GetMachine(m.ID)
 	if gotM.State != model.MachineStateFailed {
 		t.Errorf("machine state: got %s, want failed", gotM.State)
+	}
+}
+
+// afterSweepSelect arranges for fn to run exactly once, immediately after
+// the next SELECT whose SQL contains match has returned on st's database
+// handle. The expiry sweeps read their candidates with a plain SELECT and
+// then fail each one in its own transaction; this puts fn in that gap
+// deterministically, with no sleeps and no goroutines.
+func afterSweepSelect(t *testing.T, st *Store, match string, fn func()) {
+	t.Helper()
+	name := "sweep-guard-test:" + uuid.NewString()
+	fired := false
+	err := st.db.Callback().Query().After("gorm:query").Register(name, func(tx *gorm.DB) {
+		if fired || !strings.Contains(tx.Statement.SQL.String(), match) {
+			return
+		}
+		fired = true
+		fn()
+	})
+	if err != nil {
+		t.Fatalf("register interleave callback: %v", err)
+	}
+	t.Cleanup(func() { _ = st.db.Callback().Query().Remove(name) })
+}
+
+// TestExpirePendingOperations_SparesAnOpClaimedMeanwhile pins the pending
+// sweep against a worker claim that commits between the sweep's candidate
+// read and its fail (a site worker reconnecting after a long outage claims
+// its backlog on the same tick). The claim told the worker the op is its to
+// drive, so the sweep must leave the op claimed and the machine deploying,
+// not fail it as "pending op timed out" and pull the machine to failed.
+func TestExpirePendingOperations_SparesAnOpClaimedMeanwhile(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{
+		ID: uuid.New(), NetBoxSerial: "SN-pending-vs-claim",
+		State: model.MachineStateCommissioned, PXEEligible: true,
+	}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil,
+		model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.Model(&model.Operation{}).Where("id = ?", op.ID).
+		Update("created_at", time.Now().Add(-25*time.Hour)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var claimed *model.Operation
+	var claimErr error
+	afterSweepSelect(t, st, "created_at <", func() {
+		claimed, claimErr = st.ClaimOperation(op.ID, "worker-1")
+	})
+	outs, err := st.ExpirePendingOperations(24 * time.Hour)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if claimErr != nil || claimed == nil {
+		t.Fatalf("setup: the interleaved claim did not succeed (op=%v err=%v)", claimed, claimErr)
+	}
+
+	if len(outs) != 0 {
+		t.Errorf("pending sweep reported %d expired ops; its only candidate had been claimed", len(outs))
+	}
+	gotOp, _ := st.GetOperation(op.ID)
+	if gotOp.Status != model.OpClaimed {
+		t.Errorf("op status: got %s (result %s), want claimed", gotOp.Status, gotOp.Result)
+	}
+	gotM, _ := st.GetMachine(m.ID)
+	if gotM.State != model.MachineStateDeploying {
+		t.Errorf("machine state: got %s, want deploying (the claimed op is driving it)", gotM.State)
+	}
+}
+
+// TestExpireStuckOperations_SparesAnOpThatEnteredAwaitingPhoneHome pins
+// the stuck sweep's awaiting_phone_home exclusion against a deploy_complete
+// phase report that commits between the sweep's candidate read and its
+// fail. Once the op is in awaiting_phone_home it is on the phone-home
+// budget, and the stuck sweep must not fail it.
+func TestExpireStuckOperations_SparesAnOpThatEnteredAwaitingPhoneHome(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{
+		ID: uuid.New(), NetBoxSerial: "SN-stuck-vs-phone-home",
+		State: model.MachineStateCommissioned, PXEEligible: true,
+	}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil,
+		model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOperation(op.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetOperationPhase(op.ID, "finalizing"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.Model(&model.Operation{}).Where("id = ?", op.ID).
+		Update("claimed_at", time.Now().Add(-31*time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	afterSweepSelect(t, st, "claimed_at <", func() {
+		if _, err := st.SetOperationPhase(op.ID, "awaiting_phone_home"); err != nil {
+			t.Errorf("interleaved phase report: %v", err)
+		}
+	})
+	outs, err := st.ExpireStuckOperations(30 * time.Minute)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	gotOp, _ := st.GetOperation(op.ID)
+	if gotOp.Phase != "awaiting_phone_home" {
+		t.Fatalf("setup: op phase is %q, want awaiting_phone_home", gotOp.Phase)
+	}
+	if len(outs) != 0 || gotOp.Status != model.OpClaimed {
+		t.Errorf("stuck sweep failed an op in awaiting_phone_home: status=%s result=%s outcomes=%d",
+			gotOp.Status, gotOp.Result, len(outs))
+	}
+	gotM, _ := st.GetMachine(m.ID)
+	if gotM.State != model.MachineStateDeploying {
+		t.Errorf("machine state: got %s, want deploying", gotM.State)
+	}
+}
+
+// TestExpirePhoneHomeOperations_SparesAnOpThatLeftAwaitingPhoneHome pins
+// the phone-home sweep against a phase change that commits between its
+// candidate read and its fail. The worker's failure path writes phase
+// `failed` ahead of the failed status; the op is then no longer awaiting
+// phone-home, so the sweep must leave it for the worker's own failure
+// report (which carries the real error) instead of failing it as
+// "phone-home timed out".
+func TestExpirePhoneHomeOperations_SparesAnOpThatLeftAwaitingPhoneHome(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{
+		ID: uuid.New(), NetBoxSerial: "SN-phone-home-vs-phase",
+		State: model.MachineStateCommissioned, PXEEligible: true,
+	}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil,
+		model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOperation(op.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetOperationPhase(op.ID, "awaiting_phone_home"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.Model(&model.Operation{}).Where("id = ?", op.ID).
+		Update("phase_entered_at", time.Now().Add(-31*time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	afterSweepSelect(t, st, "phase_entered_at <", func() {
+		if _, err := st.SetOperationPhase(op.ID, "failed"); err != nil {
+			t.Errorf("interleaved phase report: %v", err)
+		}
+	})
+	outs, err := st.ExpirePhoneHomeOperations(30 * time.Minute)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	gotOp, _ := st.GetOperation(op.ID)
+	if gotOp.Phase != "failed" {
+		t.Fatalf("setup: op phase is %q, want failed", gotOp.Phase)
+	}
+	if len(outs) != 0 || gotOp.Status != model.OpClaimed {
+		t.Errorf("phone-home sweep failed an op no longer awaiting phone-home: status=%s result=%s outcomes=%d",
+			gotOp.Status, gotOp.Result, len(outs))
 	}
 }
 

@@ -594,6 +594,15 @@ three expiration sweeps in order. All three converge on
 | Claimed / running ops | 30 minutes | `OpTimeout` (`server.go:68`) | `Store.ExpireStuckOperations` (`store.go:874`) | `status IN ('claimed','running') AND claimed_at < cutoff AND phase != 'awaiting_phone_home'` |
 | Phone-home | 30 minutes | `PhoneHomeTimeout` (`server.go:75`) | `Store.ExpirePhoneHomeOperations` (`store.go:933`) | `status IN ('claimed','running') AND phase = 'awaiting_phone_home' AND phase_entered_at < cutoff` |
 
+Each sweep reads its candidates without a lock and then fails them one
+at a time, so it passes its predicate to `failOperationGuarded` as the
+guard: the predicate is re-checked under the op row lock, and an op
+that stopped matching in between is left alone. A worker claim that
+lands after the pending sweep's read keeps its op claimed, and a deploy
+that enters `awaiting_phone_home` after the stuck sweep's read is
+spared. `ExpireOrphanedClaims`, which fails claims whose worker died
+before recording a phase, guards the same way.
+
 The `awaiting_phone_home` phase is explicitly excluded from
 `ExpireStuckOperations` (`store.go:867`) and covered separately by
 `ExpirePhoneHomeOperations`. The deadline anchors are chosen so each
