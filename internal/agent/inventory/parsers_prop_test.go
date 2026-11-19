@@ -18,7 +18,9 @@ package inventory
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -986,8 +988,9 @@ func TestInventory_Property_CollectorsNeverPanic(t *testing.T) {
 		r.set(mutateToolOutput(t, `{"lscpu":[{"field":"Model name:","data":"X"},{"field":"Socket(s):","data":"2"},{"field":"Core(s) per socket:","data":"128"}]}`), "lscpu", "--json")
 		nics := genNICs(t, true)
 		nr := nicRunner(nics)
-		for k, v := range nr.out {
-			r.out[k] = mutateToolOutput(t, v)
+		// Sorted so the draw sequence does not depend on map iteration order.
+		for _, k := range slices.Sorted(maps.Keys(nr.out)) {
+			r.out[k] = mutateToolOutput(t, nr.out[k])
 		}
 		for k := range nr.available {
 			r.available[k] = true
