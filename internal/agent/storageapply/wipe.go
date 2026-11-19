@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -427,23 +428,38 @@ func probeError(err error) string {
 	return err.Error()
 }
 
-// CleanupMounts unmounts every layout mount under /target, deepest
-// first, before reboot.
-func CleanupMounts(ctx *agent.Context, layout storage.Layout) {
-	ctx.Log.Info("unmounting")
+// CleanupMounts unmounts every layout mount under /target before reboot,
+// deepest first, so no mount is attempted while another still sits beneath
+// it; the root, /target itself, goes last. Depth ties are broken lexically
+// so the order never depends on map iteration.
+//
+// A mount that will not unmount is an error the caller must fail the deploy
+// on: rebooting with a filesystem still mounted leaves it dirty, and a
+// bootloader that does not replay a journal (GRUB reading an xfs root) then
+// cannot find its own files. umount refuses a mount with anything still
+// mounted beneath it, so a successful unmount of /target also proves no
+// helper left a mount (a chroot bind, a tmpfs) behind.
+func CleanupMounts(ctx *agent.Context, layout storage.Layout) error {
+	ctx.Log.Info("unmounting target filesystems")
 
-	// Build mount list sorted deepest-first for clean unmount
-	var paths []string
-	for path := range layout.Mounts {
-		paths = append(paths, "/target"+path)
+	paths := make([]string, 0, len(layout.Mounts))
+	for mp := range layout.Mounts {
+		paths = append(paths, path.Join("/target", mp))
 	}
 	sort.Slice(paths, func(i, j int) bool {
-		return strings.Count(paths[i], "/") > strings.Count(paths[j], "/")
+		di, dj := strings.Count(paths[i], "/"), strings.Count(paths[j], "/")
+		if di != dj {
+			return di > dj
+		}
+		return paths[i] < paths[j]
 	})
 
 	for _, mp := range paths {
 		if err := ctx.Exec.Run("umount", mp); err != nil {
-			ctx.Log.Warn("umount failed", "path", mp, "err", err)
+			return fmt.Errorf("umount %s: %w; rebooting with it mounted would leave the filesystem dirty, "+
+				"so the deploy stops here. Something beneath %s is still mounted or in use: "+
+				"inspect it from the recovery shell (findmnt -R %s) and redeploy", mp, err, mp, mp)
 		}
 	}
+	return nil
 }

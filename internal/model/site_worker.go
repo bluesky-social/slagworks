@@ -33,5 +33,8 @@ type SiteWorker struct {
 	// worker's row always carries a verified serial. Empty appears only for
 	// rows written under a nil resolver (dev/test) or before the worker's
 	// first post-P4a hello; such a worker is ineligible for outlet ops.
+	// It keeps the board's spelling, which can differ in case from the NetBox
+	// device's serial (the gate matches case-insensitively): compare it with
+	// SameHardwareSerial.
 	Serial string `json:"serial,omitempty" gorm:"column:serial;not null;default:''"`
 }

@@ -265,7 +265,7 @@ Global to worker:
 | `snapshot` | `{"snapshot","version","proto"}`: the full site snapshot plus global's build SHA. Sent on hello when the worker is behind and whenever the site's snapshot content changes. A worker with `SLAGWORKS_AUTO_UPGRADE=1` upgrades itself when `version` differs from its own. |
 | `no_change` | `{"version","proto"}`. Hello reply when the worker's `last_seq_num` is current. |
 | `op_resync` | `{"ops","machine_states"}`: every active operation for the site, sent after every hello reply. |
-| `op_delta` | `{"operation","machine_state"}`: one operation after a mutation (create, claim, phase change). |
+| `op_delta` | `{"operation","machine_state"}`: one operation after a mutation (create, claim, phase change). Every active operation for the site is also re-sent as an `op_delta` after each `snapshot` pushed on a content change; the worker keeps the higher `version`. |
 | `op_removed` | `{"op_id","machine_id","version","machine_state"}`: an operation left the active set. |
 | `power_status` | RPC request `{"machine_id","bmc_runtime","amt_runtime"}`. |
 | `boot_status` | RPC request `{"machine_id","bmc_runtime"}`. |

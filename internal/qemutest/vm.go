@@ -78,6 +78,10 @@ type ExtraDisk struct {
 	// VM's process has fully exited — see Stop().
 	Path   string
 	Serial string
+	// LogicalBlockSize, when non-zero, sets the disk's logical and
+	// physical block size (4096 presents a 4Kn disk). Zero keeps QEMU's
+	// 512-byte default.
+	LogicalBlockSize int
 }
 
 // ExtraNIC describes an additional NIC.
@@ -323,23 +327,27 @@ func (vm *VM) buildArgs() []string {
 		if serial == "" {
 			serial = fmt.Sprintf("EXTRA%04d", i)
 		}
+		blockSize := ""
+		if ed.LogicalBlockSize != 0 {
+			blockSize = fmt.Sprintf(",logical_block_size=%d,physical_block_size=%d", ed.LogicalBlockSize, ed.LogicalBlockSize)
+		}
 		switch ed.Type {
 		case DiskNVMe:
 			args = append(args,
 				"-drive", fmt.Sprintf("file=%s,format=qcow2,if=none,id=%s", path, driveID),
-				"-device", fmt.Sprintf("nvme,drive=%s,serial=%s", driveID, serial),
+				"-device", fmt.Sprintf("nvme,drive=%s,serial=%s%s", driveID, serial, blockSize),
 			)
 		case DiskSATA:
 			args = append(args,
 				"-drive", fmt.Sprintf("file=%s,format=qcow2,if=none,id=%s", path, driveID),
-				"-device", fmt.Sprintf("ide-hd,drive=%s,serial=%s", driveID, serial),
+				"-device", fmt.Sprintf("ide-hd,drive=%s,serial=%s%s", driveID, serial, blockSize),
 			)
 		default:
 			// virtio-blk: qcow2 doesn't support a "serial" option on
 			// -drive; the serial goes on the -device line.
 			args = append(args,
 				"-drive", fmt.Sprintf("file=%s,format=qcow2,if=none,id=%s", path, driveID),
-				"-device", fmt.Sprintf("virtio-blk-pci,drive=%s,serial=%s", driveID, serial),
+				"-device", fmt.Sprintf("virtio-blk-pci,drive=%s,serial=%s%s", driveID, serial, blockSize),
 			)
 		}
 	}

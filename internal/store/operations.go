@@ -438,7 +438,7 @@ func (s *Store) CompleteActiveOperation(
 // PhaseTransition describes the result of a SetOperationPhase call.
 // Caller emits a single "phase transition" log envelope when Changed
 // is true; ignores when false (the worker emitted a duplicate phase
-// event and the row didn't change).
+// event, or the op is already terminal, and the row didn't change).
 type PhaseTransition struct {
 	Changed   bool
 	PrevPhase string
@@ -465,29 +465,56 @@ type PhaseTransition struct {
 // make the deadline forever-renewable on noisy workers; instead we
 // only bump when phase actually changes.
 //
+// A terminal (completed/failed) op is left as it is: the worker can
+// still report a phase after the op ended (a report in flight when the
+// operator aborted, or executor progress after op_removed), and the
+// phase the op ended in, phase_entered_at and version belong to the
+// terminal record. Moving the version would also publish an op_delta
+// above the tombstone workers keep for the removed op.
+//
 // Returns the transition shape (prev_phase, duration in prev) so the
 // caller can emit a "phase transition" log envelope.
 func (s *Store) SetOperationPhase(opID uuid.UUID, phase string) (PhaseTransition, error) {
 	var t PhaseTransition
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var op model.Operation
-		if err := tx.Select("id", "phase", "phase_entered_at", "machine_id", "trace_id").
+		// FOR UPDATE: the "did the phase change" decision and the
+		// PrevPhase/Duration below come from this read, so it must see the
+		// row the UPDATE writes. Under READ COMMITTED a plain SELECT lets
+		// two overlapping deliveries of one report (outbox redelivery on a
+		// new connection, an HA site-worker pair) both read the old phase
+		// and both write: two Changed=true results, two op_deltas, two
+		// envelopes, version +2. With the lock the second waits, then
+		// reads the first's phase and returns Changed=false.
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "phase", "phase_entered_at", "machine_id", "trace_id").
 			Where("id = ?", opID).First(&op).Error; err != nil {
 			return err
 		}
+		unchanged := PhaseTransition{Changed: false, NewPhase: phase, MachineID: op.MachineID, TraceID: op.TraceID}
 		if op.Phase == phase {
-			t = PhaseTransition{Changed: false, NewPhase: phase, MachineID: op.MachineID, TraceID: op.TraceID}
+			t = unchanged
 			return nil
 		}
 		now := time.Now()
-		if err := tx.Model(&model.Operation{}).
-			Where("id = ?", opID).
+		// NOT IN (completed, failed): leave a terminal op as it is. The
+		// guard sits on the UPDATE, not the read above, because the read
+		// takes no lock and an abort or timeout fail can commit between
+		// the two (the same reason CompleteOperationWithState guards its
+		// UPDATE).
+		res := tx.Model(&model.Operation{}).
+			Where("id = ? AND status NOT IN ?", opID, opstate.TerminalStatuses).
 			Updates(map[string]any{
 				"phase":            phase,
 				"phase_entered_at": now,
 				"version":          gorm.Expr("version + 1"),
-			}).Error; err != nil {
-			return err
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			t = unchanged
+			return nil
 		}
 		post, err := refetchOp(tx, opID)
 		if err != nil {
@@ -649,12 +676,16 @@ func (s *Store) failOperationGuarded(opID uuid.UUID, result []byte, guard func(*
 	return outcome, nil
 }
 
-// failOpBatch routes each op through FailOperation, continuing past
-// per-op errors so one transient failure (deadlock retry, PG hiccup)
-// doesn't strand the rest of a stuck set until the next sweep tick.
+// failOpBatch routes each op through failOperationGuarded, continuing
+// past per-op errors so one transient failure (deadlock retry, PG
+// hiccup) doesn't strand the rest of a stuck set until the next sweep
+// tick. A timeout sweep passes the predicate it selected ops with as
+// guard, so each fail re-checks it under the op row lock and skips an
+// op that moved on after the unlocked SELECT (a worker claimed it, its
+// phase advanced). nil fails any op that is still non-terminal.
 // Returns the post-mutation outcomes (one per op that actually
 // transitioned) for the op-event publisher, and the joined errors.
-func (s *Store) failOpBatch(ops []model.Operation, reason string) ([]OpOutcome, error) {
+func (s *Store) failOpBatch(ops []model.Operation, reason string, guard func(*gorm.DB) *gorm.DB) ([]OpOutcome, error) {
 	// json.Marshal, not string concat: reason is a free-form param and
 	// a quote/backslash in it would corrupt the result column's JSON.
 	result, err := json.Marshal(map[string]string{"error": reason})
@@ -664,7 +695,7 @@ func (s *Store) failOpBatch(ops []model.Operation, reason string) ([]OpOutcome, 
 	var outcomes []OpOutcome
 	var errs []error
 	for _, op := range ops {
-		out, err := s.failOperationGuarded(op.ID, result, nil)
+		out, err := s.failOperationGuarded(op.ID, result, guard)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("op %s: %w", op.ID, err))
 			continue
@@ -731,26 +762,32 @@ func (s *Store) ExpireOrphanedClaims(grace time.Duration) ([]OpOutcome, error) {
 // (longer) deadline anchored on phase_entered_at, swept by
 // ExpirePhoneHomeOperations. Without this exclusion a deploy that
 // hits awaiting_phone_home near the OpTimeout would fail-sweep
-// before phone-home ever has a chance to land.
+// before phone-home ever has a chance to land. The predicate is
+// re-checked inside each fail (see failOpBatch), so an op that enters
+// awaiting_phone_home after the SELECT is spared too.
 //
 // Returns the count of expired ops.
 func (s *Store) ExpireStuckOperations(timeout time.Duration) ([]OpOutcome, error) {
 	cutoff := time.Now().Add(-timeout)
+	stuck := func(q *gorm.DB) *gorm.DB {
+		return q.Where("status IN ? AND claimed_at < ? AND phase <> ?",
+			[]model.OperationStatus{model.OpClaimed, model.OpRunning},
+			cutoff, "awaiting_phone_home")
+	}
 	var stuckOps []model.Operation
-	if err := s.db.Where("status IN ? AND claimed_at < ? AND phase <> ?",
-		[]model.OperationStatus{model.OpClaimed, model.OpRunning},
-		cutoff, "awaiting_phone_home").
-		Find(&stuckOps).Error; err != nil {
+	if err := stuck(s.db).Find(&stuckOps).Error; err != nil {
 		return nil, err
 	}
-	return s.failOpBatch(stuckOps, "operation timed out")
+	return s.failOpBatch(stuckOps, "operation timed out", stuck)
 }
 
 // ExpirePendingOperations sweeps operations that have been pending
 // (never claimed by a worker) past the cutoff and routes each through
 // FailOperation. Pending ops have not advanced machine state, so
 // FailOperation's rule 1 leaves machine state untouched — the machine
-// stays in its prior resting state.
+// stays in its prior resting state. The predicate is re-checked inside
+// each fail (see failOpBatch), so an op a worker claims after the
+// SELECT stays claimed instead of being failed under that worker.
 //
 // Default tier: 24h. The motivation is operator hygiene: if a worker
 // is offline at op-create time and never picks it up, the op should
@@ -758,13 +795,14 @@ func (s *Store) ExpireStuckOperations(timeout time.Duration) ([]OpOutcome, error
 // scheduled (idx_one_active_op_per_machine).
 func (s *Store) ExpirePendingOperations(timeout time.Duration) ([]OpOutcome, error) {
 	cutoff := time.Now().Add(-timeout)
+	pending := func(q *gorm.DB) *gorm.DB {
+		return q.Where("status = ? AND created_at < ?", model.OpPending, cutoff)
+	}
 	var stuckOps []model.Operation
-	if err := s.db.Where("status = ? AND created_at < ?",
-		model.OpPending, cutoff).
-		Find(&stuckOps).Error; err != nil {
+	if err := pending(s.db).Find(&stuckOps).Error; err != nil {
 		return nil, err
 	}
-	return s.failOpBatch(stuckOps, "pending op timed out")
+	return s.failOpBatch(stuckOps, "pending op timed out", pending)
 }
 
 // ExpirePhoneHomeOperations sweeps deploy operations stuck in phase
@@ -778,17 +816,20 @@ func (s *Store) ExpirePendingOperations(timeout time.Duration) ([]OpOutcome, err
 // Default tier: 30 min. Tight enough to surface real "OS won't boot"
 // failures fast; loose enough not to flap on slow hardware (POST +
 // PXE chain to disk + systemd + cloud-init can run 8-15 minutes on
-// older Supermicro/AMI hosts).
+// older Supermicro/AMI hosts). The predicate is re-checked inside each
+// fail (see failOpBatch).
 func (s *Store) ExpirePhoneHomeOperations(timeout time.Duration) ([]OpOutcome, error) {
 	cutoff := time.Now().Add(-timeout)
+	waiting := func(q *gorm.DB) *gorm.DB {
+		return q.Where("status IN ? AND phase = ? AND phase_entered_at < ?",
+			[]model.OperationStatus{model.OpClaimed, model.OpRunning},
+			"awaiting_phone_home", cutoff)
+	}
 	var stuckOps []model.Operation
-	if err := s.db.Where("status IN ? AND phase = ? AND phase_entered_at < ?",
-		[]model.OperationStatus{model.OpClaimed, model.OpRunning},
-		"awaiting_phone_home", cutoff).
-		Find(&stuckOps).Error; err != nil {
+	if err := waiting(s.db).Find(&stuckOps).Error; err != nil {
 		return nil, err
 	}
-	return s.failOpBatch(stuckOps, "phone-home timed out")
+	return s.failOpBatch(stuckOps, "phone-home timed out", waiting)
 }
 
 // AbortMachine cancels any active operations on a machine. Each op is
@@ -799,6 +840,9 @@ func (s *Store) ExpirePhoneHomeOperations(timeout time.Duration) ([]OpOutcome, e
 //
 // Returns the machine row after the abort AND the post-mutation
 // outcomes (one per op that transitioned) for the op-event publisher.
+// On error the outcomes still list every op failed before the error:
+// those ops are terminal in the database and a retried abort no longer
+// sees them, so the caller publishes them whatever the error.
 func (s *Store) AbortMachine(machineID uuid.UUID) (*model.Machine, []OpOutcome, error) {
 	var existing model.Machine
 	if err := s.db.Where("id = ?", machineID).First(&existing).Error; err != nil {
@@ -813,7 +857,7 @@ func (s *Store) AbortMachine(machineID uuid.UUID) (*model.Machine, []OpOutcome, 
 	for _, op := range activeOps {
 		out, err := s.failOperationGuarded(op.ID, []byte(`{"error":"aborted by operator"}`), nil)
 		if err != nil {
-			return nil, nil, fmt.Errorf("fail op %s during abort: %w", op.ID, err)
+			return nil, outcomes, fmt.Errorf("fail op %s during abort: %w", op.ID, err)
 		}
 		if out != nil {
 			outcomes = append(outcomes, *out)
@@ -821,7 +865,7 @@ func (s *Store) AbortMachine(machineID uuid.UUID) (*model.Machine, []OpOutcome, 
 	}
 	var out model.Machine
 	if err := s.db.Where("id = ?", machineID).First(&out).Error; err != nil {
-		return nil, nil, err
+		return nil, outcomes, err
 	}
 	return &out, outcomes, nil
 }
@@ -845,7 +889,9 @@ func (s *Store) FailInFlightOpsForMachine(machineID uuid.UUID, reason string) ([
 		Find(&active).Error; err != nil {
 		return nil, err
 	}
-	return s.failOpBatch(active, reason)
+	// No guard: "still active" is exactly the non-terminal check every
+	// fail already makes under the op row lock.
+	return s.failOpBatch(active, reason, nil)
 }
 
 // CreateMachineOp inserts a pending lifecycle op against a machine.
@@ -870,7 +916,15 @@ func (s *Store) CreateMachineOp(machineID uuid.UUID, opType model.OperationType,
 	var op model.Operation
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var m model.Machine
-		if err := tx.Select("state", "locked", "pxe_eligible").Where("id = ?", machineID).First(&m).Error; err != nil {
+		// FOR KEY SHARE is the lock the operation INSERT below takes through
+		// fk_operations_machine anyway; taking it here instead means a
+		// machine delete (DeleteMachineIfIdle holds the row FOR UPDATE)
+		// cannot land between this read and the insert. The delete either
+		// waits for this create and sees its op, or commits first and this
+		// read reports the machine gone, instead of the checks below passing
+		// against a doomed row and the insert failing the foreign key.
+		if err := tx.Clauses(clause.Locking{Strength: "KEY SHARE"}).
+			Select("state", "locked", "pxe_eligible").Where("id = ?", machineID).First(&m).Error; err != nil {
 			return fmt.Errorf("machine not found: %w", err)
 		}
 		if m.Locked {

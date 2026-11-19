@@ -67,6 +67,8 @@ This is the same format the old MAAS commissioning scripts produced. It has prov
 
 Partition `size` is `"512M"`, `"100G"`, or `"rest"` (fill remaining). `fs` is optional — omit it for raw partitions (e.g., RAID members). `bootable` marks the ESP partition.
 
+A `vfat` partition is formatted FAT32, which needs at least 65525 clusters, so its minimum size depends on the disk's logical sector size: `33M` on a disk with 512-byte sectors, `257M` on a 4Kn disk (4096-byte sectors). Below that, `mkfs.fat` would format the partition anyway and UEFI firmware could not read it, so the agent refuses the layout before touching any disk, naming the minimum ("make the partition at least 257M"). The inventory a script reads does not carry the sector size, so size an ESP that may land on a 4Kn disk for 4Kn; the `512M` ESPs on this page fit both.
+
 **RAID arrays** — software RAID via mdadm. Members reference partition names or whole-disk names from the layout.
 
 ```json
@@ -77,7 +79,12 @@ Partition `size` is `"512M"`, `"100G"`, or `"rest"` (fill remaining). `fs` is op
 }
 ```
 
-Supported levels: 0, 1, 5, 6, 10.
+Supported levels: 0, 1, 5, 6, 10. Each level needs its md personality module
+(`raid0`, `raid1`, `raid456`, `raid10`) in the boot image's deploy initrd, which
+`assets/initramfs/hooks/slagworks` bakes in. A boot image built without a
+level's module fails the deploy at `mdadm --create`, after the member disks
+were repartitioned, with an error that names the module; rebuild the image and
+redeploy with `--destructive`.
 
 **Mounts** — maps mount points to device names from the layout.
 
@@ -254,12 +261,15 @@ type Command struct {
 func Plan(layout LayoutJSON, inventory []BlockDevice) ([]Command, error)
 ```
 
-The plan is deterministic: same inputs always produce the same command list. Command ordering follows dependency order: wipe disks, create partitions, re-read partition table (`blockdev --rereadpt`), create RAID arrays, format filesystems, mount.
+The plan is deterministic: same inputs always produce the same command list. Command ordering follows dependency order: wipe disks, create partitions, re-read partition table (`blockdev --rereadpt`), format each new partition that declares `fs` and clear every other one, create RAID arrays, format each array that declares `fs` and clear every other one with `wipefs -a`, mount.
+
+The clearing matters on a redeploy. A new partition or array starts with whatever bytes were at its offset, and `sgdisk --zap-all` rewrites only the partition tables. Without clearing, a partition the layout leaves unformatted (a spare ESP slot, a BIOS boot partition, a RAID member) keeps the filesystem an earlier layout put there; an old ESP on the firmware's first disk then boots the old bootloader, which drops to an initramfs shell looking for a root filesystem that no longer exists. An unformatted partition is cleared in two steps: `wipefs -a` erases every signature Linux probes for, and `dd` zeroes its first 4 KiB, because UEFI firmware mounts a FAT filesystem from its boot sector even after `wipefs` has erased the magic bytes. Preserve arrays and retained disks are never cleared.
 
 Implementation notes:
 
 - The layout JSON uses map keys for device names. `Plan()` must sort or toposort explicitly — Go map iteration is nondeterministic.
 - Only one partition per disk may use `"rest"`. `Plan()` rejects layouts with multiple `"rest"` partitions on the same disk.
+- `Plan()` rejects a `vfat` partition smaller than the FAT32 minimum for its disk's logical sector size (`BlockDevice.LogicalSectorBytes`, from `lsblk`'s `LOG-SEC` column), since `mkfs.fat -F 32` formats an undersized partition with only a warning.
 
 ### Execution
 
@@ -287,8 +297,8 @@ func TestPlan_RAID1Root(t *testing.T) {
         "mounts": {"/":{"device":"mdroot"},"/boot/efi":{"device":"nvme0n1p1"}}
     }`)
     inventory := []BlockDevice{
-        {Name: "nvme0n1", SizeBytes: 1920383410176},
-        {Name: "nvme1n1", SizeBytes: 1920383410176},
+        {Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
+        {Name: "nvme1n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
     }
 
     cmds, err := Plan(layout, inventory)
@@ -298,13 +308,16 @@ func TestPlan_RAID1Root(t *testing.T) {
         {"sgdisk", []string{"-n", "1:0:+512M", "-t", "1:EF00", "-c", "1:nvme0n1p1", "/dev/nvme0n1"}},
         {"sgdisk", []string{"-n", "2:0:0", "-t", "2:8300", "-c", "2:nvme0n1p2", "/dev/nvme0n1"}},
         {"blockdev", []string{"--rereadpt", "/dev/nvme0n1"}},
-        // ... nvme1n1 ...
         {"mkfs.fat", []string{"-F", "32", "/dev/nvme0n1p1"}},
-        {"mkfs.fat", []string{"-F", "32", "/dev/nvme1n1p1"}},
+        {"wipefs", []string{"-a", "/dev/nvme0n1p2"}},
+        {"dd", []string{"if=/dev/zero", "of=/dev/nvme0n1p2", "bs=4096", "count=1", "conv=fsync"}},
+        // ... the same seven for nvme1n1 ...
         {"mdadm", []string{"--create", "/dev/md0", "--level=1", "--raid-devices=2",
-            "--metadata=1.2", "/dev/nvme0n1p2", "/dev/nvme1n1p2"}},
-        {"mkfs.xfs", []string{"/dev/md0"}},
+            "--metadata=1.2", "--run", "/dev/nvme0n1p2", "/dev/nvme1n1p2"}},
+        {"mkfs.xfs", []string{"-f", "/dev/md0"}},
+        {"mkdir", []string{"-p", "/target"}},
         {"mount", []string{"/dev/md0", "/target"}},
+        {"mkdir", []string{"-p", "/target/boot/efi"}},
         {"mount", []string{"/dev/nvme0n1p1", "/target/boot/efi"}},
     }, cmds)
 }

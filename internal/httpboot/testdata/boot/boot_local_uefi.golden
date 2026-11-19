@@ -1,5 +1,9 @@
 #!ipxe
 echo slagworks: boot-local for mac 52:54:00:aa:bb:01
-sanboot --no-describe --drive 0x80 ||
-sanboot --no-describe --drive 0x81 ||
-exit 1
+set drive:uint8 0x80
+:try_drive
+sanboot --no-describe --drive ${drive} ||
+inc drive
+iseq ${drive} 0xa0 || goto try_drive
+echo slagworks: boot-local: no drive 0x80-0x9f booted, handing back to the firmware
+exit

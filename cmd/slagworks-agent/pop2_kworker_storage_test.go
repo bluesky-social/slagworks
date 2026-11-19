@@ -53,6 +53,11 @@ func TestPop2KworkerStorage_RetainsEveryDataDisk(t *testing.T) {
 	if err := json.Unmarshal([]byte(pop2KworkerInventory), &inventory); err != nil {
 		t.Fatalf("parse inventory fixture: %v", err)
 	}
+	// The commission inventory has no logical sector size; the agent's
+	// storage inventory reads it from lsblk at deploy time.
+	for i := range inventory.Disks {
+		inventory.Disks[i].LogicalSectorBytes = 512
+	}
 	commands, err := storage.Plan(layout, inventory.Disks)
 	if err != nil {
 		t.Fatalf("plan emitted layout: %v", err)
