@@ -136,7 +136,7 @@ func TestSyncCommissionData_SwitchRoleKeepsInterfaceNames(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				switch {
-				case r.URL.Path == "/api/dcim/devices/42/" && r.Method == http.MethodPatch:
+				case r.URL.Path == "/api/dcim/devices/42/" && (r.Method == http.MethodGet || r.Method == http.MethodPatch):
 					_, _ = w.Write([]byte(`{"id": 42}`))
 				case r.URL.Path == "/api/dcim/interfaces/" && r.Method == http.MethodGet:
 					_ = json.NewEncoder(w).Encode(map[string]any{"count": 1, "results": []map[string]any{

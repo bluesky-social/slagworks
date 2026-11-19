@@ -75,6 +75,17 @@ a machine ever gets booted:
   that lease with a warning, and the other MAC is NAKed at its next renew
   and re-DISCOVERs onto a different address. Until that renew, both devices
   answer for the address on the wire.
+- **Address conflicts (DHCPDECLINE).** A client that checks its new address
+  for duplicates before using it (dhcpcd in the initrd, for instance) sends a
+  DECLINE when another host already answers for it, then starts over at
+  DISCOVER. `handleDecline` drops that lease and withholds the address from
+  dynamic allocation for one lease duration, so the retry gets a different
+  address, and logs a warning with the declined address: find and remove the
+  other host using it. A static reservation is still offered to its MAC, so a
+  declined reservation keeps failing until the conflict is resolved.
+- **Client requests only.** A packet whose BOOTP op is not BOOTREQUEST is
+  dropped on every segment, whatever its option 53 says (RFC 2131), and
+  counted under the `not_bootrequest` drop reason.
 - **Known-MAC filter.** When a segment is non-promiscuous and `KnownMACs` is
   set, an unregistered MAC's DHCP is silently dropped at debug level
   (`handler.go:424-428`). A promiscuous segment (typical for OOB where you
@@ -352,6 +363,13 @@ What the agent actually does, in order:
     and deletes the backups, which on an XFS root can leave a hole in
     that directory; GRUB 2.12 cannot read past one and stops at
     `error: not a correct XFS inode.`
+  - **RAID** (layouts with md arrays): `target.ConfigureRAID` writes
+    `/etc/mdadm/mdadm.conf` with `AUTO -all` and an `ARRAY` line, by UUID,
+    for each array the layout names, regenerates the target's initramfs so
+    it carries that file, and on UEFI replaces the ESP's
+    `/slagworks/initrd.img` with it. The installed system then assembles
+    those arrays and no others (see `docs/user/storage-scripts.md`). Any
+    failure here is a hard fail.
 - `finalizing`: write `/etc/fstab`, seed cloud-init, apply the network
   config script (with NetBox facts injected), write the hostname, disable
   first-boot apt timers, write operator SSH keys, enroll on tailscale (if

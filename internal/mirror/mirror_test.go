@@ -350,6 +350,97 @@ func TestOnDeviceCreatedRebindPreservesNonOwnedColumns(t *testing.T) {
 	}
 }
 
+// TestOnDeviceUpdatedEnrollsUntrackedDevice: a device.updated for a claimed
+// device that has a serial but no machine row must enroll it, the rule the
+// reconciler already applies to untracked devices. Two ordinary operator
+// actions produce that event: filling in the serial of a device whose
+// device.created was skipped with ErrSerialRequired, and moving a serialled
+// device into a claimed site or location. The webhook handler routes both to
+// OnDeviceUpdated, which used to only invalidate, so the device stayed out of
+// the machine list and the site snapshot until the next reconcile tick.
+func TestOnDeviceUpdatedEnrollsUntrackedDevice(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("serial filled in after a skipped create", func(t *testing.T) {
+		st, inv, m := withSite(t)
+		if err := m.OnDeviceCreated(ctx, mkDevice(5, "host-5", "")); !errors.Is(err, ErrSerialRequired) {
+			t.Fatalf("setup: want ErrSerialRequired, got %v", err)
+		}
+		if err := m.OnDeviceUpdated(ctx, mkDevice(5, "host-5", "SN-5")); err != nil {
+			t.Fatal(err)
+		}
+		got, err := st.GetMachineByNetBoxDeviceID(5)
+		if err != nil {
+			t.Fatalf("device 5 now has a serial and is claimed, but device.updated did not enroll it: %v", err)
+		}
+		if got.NetBoxSerial != "SN-5" || got.State != model.MachineStateNew {
+			t.Fatalf("enrolled row = %+v; want serial SN-5 in state new", got)
+		}
+		if inv.count("pop3") != 1 {
+			t.Fatalf("pop3 invalidations = %d; want 1", inv.count("pop3"))
+		}
+	})
+
+	t.Run("serialled device moved into a claimed scope", func(t *testing.T) {
+		st, _, m := withSite(t)
+		// The mirror has never seen device 6: it lived in an unclaimed
+		// location until this update moved it into pop3's scope.
+		if err := m.OnDeviceUpdated(ctx, mkDevice(6, "host-6", "SN-6")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.GetMachineByNetBoxDeviceID(6); err != nil {
+			t.Fatalf("device 6 moved into a claimed scope with a serial, but device.updated did not enroll it: %v", err)
+		}
+	})
+}
+
+// TestOnDeviceUpdatedWithNothingToEnrollOnlyInvalidates pins the paths the
+// enrollment check leaves alone: an update to a tracked device keeps its row
+// as is, and an update to a device that still has no serial creates nothing.
+func TestOnDeviceUpdatedWithNothingToEnrollOnlyInvalidates(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("tracked device", func(t *testing.T) {
+		st, inv, m := withSite(t)
+		id := uuid.New()
+		nbID := 8
+		if err := st.CreateMachine(&model.Machine{
+			ID: id, NetBoxDeviceID: &nbID, NetBoxSerial: "SN-8", State: model.MachineStateRunning, Locked: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.OnDeviceUpdated(ctx, mkDevice(8, "host-8-renamed", "SN-8")); err != nil {
+			t.Fatal(err)
+		}
+		got, err := st.GetMachineByNetBoxDeviceID(8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != id || got.State != model.MachineStateRunning || !got.Locked {
+			t.Fatalf("update touched the tracked row: %+v", got)
+		}
+		if len(st.machines) != 1 {
+			t.Fatalf("machines = %d; want the one tracked row", len(st.machines))
+		}
+		if inv.count("pop3") != 1 {
+			t.Fatalf("pop3 invalidations = %d; want 1", inv.count("pop3"))
+		}
+	})
+
+	t.Run("still no serial", func(t *testing.T) {
+		st, inv, m := withSite(t)
+		if err := m.OnDeviceUpdated(ctx, mkDevice(9, "host-9", "")); err != nil {
+			t.Fatalf("an update to an unserialled device is not an error, got %v", err)
+		}
+		if _, err := st.GetMachineByNetBoxDeviceID(9); err == nil {
+			t.Fatal("a device without a serial must not be enrolled")
+		}
+		if inv.count("pop3") != 1 {
+			t.Fatalf("pop3 invalidations = %d; want 1", inv.count("pop3"))
+		}
+	})
+}
+
 // TestOnDeviceDeletedHardDeletes covers the new hard-delete semantics:
 // when a NetBox device is deleted, the Machine row is removed from the
 // store outright.

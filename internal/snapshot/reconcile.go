@@ -155,13 +155,25 @@ func (r *Reconciler) tick(ctx context.Context) {
 
 	// Phase 2: walk machines once, soft-decommission those whose
 	// NetBoxDeviceID isn't in any processed site's seen set AND
-	// NetBox confirms the device is truly gone. If a site failed
-	// to reconcile this tick (marked stale, network blip), we skip
-	// the global decommission pass entirely: an empty seen set from
-	// a broken site would look indistinguishable from "that site
-	// lost all its machines" and trigger false decommissions.
-	if len(processed) == len(cfgs) && len(cfgs) > 0 {
+	// NetBox confirms the device is truly gone. The per-device 404
+	// from GetDeviceByID is what makes a delete safe; allSeen only
+	// saves lookups. So a config that failed this tick (stale, or a
+	// NetBox blip) does not gate the sweep: its machines are missing
+	// from allSeen, but their devices still resolve (skip) or the
+	// lookup errors (skip). Gating on every config succeeding would
+	// let one stale config, which can stay stale indefinitely, stop
+	// fleet-wide cleanup of devices deleted while a webhook was lost.
+	//
+	// The sweep still needs at least one config to have reconciled.
+	// When none did, NetBox may not be the instance we think it is
+	// (repointed at an empty or wrong instance, every managed site
+	// missing), and there every lookup 404s and the sweep would delete
+	// every machine.
+	if anyProcessed {
 		r.sweepMissingDevices(ctx, allSeen)
+	} else if len(cfgs) > 0 {
+		r.log.Warn("reconcile: no site_config reconciled this tick; skipping the missing-device sweep",
+			"configs", len(cfgs))
 	}
 
 	for _, p := range processed {

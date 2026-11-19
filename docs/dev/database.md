@@ -90,7 +90,12 @@ detail; this is the map.
   1:1 op ↔ trace binding. `phase_entered_at` (00014) drives per-phase
   timeouts (phone-home in particular). The unique partial index
   `idx_one_active_op_per_machine` guarantees at most one pending /
-  claimed / running op per machine.
+  claimed / running op per machine. `result` and
+  `machines.commission_data` hold text from outside slagworks (script
+  stderr, BMC error bodies, tool output), so the store writes them
+  through `jsonbSafe`, which replaces the two escapes jsonb refuses
+  (`\u0000` and an unpaired UTF-16 surrogate) with U+FFFD instead of
+  letting the write fail.
 - `images(id uuid, name, version, arch, sha256, url, created_at)`.
   Collapsed to one PXE image row by 00022 — deploy and
   commission boot the same bytes and differ only by the
@@ -107,6 +112,9 @@ detail; this is the map.
   mirrors, so two workers can serve disjoint cages of one NetBox site.
   `relay_pools` (00018) is the list of relayed DHCP scopes the worker
   serves in addition to its directly-attached ephemeral pool.
+  `last_snapshot_seq` is drawn from the `site_snapshot_seq` sequence
+  (00031), so it is never reissued and keeps rising across a delete and
+  re-create of the same slug; per-slug values are not contiguous.
 - `site_workers(id, site_slug, worker_id, fqdn, first_seen_at,
   last_seen_at, token_hash)`. `token_hash` (00012) is `sha256(bearer)`;
   the plaintext is returned once at registration and never persisted.
@@ -195,7 +203,11 @@ Tables (all defined by GORM structs in `localdb.go`):
   and the seq cursor can't disagree after a mid-write crash.
 - `dhcp_leases(mac PK, ip, expires_at)` — active leases persisted
   through restart. Expired rows are lazily deleted by
-  `LoadDHCPLeases`.
+  `LoadDHCPLeases`. `expires_at` is declared `datetime` but holds
+  text with the writer's UTC offset, so expiry is judged in Go after
+  the driver parses it, never by an SQL comparison (which would order
+  wall-clock readings and misjudge rows across a DST or time-zone
+  change).
 - `current_deploy_ops(machine_id PK, operation_id)` — gates
   progress reports against ops the cache hasn't yet seen via
   snapshot. Kept after the `deploy_logs` and `sol_lines` tables were
