@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,7 +22,7 @@ import (
 )
 
 // WorkerAuthenticator authenticates a site worker by the plaintext
-// token value pulled off the ?token= query string at WS upgrade time.
+// token value pulled off the Authorization header at WS upgrade time.
 // Returns ErrSiteWorkerNotFound on invalid/missing token; callers 401
 // without disambiguating.
 type WorkerAuthenticator interface {
@@ -138,10 +139,11 @@ type OpClaimer interface {
 	ClaimOperation(opID uuid.UUID, workerID string) (*model.Operation, error)
 	// GetOperationIfExists reads an op row by ID, returning (nil, nil) when
 	// no row matches (never a not-found sentinel — keeps the ws package free
-	// of a gorm import). The P4b outlet-op interlock reads the pending op's
-	// Params (PDURuntime.Outlet/DownstreamSerial/AllowSelf) and Type BEFORE
-	// the claim CAS to decide eligibility. This is a plain read outside any
-	// txn — the eligibility gate holds no DB lock (see handleClaimOp). A real
+	// of a gorm import). handleClaimOp reads the pending op BEFORE the claim
+	// CAS: its MachineID for the site-scope gate, and its Params
+	// (PDURuntime.Outlet/DownstreamSerial/AllowSelf) and Type for the P4b
+	// outlet-op interlock. This is a plain read outside any txn — the gates
+	// hold no DB lock (see handleClaimOp). A real
 	// store error (nil, err) fails the claim CLOSED: nothing is granted and
 	// the worker gets a retryable rpc error. *store.Store satisfies it.
 	GetOperationIfExists(opID uuid.UUID) (*model.Operation, error)
@@ -157,9 +159,9 @@ func (noopOpClaimer) ClaimOperation(_ uuid.UUID, _ string) (*model.Operation, er
 }
 
 // GetOperationIfExists on the noop claimer returns (nil, nil): no op found,
-// so the interlock treats it as a non-outlet op and lets the claim proceed
-// to the (noop) CAS, which returns already-claimed. Tests that exercise the
-// interlock wire a real/fake claimer.
+// so both pre-CAS gates let the claim proceed to the (noop) CAS, which
+// returns already-claimed. Tests that exercise the gates wire a real/fake
+// claimer.
 func (noopOpClaimer) GetOperationIfExists(_ uuid.UUID) (*model.Operation, error) {
 	return nil, nil
 }
@@ -340,7 +342,8 @@ type HubConfig struct {
 
 // Hub is the server-side endpoint for the worker-facing WebSocket
 // protocol. It:
-//   - authenticates each connection at upgrade time via ?token=
+//   - authenticates each connection at upgrade time by the bearer token
+//     in its Authorization header
 //   - tracks connected workers per site slug (many-per-slug for HA)
 //   - accepts Push(slug, snap) from the snapshot dispatcher and fans
 //     out to all connected workers for that slug
@@ -442,15 +445,19 @@ func NewHub(cfg HubConfig) *Hub {
 
 // Push implements snapshot.PushSink. Called by the dispatcher after a
 // content-hash change: cache the snapshot and fan out to every
-// connected worker for the slug. Each worker is written in its own
-// goroutine so one slow worker cannot stall delivery to the rest;
-// per-connection write ordering is preserved by workerConn.writeMu.
+// connected worker for the slug. The snapshot is queued on each worker's
+// outbound writer (workerConn.enqueue), so one slow worker cannot stall
+// delivery to the rest and each worker receives snapshots in push order.
 // Each fan-out snapshot is followed by the site's active ops, re-sent as
 // op_deltas scoped to the new membership (see workerConn.send). The cache
 // is updated before the fan-out starts, which the opReady handoff in send
 // relies on.
+//
+// A snapshot whose SeqNum is lower than the cached one is not fanned out:
+// the slug's connections are closed instead (see below).
 func (h *Hub) Push(slug string, snap model.SiteSnapshot) {
 	h.mu.Lock()
+	prev, cached := h.snapshots[slug]
 	h.snapshots[slug] = snap
 	conns := make([]*workerConn, 0, len(h.connections[slug]))
 	for c := range h.connections[slug] {
@@ -458,8 +465,26 @@ func (h *Hub) Push(slug string, snap model.SiteSnapshot) {
 	}
 	h.mu.Unlock()
 
+	// The slug's counter went backwards: its site config was deleted and
+	// recreated (the new row counts from 0 again) or global's database was
+	// restored. A connected worker holds the higher SeqNum and drops a
+	// lower one on a live connection, where the hello reply (written
+	// directly, not through the outbound queue) can race a fan-out, so it
+	// would stay on the stale site. Close its connection
+	// instead: the worker reconnects, and the hello reply carrying snap is
+	// the first snapshot on the new connection, which it adopts whatever
+	// its SeqNum (worker.Cache.AdoptSnapshot).
+	if cached && snap.SeqNum < prev.SeqNum {
+		h.log.Warn("site snapshot sequence went backwards; closing the site's worker connections so they reconnect and adopt the new snapshot",
+			"slug", slug, "cached_seq", prev.SeqNum, "new_seq", snap.SeqNum, "workers", len(conns))
+		for _, c := range conns {
+			_ = c.conn.CloseNow()
+		}
+		return
+	}
+
 	for _, c := range conns {
-		go c.send(snap)
+		c.enqueue("snapshot", func() { c.send(snap) })
 	}
 }
 
@@ -522,7 +547,7 @@ func (h *Hub) PublishOpDelta(op model.Operation, machineState model.MachineState
 		if !h.machineInSlug(c.slug, op.MachineID) {
 			continue
 		}
-		go h.sendOpMessage(c, TypeOpDelta, msg, "op_delta", op.ID.String())
+		c.enqueue("op_delta", func() { h.sendOpMessage(c, TypeOpDelta, msg, "op_delta", op.ID.String()) })
 	}
 }
 
@@ -544,14 +569,16 @@ func (h *Hub) PublishOpRemoved(op model.Operation, machineState model.MachineSta
 		MachineState: machineState,
 	}
 	for _, c := range h.connsSnapshot() {
-		go h.sendOpMessage(c, TypeOpRemoved, msg, "op_removed", op.ID.String())
+		c.enqueue("op_removed", func() { h.sendOpMessage(c, TypeOpRemoved, msg, "op_removed", op.ID.String()) })
 	}
 }
 
 // sendOpMessage writes one op-stream message to a worker under a bounded
-// timeout. On failure it force-closes the connection: the reconnect
-// replays the full active set via op_resync, so a lost op message
-// self-heals within one reconnect (plan "Delivery reliability").
+// timeout. PublishOpDelta and PublishOpRemoved run it on the conn's
+// outbound writer (workerConn.enqueue), so a worker receives op messages
+// in publish order. On failure it force-closes the connection: the
+// reconnect replays the full active set via op_resync, so a lost op
+// message self-heals within one reconnect (plan "Delivery reliability").
 //
 // The write happens under opStreamMu with an opReady gate: a conn that
 // hasn't sent its hello op_resync yet gets NO op messages (the publish is
@@ -573,17 +600,20 @@ func (h *Hub) sendOpMessage(c *workerConn, msgType string, payload any, kind, op
 }
 
 // ServeHTTP upgrades the incoming request to a WebSocket connection
-// for a site worker. The request must include ?token=<plaintext>;
-// authentication resolves (site_slug, worker_id) from
-// site_workers.token_hash.
+// for a site worker. The request must carry the plaintext worker token
+// as "Authorization: Bearer <token>"; authentication resolves
+// (site_slug, worker_id) from site_workers.token_hash. The token is
+// never read from the URL: request loggers and net/http dial errors
+// quote URLs, so a URL-borne token ends up in logs.
 //
 // On success the call blocks until the worker disconnects or ctx is
 // cancelled, so this is intended to be wired under a long-lived
 // handler (e.g. echo.WrapHandler) rather than a request-scoped one.
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
-	if token == "" {
-		http.Error(w, "missing token", http.StatusUnauthorized)
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	token = strings.TrimSpace(token)
+	if !ok || token == "" {
+		http.Error(w, "missing worker token: send it as Authorization: Bearer <token>", http.StatusUnauthorized)
 		return
 	}
 	worker, err := h.cfg.Auth.GetSiteWorkerByTokenHash(store.HashWorkerToken(token))
@@ -608,6 +638,11 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn("ws accept failed", "slug", worker.SiteSlug, "worker", worker.WorkerID, "err", err)
 		return
 	}
+	// Worker messages exceed Accept's 1 MiB default: an outbox
+	// observation carries an inventory report httpboot admits up to
+	// 10 MiB, and a log batch of exec output reaches several MiB. Read
+	// up to the bound the worker reads the snapshot with.
+	conn.SetReadLimit(MaxMessageBytes)
 
 	ctx := r.Context()
 	wc := &workerConn{
@@ -616,6 +651,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		slug:     worker.SiteSlug,
 		workerID: worker.WorkerID,
 		log:      h.log.With("slug", worker.SiteSlug, "worker", worker.WorkerID),
+		outbound: make(chan func(), outboundQueueSize),
 	}
 	// Registration happens inside serve, immediately before the hello
 	// reply is sent. See workerConn.serve for the rationale — the
@@ -977,9 +1013,21 @@ func (h *Hub) deliverRPCReply(reqID string, resp RPCResponseMsg) {
 	}
 }
 
+// outboundQueueSize bounds a worker connection's outbound queue
+// (workerConn.enqueue). The queue only grows while the conn's writer is
+// stuck on one write, and every write times out after 10s. The largest
+// burst one caller publishes is a message per active op (an expiry sweep,
+// the mirror's drift fail), and the active set is dozens of ops, so a
+// queue this size fills only when the worker has stopped reading.
+const outboundQueueSize = 4096
+
 // workerConn is a single authenticated worker connection. The goroutine
 // in serve() owns reads; per-connection writes are serialized by
-// writeMu (coder/websocket requires one writer at a time).
+// writeMu (coder/websocket requires one writer at a time). Snapshot
+// fan-outs and op-stream messages are not written by their publishers:
+// they go through outbound, whose one writer goroutine delivers them in
+// the order they were queued. The hello reply, the hello op_resync and RPC
+// traffic are written directly by the goroutine that produces them.
 type workerConn struct {
 	hub      *Hub
 	conn     *Conn
@@ -1010,6 +1058,13 @@ type workerConn struct {
 
 	writeMu sync.Mutex
 
+	// outbound is the conn's FIFO of snapshot fan-outs and op-stream
+	// messages, run one at a time by writeOutbound, which serve starts
+	// before the conn registers. Push and PublishOp* add to it through
+	// enqueue instead of writing, so the worker receives their messages in
+	// the order they were published.
+	outbound chan func()
+
 	// opStreamMu + opReady close the register-before-resync race: the
 	// conn registers BEFORE the hello reply (so it can't miss snapshot
 	// fan-outs), which means a PublishOp* can otherwise write an op
@@ -1023,8 +1078,9 @@ type workerConn struct {
 	// before the resync's DB read (mutate-then-publish ordering), so the
 	// mutation is IN the resync — the drop loses nothing; any publisher
 	// that observes opReady=true writes strictly after the resync.
-	// Holding opStreamMu across op-message writes also serializes them
-	// per-conn, preserving op-stream ordering.
+	// Op messages are ordered among themselves by outbound, which runs
+	// them one at a time; opStreamMu orders them against the resync, which
+	// handleHello writes from the read goroutine.
 	//
 	// The post-push op re-send (send) follows the same rule: a Push whose
 	// fan-out observed opReady=false cached its snapshot before the hello
@@ -1166,6 +1222,13 @@ func (c *workerConn) serve(ctx context.Context) error {
 	// fan-out snapshot — and rely on Cache.ApplySnapshot's SeqNum
 	// monotonicity check to drop it. Until the reply is sent, op-stream
 	// messages skip the conn (opReady) and so do RPCs (helloReplied).
+	//
+	// The outbound writer starts first, because a Push or PublishOp* can
+	// queue to the conn as soon as it is registered, and stops only after
+	// the conn has unregistered (deferred calls run in reverse order).
+	stopWriter := make(chan struct{})
+	go c.writeOutbound(stopWriter)
+	defer close(stopWriter)
 	c.hub.register(c)
 	defer c.hub.unregister(c)
 
@@ -1212,10 +1275,19 @@ func (c *workerConn) handleHello(ctx context.Context, hello HelloMsg) error {
 		// skipped_no_change and never Pushes, leaving this slug absent
 		// from the cache. machineInSlug reads that cache as the op-stream
 		// confidentiality gate, so an uncached slug would silently drop
-		// every op_delta for this worker until an unrelated Push. Guard
-		// against clobbering a newer concurrently-Pushed snapshot.
+		// every op_delta for this worker until an unrelated Push.
+		//
+		// A snapshot cached while the rebuild was pending (by a Push, or by
+		// another cold hello) is never older than built: the dispatcher
+		// pushes every content change before returning it, and a cold
+		// hello only fills an empty slot. Keep it and answer the hello
+		// from it.
+		// Comparing SeqNums instead would put a pre-reset snapshot back
+		// when the slug's counter went backwards in the meantime.
 		c.hub.mu.Lock()
-		if cur, ok := c.hub.snapshots[c.slug]; !ok || cur.SeqNum < built.SeqNum {
+		if cur, ok := c.hub.snapshots[c.slug]; ok {
+			snap = cur
+		} else {
 			c.hub.snapshots[c.slug] = built
 		}
 		c.hub.mu.Unlock()
@@ -1329,18 +1401,17 @@ func (c *workerConn) siteActiveOpsLocked() ([]model.Operation, error) {
 	return ops, nil
 }
 
-// send is the Push fan-out write path. Called from Hub.Push holding no
-// hub lock, from its own goroutine per fan-out target. It writes the
-// snapshot, then re-sends the site's active ops (resendOpsAfterPush).
+// send is the Push fan-out write path. Hub.Push queues it on the conn's
+// outbound writer, so it runs in order with the conn's other snapshots
+// and op messages. It writes the snapshot, then re-sends the site's
+// active ops (resendOpsAfterPush).
 //
 // A failed snapshot write force-closes the connection, as a failed
 // op-stream write does: the re-sent ops are only actionable for a worker
 // holding the snapshot, and the reconnect's hello delivers both.
 func (c *workerConn) send(snap model.SiteSnapshot) {
-	// Fan-out writes run under a per-connection timeout; a single slow
-	// worker must not block all others. Per-connection write ordering
-	// is preserved by writeMu (Push spawns one goroutine per conn;
-	// multiple pushes on the same conn serialize through writeMu).
+	// The write runs under a timeout so a worker that stops reading fails
+	// it and is force-closed, rather than holding up its outbound writer.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := c.writeTyped(ctx, TypeSnapshot, "", c.hub.snapshotMsg(snap)); err != nil {
@@ -1364,6 +1435,13 @@ func (c *workerConn) send(snap model.SiteSnapshot) {
 // it: when that delta was filtered out, or when the re-send reads a
 // just-committed claim and is written before the claim's own delta, which
 // the worker then drops as a version it already holds.
+//
+// The re-send reads the op rows when the outbound writer runs it, not when
+// Push queued it, so a re-sent row can be newer than an op message queued
+// behind it: a create's pending delta queued after the snapshot reaches
+// the worker after a re-send that already read the claim. The worker drops
+// that older version too, so the publish-order guarantee covers what was
+// published, not rows the re-send reads.
 //
 // op_delta rather than op_resync: the worker applies op_delta
 // last-writer-wins by Version and drops a version it already holds, so
@@ -1680,7 +1758,9 @@ func (c *workerConn) handleCastResume(parent context.Context, env Envelope) {
 //
 // Response shape:
 //   - success: rpc_response{ data: {operation: <op>} }
-//   - already-claimed (store returned nil/nil):
+//   - already-claimed (store returned nil/nil, or a pre-CAS gate
+//     declined: the op's machine is not in this worker's site, or the
+//     outlet interlock refused this worker):
 //     rpc_response{ data: {already_claimed: true} } — structured,
 //     NOT an error, so the worker counts it as a lost race
 //     (metrics outcome "lost") instead of a claim failure.
@@ -1726,17 +1806,50 @@ func (c *workerConn) handleClaimOp(parent context.Context, env Envelope) {
 	defer cancel()
 	_ = ctx // store doesn't take ctx today; reserved for future deadline plumbing
 
+	// Both pre-CAS gates below decide from the op row, read once here with
+	// no db lock. A failed read is a hard error, not a decline: nothing is
+	// granted (fail-closed), and the worker rolls the op back to pending and
+	// retries, where already_claimed would make it drop an op that is still
+	// pending. A genuinely absent op (nil, nil) passes both gates and the CAS
+	// reports already-claimed.
+	row, err := c.hub.cfg.OpClaimer.GetOperationIfExists(opID)
+	if err != nil {
+		c.log.Warn("claim_op pre-claim read failed; claim not granted",
+			"op_id", opID, "worker_id", c.workerID, "err", err)
+		resp.Error = fmt.Sprintf("claim failed: read op before claim: %v; nothing was claimed, retry the claim", err)
+		return
+	}
+
+	// Site scope: a worker may claim only ops on its own site's machines.
+	// The claim reply carries the op's params unredacted, and those hold
+	// per-site credentials, so this is the op stream's confidentiality gate
+	// (machineInSlug, see PublishOpDelta) applied to the reply; it also stops
+	// a worker that cannot reach the machine from taking the op from the site
+	// that can. A correct worker never trips it: it claims only ops the
+	// slug-scoped op stream sent it. The decline answers already_claimed, as
+	// the interlock does, so the worker moves on and the op stays pending for
+	// its own site. Checking before the CAS leaves no race: an op's machine
+	// never changes.
+	if row != nil && !c.hub.machineInSlug(c.slug, row.MachineID) {
+		c.log.Warn("claim_op declined: the op's machine is not in this worker's site",
+			"op_id", opID, "machine_id", row.MachineID, "worker_id", c.workerID, "slug", c.slug)
+		out, mErr := json.Marshal(ClaimOpResponse{AlreadyClaimed: true})
+		if mErr != nil {
+			resp.Error = fmt.Sprintf("marshal response: %v", mErr)
+			return
+		}
+		resp.Data = out
+		return
+	}
+
 	// P4b self-power interlock: BEFORE the store CAS, decide whether THIS
 	// worker may serve THIS op. Only outlet ops (PDURuntime.Outlet==true) are
 	// gated; everything else passes through unaffected. A declined claim
 	// returns the SAME already-claimed response a lost race produces, so the
 	// worker moves on and the op stays pending for a partner (INV-3
-	// decline-not-handoff). The gate holds no db lock — it does a plain op
-	// read (params) + a registered-serial-set read. A failed read is a hard
-	// error, not a decline: nothing is granted (fail-closed), and the worker
-	// rolls the op back to pending and retries, where already_claimed would
-	// make it drop an op that is still pending.
-	eligible, reason, err := c.outletClaimEligible(opID)
+	// decline-not-handoff). Beyond the op read above, the gate does a
+	// registered-serial-set read; a failure there is a hard error too.
+	eligible, reason, err := c.outletClaimEligible(row)
 	if err != nil {
 		c.log.Warn("claim_op interlock read failed; claim not granted",
 			"op_id", opID, "worker_id", c.workerID, "err", err)
@@ -1799,25 +1912,20 @@ func (c *workerConn) handleClaimOp(parent context.Context, env Envelope) {
 }
 
 // outletClaimEligible is the workerConn-scoped wrapper around the P4b
-// interlock (outletClaimEligibility). It reads the pending op and, for an
-// outlet op, the registered site-worker serial set for this conn's slug, then
-// applies the eligibility invariants. Returns (eligible, reason, err); reason
-// is a log-only diagnostic when ineligible.
+// interlock (outletClaimEligibility). Given the op row handleClaimOp read, it
+// reads, for an outlet op, the registered site-worker serial set for this
+// conn's slug, then applies the eligibility invariants. Returns (eligible,
+// reason, err); reason is a log-only diagnostic when ineligible.
 //
-// A store failure on either read returns err, and the caller grants nothing
-// (a hard-AC-cut primitive must never fail open). It is deliberately not a
-// decline: the op read runs before the op is known to be an outlet op, and a
-// decline tells the worker another worker owns the op, so a transient store
-// error would strand every op type, deploys included. An err is answered as a
-// retryable rpc error instead. A genuinely-absent op (nil, nil from
-// GetOperationIfExists) is treated as eligible so the claim proceeds to the
-// CAS, which reports already-claimed — the interlock never fabricates a
-// decline for an op that simply raced away.
-func (c *workerConn) outletClaimEligible(opID uuid.UUID) (bool, string, error) {
-	op, err := c.hub.cfg.OpClaimer.GetOperationIfExists(opID)
-	if err != nil {
-		return false, "", fmt.Errorf("read op before claim: %w", err)
-	}
+// A store failure on that read returns err, and the caller grants nothing (a
+// hard-AC-cut primitive must never fail open). It is deliberately not a
+// decline: every worker on the slug would hit the same failing read, and a
+// decline tells the worker another worker owns the op, so the op would sit
+// pending with nothing left to claim it. An err is answered as a retryable
+// rpc error instead. A genuinely-absent op (nil) is treated as eligible so
+// the claim proceeds to the CAS, which reports already-claimed — the
+// interlock never fabricates a decline for an op that simply raced away.
+func (c *workerConn) outletClaimEligible(op *model.Operation) (bool, string, error) {
 	if op == nil {
 		// Op is gone; let the CAS report already-claimed.
 		return true, "", nil
@@ -1889,6 +1997,40 @@ func (c *workerConn) replyObservation(reqID string, handlerErr error) {
 // hub (and in turn the worker) that retrying won't help. The worker
 // sees Terminal=true in the rpc_response and drops the outbox row.
 var ErrTerminal = errors.New("terminal")
+
+// enqueue adds write to the conn's outbound queue without blocking.
+// writeOutbound runs queued writes one at a time in queue order, which is
+// what makes the worker receive them in the order they were queued:
+// starting a goroutine per write and serializing the writes with a mutex
+// leaves their order to the scheduler.
+//
+// A full queue means the worker has stopped reading. enqueue then
+// force-closes the connection rather than block the publisher (the API, a
+// sweep, or a worker's read loop) or drop the message unnoticed: the
+// reconnect's hello snapshot and op_resync supersede everything that was
+// queued.
+func (c *workerConn) enqueue(kind string, write func()) {
+	select {
+	case c.outbound <- write:
+	default:
+		c.log.Warn("outbound queue full; forcing reconnect", "kind", kind, "queue_size", cap(c.outbound))
+		_ = c.conn.CloseNow()
+	}
+}
+
+// writeOutbound is the conn's outbound writer: it runs queued writes in
+// order until stop is closed. Writes still queued then are discarded; the
+// conn is closing, and the worker's next hello replaces them.
+func (c *workerConn) writeOutbound(stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		case write := <-c.outbound:
+			write()
+		}
+	}
+}
 
 func (c *workerConn) writeTyped(ctx context.Context, msgType, reqID string, payload any) error {
 	c.writeMu.Lock()

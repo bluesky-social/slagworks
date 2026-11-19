@@ -2,14 +2,12 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,8 +16,9 @@ import (
 
 	slclient "github.com/bluesky-social/slagworks/cmd/slagctl/client"
 	"github.com/bluesky-social/slagworks/cmd/slagctl/format"
+	"github.com/bluesky-social/slagworks/cmd/slagctl/tui"
 	"github.com/bluesky-social/slagworks/internal/model"
-	"github.com/bluesky-social/slagworks/internal/ws"
+	"github.com/bluesky-social/slagworks/internal/slogkit"
 )
 
 func newOperationCmd() *cobra.Command {
@@ -121,8 +120,9 @@ func renderOperations(out io.Writer, ops []model.Operation) error {
 		// Completed ops keep their last phase in the DB; showing
 		// "finalizing" next to status=completed reads as stuck, so blank
 		// it. Failed ops KEEP the phase — "failed at partitioning" is the
-		// single most useful triage datum.
-		phase := op.Phase
+		// single most useful triage datum. The phase is whatever the
+		// target's agent reported, so it is escaped for the terminal.
+		phase := format.Untrusted(op.Phase)
 		if op.Status == model.OpCompleted {
 			phase = ""
 		}
@@ -231,10 +231,6 @@ Machine resolution lets on-call type
 				if err := apiClient.Get(cmd.Context(), "/api/v1/operations/"+opID, nil, &op); err != nil {
 					return err
 				}
-				machineID := ""
-				if op.MachineID != uuid.Nil {
-					machineID = op.MachineID.String()
-				}
 				if isTerminal(op.Status) {
 					reportTerminalOp(cmd.Context(), op)
 					if op.Status == model.OpFailed {
@@ -244,17 +240,7 @@ Machine resolution lets on-call type
 				}
 				ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
 				defer cancel()
-				return WatchStream(ctx, apiURL, apiToken, machineID, opID, func(e WatchEntry) {
-					ts := e.TS
-					if len(ts) >= 19 {
-						ts = ts[11:19]
-					}
-					if e.Source == "phase" {
-						fmt.Printf("phase: %s\n", e.Line)
-					} else {
-						fmt.Printf("[%s %5s] %s\n", ts, e.Source, e.Line)
-					}
-				})
+				return watchPlain(ctx, op, os.Stdout, plainWatchPollInterval)
 			}
 			return watchOperation(cmd.Context(), opID, timeout, hold, noHold)
 		},
@@ -329,10 +315,6 @@ func watchOperation(ctx context.Context, opID string, timeout time.Duration, hol
 		if err := apiClient.Get(ctx, "/api/v1/operations/"+opID, nil, &op); err != nil {
 			return err
 		}
-		machineID := ""
-		if op.MachineID != uuid.Nil {
-			machineID = op.MachineID.String()
-		}
 		if isTerminal(op.Status) {
 			reportTerminalOp(ctx, op)
 			if op.Status == model.OpFailed {
@@ -340,61 +322,144 @@ func watchOperation(ctx context.Context, opID string, timeout time.Duration, hol
 			}
 			return nil
 		}
-		return watchPlain(ctx, machineID, opID, timeout)
+		return watchPlain(ctx, op, os.Stderr, plainWatchPollInterval)
 	}
 
 	return runDeployTUI(ctx, opID, hold, noHold)
 }
 
-// watchPlain streams log entries to stderr for non-TTY contexts.
-func watchPlain(ctx context.Context, machineID, opID string, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+// plainWatchPollInterval is how often watchPlain re-reads the op row as its
+// liveness backstop: the same cadence as the TUI's op-row poll.
+const plainWatchPollInterval = 5 * time.Second
 
-	es, err := ConnectWithRetry(ctx, apiURL, apiToken, machineID, opID, 0)
-	if err != nil {
-		return fmt.Errorf("watching operation %s: %w", opID, err)
+// watchPlain is the non-TUI watch (`operation watch --plain`, and any watch
+// whose stderr is not a terminal: CI, pipes, `machine deploy -w 2>log`). It
+// prints op's structured log envelopes to out in the `machine logs` line
+// format until the op reaches a terminal state, prints the same one-line
+// summary as the TUI to stderr, and returns nil only if the op completed. A
+// failed op, or ctx ending first (--timeout, interrupt), returns an error, so
+// the exit code is safe for automation to act on. ctx bounds the whole watch.
+//
+// The envelopes come from /api/v1/logs/stream through logSource, the feed the
+// TUI's log pane reads: it backfills from the op's start and resumes from its
+// cursor after a drop. Global's source=global envelope for this op carrying
+// extra.status completed or failed ends the watch. The subscription also
+// matches other ops on the same machine, so the op id must match too. The op
+// row is polled every pollEvery as a backstop for a terminal envelope the
+// stream never delivers (stranded behind the live-tail watermark, or a stream
+// that cannot connect). A first terminal poll waits one more interval so the
+// stream, which trails the commit by the live-tail watermark, can print the
+// op's last lines before the watch ends.
+func watchPlain(ctx context.Context, op model.Operation, out *os.File, pollEvery time.Duration) error {
+	opID := op.ID.String()
+	machineID := ""
+	if op.MachineID != uuid.Nil {
+		machineID = op.MachineID.String()
 	}
-	defer func() { _ = es.Close() }()
+	started := op.CreatedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
 
-	start := time.Now()
+	type terminal struct {
+		outcome tui.RunOutcome
+		reason  string
+	}
+	streamed := make(chan terminal, 1)
+	streamCtx, stopStream := context.WithCancel(ctx)
+	defer stopStream()
+	streamDone := make(chan struct{})
+	var lastPhase string // owned by the stream goroutine until streamDone closes
+	go func() {
+		defer close(streamDone)
+		render := humanRenderer(out)
+		_ = logSource(machineID, opID, op.CreatedAt)(streamCtx, func(id int64, env slogkit.Envelope) {
+			_ = render(env, id)
+			if env.OpID != op.ID {
+				return
+			}
+			if env.Phase != "" {
+				lastPhase = env.Phase
+			}
+			status := model.OperationStatus(env.StringExtra("status"))
+			if env.Source != slogkit.SourceGlobal || !isTerminal(status) {
+				return
+			}
+			t := terminal{outcome: tui.OutcomeCompleted, reason: env.StringExtra("error")}
+			if status == model.OpFailed {
+				t.outcome = tui.OutcomeFailed
+			}
+			select {
+			case streamed <- t:
+			default:
+			}
+		})
+	}()
 
+	outcome, reason := tui.OutcomeIncomplete, ""
+	poll := opPoller(opID)
+	polledTerminal := false
+	tick := time.NewTicker(pollEvery)
+	defer tick.Stop()
+wait:
 	for {
-		env, err := es.ReadEvent(ctx)
-		if err != nil {
-			return fmt.Errorf("read event: %w", err)
-		}
-
-		if env.Type != ws.TypeLogEntries {
-			continue
-		}
-
-		var msg ws.LogEntriesMsg
-		if err := json.Unmarshal(env.Data, &msg); err != nil {
-			continue
-		}
-
-		for _, entry := range msg.Entries {
-			ts := entry.TS
-			if len(ts) >= 19 {
-				ts = ts[11:19]
+		select {
+		case <-ctx.Done():
+			break wait
+		case t := <-streamed:
+			outcome, reason = t.outcome, t.reason
+			break wait
+		case <-tick.C:
+			done, failed, why, err := poll(ctx)
+			if err != nil || !done {
+				continue
 			}
-			if entry.Source == "phase" {
-				if entry.Line == "completed" {
-					elapsed := time.Since(start).Round(time.Second)
-					fmt.Fprintf(os.Stderr, "%s\n", format.StateReady.Render(
-						fmt.Sprintf("%s completed in %s", format.IconReady, elapsed)))
-					return nil
-				}
-				if entry.Line == "failed" || strings.HasPrefix(entry.Line, "failed:") {
-					elapsed := time.Since(start).Round(time.Second)
-					return fmt.Errorf("operation %s failed after %s", opID, elapsed)
-				}
-				fmt.Fprintf(os.Stderr, "phase: %s\n", entry.Line)
-			} else {
-				fmt.Fprintf(os.Stderr, "[%s %5s] %s\n", ts, entry.Source, entry.Line)
+			if !polledTerminal {
+				// Restart the interval: a poll slower than pollEvery leaves the
+				// next tick already pending, which would skip the grace.
+				polledTerminal = true
+				tick.Reset(pollEvery)
+				continue
 			}
+			outcome, reason = tui.OutcomeCompleted, why
+			if failed {
+				outcome = tui.OutcomeFailed
+			}
+			break wait
 		}
+	}
+	// Stop the stream and wait for it, so no log line lands after the summary
+	// and lastPhase is safe to read.
+	stopStream()
+	<-streamDone
+	// A terminal envelope the stream delivered while ctx was expiring (or
+	// while a poll was in flight) still decides the outcome: select picks
+	// among ready cases at random, so the loop can have left on ctx.Done.
+	if outcome == tui.OutcomeIncomplete {
+		select {
+		case t := <-streamed:
+			outcome, reason = t.outcome, t.reason
+		default:
+		}
+	}
+
+	fmt.Fprintln(os.Stderr, watchExitSummary(opID, tui.RunResult{
+		Outcome:   outcome,
+		LastPhase: lastPhase,
+		Elapsed:   time.Since(started),
+	}))
+	switch outcome {
+	case tui.OutcomeCompleted:
+		return nil
+	case tui.OutcomeFailed:
+		if reason != "" {
+			// The failure cause is the target agent's own report, and main
+			// prints this error to the terminal.
+			return fmt.Errorf("operation %s failed: %s", opID, format.Untrusted(reason))
+		}
+		return errOperationFailed(opID)
+	default:
+		return fmt.Errorf("operation %s had not finished when the watch ended: %w", opID, ctx.Err())
 	}
 }
 

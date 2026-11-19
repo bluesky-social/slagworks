@@ -67,6 +67,27 @@ func TestHostnameTemplate_Unset(t *testing.T) {
 	}
 }
 
+// NetBox stores a device name as free text. A name that does not make a
+// valid hostname gives none (the agent keeps the image's default) instead of
+// a malformed /etc/hostname, and instead of a newline that would add lines
+// to the deployed host's /etc/hosts.
+func TestHostnameTemplate_NotAHostname(t *testing.T) {
+	assertExpansions(t, HostnameTemplate{}, map[string]string{
+		"web1\n203.0.113.9 registry.example.net": "",
+		"web 1.site-a":                           "",
+		"web_1.site-a":                           "",
+		"web1..site-a":                           "",
+		"-web1.site-a":                           "",
+	})
+	assertExpansions(t, mustParseHostnameTemplate(t, internalZoneTemplate), map[string]string{
+		"web1\n203.0.113.9 registry.site-a": "",
+		"web 1.site-a":                      "",
+		"web1.po p1":                        "",
+		// Already qualified: passed through, so still checked.
+		"web 1.internal.site-a.example.net": "",
+	})
+}
+
 func TestHostnameTemplate_NamePlaceholder(t *testing.T) {
 	assertExpansions(t, mustParseHostnameTemplate(t, "{name}.example.net"), map[string]string{
 		// {name} needs no dot: every non-empty name expands.
@@ -92,6 +113,75 @@ func TestHostnameTemplate_NoTrailingLiteral(t *testing.T) {
 	})
 	assertExpansions(t, mustParseHostnameTemplate(t, "{node}.{zone}.{name}"), map[string]string{
 		"a.b": "a.b.a.b",
+	})
+}
+
+// A NetBox device name that is not a hostname gives no hostname, under every
+// kind of template, instead of passing through to MachineSnapshot.FQDN: the
+// agent writes that value verbatim into /etc/hostname and the 127.0.1.1 line
+// of /etc/hosts. The first name would otherwise add a second /etc/hosts line
+// mapping 203.0.113.9 to a name of the NetBox editor's choosing.
+func TestHostnameTemplate_RejectsNamesThatAreNotHostnames(t *testing.T) {
+	names := []string{
+		"host-a\n203.0.113.9 mirror.example.org",
+		"host-a.site1\n203.0.113.9 mirror.example.org",
+		"spare server.site1",
+		// ends with the templates' trailing literal: the already-qualified
+		// passthrough must not skip the check.
+		"spare server.internal.site1.example.net",
+		"host\ta.site1",
+		"rack1/host-a.site1",
+		"host-a#2.site1",
+		"web_01.site1",
+		"host-a-.site1",
+		"host-a..site1",
+		"host-a.site1.",
+		strings.Repeat("a", 64) + ".site1",
+	}
+	for _, raw := range []string{"", "{name}", "{name}.example.net", internalZoneTemplate, "{zone}-{node}"} {
+		tmpl := mustParseHostnameTemplate(t, raw)
+		for _, name := range names {
+			if got := tmpl.Expand(name); got != "" {
+				t.Errorf("template %q: Expand(%q) = %q, want \"\" (not a valid hostname)", raw, name, got)
+			}
+		}
+	}
+	// The check is on the hostname produced, not on the device name: a
+	// leading hyphen that the template moves inside a label is fine.
+	assertExpansions(t, mustParseHostnameTemplate(t, "{zone}-{node}"), map[string]string{
+		"-host-a.site1": "site1--host-a",
+	})
+}
+
+// Template literal text that no device name could turn into a hostname is a
+// configuration error at startup, not a silent loss of every machine's
+// hostname.
+func TestParseHostnameTemplate_LiteralCannotFormHostname(t *testing.T) {
+	for _, raw := range []string{
+		"{node}.internal.{zone}.example_net",
+		"{node} {zone}",
+		"{name}.example.net.",
+		".{name}",
+		"{node}..{zone}",
+		"-{name}",
+		"{name}-",
+		"{node}.-{zone}",
+	} {
+		_, err := ParseHostnameTemplate(raw)
+		if err == nil {
+			t.Errorf("ParseHostnameTemplate(%q): expected an error", raw)
+			continue
+		}
+		if !strings.Contains(err.Error(), "valid hostname") {
+			t.Errorf("ParseHostnameTemplate(%q) error %q does not say the literal text cannot form a hostname", raw, err)
+		}
+	}
+	// A literal label too long on its own is not a startup error: a dot in
+	// {name} or {node} can split it. Expand judges each result instead.
+	x, y := strings.Repeat("x", 32), strings.Repeat("y", 32)
+	assertExpansions(t, mustParseHostnameTemplate(t, x+"{name}"+y), map[string]string{
+		"a.b": x + "a.b" + y,
+		"ab":  "",
 	})
 }
 
