@@ -490,6 +490,60 @@ func TestLocalDB_DHCPLeases_ExpiredFiltered(t *testing.T) {
 	}
 }
 
+// TestLocalDB_DHCPLeaseExpiryComparedAsInstant pins that LoadDHCPLeases
+// and CountActiveDHCPLeases treat a lease as live iff its expiry instant is
+// after now, whatever UTC offset the stored expiry carries. The SQLite
+// driver stores a time.Time as text with the value's own offset
+// ("2006-01-02 15:04:05.999999999-07:00"), so comparing the column as text
+// orders by wall clock, not by instant. In production every expiry carries
+// the process's Local zone, whose offset changes at a DST fall-back: with
+// now at 01:50-07:00, an expiry 30 minutes later is 01:20-08:00, which
+// sorts before now. A worker restart in that window dropped the live lease
+// from the restored pool, and LoadDHCPLeases' cleanup deleted it.
+//
+// The offsets are relative to the test process's own, so the test behaves
+// the same on a UTC host as on a DST-observing one.
+func TestLocalDB_DHCPLeaseExpiryComparedAsInstant(t *testing.T) {
+	_, localOff := time.Now().Zone()
+
+	t.Run("live lease in the offset after a fall-back", func(t *testing.T) {
+		db := openTestDB(t)
+		mac, _ := net.ParseMAC("52:54:00:aa:bb:01")
+		// Expires 30 minutes from now, written one hour behind now's
+		// offset: its wall-clock text reads 30 minutes before now's.
+		after := time.FixedZone("after-fall-back", localOff-3600)
+		db.SaveDHCPLease(DHCPLease{MAC: mac, IP: net.ParseIP("10.0.0.50"), ExpiresAt: time.Now().Add(30 * time.Minute).In(after)})
+
+		if got := db.CountActiveDHCPLeases(); got != 1 {
+			t.Errorf("CountActiveDHCPLeases = %d, want 1 (lease expires in 30m)", got)
+		}
+		if got := db.LoadDHCPLeases(); len(got) != 1 || got[0].MAC.String() != mac.String() {
+			t.Fatalf("LoadDHCPLeases = %v, want the lease that expires in 30m", got)
+		}
+		// LoadDHCPLeases deletes the rows it considers expired; the live
+		// lease must survive that cleanup.
+		if got := db.LoadDHCPLeases(); len(got) != 1 {
+			t.Fatalf("second LoadDHCPLeases = %v: the live lease was deleted from worker.db", got)
+		}
+	})
+
+	t.Run("expired lease in the offset before a fall-back", func(t *testing.T) {
+		db := openTestDB(t)
+		mac, _ := net.ParseMAC("52:54:00:aa:bb:02")
+		// Expired 30 minutes ago, written one hour ahead of now's offset:
+		// its wall-clock text reads 30 minutes after now's.
+		before := time.FixedZone("before-fall-back", localOff+3600)
+		db.SaveDHCPLease(DHCPLease{MAC: mac, IP: net.ParseIP("10.0.0.51"), ExpiresAt: time.Now().Add(-30 * time.Minute).In(before)})
+
+		if got := db.CountActiveDHCPLeases(); got != 0 {
+			t.Errorf("CountActiveDHCPLeases = %d, want 0 (lease expired 30m ago)", got)
+		}
+		if got := db.LoadDHCPLeases(); len(got) != 0 {
+			t.Fatalf("LoadDHCPLeases = %v, want none (lease expired 30m ago)", got)
+		}
+	})
+}
+
 func TestLocalDB_DHCPLeases_Upsert(t *testing.T) {
 	db := openTestDB(t)
 

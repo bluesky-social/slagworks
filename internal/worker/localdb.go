@@ -500,10 +500,21 @@ func (l *LocalDB) DeleteDHCPLease(mac net.HardwareAddr) {
 	l.db.Delete(&dhcpLeaseRow{}, "mac = ?", mac.String())
 }
 
+// The SQLite driver stores a time.Time as text carrying the value's own
+// UTC offset ("2006-01-02 15:04:05.999999999-07:00"), and expiries are in
+// the process's Local zone, whose offset changes across DST. Comparing
+// that text orders by wall clock, so at a fall-back a live lease reads as
+// expired. julianday() applies the offset and compares instants (to the
+// millisecond), whatever offset each row was written with.
+const (
+	leaseLive    = "julianday(expires_at) > julianday(?)"
+	leaseExpired = "julianday(expires_at) <= julianday(?)"
+)
+
 // LoadDHCPLeases returns all non-expired persisted leases.
 func (l *LocalDB) LoadDHCPLeases() []DHCPLease {
 	var rows []dhcpLeaseRow
-	l.db.Where("expires_at > ?", time.Now()).Find(&rows)
+	l.db.Where(leaseLive, time.Now()).Find(&rows)
 
 	leases := make([]DHCPLease, 0, len(rows))
 	for _, r := range rows {
@@ -521,7 +532,7 @@ func (l *LocalDB) LoadDHCPLeases() []DHCPLease {
 	}
 
 	// Clean up expired leases
-	l.db.Where("expires_at <= ?", time.Now()).Delete(&dhcpLeaseRow{})
+	l.db.Where(leaseExpired, time.Now()).Delete(&dhcpLeaseRow{})
 
 	return leases
 }
@@ -532,7 +543,7 @@ func (l *LocalDB) LoadDHCPLeases() []DHCPLease {
 // set when the site only needs the integer.
 func (l *LocalDB) CountActiveDHCPLeases() int64 {
 	var n int64
-	l.db.Model(&dhcpLeaseRow{}).Where("expires_at > ?", time.Now()).Count(&n)
+	l.db.Model(&dhcpLeaseRow{}).Where(leaseLive, time.Now()).Count(&n)
 	return n
 }
 
