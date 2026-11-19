@@ -137,11 +137,14 @@ detail; this is the map.
 - `console_casts(id bigserial, machine_id UUID UNIQUE, cast_started_at,
   width, height)` and `console_cast_events(id bigserial, cast_id,
   t_us bigint, received_at, data bytea)` — one perpetual asciicast
-  per machine, appended forever. `t_us` is monotonic-per-cast
-  microseconds; the site worker computes it as `prev_max_us +
-  monotonic_since_pump_start` and the on-demand resume-offset RPC
-  keeps it monotonic across pump restarts. `data` is `bytea` because
-  SOL bytes are not guaranteed UTF-8.
+  per machine, appended forever. `t_us` is strictly increasing
+  per-cast microseconds; the site worker computes it as `prev_max_us +
+  monotonic_since_pump_start`, bumped to one past the pump's previous
+  frame when two frames land in the same microsecond, and the
+  on-demand resume-offset RPC keeps it increasing across pump
+  restarts. The console stream relies on strictness: it pages with
+  cursor `t_us + 1`, so a repeated `t_us` would be skipped. `data` is
+  `bytea` because SOL bytes are not guaranteed UTF-8.
 
 ### testpg
 
