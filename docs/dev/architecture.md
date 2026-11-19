@@ -897,7 +897,12 @@ Agent produces a slog line:
 2. `agentlog.Client.Run` batches envelopes and
    POSTs to `http://<site>/logs/ingest`.
 3. The site's `httpboot.Handler.handleLogsIngest` unmarshals and
-   pushes into the site's `logring.Ring`.
+   pushes into the site's `logring.Ring`. The endpoint is
+   unauthenticated, so it refuses (400) any batch holding an envelope
+   whose `source` is not `agent`: global and site envelopes carry op
+   lifecycle and phase events that the interactive
+   `slagctl operation watch` trusts, and no host on a served segment
+   may assert them.
 
 Site produces a slog line: directly into the same `logring.Ring`
 via the site slog handler's sink.
