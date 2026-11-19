@@ -75,8 +75,23 @@ func TestPropRegistrySchedule(t *testing.T) {
 		stats.cases++
 
 		rapid.SyncTest(rt, func(rt *rapid.T) {
+			// Virtual time stands still while goroutines are runnable, so
+			// several observations can share an instant. now breaks the
+			// tie by a nanosecond in observation order, which is what the
+			// started-before / started-after checks below compare.
 			base := time.Now()
-			now := func() time.Duration { return time.Since(base) }
+			var clockMu sync.Mutex
+			var lastStamp time.Duration
+			now := func() time.Duration {
+				clockMu.Lock()
+				defer clockMu.Unlock()
+				stamp := time.Since(base)
+				if stamp <= lastStamp {
+					stamp = lastStamp + time.Nanosecond
+				}
+				lastStamp = stamp
+				return stamp
+			}
 
 			var mu sync.Mutex
 			var runs []propRegRun
