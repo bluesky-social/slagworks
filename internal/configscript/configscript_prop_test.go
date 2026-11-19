@@ -191,7 +191,16 @@ func TestProp_ParseRoundTripAndMatch(t *testing.T) {
 		want, wantAmbig := refMatch(gens, host)
 
 		check := func(label string, scripts []Script) {
+			paths := make([]string, len(scripts))
+			for i := range scripts {
+				paths[i] = scripts[i].Path
+			}
 			got, err := Match(scripts, resolve)
+			for i := range scripts {
+				if scripts[i].Path != paths[i] {
+					t.Fatalf("%s: Match reordered its input slice", label)
+				}
+			}
 			switch {
 			case wantAmbig:
 				if err == nil {
@@ -208,22 +217,13 @@ func TestProp_ParseRoundTripAndMatch(t *testing.T) {
 			}
 		}
 		check("orig", parsed)
-		// Permutation invariance (and Match must not reorder its input).
-		before := make([]string, len(parsed))
-		for i := range parsed {
-			before[i] = parsed[i].Path
-		}
+		// Permutation invariance.
 		perm := append([]Script(nil), parsed...)
 		for i := len(perm) - 1; i > 0; i-- {
 			j := rapid.IntRange(0, i).Draw(t, fmt.Sprintf("perm%d", i))
 			perm[i], perm[j] = perm[j], perm[i]
 		}
 		check("permuted", perm)
-		for i := range parsed {
-			if parsed[i].Path != before[i] {
-				t.Fatalf("Match mutated its input slice")
-			}
-		}
 		switch {
 		case wantAmbig:
 			cvAmbig.Add(1)
