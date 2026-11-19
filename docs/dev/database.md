@@ -129,9 +129,10 @@ detail; this is the map.
 - `log_envelopes(id bigserial, ts, global_received_at, received_at,
   level, source, host, machine_id, op_id, trace_id, phase, msg,
   payload jsonb)` — one row per structured log envelope from agents,
-  SOL pumps, site workers, and global itself. Live-tail queries lag
-  by 500ms past `now()` so an in-flight transaction can't allocate a
-  sequence id inside the read window and get skipped. Emitter clocks
+  SOL pumps, site workers, and global itself. Every `/logs/stream`
+  query, backfill pages as well as live-tail polls, lags by 500ms past
+  `now()` so an in-flight transaction can't allocate a sequence id
+  inside the read window and get skipped. Emitter clocks
   can be arbitrarily skewed (agents pre-NTP); the watermark uses
   `global_received_at`, which is server-assigned.
 - `console_casts(id bigserial, machine_id UUID UNIQUE, cast_started_at,
