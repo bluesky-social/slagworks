@@ -194,7 +194,18 @@ policy lives. `Handler.ServeHTTP`
   (`destructive`, `wipe_all_disks`, `recovery`, `tailscale_authkey`, etc.).
   If the machine has never been commissioned (no `SystemUUID`), the
   handler refuses to serve a deploy script and returns an iPXE `shell`
-  drop instead (`handler.go:441-444`).
+  drop instead (`handler.go:441-444`). It refuses the same way when a
+  value it would put on the kernel line as one `key=value` argument (the
+  tailnet auth key, the system UUID, the test-only knobs) contains a
+  space, a control or non-ASCII byte, `"`, `\` or `${`, any of which
+  would add kernel arguments or iPXE commands; the error names the
+  argument, and the site worker log says why. A tailnet hostname that is
+  not a valid hostname is not refused: the handler leaves out both
+  tailnet arguments and the deploy goes ahead without tailnet enrollment
+  (global does not mint a key for such a name in the first place).
+  Every kernel boot (deploy, commission, kernel-only) likewise refuses a
+  `slagworks_kernel_params` value iPXE would read as more than kernel
+  arguments (see `hardware/adding-new-hardware.md`).
 Each generated script sets `BOOTIF=01-${net0/mac:hexhyp}` and `ip=dhcp` so
 stock Ubuntu `/init` (via `configure_networking`) knows which NIC iPXE
 chainloaded on and will DHCP on the correct port. `boot=slagworks` is the

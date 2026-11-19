@@ -80,6 +80,14 @@ until you set a value manually or the explicit opt-out:
 - No serial console at all: the literal string `none`. This is the explicit
   opt-out and passes preflight.
 
+Surrounding whitespace is ignored. The value also goes onto the iPXE
+`kernel` line verbatim, and iPXE reads that line before the kernel does, so
+the boot handler refuses to boot the host (an iPXE `shell` with an error
+naming the field) when the value contains a control character or non-ASCII
+byte, contains `${`, or has a word that is `||`, `&&` or `;` or starts with
+`#`. Each of those would make iPXE run a command, expand a setting or drop
+the rest of the boot line instead of passing kernel arguments.
+
 The old convention of a `# slagworks:kernel_params` comment in the storage
 script is retired and now rejected at upload time (`internal/storage/script.go`
 `rejectKernelParams`); use the NetBox custom field instead.
