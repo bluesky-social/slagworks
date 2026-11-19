@@ -511,7 +511,10 @@ resurrect a zombie op, and — the re-wipe-window fix — clears its op-driven
 machine-state overlay on an identity apply ONLY where the applied baseline
 equals the overlay value. A rehydrated-from-LocalDB op set is UNTRUSTED
 until the first `op_resync`: it may force `BootLocal` but never actuate.
-Fail-closed rule: an effective transient state (deploying/commissioning)
+The worker persists its op layer (`worker.db`, kv key `op_state`) after
+every stream apply and after the two local writes that protect an
+installed host, a deploy op reaching `awaiting_phone_home` and a
+phone-home; see [the latch](#the-awaiting_phone_home-latch). Fail-closed rule: an effective transient state (deploying/commissioning)
 with NO matching active op in the op layer serves `BootLocal`, never
 `BootDeploy`/`BootCommission`. Protocol skew is loud: `HelloMsg.Proto` and
 every hello reply carry `ws.OpStreamProto`; either side refuses an
@@ -735,6 +738,18 @@ whenever `state = deploying` and `phase = awaiting_phone_home`
 service POSTs `/api/v1/phone-home`, `RecordPhoneHome` fires the
 completion path described earlier, and the op transitions to
 `completed` with `machine.state = running`.
+
+The latch has to survive a worker restart. The phase and the completion
+reach global only as op_updates, which the outbox keeps in memory, so
+global can still hold the op claimed at a pre-install phase when the
+install finishes during a WAN outage. `Cache.UpdateOpPhase` therefore
+writes the op layer to LocalDB when it sets `awaiting_phone_home`, and
+`Cache.RecordPhoneHome` writes it with the running overlay and the
+`phoneHomed` pin. After a restart the first `op_resync` (built from
+global's stale row) then finds the latched phase to keep
+(`keepTerminalWait`) and the pin to apply, and the host's next PXE still
+boots its disk. Test: `TestAwaitingPhoneHomeSurvivesRestart`
+(`opstream_test.go`).
 
 Timeout: `PhoneHomeTimeout` (30 minutes by default) anchored on
 `phase_entered_at`.

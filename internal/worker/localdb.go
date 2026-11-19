@@ -271,25 +271,34 @@ func (l *LocalDB) AckOutboxRow(rowID uint64) {
 }
 
 // PersistedOpState is the op-layer half of the worker's warm-restart
-// state (Tier 2 Phase 2): the active op set + the op-driven machine-state
-// overlay. It is persisted OUTSIDE the snapshot path (SaveOpState),
-// because operations left SiteSnapshot and now flow on the op-event
-// stream — the op set is written on every stream apply, not on snapshot
-// apply. On rehydration the loaded set is treated as UNTRUSTED until the
-// first op_resync (it may be stale: global could have failed/completed an
-// op during the outage), so a persisted active deploy op never actuates a
-// re-wipe on cold start.
+// state (Tier 2 Phase 2): the active op set, the op-driven machine-state
+// overlay, and the deploy ops that phone-homed locally. It is persisted
+// OUTSIDE the snapshot path (SaveOpState), because operations left
+// SiteSnapshot and now flow on the op-event stream — the op set is written
+// on every stream apply and on the two local mutations that guard an
+// installed host against a re-image (the awaiting_phone_home phase and
+// phone-home), not on snapshot apply. On rehydration the loaded set is
+// treated as UNTRUSTED until the first op_resync (it may be stale: global
+// could have failed/completed an op during the outage), so a persisted
+// active deploy op never actuates a re-wipe on cold start.
 type PersistedOpState struct {
 	Ops     []model.Operation             `json:"ops"`
 	Overlay map[string]model.MachineState `json:"overlay"`
+	// PhoneHomed is opState.phoneHomed: deploy op IDs whose installed OS
+	// phoned home to this worker. Global may not know yet (the completion
+	// op_update is not durable), so the first op_resync after a restart can
+	// still carry the op as claimed; the restored entry keeps the machine
+	// pinned to running instead of re-imaging it.
+	PhoneHomed []string `json:"phone_homed"`
 }
 
-// SaveOpState persists the op set + machine-state overlay to the kv table
-// under "op_state". Called on every op-stream apply (delta/resync/removed)
-// — small, bounded by active-op count. Best-effort: a failure is logged,
-// not fatal (the op set re-syncs from global on the next connect anyway).
-func (l *LocalDB) SaveOpState(ops []model.Operation, overlay map[string]model.MachineState) {
-	blob, err := json.Marshal(PersistedOpState{Ops: ops, Overlay: overlay})
+// SaveOpState persists the op layer to the kv table under "op_state".
+// Called on every op-stream apply (delta/resync/removed) and on the local
+// latch mutations (Cache.UpdateOpPhase to awaiting_phone_home,
+// Cache.RecordPhoneHome) — small, bounded by active-op count. Best-effort:
+// a failure is logged, not fatal.
+func (l *LocalDB) SaveOpState(st PersistedOpState) {
+	blob, err := json.Marshal(st)
 	if err != nil {
 		l.log.Error("marshal op_state", "err", err)
 		return
@@ -299,7 +308,7 @@ func (l *LocalDB) SaveOpState(ops []model.Operation, overlay map[string]model.Ma
 	}
 }
 
-// LoadOpState returns the persisted op set + overlay, or nil if none has
+// LoadOpState returns the persisted op layer, or nil if none has
 // been saved (fresh install, or a DB written by a pre-Tier-2 binary that
 // carried ops in the snapshot meta — those are simply absent here, so the
 // worker starts with an empty untrusted op set, which is correct). Corrupt
