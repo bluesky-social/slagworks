@@ -46,7 +46,12 @@ func (e *AmbiguousSiteWorkerError) Error() string {
 // On first call for a (slug, worker_id) pair: creates the row, stores
 // TokenHash, returns plaintext.
 // On re-register (rotation): updates TokenHash with a fresh value,
-// refreshes fqdn + last_seen_at, preserves first_seen_at.
+// refreshes fqdn + last_seen_at, preserves id, first_seen_at and serial.
+//
+// clause.Returning{} makes the upsert `RETURNING *` so w is refreshed
+// from the stored row. Without it the conflict path leaves w holding the
+// uuid.New() and time.Now() built for the insert attempt, and the API
+// handler would hand the caller an id that names no row.
 func (s *Store) RegisterSiteWorker(siteSlug, workerID, fqdn string) (*model.SiteWorker, string, error) {
 	token, hash, err := newWorkerToken()
 	if err != nil {
@@ -62,14 +67,17 @@ func (s *Store) RegisterSiteWorker(siteSlug, workerID, fqdn string) (*model.Site
 		FirstSeenAt: now,
 		LastSeenAt:  now,
 	}
-	err = s.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "site_slug"}, {Name: "worker_id"}},
-		DoUpdates: clause.Assignments(map[string]any{
-			"last_seen_at": now,
-			"fqdn":         fqdn,
-			"token_hash":   hash,
-		}),
-	}).Create(&w).Error
+	err = s.db.Clauses(
+		clause.OnConflict{
+			Columns: []clause.Column{{Name: "site_slug"}, {Name: "worker_id"}},
+			DoUpdates: clause.Assignments(map[string]any{
+				"last_seen_at": now,
+				"fqdn":         fqdn,
+				"token_hash":   hash,
+			}),
+		},
+		clause.Returning{},
+	).Create(&w).Error
 	if err != nil {
 		return nil, "", err
 	}

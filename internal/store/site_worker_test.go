@@ -43,15 +43,54 @@ func TestRegisterSiteWorker_RotatesOnReregister(t *testing.T) {
 	if token1 == token2 {
 		t.Fatal("re-registration should mint a new token")
 	}
-	// Row identity (first.ID vs second.ID) is GORM-decided; the
-	// (slug, worker_id) upsert handles dedupe. We verify the rotation
-	// by confirming the new FQDN landed and the old token no longer
-	// authenticates.
+	// The (slug, worker_id) upsert handles dedupe; row identity of the
+	// returned struct is pinned by TestRegisterSiteWorker_ReregisterReturnsPersistedRow.
+	// Here we verify the rotation by confirming the new FQDN landed and
+	// the old token no longer authenticates.
 	if second.FQDN != "worker-1.pop3-renamed" {
 		t.Fatalf("fqdn not refreshed: %q", second.FQDN)
 	}
 	if _, err := st.GetSiteWorkerByTokenHash(HashWorkerToken(token1)); !errors.Is(err, ErrSiteWorkerNotFound) {
 		t.Fatal("old token should no longer authenticate")
+	}
+}
+
+// TestRegisterSiteWorker_ReregisterReturnsPersistedRow: re-registering an
+// existing (slug, worker_id) takes the ON CONFLICT DO UPDATE path, which
+// keeps the row's id, first_seen_at and serial. The struct handed back
+// (served as POST /site-workers' "id" and "first_seen_at") must be that
+// row, not the uuid.New() and time.Now() built for the insert attempt: an
+// id that names no row 404s on DELETE /site-workers/<id>.
+func TestRegisterSiteWorker_ReregisterReturnsPersistedRow(t *testing.T) {
+	st := testStore(t)
+
+	first, _, err := st.RegisterSiteWorker("pop3", "worker-1", "a.pop3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial := "SN-1"
+	if _, err := st.TouchSiteWorker("pop3", "worker-1", "", &serial); err != nil {
+		t.Fatal(err)
+	}
+	second, token2, err := st.RegisterSiteWorker("pop3", "worker-1", "b.pop3")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if second.ID != first.ID {
+		t.Errorf("re-register returned id %s; the row's id is %s", second.ID, first.ID)
+	}
+	if !sameDBTime(second.FirstSeenAt, first.FirstSeenAt) {
+		t.Errorf("re-register returned first_seen_at %v; the row's is %v", second.FirstSeenAt, first.FirstSeenAt)
+	}
+	if second.Serial != serial {
+		t.Errorf("re-register returned serial %q; the row's is %q", second.Serial, serial)
+	}
+	if second.FQDN != "b.pop3" || second.TokenHash != HashWorkerToken(token2) {
+		t.Errorf("re-register returned fqdn=%q token_hash=%q; want the rotated values", second.FQDN, second.TokenHash)
+	}
+	if _, err := st.ResolveSiteWorker(second.ID.String()); err != nil {
+		t.Errorf("id returned by re-register does not resolve: %v", err)
 	}
 }
 
