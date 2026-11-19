@@ -229,7 +229,9 @@ in [`configuration.md`](../user/configuration.md#site-config-model).
 
 The only channel between global and site workers. Every frame is an
 envelope `{"type": "<string>", "request_id": "<id>", "data": <payload>}`.
-Request/reply pairs share a `request_id`.
+Request/reply pairs share a `request_id`. Global reads at most 1 MiB
+(`ws.MaxWorkerFrameBytes`) per frame from a worker and closes the
+connection on a longer one; the worker reads up to 16 MiB from global.
 
 Connection setup:
 
@@ -348,6 +350,17 @@ crash between them and the acknowledgement is safe to replay. A
 `terminal` error drops the entry. Consequence: commissioning blocks while
 NetBox is unreachable. Deployed machines keep running from the last
 snapshot.
+
+An entry too large to send is never retried. `/api/v1/report` and
+`/api/v1/inventory` answer 413 for a body over
+`ws.MaxObservationDataBytes` (4 KiB under global's 1 MiB frame limit,
+leaving room for the envelope), measured after the JSON escaping the
+worker applies when it re-encodes the body. The drain drops any
+observation whose encoded frame would still exceed
+`ws.MaxWorkerFrameBytes`, logging it at ERROR, as it does for a
+`terminal` error. Sending that frame would make global close the
+connection without replying, and the reconnect would replay the entry
+first, cutting off every observation and op update queued behind it.
 
 ---
 

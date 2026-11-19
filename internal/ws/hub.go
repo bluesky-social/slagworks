@@ -607,6 +607,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn("ws accept failed", "slug", worker.SiteSlug, "worker", worker.WorkerID, "err", err)
 		return
 	}
+	// The worker sizes its outbound observations against this same
+	// constant, so the two sides agree on what is deliverable.
+	conn.SetReadLimit(MaxWorkerFrameBytes)
 
 	ctx := r.Context()
 	wc := &workerConn{

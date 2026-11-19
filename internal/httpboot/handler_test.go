@@ -13,6 +13,7 @@ import (
 
 	"github.com/bluesky-social/slagworks/internal/bmcreconcile"
 	"github.com/bluesky-social/slagworks/internal/model"
+	"github.com/bluesky-social/slagworks/internal/ws"
 )
 
 func newTestProvider() *model.InMemoryProvider {
@@ -1717,6 +1718,80 @@ func TestInventoryEndpoint_UnknownMachine_ForwardsToGlobal(t *testing.T) {
 	// for global to resolve). PXE boot endpoints still reject unknown MACs.
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for unknown MAC inventory, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// inventoryCounter counts the inventory reports the handler queues.
+type inventoryCounter struct {
+	*model.InMemoryProvider
+	queued int
+}
+
+func (p *inventoryCounter) RecordInventoryReport(uuid.UUID, []byte) { p.queued++ }
+
+// paddedJSON returns a valid JSON object of exactly n bytes.
+func paddedJSON(t *testing.T, n int) string {
+	t.Helper()
+	const head, tail = `{"nics":[],"padding":"`, `"}`
+	if n < len(head)+len(tail) {
+		t.Fatalf("paddedJSON: %d bytes is too small", n)
+	}
+	return head + strings.Repeat("x", n-len(head)-len(tail)) + tail
+}
+
+// escapingJSON returns a valid JSON object of about 200 KiB that
+// json.Marshal re-encodes to over 1 MiB: each '<' becomes "<".
+func escapingJSON() string {
+	return `{"nics":[],"padding":"` + strings.Repeat("<", 200<<10) + `"}`
+}
+
+// TestInventoryEndpoint_BodyCappedAtObservationLimit: the worker queues an
+// inventory body verbatim as an observation, and global cannot read one
+// over ws.MaxWorkerFrameBytes. A body at ws.MaxObservationDataBytes is
+// queued. One byte more, or a smaller body that JSON escaping grows past
+// the cap, gets 413 and is not queued, instead of a 200 for a report that
+// can never reach global.
+func TestInventoryEndpoint_BodyCappedAtObservationLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantQueued int
+	}{
+		{"at cap", paddedJSON(t, ws.MaxObservationDataBytes), http.StatusOK, 1},
+		{"one byte over", paddedJSON(t, ws.MaxObservationDataBytes+1), http.StatusRequestEntityTooLarge, 0},
+		{"grows past cap when escaped", escapingJSON(), http.StatusRequestEntityTooLarge, 0},
+	} {
+		p := &inventoryCounter{InMemoryProvider: model.NewInMemoryProvider()}
+		mux := NewServer(":0", ServerConfig{Provider: p}).buildMux()
+		req := httptest.NewRequest("POST", "/api/v1/inventory", strings.NewReader(tc.body))
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != tc.wantStatus || p.queued != tc.wantQueued {
+			t.Errorf("%s (%d bytes): status %d, queued %d; want %d, %d (%s)",
+				tc.name, len(tc.body), w.Code, p.queued, tc.wantStatus, tc.wantQueued, w.Body.String())
+		}
+	}
+}
+
+// TestReport_OversizedBodyReturns413: /api/v1/report queues a commission
+// report's data the same way, so it refuses a body over
+// ws.MaxObservationDataBytes, counting bytes after the first JSON value and
+// JSON escaping growth.
+func TestReport_OversizedBodyReturns413(t *testing.T) {
+	small := `{"machine_id":"` + uuid.NewString() + `","op_id":"` + uuid.NewString() + `","event":"phone_home"}`
+	for _, tc := range []struct{ name, body string }{
+		{"one byte over", paddedJSON(t, ws.MaxObservationDataBytes+1)},
+		{"small report, oversized trailing whitespace", small + strings.Repeat(" ", ws.MaxObservationDataBytes)},
+		{"grows past cap when escaped", escapingJSON()},
+	} {
+		mux := NewServer(":0", ServerConfig{Provider: newTestProvider()}).buildMux()
+		req := httptest.NewRequest("POST", "/api/v1/report", strings.NewReader(tc.body))
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusRequestEntityTooLarge {
+			t.Errorf("%s (%d bytes): got %d, want 413: %s", tc.name, len(tc.body), w.Code, w.Body.String())
+		}
 	}
 }
 
