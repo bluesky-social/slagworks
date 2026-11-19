@@ -454,7 +454,11 @@ type ErrorMsg struct {
 // when the transition changed the machine's state, the new machine_state.
 // Sent on every op mutation: create (pending), claim, each phase
 // transition. MachineState is empty ("") when the transition changed no
-// machine state (phase-only, pending create).
+// machine state (phase-only, pending create). After every snapshot the
+// hub pushes on a content change it re-sends each active op of the site as
+// an op_delta, with the transient state a claimed lifecycle op implies as
+// MachineState: the new membership can admit an op whose delta the old one
+// filtered out, and the worker drops the versions it already holds.
 type OpDeltaMsg struct {
 	Operation    model.Operation    `json:"operation"`
 	MachineState model.MachineState `json:"machine_state,omitempty"`

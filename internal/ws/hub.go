@@ -444,6 +444,10 @@ func NewHub(cfg HubConfig) *Hub {
 // connected worker for the slug. Each worker is written in its own
 // goroutine so one slow worker cannot stall delivery to the rest;
 // per-connection write ordering is preserved by workerConn.writeMu.
+// Each fan-out snapshot is followed by the site's active ops, re-sent as
+// op_deltas scoped to the new membership (see workerConn.send). The cache
+// is updated before the fan-out starts, which the opReady handoff in send
+// relies on.
 func (h *Hub) Push(slug string, snap model.SiteSnapshot) {
 	h.mu.Lock()
 	h.snapshots[slug] = snap
@@ -500,12 +504,13 @@ func (h *Hub) machineInSlug(slug string, machineID uuid.UUID) bool {
 // and this membership filter preserves that confidentiality baseline.
 //
 // A conn whose slug has no cached snapshot (or whose snapshot doesn't
-// contain the machine) is skipped. Dropping is safe: an op can only be
-// created against a machine that already exists in the identity snapshot
-// (the mirror creates machine rows and fires an identity rebuild before
-// any op can target them), so a missing membership means either a cold
-// slug (its hello-path RebuildAndWait builds the snapshot and the resync
-// barrier then covers the op) or a foreign site (must not receive it).
+// contain the machine) is skipped. The skip can drop an op the conn's
+// site owns: the mirror commits a machine row and only schedules the
+// identity rebuild (debounced, then NetBox round trips, retried on
+// failure), so an op can be created on the machine before the snapshot
+// holding it is pushed. The op then reaches the worker in the op re-send
+// that follows that push (workerConn.send), or in the hello resync of a
+// conn that connects after it.
 //
 // On a write failure the worker's connection is force-closed (B3
 // drain-loop pattern) so its reconnect + op_resync self-heals a missed
@@ -1014,6 +1019,11 @@ type workerConn struct {
 	// that observes opReady=true writes strictly after the resync.
 	// Holding opStreamMu across op-message writes also serializes them
 	// per-conn, preserving op-stream ordering.
+	//
+	// The post-push op re-send (send) follows the same rule: a Push whose
+	// fan-out observed opReady=false cached its snapshot before the hello
+	// resync reads the slug's membership under opStreamMu, so the hello
+	// resync is already scoped by that snapshot.
 	opStreamMu sync.Mutex
 	opReady    bool
 }
@@ -1200,24 +1210,13 @@ func (c *workerConn) handleHello(ctx context.Context, hello HelloMsg) error {
 	// worker full-replaces its op set + rebuilds machine-state overlays
 	// from it and clears its untrusted flag. Bounded by active-op count,
 	// so a resync is cheap even when no ops changed (plan: no op-watermark).
-	// snap (guaranteed to exist here — the cold path did RebuildAndWait)
-	// supplies the slug's machine membership for the confidentiality filter.
-	return c.sendOpResync(ctx, snap)
+	return c.sendOpResync(ctx)
 }
 
-// sendOpResync builds and writes the op_resync: the active-op set SCOPED
-// TO THIS CONN'S SITE, plus the transient machine-state overlay each
-// claimed/running lifecycle op implies (opstate.ClaimTransition). Pending
-// ops imply no overlay. Global has no overlay store — the map is derived
-// here.
-//
-// Confidentiality filter: ListActiveOperations returns the FLEET-WIDE
-// set, and Operation.Params carries per-site secrets (BMC/PDU passwords,
-// tailnet auth keys). Only ops whose machine is in snap — the slug's own
-// identity snapshot, guaranteed built by handleHello — go on the wire;
-// this preserves the pre-cutover baseline where ops rode the per-slug
-// SiteSnapshot. The derived machine_states map is built from the filtered
-// set only.
+// sendOpResync builds and writes the hello op_resync: the site's active
+// ops (siteActiveOpsLocked), plus the transient machine-state overlay each
+// claimed/running lifecycle op implies (claimedState). Global has no
+// overlay store — the map is derived here, from the site-scoped set only.
 //
 // The whole body — flipping opReady AND the ListActiveOperations DB read
 // AND the resync write — runs under opStreamMu (see workerConn). This
@@ -1228,45 +1227,85 @@ func (c *workerConn) handleHello(ctx context.Context, hello HelloMsg) error {
 // its delta strictly after it. The DB read under a per-conn mutex is fine:
 // it blocks only op messages destined for THIS conn, it's a bounded
 // active-set query (dozens of rows), and hellos are rare.
-func (c *workerConn) sendOpResync(ctx context.Context, snap model.SiteSnapshot) error {
+func (c *workerConn) sendOpResync(ctx context.Context) error {
 	c.opStreamMu.Lock()
 	defer c.opStreamMu.Unlock()
 	c.opReady = true
 
-	fleet, err := c.hub.cfg.ActiveOps.ListActiveOperations()
+	ops, err := c.siteActiveOpsLocked()
 	if err != nil {
 		// A resync failure is connection-fatal: without the op set the
 		// worker stays untrusted and can't actuate. Surface it and drop.
 		c.writeError(ctx, "resync_failed", err.Error())
-		return fmt.Errorf("op resync: list active ops: %w", err)
+		return fmt.Errorf("op resync: %w", err)
 	}
-	members := make(map[uuid.UUID]bool, len(snap.Machines))
-	for i := range snap.Machines {
-		members[snap.Machines[i].ID] = true
-	}
-	ops := make([]model.Operation, 0, len(fleet))
 	states := make(map[string]model.MachineState)
-	for _, op := range fleet {
-		if !members[op.MachineID] {
-			continue // another site's op: its params must not reach this worker
-		}
-		ops = append(ops, op)
-		// Only claimed/running lifecycle ops imply a transient state;
-		// pending ops imply nothing (the machine is still at its
-		// baseline). A power op's ClaimTransition is ("", nil).
-		if op.Status != model.OpClaimed && op.Status != model.OpRunning {
-			continue
-		}
-		target, _ := opstate.ClaimTransition(op.Type)
-		if target != "" {
+	for _, op := range ops {
+		if target := claimedState(op); target != "" {
 			states[op.MachineID.String()] = target
 		}
 	}
 	return c.writeTyped(ctx, TypeOpResync, "", OpResyncMsg{Ops: ops, MachineStates: states})
 }
 
+// claimedState is the transient machine state an active op implies: the
+// claim's target (opstate.ClaimTransition) for a claimed/running lifecycle
+// op, "" otherwise. Pending ops imply nothing (the machine is still at its
+// baseline); a power op's ClaimTransition is ("", nil).
+func claimedState(op model.Operation) model.MachineState {
+	if op.Status != model.OpClaimed && op.Status != model.OpRunning {
+		return ""
+	}
+	target, _ := opstate.ClaimTransition(op.Type)
+	return target
+}
+
+// siteActiveOpsLocked returns the active-op set SCOPED TO THIS CONN'S
+// SITE. Caller holds opStreamMu.
+//
+// Confidentiality filter: ListActiveOperations returns the FLEET-WIDE
+// set, and Operation.Params carries per-site secrets (BMC/PDU passwords,
+// tailnet auth keys). Only ops whose machine is in the slug's own cached
+// identity snapshot go on the wire; this preserves the pre-cutover
+// baseline where ops rode the per-slug SiteSnapshot.
+//
+// The membership is read from the hub cache here, under opStreamMu and
+// after the DB read, rather than taken from the snapshot the hello reply
+// carried: a Push that lands after the hello reply but before the hello
+// resync, and whose fan-out skipped its op re-send because the conn was
+// not op-ready yet, is then still covered, and so is a Push that lands
+// during the DB read. The cache always holds the slug by now: handleHello's
+// cold path caches its rebuild, and Push caches before fanning out.
+func (c *workerConn) siteActiveOpsLocked() ([]model.Operation, error) {
+	fleet, err := c.hub.cfg.ActiveOps.ListActiveOperations()
+	if err != nil {
+		return nil, fmt.Errorf("list active ops: %w", err)
+	}
+	snap, ok := c.hub.snapshotFor(c.slug)
+	if !ok {
+		return nil, fmt.Errorf("no cached snapshot for site %q to scope the op set by", c.slug)
+	}
+	members := make(map[uuid.UUID]bool, len(snap.Machines))
+	for i := range snap.Machines {
+		members[snap.Machines[i].ID] = true
+	}
+	ops := make([]model.Operation, 0, len(fleet))
+	for _, op := range fleet {
+		if !members[op.MachineID] {
+			continue // another site's op: its params must not reach this worker
+		}
+		ops = append(ops, op)
+	}
+	return ops, nil
+}
+
 // send is the Push fan-out write path. Called from Hub.Push holding no
-// hub lock, from its own goroutine per fan-out target.
+// hub lock, from its own goroutine per fan-out target. It writes the
+// snapshot, then re-sends the site's active ops (resendOpsAfterPush).
+//
+// A failed snapshot write force-closes the connection, as a failed
+// op-stream write does: the re-sent ops are only actionable for a worker
+// holding the snapshot, and the reconnect's hello delivers both.
 func (c *workerConn) send(snap model.SiteSnapshot) {
 	// Fan-out writes run under a per-connection timeout; a single slow
 	// worker must not block all others. Per-connection write ordering
@@ -1275,7 +1314,60 @@ func (c *workerConn) send(snap model.SiteSnapshot) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := c.writeTyped(ctx, TypeSnapshot, "", c.hub.snapshotMsg(snap)); err != nil {
-		c.log.Warn("fan-out snapshot write failed", "err", err)
+		c.log.Warn("fan-out snapshot write failed; forcing reconnect", "err", err)
+		_ = c.conn.CloseNow()
+		return
+	}
+	c.resendOpsAfterPush()
+}
+
+// resendOpsAfterPush re-sends every active op of the site, scoped to the
+// slug's newly cached membership, as an op_delta. PublishOpDelta filters
+// by the membership cached at publish time, so an op created on a machine
+// before the snapshot holding that machine was pushed never reached this
+// worker; this delivers it, and likewise a later version published while
+// the machine was missing from the cached snapshot.
+//
+// Each re-sent delta carries the transient state a claimed op implies
+// (claimedState), as the hello resync derives it. Of an op's deltas only
+// the claim's sets the worker's overlay, and a re-send can stand in for
+// it: when that delta was filtered out, or when the re-send reads a
+// just-committed claim and is written before the claim's own delta, which
+// the worker then drops as a version it already holds.
+//
+// op_delta rather than op_resync: the worker applies op_delta
+// last-writer-wins by Version and drops a version it already holds, so
+// the ops it is up to date on are left alone, including progress it has
+// recorded locally without a Version bump (a claim or a failure whose
+// op_update global has not processed yet). An op_resync full-replaces the
+// op set and would revert that progress to global's row on every push.
+//
+// A conn that is not op-ready yet skips the re-send: Push cached the
+// snapshot before this fan-out began, so the pending hello resync, which
+// reads the membership under opStreamMu, is already scoped by it (see
+// workerConn). Any failure force-closes the connection, as sendOpMessage
+// does, so the reconnect's hello resync covers what this could not.
+func (c *workerConn) resendOpsAfterPush() {
+	c.opStreamMu.Lock()
+	defer c.opStreamMu.Unlock()
+	if !c.opReady {
+		return
+	}
+	ops, err := c.siteActiveOpsLocked()
+	if err != nil {
+		c.log.Warn("post-push op re-send failed; forcing reconnect", "err", err)
+		_ = c.conn.CloseNow()
+		return
+	}
+	for _, op := range ops {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := c.writeTyped(ctx, TypeOpDelta, "", OpDeltaMsg{Operation: op, MachineState: claimedState(op)})
+		cancel()
+		if err != nil {
+			c.log.Warn("post-push op re-send failed; forcing reconnect", "op_id", op.ID, "err", err)
+			_ = c.conn.CloseNow()
+			return
+		}
 	}
 }
 
