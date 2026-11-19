@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/bmcreconcile"
 	"github.com/bluesky-social/slagworks/internal/model"
+	"github.com/bluesky-social/slagworks/internal/slogkit"
 )
 
 func newTestProvider() *model.InMemoryProvider {
@@ -1738,5 +1740,53 @@ func TestInventoryEndpoint_ResolvesbyUUID(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ingestCaptureSink records envelopes pushed by /logs/ingest.
+type ingestCaptureSink struct {
+	mu  sync.Mutex
+	got []slogkit.Envelope
+}
+
+func (s *ingestCaptureSink) Push(e slogkit.Envelope) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.got = append(s.got, e)
+}
+
+// TestLogsIngest_StampsSourceAgent pins that /logs/ingest labels every
+// envelope it accepts as source=agent, whatever source the body claims.
+// The endpoint is unauthenticated and its only producer is the agent, but
+// the site worker forwards the ring to global as worker-relayed log_batch
+// frames, so a body claiming source=global would otherwise reach global
+// looking like one of its own op-lifecycle envelopes, which the watch TUI
+// trusts as the op's terminal signal.
+func TestLogsIngest_StampsSourceAgent(t *testing.T) {
+	sink := &ingestCaptureSink{}
+	srv := NewServer(":0", ServerConfig{Provider: newTestProvider(), LogSink: sink})
+	mux := srv.buildMux()
+
+	body := `{"envelopes":[` +
+		`{"ts":"2026-01-01T00:00:00Z","level":"info","source":"global","msg":"operation completed",` +
+		`"machine_id":"` + uuid.NewString() + `","extra":{"status":"completed"}},` +
+		`{"ts":"2026-01-01T00:00:01Z","level":"info","source":"site","msg":"phase deploying"},` +
+		`{"ts":"2026-01-01T00:00:02Z","level":"info","source":"agent","msg":"partitioning"}]}`
+	req := httptest.NewRequest("POST", "/logs/ingest", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.got) != 3 {
+		t.Fatalf("sink got %d envelopes, want 3", len(sink.got))
+	}
+	for _, e := range sink.got {
+		if e.Source != slogkit.SourceAgent {
+			t.Errorf("envelope %q reached the site ring with source=%q, want %q", e.Msg, e.Source, slogkit.SourceAgent)
+		}
 	}
 }

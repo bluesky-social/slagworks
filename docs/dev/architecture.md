@@ -873,8 +873,13 @@ store.
 `internal/slogkit/envelope.go`:
 
 - `Source` (line 20) — `SourceGlobal`, `SourceSite`, `SourceAgent`.
-  (`source=sol` was the older SOL path; ingest rejects it loudly so a
-  stale worker binary fails visibly. SOL rides the cast pipeline.)
+  `source=global` rows are written only by global's store, inside
+  the op-transition transaction (`store/op_events.go`), and the watch
+  TUI trusts them as the op's terminal signal; a worker `log_batch`
+  carrying one is rejected whole, as is any source other than `agent`
+  or `site`. (`source=sol` was the older SOL path; ingest rejects it
+  loudly so a stale worker binary fails visibly. SOL rides the cast
+  pipeline.)
 - `Envelope` (line 42) — `TS`, `Level`, `Source`, `Host`, `Msg`,
   `MachineID`, `MachineName`, `OpID`, `Phase`, `TraceID`,
   `ReceivedAt`, `Extra` (map). `MarshalJSON` elides zero UUIDs.
@@ -905,8 +910,10 @@ Agent produces a slog line:
    `agentlog.Client` sink.
 2. `agentlog.Client.Run` batches envelopes and
    POSTs to `http://<site>/logs/ingest`.
-3. The site's `httpboot.Handler.handleLogsIngest` unmarshals and
-   pushes into the site's `logring.Ring`.
+3. The site's `httpboot.Handler.handleLogsIngest` unmarshals, stamps
+   every envelope `source=agent` (the endpoint is unauthenticated and
+   the agent is its only producer), and pushes into the site's
+   `logring.Ring`.
 
 Site produces a slog line: directly into the same `logring.Ring`
 via the site slog handler's sink.
@@ -916,8 +923,9 @@ From the site ring:
 1. `WSConn.logRingDrainLoop` (`worker/wsconn.go:601`) drains the ring
    and calls `sendLogBatch` (691) with `TypeLogBatch`.
 2. Hub dispatches to `hubhandlers.LogBatch.HandleLogBatch`.
-3. Handler inserts into `log_envelopes` and pushes into the global
-   `logring.Ring`, and re-emits JSONL on stdout for the fleet
+3. Handler rejects the batch if any envelope's source is not `agent`
+   or `site`, then inserts into `log_envelopes` and pushes into the
+   global `logring.Ring`, and re-emits JSONL on stdout for the fleet
    log-shipper.
 
 `slagctl logs` and `slagctl operation watch` open a WebSocket to
