@@ -620,54 +620,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			case <-ctx.Done():
 				return
 			case <-s.expireTicker.C:
-				// Each sweep returns the affected ops' post-mutation
-				// outcomes. Publish op_removed per op (carrying the durable
-				// state the fail wrote, "" for pending-expiry), and fire ONE
-				// identity rebuild across all sites if ANY swept op wrote
-				// durable machines.state — per the plan's durable-state rule.
-				// Pending-expiry writes no state, so a tick that only expires
-				// pending ops publishes op_removed with no state and fires NO
-				// rebuild.
-				durable := false
-				sweep := func(label string, outs []store.OpOutcome) {
-					if len(outs) == 0 {
-						return
-					}
-					s.log.Info("expired operations", "sweep", label, "count", len(outs))
-					s.observeSweep(label, int64(len(outs)))
-					for _, o := range outs {
-						s.publishOpRemoved(o.Op, o.MachineState)
-						if o.MachineState != "" {
-							durable = true
-						}
-					}
-				}
-				if outs, err := s.store.ExpirePendingOperations(s.pendingOpTimeout); err != nil {
-					s.log.Error("expiring pending operations", "err", err)
-				} else {
-					sweep("pending", outs)
-				}
-				if outs, err := s.store.ExpireStuckOperations(s.opTimeout); err != nil {
-					s.log.Error("expiring stuck operations", "err", err)
-				} else {
-					sweep("stuck", outs)
-				}
-				if outs, err := s.store.ExpireOrphanedClaims(s.orphanedClaimGrace); err != nil {
-					s.log.Error("expiring orphaned claims", "err", err)
-				} else {
-					if len(outs) > 0 {
-						s.log.Error("expired orphaned claims (worker died mid-claim)", "count", len(outs))
-					}
-					sweep("orphaned_claim", outs)
-				}
-				if outs, err := s.store.ExpirePhoneHomeOperations(s.phoneHomeTimeout); err != nil {
-					s.log.Error("expiring phone-home operations", "err", err)
-				} else {
-					sweep("phone_home", outs)
-				}
-				if durable {
-					s.invalidateAllSites()
-				}
+				s.expireOperations()
 				s.scrubTerminalCredentials()
 			}
 		}
@@ -687,6 +640,56 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	}
 	s.bgWG.Wait()
 	return nil
+}
+
+// expireOperations runs one tick of the op-timeout sweeps.
+//
+// Each sweep returns the affected ops' post-mutation outcomes. Publish
+// op_removed per op (carrying the durable state the fail wrote, "" for
+// pending-expiry), and fire ONE identity rebuild across all sites if ANY
+// swept op wrote durable machines.state — per the plan's durable-state rule.
+// Pending-expiry writes no state, so a tick that only expires pending ops
+// publishes op_removed with no state and fires NO rebuild.
+//
+// A sweep keeps going past a per-op error and returns BOTH the ops it did
+// fail and the joined error, so outs is published whatever err says: those
+// ops are terminal in the database and no later tick selects them again, so
+// skipping them would leave a connected worker holding them as active until
+// it reconnects. The ops behind err are still active and the next tick
+// retries them.
+func (s *Server) expireOperations() {
+	durable := false
+	sweep := func(label string, outs []store.OpOutcome, err error) {
+		if err != nil {
+			s.log.Error("expiry sweep could not fail some expired operations; they stay active and are retried on the next tick",
+				"sweep", label, "err", err)
+		}
+		if len(outs) == 0 {
+			return
+		}
+		s.log.Info("expired operations", "sweep", label, "count", len(outs))
+		s.observeSweep(label, int64(len(outs)))
+		for _, o := range outs {
+			s.publishOpRemoved(o.Op, o.MachineState)
+			if o.MachineState != "" {
+				durable = true
+			}
+		}
+	}
+	outs, err := s.store.ExpirePendingOperations(s.pendingOpTimeout)
+	sweep("pending", outs, err)
+	outs, err = s.store.ExpireStuckOperations(s.opTimeout)
+	sweep("stuck", outs, err)
+	outs, err = s.store.ExpireOrphanedClaims(s.orphanedClaimGrace)
+	if len(outs) > 0 {
+		s.log.Error("expired orphaned claims (worker died mid-claim)", "count", len(outs))
+	}
+	sweep("orphaned_claim", outs, err)
+	outs, err = s.store.ExpirePhoneHomeOperations(s.phoneHomeTimeout)
+	sweep("phone_home", outs, err)
+	if durable {
+		s.invalidateAllSites()
+	}
 }
 
 // scrubTerminalCredentials removes credentials from the stored params of
@@ -1255,13 +1258,12 @@ func (s *Server) abortMachine(c *echo.Context) error {
 		return err
 	}
 	m, outcomes, err := s.store.AbortMachine(id)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
 	// Each aborted op left the active set: publish op_removed carrying the
 	// durable state the fail wrote (failed/new; "" for a pending/power op).
 	// If ANY op wrote durable machines.state, fire one identity rebuild so
-	// the baseline catches up (per the plan's durable-state rule).
+	// the baseline catches up (per the plan's durable-state rule). This runs
+	// before the error check: AbortMachine returns the ops it failed even
+	// when it errors afterwards, and a retried abort will not find them.
 	durable := false
 	for _, o := range outcomes {
 		s.publishOpRemoved(o.Op, o.MachineState)
@@ -1271,6 +1273,9 @@ func (s *Server) abortMachine(c *echo.Context) error {
 	}
 	if durable {
 		s.invalidateAllSites()
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, m)
 }

@@ -619,6 +619,14 @@ Phase failure is not timeout-driven. When the agent's `fatal` runs
 site worker marks the op failed immediately. The timeout sweeps
 exist only for the "agent died silently" case.
 
+Each sweep fails its ops one transaction at a time and keeps going past
+a per-op error, returning both the ops it failed and the joined error.
+The tick (`Server.expireOperations`) publishes `op_removed` for every op
+a sweep failed, and fires the identity rebuild, even when that sweep
+also returned an error: those ops are terminal and no later tick selects
+them again. The ops behind the error stay active and the next tick
+retries them.
+
 After the sweeps, each tick runs
 `Store.ScrubTerminalOperationCredentials` (also run once before the API
 starts serving); see [Credentials in operations](#credentials-in-operations).
@@ -641,6 +649,11 @@ Handler calls `store.AbortMachine(id)` (`server.go:1008`).
 3. For each, call `FailOperation(opID, {"error":"aborted by
    operator"})`.
 4. Return the fresh machine row.
+
+The handler publishes `op_removed` for each failed op (and fires the
+identity rebuild for a durable state write) before it checks the error,
+because `AbortMachine` also returns the ops it failed when a later step
+errors, and a retried abort no longer finds them.
 
 Effect on machine state follows the four `FailOperation` rules
 uniformly:
