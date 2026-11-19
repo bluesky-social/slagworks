@@ -1,8 +1,10 @@
 package api
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/labstack/echo/v5"
@@ -66,6 +68,36 @@ func TestDeleteImage_Succeeds(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	images, err := st.ListImages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(images) != 0 {
+		t.Fatalf("expected 0 images after delete, got %d", len(images))
+	}
+}
+
+// TestDeleteImage_NameThatParsesAsUUID: image names are free-form, and 32
+// hex digits (an md5-style name) parse as a uuid. DELETE /images/:name must
+// still reach that image by its name rather than 404 because no row has
+// that id.
+func TestDeleteImage_NameThatParsesAsUUID(t *testing.T) {
+	s, st := imageDeleteFixtureServer(t)
+	const name = "0123456789abcdef0123456789abcdef"
+	seedAPIImage(t, st, name)
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/api/v1/images/"+name, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("DELETE /images/%s: status = %d %s, want 204", name, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	images, err := st.ListImages()
 	if err != nil {

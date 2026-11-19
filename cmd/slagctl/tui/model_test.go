@@ -532,6 +532,83 @@ func TestModel_LastUpdateFrozenAfterTerminal(t *testing.T) {
 	}
 }
 
+// TestModel_LatePhaseAfterFailureLeavesSpineFrozen: on a held screen the log
+// stream keeps delivering after the terminal signal, and a phase envelope for
+// the same op can arrive after its failure (an op-timeout or abort fails the op
+// while the agent is still working; the op-row poll can beat the stream). The
+// failed spine is final: the late phase must not start spinning under the
+// FAILED header or skip-mark the runway between it and the failed phase. The
+// envelope's log line still lands in the log pane.
+func TestModel_LatePhaseAfterFailureLeavesSpineFrozen(t *testing.T) {
+	m := newModelAt(model.OpDeploy, "host", "op", at(0), time.UTC, fixedClock(at(90*time.Second)))
+	m.holdOnTerminal = true
+	m = send(m, translateEnvelope(1, mkEnv("agent", at(10*time.Second), "partitioning", "partitioning", nil), watchedOp))
+	m = send(m, translateEnvelope(2, mkEnv("global", at(30*time.Second), "", "operation failed",
+		map[string]any{"status": "failed", "error": "op timeout"}), watchedOp))
+	before := plain(m.lifecycle.Render(40, "@"))
+
+	m = send(m, translateEnvelope(3, mkEnv("agent", at(40*time.Second), "rsyncing_os", "rsync started", nil), watchedOp))
+
+	if got := m.lifecycle.CurrentPhase(); got != "" {
+		t.Fatalf("failed op shows phase %q spinning after a late envelope", got)
+	}
+	if after := plain(m.lifecycle.Render(40, "@")); after != before {
+		t.Fatalf("final lifecycle changed after terminal:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	if got := m.lifecycle.FailedPhase(); got != "partitioning" {
+		t.Errorf("FailedPhase() = %q, want partitioning", got)
+	}
+	if lines := m.logs.Lines(); len(lines) == 0 || !strings.Contains(lines[len(lines)-1], "rsync started") {
+		t.Errorf("late envelope's log line should still append to the log pane: %q", lines)
+	}
+}
+
+// TestModel_SecondTerminalDoesNotRewriteFinalScreen: a held screen gets two
+// terminal signals for one op, the stream's source=global envelope and the
+// op-row poll backstop (runOpPoll keeps polling until it sees the op terminal,
+// whichever arrives first). The first one ends the run; the second must not
+// move endTime (the frozen total), replace the reason, or re-run Fail on a
+// late phase and mark a second row failed.
+func TestModel_SecondTerminalDoesNotRewriteFinalScreen(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		failed bool
+	}{
+		{"failed", true},
+		{"completed", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newModelAt(model.OpDeploy, "host", "op", at(0), time.UTC, fixedClock(at(90*time.Second)))
+			m.holdOnTerminal = true
+			m = send(m, translateEnvelope(1, mkEnv("agent", at(10*time.Second), "partitioning", "partitioning", nil), watchedOp))
+			status, reason, pollReason := "completed", "", ""
+			if tc.failed {
+				status, reason, pollReason = "failed", "op timeout", "op timeout (from the op row)"
+			}
+			m = send(m, translateEnvelope(2, mkEnv("global", at(30*time.Second), "", "operation "+status,
+				map[string]any{"status": status, "error": reason}), watchedOp))
+			wantResult := m.runResult()
+			wantSpine := plain(m.lifecycle.Render(40, "@"))
+
+			m = send(m, translateEnvelope(3, mkEnv("agent", at(40*time.Second), "rsyncing_os", "rsync started", nil), watchedOp))
+			m = send(m, opTerminalMsg{failed: tc.failed, reason: pollReason, at: at(50 * time.Second)})
+
+			if !m.endTime.Equal(at(30 * time.Second)) {
+				t.Errorf("endTime = %s, want the first terminal's %s", m.endTime, at(30*time.Second))
+			}
+			if m.failReason != reason {
+				t.Errorf("failReason = %q, want the first terminal's %q", m.failReason, reason)
+			}
+			if got := m.runResult(); got != wantResult {
+				t.Errorf("runResult() = %+v, want %+v", got, wantResult)
+			}
+			if got := plain(m.lifecycle.Render(40, "@")); got != wantSpine {
+				t.Errorf("final lifecycle changed after a second terminal:\nbefore:\n%s\nafter:\n%s", wantSpine, got)
+			}
+		})
+	}
+}
+
 // TestModel_FrozenClockOnDone: after completion the elapsed timer stops at
 // endTime rather than counting up while the operator reads the screen.
 func TestModel_FrozenClockOnDone(t *testing.T) {

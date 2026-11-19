@@ -13,7 +13,7 @@ import (
 
 // refuseNUL answers 400 to an operator request that carries a NUL byte
 // (U+0000) anywhere a handler reads text from: the path, the query string,
-// or a JSON or form body. Postgres cannot store U+0000 in text or jsonb,
+// or the JSON body. Postgres cannot store U+0000 in text or jsonb,
 // and no field this API accepts has a use for it. Let through, it fails
 // the handler's first write or lookup with SQLSTATE 22021, which handlers
 // report as a 500 carrying the raw database error.
@@ -23,9 +23,14 @@ import (
 // map-bound bodies (PATCH /machines/:id) as well as through named fields,
 // and a per-field check is one a new handler can forget.
 //
-// The body is examined for the media types echo's Bind decodes and put
-// back, so the handler reads exactly what it would have without this
-// check. XML needs no check: encoding/xml refuses U+0000.
+// A body is read as JSON whatever its Content-Type and put back, so the
+// handler reads exactly what it would have without this check. JSON is the
+// only body encoding the API takes: jsonBodyBinder refuses any other
+// Content-Type at Bind, and the one handler that decodes its body itself
+// (netboxMigrateChassisSerial) decodes it as JSON without looking at
+// the header, so the label must not be what decides whether the body is
+// examined. A body that is not JSON carries nothing a handler will store,
+// and is left for the handler to refuse.
 func refuseNUL(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		req := c.Request()
@@ -37,10 +42,7 @@ func refuseNUL(next echo.HandlerFunc) echo.HandlerFunc {
 				return nulRefusal(fmt.Sprintf("query parameter %q", k))
 			}
 		}
-		base, _, _ := strings.Cut(req.Header.Get(echo.HeaderContentType), ";")
-		mediaType := strings.TrimSpace(base)
-		if req.ContentLength == 0 || (mediaType != echo.MIMEApplicationJSON &&
-			mediaType != echo.MIMEApplicationForm && mediaType != echo.MIMEMultipartForm) {
+		if req.ContentLength == 0 {
 			return next(c)
 		}
 		body, err := io.ReadAll(req.Body)
@@ -51,13 +53,7 @@ func refuseNUL(next echo.HandlerFunc) echo.HandlerFunc {
 			return echo.ErrBadRequest.Wrap(err)
 		}
 		req.Body = io.NopCloser(bytes.NewReader(body))
-		var where string
-		if mediaType == echo.MIMEApplicationJSON {
-			where = nulInJSONBody(body)
-		} else {
-			where = nulInFormBody(req, mediaType, body)
-		}
-		if where != "" {
+		if where := nulInJSONBody(body); where != "" {
 			return nulRefusal(where)
 		}
 		return next(c)
@@ -131,34 +127,4 @@ func jsonHasNUL(v any) bool {
 		}
 	}
 	return false
-}
-
-// nulInFormBody parses a copy of a form request with the net/http parser
-// echo's Bind uses for its media type, and names the first field whose
-// name or value contains U+0000, or returns "". Parsing the copy leaves
-// the request's own body for the handler. A body that does not parse is
-// left to the handler's Bind, which reports the error.
-func nulInFormBody(req *http.Request, mediaType string, body []byte) string {
-	cp := req.Clone(req.Context())
-	cp.Body = io.NopCloser(bytes.NewReader(body))
-	var err error
-	if mediaType == echo.MIMEMultipartForm {
-		// echo's default parse memory; the body is already in memory
-		// and capped by BodyLimit, so no part spills to disk.
-		err = cp.ParseMultipartForm(32 << 20)
-		if cp.MultipartForm != nil {
-			defer func() { _ = cp.MultipartForm.RemoveAll() }()
-		}
-	} else {
-		err = cp.ParseForm()
-	}
-	if err != nil {
-		return ""
-	}
-	for k, vs := range cp.Form {
-		if containsNUL(k, vs) {
-			return fmt.Sprintf("form field %q", k)
-		}
-	}
-	return ""
 }

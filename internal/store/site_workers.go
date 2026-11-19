@@ -19,10 +19,10 @@ import (
 // ErrSiteWorkerNotFound is returned when token lookup finds no row.
 var ErrSiteWorkerNotFound = errors.New("site worker not found")
 
-// AmbiguousSiteWorkerError is returned by ResolveSiteWorker when a
-// non-uuid ident (worker_id or fqdn) matches more than one row — e.g. the
-// same worker_id registered under two site slugs, or two workers sharing
-// an fqdn. Candidates lists every match so a caller can tell the operator
+// AmbiguousSiteWorkerError is returned by ResolveSiteWorker when an ident
+// that is no row's id (a worker_id or fqdn) matches more than one row —
+// e.g. the same worker_id registered under two site slugs, or two workers
+// sharing an fqdn. Candidates lists every match so a caller can tell the operator
 // which uuid to disambiguate with without re-querying.
 type AmbiguousSiteWorkerError struct {
 	Ident      string
@@ -171,17 +171,22 @@ func (s *Store) ListSiteWorkersBySerial(serial string) ([]model.SiteWorker, erro
 // Returns ErrSiteWorkerNotFound if nothing matches, *AmbiguousSiteWorkerError
 // if more than one row matches (e.g. the same worker_id registered under
 // two different site slugs, or two different workers sharing an fqdn).
+//
+// An ident that parses as a uuid is tried as an id first, so the id wins
+// when it is one row's id and another row's worker_id: the uuid is what
+// slagctl tells an operator to use to disambiguate. When no row has that
+// id, the ident is tried as a worker_id or fqdn, since slagworksd generates
+// a uuid for its worker_id unless SLAGWORKS_WORKER_ID overrides it.
 func (s *Store) ResolveSiteWorker(ident string) (*model.SiteWorker, error) {
 	if id, err := uuid.Parse(ident); err == nil {
 		var w model.SiteWorker
 		err := s.db.Where("id = ?", id).First(&w).Error
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrSiteWorkerNotFound
+		if err == nil {
+			return &w, nil
 		}
-		if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, err
 		}
-		return &w, nil
 	}
 	var matches []model.SiteWorker
 	if err := s.db.Where("worker_id = ? OR fqdn = ?", ident, ident).Find(&matches).Error; err != nil {

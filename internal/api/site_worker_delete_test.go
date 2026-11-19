@@ -146,6 +146,34 @@ func TestDeleteSiteWorker_RefusesInFlightOp(t *testing.T) {
 	}
 }
 
+// TestDeleteSiteWorker_ByUUIDShapedWorkerID: slagworksd's default
+// worker_id is a generated uuid. DELETE /site-workers/:ident with that
+// worker_id must reach the row rather than 404 because no row has that id.
+func TestDeleteSiteWorker_ByUUIDShapedWorkerID(t *testing.T) {
+	s, st := siteWorkerDeleteFixtureServer(t, fakeWorkerLiveness{})
+	workerID := uuid.NewString()
+	w, _, err := st.RegisterSiteWorker("pop3", workerID, "a.pop3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/api/v1/site-workers/"+workerID, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("DELETE /site-workers/%s: status = %d %s, want 204", workerID, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if _, err := st.ResolveSiteWorker(w.ID.String()); !errors.Is(err, store.ErrSiteWorkerNotFound) {
+		t.Fatalf("row should be gone after delete, resolve err = %v", err)
+	}
+}
+
 // TestDeleteSiteWorker_Succeeds: no connection, no ops -> 204 and the row
 // is gone.
 func TestDeleteSiteWorker_Succeeds(t *testing.T) {

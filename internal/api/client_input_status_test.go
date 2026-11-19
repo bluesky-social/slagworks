@@ -120,10 +120,12 @@ func TestOperatorRequestWithANULByteIs400(t *testing.T) {
 		{"site config in the path", http.MethodDelete, "/api/v1/site-configs/p%00", "", "", "the request path"},
 		{"desired_os", http.MethodPatch, "/api/v1/machines/" + id.String(), jsonType,
 			`{"desired_os":"noble\u0000"}`, `body field "desired_os"`},
-		{"desired_os, form-encoded", http.MethodPatch, "/api/v1/machines/" + id.String(), formType,
-			"desired_os=noble%00", `form field "desired_os"`},
-		{"desired_os, multipart", http.MethodPatch, "/api/v1/machines/" + id.String(), "multipart/form-data; boundary=b",
-			"--b\r\nContent-Disposition: form-data; name=\"desired_os\"\r\n\r\nnoble\x00\r\n--b--\r\n", `form field "desired_os"`},
+		// The body is examined as JSON whatever it is labelled: a
+		// handler that decodes its body itself does not read the header.
+		{"desired_os, JSON labelled as a form", http.MethodPatch, "/api/v1/machines/" + id.String(), formType,
+			`{"desired_os":"noble\u0000"}`, `body field "desired_os"`},
+		{"desired_os, no Content-Type", http.MethodPatch, "/api/v1/machines/" + id.String(), "",
+			`{"desired_os":"noble\u0000"}`, `body field "desired_os"`},
 		{"storage script content", http.MethodPut, "/api/v1/storage-scripts/raid1", jsonType,
 			`{"content":"#!/bin/sh\necho \u0000\n"}`, `body field "content"`},
 		{"storage script name in the path", http.MethodPut, "/api/v1/storage-scripts/raid%001", jsonType,
@@ -148,19 +150,23 @@ func TestOperatorRequestWithANULByteIs400(t *testing.T) {
 	}
 
 	// The check reads the body and puts it back: a clean request still
-	// reaches the handler with its body intact, in each encoding.
-	for _, enc := range []struct{ contentType, body, want string }{
-		{jsonType, `{"desired_os":"noble"}`, "noble"},
-		{formType, "desired_os=jammy", "jammy"},
-		{"multipart/form-data; boundary=b", "--b\r\nContent-Disposition: form-data; name=\"desired_os\"\r\n\r\nplucky\r\n--b--\r\n", "plucky"},
-	} {
-		w := operatorRequest(s, http.MethodPatch, "/api/v1/machines/"+id.String(), enc.contentType, enc.body)
-		m, err := st.GetMachine(id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if w.Code != http.StatusOK || m.DesiredOS != enc.want {
-			t.Errorf("clean %s PATCH = %d %s, desired_os %q; want 200 and %q", enc.contentType, w.Code, strings.TrimSpace(w.Body.String()), m.DesiredOS, enc.want)
-		}
+	// reaches the handler with its body intact.
+	w := operatorRequest(s, http.MethodPatch, "/api/v1/machines/"+id.String(), jsonType, `{"desired_os":"noble"}`)
+	m, err := st.GetMachine(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusOK || m.DesiredOS != "noble" {
+		t.Errorf("clean PATCH = %d %s, desired_os %q; want 200 and \"noble\"", w.Code, strings.TrimSpace(w.Body.String()), m.DesiredOS)
+	}
+
+	// A body that is not JSON is not this check's to refuse: it passes
+	// through untouched and the binder refuses its Content-Type.
+	w = operatorRequest(s, http.MethodPatch, "/api/v1/machines/"+id.String(), formType, "desired_os=jammy%00")
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "Content-Type") || strings.Contains(w.Body.String(), "NUL byte") {
+		t.Errorf("form-encoded PATCH = %d %s, want the JSON-only binder's 400 naming the Content-Type", w.Code, strings.TrimSpace(w.Body.String()))
+	}
+	if m, err := st.GetMachine(id); err != nil || m.DesiredOS != "noble" {
+		t.Errorf("form-encoded PATCH changed the machine: desired_os %q, err %v", m.DesiredOS, err)
 	}
 }
