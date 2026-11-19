@@ -102,7 +102,11 @@ func (r *redeployRig) deploy(ctx context.Context, name, script string, params mo
 		}
 	}
 	if err != nil {
-		t.Fatalf("%s: the installed system did not phone home: %v\n%s", name, err, serialDump(vm))
+		// Say why when the console shows it: a mount that never got its
+		// device leaves the first boot in emergency mode, and a machine in
+		// emergency mode does not phone home.
+		t.Fatalf("%s: the installed system did not phone home: %v\nfailed mounts: %s\nmd state: %s\n%s",
+			name, err, grepSerial(vm, "Dependency failed for"), grepSerial(vm, "md0 : "), serialDump(vm))
 	}
 	return vm
 }

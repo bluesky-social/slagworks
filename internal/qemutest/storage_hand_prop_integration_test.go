@@ -137,6 +137,18 @@ func propHandCases() []propCase {
 		},
 	}
 	cases = append(cases, propPatternCases()...)
+	cases = append(cases,
+		propBIOSMirrorCase("bios-xfs-mirror3-a", 3, "xfs"),
+		propBIOSMirrorCase("bios-xfs-mirror3-b", 3, "xfs"),
+		propBIOSMirrorCase("bios-xfs-mirror3-c", 3, "xfs"),
+		propBIOSMirrorCase("bios-xfs-mirror2-a", 2, "xfs"),
+		propBIOSMirrorCase("bios-xfs-mirror2-b", 2, "xfs"),
+		propBIOSMirrorCase("bios-ext4-mirror3", 3, "ext4"),
+		propBIOSMirrorGrubCase("bios-xfs-mirror3-grub1", 3, 1),
+		propBIOSMirrorGrubCase("bios-xfs-mirror2-grub3", 2, 3),
+		propSmallESPCase("uefi-4kn-esp256", 4096),
+		propSmallESPCase("uefi-512-esp256", 512),
+	)
 	// The safety check against each kind of prior content, without
 	// --destructive. (The fourth kind, "ambiv", gets through the check and
 	// lives in storage_findings_prop_integration_test.go.)
@@ -197,6 +209,73 @@ func propPatternCases() []propCase {
 					Destructive: true, Expect: "ok", Why: "destructive deploy"},
 			},
 		},
+	}
+}
+
+// propBIOSMirrorCase is a BIOS root mirror over n disks, each with a BIOS
+// boot partition and a fixed-size member, nothing else. Generated case g0065
+// (three members, xfs) stopped in GRUB with "not a correct XFS inode" after a
+// clean unmount; these vary the member count and filesystem around it.
+func propBIOSMirrorCase(name string, n int, fs string) propCase {
+	c := propCase{Name: name, Firmware: "bios"}
+	l := propLayout{}
+	a := propArray{Name: "mdroot", Type: "raid", Level: 1, FS: fs, Mount: "/"}
+	var attach []string
+	for i := 0; i < n; i++ {
+		id := "d" + string(rune('0'+i))
+		c.Disks = append(c.Disks, propD(id, "virtio", 10, i, 512, ""))
+		l.Disks = append(l.Disks, propDiskLayout{Disk: id, Parts: []propPart{{Size: "1M", BIOSGrub: true}, {Size: "5G"}}})
+		a.Members = append(a.Members, propMember{Disk: id, Part: 2})
+		attach = append(attach, id)
+	}
+	l.Arrays = []propArray{a}
+	c.Steps = []propStep{{Attach: attach, Layout: l, Reboot: true, Expect: "ok", Why: "blank disks"}}
+	return c
+}
+
+// propBIOSMirrorGrubCase separates the two things that grow together in
+// propBIOSMirrorCase: the number of mirror members and the number of disks
+// GRUB is installed on (one grub-install run per disk with a BIOS boot
+// partition). Three disks always; the first `members` carry the xfs root
+// mirror, the first `grubs` carry a BIOS boot partition.
+func propBIOSMirrorGrubCase(name string, members, grubs int) propCase {
+	c := propCase{Name: name, Firmware: "bios"}
+	l := propLayout{}
+	a := propArray{Name: "mdroot", Type: "raid", Level: 1, FS: "xfs", Mount: "/"}
+	var attach []string
+	for i := 0; i < 3; i++ {
+		id := "d" + string(rune('0'+i))
+		c.Disks = append(c.Disks, propD(id, "virtio", 10, i, 512, ""))
+		attach = append(attach, id)
+		parts := []propPart{{Size: "1M", BIOSGrub: i < grubs}, {Size: "5G"}}
+		if i >= members && i >= grubs {
+			continue // a bystander
+		}
+		l.Disks = append(l.Disks, propDiskLayout{Disk: id, Parts: parts})
+		if i < members {
+			a.Members = append(a.Members, propMember{Disk: id, Part: 2})
+		}
+	}
+	l.Arrays = []propArray{a}
+	c.Steps = []propStep{{Attach: attach, Layout: l, Expect: "ok", Why: "blank disks"}}
+	return c
+}
+
+// propSmallESPCase is a single-disk UEFI layout with a 256M ESP. Generated
+// case g0064 put one on a 4Kn disk: mkfs.fat -F 32 warned that the cluster
+// count is below the FAT32 minimum, the deploy completed, and the firmware
+// could not boot the disk.
+func propSmallESPCase(name string, lbs int) propCase {
+	return propCase{
+		Name: name, Firmware: "uefi",
+		Disks: []propDisk{propD("d0", "virtio", 8, 0, lbs, "")},
+		Steps: []propStep{{
+			Attach: []string{"d0"}, Reboot: true, Expect: "ok", Why: "blank disk",
+			Layout: propLayout{Disks: []propDiskLayout{{Disk: "d0", Parts: []propPart{
+				{Size: "256M", FS: "vfat", ESP: true, Mount: "/boot/efi"},
+				{Size: "rest", FS: "ext4", Mount: "/"},
+			}}}},
+		}},
 	}
 }
 
