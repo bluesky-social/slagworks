@@ -172,7 +172,10 @@ the shape; the interesting bits:
   latter two are mutually exclusive with `fs`.
 - Mounts are keyed by mount point and reference a device or partition name
   from the layout. The planner sorts by depth so `/` mounts before
-  `/boot/efi`.
+  `/boot/efi`. A mount point must be a clean absolute path (`/var/lib`, not
+  `var/lib`, `/var/lib/` or `/var//lib`) with no whitespace, control
+  characters or backslashes; the planner rejects anything else (see
+  [Storage Templates](../storage-scripts.md)).
 
 The planner (`internal/storage/plan.go`) translates the JSON into an ordered
 list of `sgdisk`, `mdadm`, `mkfs.*`, `wipefs` and `dd` (which clear every

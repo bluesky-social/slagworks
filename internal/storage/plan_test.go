@@ -1516,3 +1516,74 @@ func TestPlan_RejectsMountingWholeDisk(t *testing.T) {
 		t.Fatal("expected error for mounting a whole disk")
 	}
 }
+
+// A mount point is used verbatim: the planner mounts at "/target"+key and
+// orders mounts by counting the "/" in each key, and the agent writes the key
+// into the whitespace-separated /etc/fstab. A key that is not a clean
+// absolute path breaks one of those, so Plan must reject it.
+func TestPlan_RejectsMountPointThatIsNotACleanAbsolutePath(t *testing.T) {
+	layout := func(mounts map[string]Mount) Layout {
+		return Layout{
+			Devices: map[string]Device{"sda": {Type: "disk", PTable: "gpt", Partitions: []Partition{
+				{Name: "sda1", FS: "ext4", Size: "100G"},
+				{Name: "sda2", FS: "ext4", Size: "100G"},
+				{Name: "sda3", FS: "ext4", Size: "rest"},
+			}}},
+			Mounts: mounts,
+		}
+	}
+	inventory := []BlockDevice{{Name: "sda", SizeBytes: 1 << 40}}
+	mountTargets := func(cmds []Command) []string {
+		var targets []string
+		for _, c := range cmds {
+			if c.Name == "mount" {
+				targets = append(targets, c.Args[1])
+			}
+		}
+		return targets
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mounts map[string]Mount
+	}{
+		// Mounts at /targetdata, beside the target root rather than in it.
+		{"relative", map[string]Mount{"/": {Device: "sda1"}, "data": {Device: "sda2"}}},
+		// Mounts at /target/../srv, outside the target root.
+		{"dot-dot segment", map[string]Mount{"/": {Device: "sda1"}, "/../srv": {Device: "sda2"}}},
+		{"dot segment", map[string]Mount{"/": {Device: "sda1"}, "/./srv": {Device: "sda2"}}},
+		// "/var//" has more slashes than "/var/lib", so /var is mounted
+		// second and hides /var/lib.
+		{"doubled slash", map[string]Mount{"/": {Device: "sda1"}, "/var//": {Device: "sda2"}, "/var/lib": {Device: "sda3"}}},
+		// Both name /target/srv, so the second mount stacks on the first.
+		{"trailing slash", map[string]Mount{"/": {Device: "sda1"}, "/srv": {Device: "sda2"}, "/srv/": {Device: "sda3"}}},
+		// fstab separates fields with blanks and lines with newlines.
+		{"space", map[string]Mount{"/": {Device: "sda1"}, "/srv data": {Device: "sda2"}}},
+		{"tab", map[string]Mount{"/": {Device: "sda1"}, "/srv\tdata": {Device: "sda2"}}},
+		{"newline", map[string]Mount{"/": {Device: "sda1"}, "/srv\n/x": {Device: "sda2"}}},
+		// fstab decodes \040 as a space, so the fstab entry would name
+		// "/srv data" while the deploy mounted the literal path.
+		{"backslash", map[string]Mount{"/": {Device: "sda1"}, `/srv\040data`: {Device: "sda2"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmds, err := Plan(layout(tc.mounts), inventory)
+			if err == nil {
+				t.Fatalf("Plan accepted the layout; mount targets: %q", mountTargets(cmds))
+			}
+			if !strings.Contains(err.Error(), "mount point") {
+				t.Errorf("error should name the bad mount point, got: %v", err)
+			}
+		})
+	}
+
+	// Clean nested paths are still accepted, and the parent mounts first.
+	cmds, err := Plan(layout(map[string]Mount{
+		"/": {Device: "sda1"}, "/var": {Device: "sda2"}, "/var/lib": {Device: "sda3"},
+	}), inventory)
+	if err != nil {
+		t.Fatalf("Plan rejected clean mount points: %v", err)
+	}
+	if got, want := mountTargets(cmds), []string{"/target", "/target/var", "/target/var/lib"}; !sliceEqual(got, want) {
+		t.Errorf("mount targets = %q, want %q", got, want)
+	}
+}
