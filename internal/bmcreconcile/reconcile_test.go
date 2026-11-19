@@ -1353,7 +1353,9 @@ func TestReconcile_StoredPassword_LostWriteResponse_Confirmed(t *testing.T) {
 // When that slot already holds it (an un-named slot that kept a previous
 // monitor's password), MegaRAC refuses the write with 0x19. The test after
 // the refusal finds the password in place, so the account is created
-// rather than the run failing on a write that had nothing to change.
+// rather than the run failing on a write that had nothing to change. The
+// create drops the slot to NO ACCESS before naming it, as every create does;
+// that leaves the password alone, so the test still finds it.
 func TestReconcile_StoredPassword_CreateIntoSlotAlreadyHoldingIt(t *testing.T) {
 	fake := newFakeIPMITool(t)
 	fake.queueOutput("user list 1", userTable(
@@ -1361,6 +1363,7 @@ func TestReconcile_StoredPassword_CreateIntoSlotAlreadyHoldingIt(t *testing.T) {
 		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
 		[3]string{"3", "", ""},
 	))
+	fake.queueOutput("user priv 3 15 1", "")
 	fake.queueOutput("user set name 3 monitor", "")
 	for range 3 {
 		fake.queueFailure("user set password 3 "+storedMonitorPW, megaRACRefusal("3"), 1)
