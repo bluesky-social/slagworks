@@ -21,6 +21,12 @@ func (s *Store) CreateImage(img *model.Image) error {
 // CreatedAt are preserved by gorm's autoCreateTime / primary-key
 // semantics.
 //
+// The row is keyed by name, so the store always assigns the id and any
+// id the caller set is discarded: the conflict target is name alone, so
+// a caller's id that belongs to another row would fail on the primary
+// key instead of resolving. A new row gets a fresh id; an existing row
+// keeps its own.
+//
 // We use UpdateAll rather than an explicit AssignmentColumns list so
 // future Image schema additions are picked up automatically; otherwise
 // a new column would silently fail to update on follow-latest pins.
@@ -36,9 +42,7 @@ func (s *Store) CreateImage(img *model.Image) error {
 // that resolves the current latest <git-sha>.tar.gz on S3 and points
 // the named row at it without caring whether the row already exists.
 func (s *Store) UpsertImage(img *model.Image) error {
-	if img.ID == uuid.Nil {
-		img.ID = uuid.New()
-	}
+	img.ID = uuid.New()
 	return s.db.Clauses(
 		clause.OnConflict{
 			Columns:   []clause.Column{{Name: "name"}},

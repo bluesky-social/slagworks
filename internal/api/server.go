@@ -463,8 +463,9 @@ func (s *Server) registerRoutes() {
 	// Unauthenticated by design: a CLI reads it before it can sign in.
 	api.GET("/client-config", s.clientConfig)
 
-	// Read-only endpoints (admin token).
-	read := api.Group("", s.oidcAuth)
+	// Read-only endpoints (admin token). Both operator groups refuse a NUL
+	// byte in the request after authenticating it (see refuseNUL).
+	read := api.Group("", s.oidcAuth, refuseNUL)
 	read.GET("/machines", s.listMachines)
 	read.GET("/machines/:id", s.getMachine)
 	// Power status is a read: no op row, answered synchronously via a
@@ -516,7 +517,7 @@ func (s *Server) registerRoutes() {
 	read.GET("/workers", s.listWorkers)
 
 	// Admin-only mutating endpoints.
-	admin := api.Group("", s.oidcAuth)
+	admin := api.Group("", s.oidcAuth, refuseNUL)
 	admin.PATCH("/machines/:id", s.updateMachine)
 	admin.POST("/machines/:id/deploy", s.deployMachine)
 	admin.POST("/machines/:id/commission", s.commissionMachine)
