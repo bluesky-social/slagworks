@@ -46,7 +46,9 @@ type ClientConfig struct {
 	APIVersion string
 	// Timeout for individual HTTP requests (default 10s).
 	Timeout time.Duration
-	// MaxRetries for rate-limited (429) responses (default 3).
+	// MaxRetries is how many times a request answered with 429 is retried
+	// after the first attempt, with exponential backoff starting at 1s
+	// (default 3: up to 4 requests over 1s+2s+4s of waiting).
 	MaxRetries int
 	// HTTPClient allows injecting a custom client for testing.
 	HTTPClient *http.Client
@@ -184,7 +186,7 @@ func (e *APIError) Error() string {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, body, dest any) error {
-	var attempt int
+	var retries int
 	for {
 		err := c.doOnce(ctx, method, path, query, body, dest)
 		if err == nil {
@@ -196,13 +198,15 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 			return err
 		}
 
-		attempt++
-		if attempt >= c.maxRetries {
+		// The first request is not a retry: give up only once maxRetries
+		// retries have already been spent.
+		if retries >= c.maxRetries {
 			return err
 		}
+		retries++
 
-		wait := c.retryBaseWait * time.Duration(1<<(attempt-1))
-		c.log.Warn("netbox rate limited, retrying", "attempt", attempt, "wait", wait)
+		wait := c.retryBaseWait * time.Duration(1<<(retries-1))
+		c.log.Warn("netbox rate limited, retrying", "retry", retries, "max_retries", c.maxRetries, "wait", wait)
 
 		select {
 		case <-ctx.Done():

@@ -146,6 +146,57 @@ func TestRateLimitExhausted(t *testing.T) {
 	}
 }
 
+// TestRateLimitDefaultBudgetAbsorbsThree429s pins the documented default:
+// MaxRetries 3 means three retries after the first attempt, so three 429s
+// followed by a 200 must succeed on the fourth request. do() used to count
+// the first attempt against the budget and gave up after the third request.
+func TestRateLimitDefaultBudgetAbsorbsThree429s(t *testing.T) {
+	var calls atomic.Int32
+	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) <= 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"ok": "true"})
+	}))
+	c.retryBaseWait = time.Millisecond
+
+	var dest map[string]string
+	if err := c.Get(context.Background(), "/api/test/", nil, &dest); err != nil {
+		t.Fatalf("three 429s with the default MaxRetries (3) should be retried, got: %v (calls=%d)", err, calls.Load())
+	}
+	if got := calls.Load(); got != 4 {
+		t.Errorf("calls = %d, want 4 (1 attempt + 3 retries)", got)
+	}
+}
+
+// TestRateLimitRetriesMaxRetriesTimes pins the request count against a
+// server that never stops answering 429: one attempt plus MaxRetries
+// retries, for several budgets. MaxRetries 1 used to perform no retry.
+func TestRateLimitRetriesMaxRetriesTimes(t *testing.T) {
+	for _, maxRetries := range []int{1, 2, 3, 5} {
+		t.Run(fmt.Sprintf("MaxRetries=%d", maxRetries), func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(http.StatusTooManyRequests)
+			}))
+			t.Cleanup(srv.Close)
+			c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "test-token", MaxRetries: maxRetries})
+			c.retryBaseWait = time.Millisecond
+
+			err := c.Get(context.Background(), "/api/test/", nil, nil)
+			apiErr, ok := err.(*APIError)
+			if !ok || apiErr.StatusCode != http.StatusTooManyRequests {
+				t.Fatalf("expected 429 APIError from an always-429 server, got %v", err)
+			}
+			if got, want := int(calls.Load()), maxRetries+1; got != want {
+				t.Errorf("calls = %d, want %d (1 attempt + %d retries)", got, want, maxRetries)
+			}
+		})
+	}
+}
+
 func TestPagination(t *testing.T) {
 	// Simulate 3 pages of results.
 	c := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
