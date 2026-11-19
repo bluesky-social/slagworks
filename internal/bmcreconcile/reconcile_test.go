@@ -82,11 +82,13 @@ func TestReconcile_FullProvisioning_FreshBMC(t *testing.T) {
 `)
 	// Setter sequence for slots 3 and 4, then boot order.
 	for _, cmd := range []string{
+		"user priv 3 15 1",
 		"user set name 3 slagworks",
 		"user set password 3 *",
 		"user priv 3 3 1",
 		"channel setaccess 1 3 callin=on ipmi=on link=on privilege=3",
 		"user enable 3",
+		"user priv 4 15 1",
 		"user set name 4 monitor",
 		"user set password 4 *",
 		"user priv 4 2 1",
@@ -233,10 +235,10 @@ func TestReconcile_WrongPriv_FixedInPlace_NoPasswordRewrite(t *testing.T) {
 }
 
 // TestReconcile_PartialCreate_DisabledUser_GetsFreshPassword guards the
-// partial-create recovery path: create does set-name -> set-password -> priv
-// -> ENABLE, so a crash after set-name (but before the password write) leaves
-// the slot NAMED-BUT-DISABLED with no usable password. A reconcile retry MUST
-// treat such a slot as needing (re)provisioning — write a fresh password and
+// partial-create recovery path: create does NO ACCESS -> set-name ->
+// set-password -> priv -> ENABLE, so a crash after set-name (but before the
+// password write) leaves the slot NAMED-BUT-DISABLED with no usable
+// password. A reconcile retry MUST treat such a slot as needing (re)provisioning — write a fresh password and
 // report the cred — NOT silently enable it at the right privilege with an
 // unknown password (which would strand the account, with slagworksd holding no
 // valid cred). slagworks exists at slot 3 but is DISABLED.
@@ -284,6 +286,71 @@ func TestReconcile_PartialCreate_DisabledUser_GetsFreshPassword(t *testing.T) {
 	u := res.CreatedOrUpdated[0]
 	if u.Name != "slagworks" || u.Slot != 3 || u.Password == "" || u.Privilege != PrivAdmin {
 		t.Errorf("re-provisioned slagworks: %+v (want name=slagworks slot=3 priv=ADMIN non-empty pw)", u)
+	}
+}
+
+// TestReconcile_PartialCreate_ReusedSlot_GetsFreshPassword: deploy 1 creates
+// the monitor in a free slot that still lists a real privilege limit, as a
+// slot the leftover pass disabled and cleared does (that pass leaves the
+// limit and the old password in place), and stops after the name write
+// because the BMC refuses the password. `user list` has no enable column, so
+// reconcile reads a slot as disabled only when it lists NO ACCESS, and only
+// a disabled remnant gets a fresh password. Were the remnant to list the old
+// limit, deploy 2 would read an enabled monitor and only fix its privilege
+// and enable it, putting the previous occupant's password live under the
+// monitor name, or at USER do nothing at all; either way it reports no cred.
+// After deploy 2 the monitor must be enabled at USER with a password one of
+// the deploys reported.
+func TestReconcile_PartialCreate_ReusedSlot_GetsFreshPassword(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		leftoverPriv PrivLevel
+	}{
+		{"never-used slot", privNoAccess},
+		{"cleared leftover at OPERATOR", PrivOperator},
+		{"cleared leftover at USER", PrivUser},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			bmc := newStatefulBMC(t, map[int]bmcSlot{
+				1: {Priv: privNoAccess},
+				2: {Name: "ADMIN", Priv: PrivAdmin, Password: "Adm1n!pw", Enabled: true},
+				3: {Priv: tc.leftoverPriv, Password: "Old!leftover1"},
+			})
+			opt := Options{IPMITool: bmc.path, Desired: []DesiredUser{{Name: MonitorUser, Privilege: PrivUser}}}
+
+			bmc.refusePasswordWrites(true)
+			res1, err := Reconcile(context.Background(), opt)
+			if err == nil {
+				t.Fatal("deploy 1: expected the refused password write to fail the reconcile")
+			}
+			if got := bmc.slot(3).Name; got != MonitorUser {
+				t.Fatalf("deploy 1 should have named slot 3 before the password write; slot 3 name = %q", got)
+			}
+
+			bmc.refusePasswordWrites(false)
+			res2, err := Reconcile(context.Background(), opt)
+			if err != nil {
+				t.Fatalf("deploy 2: %v", err)
+			}
+
+			var reported []string
+			for _, res := range []*Result{res1, res2} {
+				if res == nil {
+					continue
+				}
+				for _, u := range res.CreatedOrUpdated {
+					reported = append(reported, u.Password)
+				}
+			}
+			got := bmc.slot(3)
+			if got.Name != MonitorUser || !got.Enabled || got.Priv != PrivUser {
+				t.Fatalf("after deploy 2 slot 3 is %+v; want monitor enabled at USER", got)
+			}
+			if !slices.Contains(reported, got.Password) {
+				t.Fatalf("the monitor at slot 3 holds password %q, which no deploy reported (reported: %q)", got.Password, reported)
+			}
+		})
 	}
 }
 
@@ -456,6 +523,7 @@ func TestReconcile_RestoresMissingUser(t *testing.T) {
 4                    true    false      false      NO ACCESS
 `)
 	for _, cmd := range []string{
+		"user priv 4 15 1",
 		"user set name 4 monitor",
 		"user set password 4 *",
 		"user priv 4 2 1",
@@ -1014,6 +1082,7 @@ func TestReconcile_StoredPassword_CreatesAbsentMonitor(t *testing.T) {
 		[3]string{"3", "", ""},
 	))
 	for _, cmd := range []string{
+		"user priv 3 15 1",
 		"user set name 3 monitor",
 		"user set password 3 " + storedMonitorPW,
 		"user priv 3 2 1",
@@ -1301,6 +1370,7 @@ func TestReconcile_Remote_EndToEnd(t *testing.T) {
 		[3]string{"4", "", ""},
 	))
 	for _, cmd := range []string{
+		"user priv 4 15 1",
 		"user set name 4 monitor",
 		"user set password 4 *",
 		"user priv 4 2 1",
@@ -1611,4 +1681,131 @@ func (f *fakeIPMITool) calls() []fakeCall {
 		out = append(out, fakeCall{Args: args, Env: env, TZ: tz})
 	}
 	return out
+}
+
+// statefulBMC is an ipmitool replacement that keeps a BMC's user table in a
+// JSON file across calls, for tests that run Reconcile more than once against
+// one BMC: what a later run lists follows from what earlier runs wrote, which
+// the scripted fakeIPMITool cannot express. As on a real BMC, `user list`
+// shows each slot's channel-1 privilege limit whatever its enable bit, and
+// naming, disabling or setting the password of a slot leaves the limit
+// alone. It handles only the commands the in-band path issues and fails on
+// any other.
+type statefulBMC struct {
+	t     *testing.T
+	path  string // the fake ipmitool
+	state string // its JSON state file
+}
+
+// bmcSlot is one user slot of a statefulBMC.
+type bmcSlot struct {
+	Name     string
+	Priv     PrivLevel // channel-1 privilege limit; privNoAccess for none
+	Password string
+	Enabled  bool // the enable bit, which `user list` does not show
+}
+
+type bmcState struct {
+	Slots map[int]bmcSlot
+	// RefusePasswordWrites makes every `user set password` fail.
+	RefusePasswordWrites bool
+}
+
+// statefulBMCScript is the fake ipmitool. It keeps its state in state.json
+// beside itself.
+const statefulBMCScript = `#!/usr/bin/env python3
+import json, os, sys
+
+state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+args = sys.argv[1:]
+if args[:1] == ["-I"]:
+    args = args[2:]
+cmd = " ".join(args)
+with open(state_path) as f:
+    state = json.load(f)
+slots = state["Slots"]
+
+def slot(n):
+    if n not in slots:
+        sys.exit("fake BMC: no slot %s: %s" % (n, cmd))
+    return slots[n]
+
+PRIV = {1: "CALLBACK", 2: "USER", 3: "OPERATOR", 4: "ADMINISTRATOR", 15: "NO ACCESS"}
+if args[:3] == ["user", "list", "1"]:
+    print("ID  Name             Callin  Link Auth  IPMI Msg   Channel Priv Limit")
+    for n in sorted(slots, key=int):
+        s = slots[n]
+        print("%-4s%-17s%-8s%-11s%-11s%s" % (n, s["Name"], "true", "true", "true", PRIV[s["Priv"]]))
+elif args[:3] == ["user", "set", "name"]:
+    slot(args[3])["Name"] = args[4]
+elif args[:3] == ["user", "set", "password"]:
+    if state["RefusePasswordWrites"]:
+        sys.exit("Set User Password command failed (user %s)" % args[3])
+    slot(args[3])["Password"] = args[4]
+elif args[:2] == ["user", "priv"]:
+    slot(args[2])["Priv"] = int(args[3])
+elif args[:2] == ["channel", "setaccess"]:
+    for a in args[4:]:
+        if a.startswith("privilege="):
+            slot(args[3])["Priv"] = int(a[len("privilege="):])
+elif args[:2] == ["user", "enable"]:
+    slot(args[2])["Enabled"] = True
+elif args[:2] == ["user", "disable"]:
+    slot(args[2])["Enabled"] = False
+elif args[:3] == ["chassis", "bootparam", "set"]:
+    pass
+else:
+    sys.exit("fake BMC: unhandled command: " + cmd)
+with open(state_path, "w") as f:
+    json.dump(state, f)
+`
+
+func newStatefulBMC(t *testing.T, slots map[int]bmcSlot) *statefulBMC {
+	t.Helper()
+	dir := t.TempDir()
+	b := &statefulBMC{t: t, path: filepath.Join(dir, "ipmitool"), state: filepath.Join(dir, "state.json")}
+	if err := os.WriteFile(b.path, []byte(statefulBMCScript), 0o755); err != nil {
+		t.Fatalf("write fake ipmitool: %v", err)
+	}
+	b.save(bmcState{Slots: slots})
+	return b
+}
+
+func (b *statefulBMC) load() bmcState {
+	b.t.Helper()
+	data, err := os.ReadFile(b.state)
+	if err != nil {
+		b.t.Fatalf("read fake BMC state: %v", err)
+	}
+	var s bmcState
+	if err := json.Unmarshal(data, &s); err != nil {
+		b.t.Fatalf("parse fake BMC state: %v", err)
+	}
+	return s
+}
+
+func (b *statefulBMC) save(s bmcState) {
+	b.t.Helper()
+	data, err := json.Marshal(s)
+	if err != nil {
+		b.t.Fatalf("encode fake BMC state: %v", err)
+	}
+	if err := os.WriteFile(b.state, data, 0o644); err != nil {
+		b.t.Fatalf("write fake BMC state: %v", err)
+	}
+}
+
+// refusePasswordWrites makes every later `user set password` fail (true) or
+// succeed (false).
+func (b *statefulBMC) refusePasswordWrites(refuse bool) {
+	b.t.Helper()
+	s := b.load()
+	s.RefusePasswordWrites = refuse
+	b.save(s)
+}
+
+// slot returns slot n as the BMC holds it now.
+func (b *statefulBMC) slot(n int) bmcSlot {
+	b.t.Helper()
+	return b.load().Slots[n]
 }

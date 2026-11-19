@@ -65,6 +65,11 @@ const (
 	PrivAdmin    PrivLevel = 4
 )
 
+// privNoAccess is the NO ACCESS privilege limit (0xF), which bars a user
+// from the channel. Reconcile only writes it: parseUserList reads a slot
+// listing NO ACCESS as Privilege 0, disabled.
+const privNoAccess PrivLevel = 0xF
+
 func (p PrivLevel) String() string {
 	switch p {
 	case PrivCallback:
@@ -414,14 +419,15 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			// An existing-but-DISABLED user is treated as not-yet-fully-
 			// provisioned and gets a fresh password (needsPassword). This
 			// covers the partial-create crash window: create does
-			// set-name -> set-password -> priv -> ENABLE in that order, so a
-			// crash after set-name but before the password write leaves the
-			// slot named-but-disabled with no usable password. Without
-			// needsPassword we'd "fix" such a slot to enabled at the right
-			// priv with an unknown password and never report a cred — a
-			// stranded account (idempotency-of-partial-retry break). An
-			// ENABLED user with merely the wrong privilege is a genuine
-			// in-place priv fix: leave its working password alone.
+			// NO ACCESS -> set-name -> set-password -> priv -> ENABLE in
+			// that order, so a crash after set-name but before the priv
+			// write leaves the slot named and listing NO ACCESS, which
+			// parseUserList reads as disabled, with a password slagworksd
+			// never received. Without needsPassword we'd "fix" such a slot to enabled
+			// at the right priv with an unknown password and never report a
+			// cred — a stranded account (idempotency-of-partial-retry
+			// break). An ENABLED user with merely the wrong privilege is a
+			// genuine in-place priv fix: leave its working password alone.
 			plans = append(plans, plan{
 				desired:       d,
 				slot:          existing.Slot,
@@ -480,6 +486,18 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			// named-but-misconfigured slot with a known password is still
 			// reported when those fail.
 			if !p.exists {
+				// Drop the slot to NO ACCESS before naming it, so a run that
+				// stops before the priv write leaves a remnant the next run
+				// reads as disabled and re-passwords. A free slot keeps the
+				// privilege limit of whatever account held it last (the
+				// leftover pass disables and clears an account but leaves
+				// its limit); named at that limit, the remnant would read
+				// as an enabled account and get enabled without a password
+				// write, live with the previous occupant's password.
+				if err := runIPMIToolVoid(ctx, opt, "user", "priv",
+					strconv.Itoa(p.slot), strconv.Itoa(int(privNoAccess)), "1"); err != nil {
+					return res, fmt.Errorf("bmcreconcile: set NO ACCESS on slot %d before naming it: %w", p.slot, err)
+				}
 				if err := runIPMIToolVoid(ctx, opt, "user", "set", "name",
 					strconv.Itoa(p.slot), p.desired.Name); err != nil {
 					return res, fmt.Errorf("bmcreconcile: set name slot %d: %w", p.slot, err)
