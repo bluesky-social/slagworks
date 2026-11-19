@@ -114,8 +114,8 @@ func TestUpdateMachineDoesNotResurrectAMachineDeletedMidRequest(t *testing.T) {
 	}
 
 	rec := patchMachineWhile(t, st, m.ID, `{"desired_os":"noble"}`, func() {
-		if err := st.DeleteMachine(m.ID); err != nil {
-			t.Errorf("mid-request delete: %v", err)
+		if deleted, err := st.DeleteMachineIfIdle(m.ID); err != nil || !deleted {
+			t.Errorf("mid-request delete: deleted=%v err=%v", deleted, err)
 		}
 	})
 
