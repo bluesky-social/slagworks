@@ -230,7 +230,8 @@ in [`configuration.md`](../user/configuration.md#site-config-model).
 
 The only channel between global and site workers. Every frame is an
 envelope `{"type": "<string>", "request_id": "<id>", "data": <payload>}`.
-Request/reply pairs share a `request_id`.
+Request/reply pairs share a `request_id`. Both ends read messages of up to
+16 MiB (`ws.MaxMessageBytes`) and close the connection on a larger one.
 
 Connection setup:
 
@@ -354,6 +355,11 @@ crash between them and the acknowledgement is safe to replay. A
 `terminal` error drops the entry. Consequence: commissioning blocks while
 NetBox is unreachable. Deployed machines keep running from the last
 snapshot.
+
+The worker drops an entry itself, logging an error, when its `observation`
+message would exceed the 16 MiB message limit or cannot be encoded. Global
+could never read it, and resending it on every reconnect would hold up
+every observation and `op_update` queued behind it.
 
 ---
 

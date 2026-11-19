@@ -366,9 +366,9 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 	w.conn = conn
 	w.connMu.Unlock()
 
-	// Site worker reads can be up to 16MB (full snapshot with
-	// commission data for all machines at the site).
-	conn.SetReadLimit(16 << 20)
+	// Site worker reads can be up to ws.MaxMessageBytes (full snapshot
+	// with commission data for all machines at the site).
+	conn.SetReadLimit(ws.MaxMessageBytes)
 
 	// Send hello first. The hub uses last_seq_num to decide whether to
 	// reply with a fresh snapshot or a no_change ack.
@@ -834,13 +834,31 @@ func (w *WSConn) drainOnce(ctx context.Context, conn *ws.Conn) {
 	// Postgres writes succeeded.
 	for i, p := range obs {
 		reqID := uuid.New().String()
+		frame, err := observationFrame(reqID, p.Obs)
+		if err == nil && len(frame) > ws.MaxMessageBytes {
+			err = fmt.Errorf("encoded message is %d bytes, over the %d-byte limit global reads",
+				len(frame), ws.MaxMessageBytes)
+		}
+		if err != nil {
+			// No retry can deliver this row. Global closes the
+			// connection on an oversized message without answering
+			// it, and the reconnect's ReloadOutboxFromDisk puts the
+			// row back first, so sending or requeueing it would cut
+			// every later observation and op_update off from global
+			// for good. Drop it, as a terminal rejection does.
+			w.log.Error("dropping outbox observation that cannot be sent to global",
+				"event", p.Obs.Event, "machine_id", p.Obs.MachineID, "op_id", p.Obs.OperationID,
+				"row_id", p.RowID, "err", err)
+			w.cache.AckObservation(p.RowID)
+			continue
+		}
 		// Track BEFORE sending: otherwise the global can process
 		// the observation and write rpc_response back faster than
-		// we return from WriteTyped, and the read loop drops the
+		// we return from WriteFrame, and the read loop drops the
 		// ack because ackPending doesn't know about reqID yet.
 		// Untrack on send failure so we don't leak the entry.
 		w.trackAck(reqID, p)
-		if err := w.sendObservationWithID(ctx, conn, reqID, p.Obs); err != nil {
+		if err := conn.WriteFrame(ctx, frame); err != nil {
 			w.untrackAck(reqID)
 			w.log.Warn("send observation failed, requeueing remainder", "err", err, "unsent", len(obs)-i)
 			w.cache.RequeueOutbox(obs[i:], updates)
@@ -1292,7 +1310,9 @@ func (w *WSConn) ResumeOffsetUs(ctx context.Context, machineID uuid.UUID) (int64
 	return w.CastResumeOffset(ctx, machineID)
 }
 
-func (w *WSConn) sendObservationWithID(ctx context.Context, conn *ws.Conn, reqID string, obs model.Observation) error {
+// observationFrame encodes an outbox observation as the message drainOnce
+// sends, so its size can be checked against ws.MaxMessageBytes first.
+func observationFrame(reqID string, obs model.Observation) ([]byte, error) {
 	msg := ws.ObservationMsg{
 		MachineID:   obs.MachineID,
 		OperationID: obs.OperationID,
@@ -1300,7 +1320,7 @@ func (w *WSConn) sendObservationWithID(ctx context.Context, conn *ws.Conn, reqID
 		Timestamp:   obs.Timestamp.Format(time.RFC3339),
 		Data:        obs.Data,
 	}
-	return conn.WriteTyped(ctx, ws.TypeObservation, reqID, msg)
+	return ws.EncodeTyped(ws.TypeObservation, reqID, msg)
 }
 
 // trackAck records that a request_id corresponds to a particular
