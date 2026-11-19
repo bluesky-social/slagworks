@@ -201,6 +201,25 @@ func TestPreflight_PlaceholderSerialsDoNotCreateForeignOwnership(t *testing.T) {
 	}
 }
 
+// Supermicro firmware ships unprogrammed SMBIOS serials as "0123456789". Two
+// distinct hosts that both carry it as their chassis serial must not refuse
+// each other's deploy as cross-attributed inventory.
+func TestPreflight_UnprogrammedChassisSerialDoesNotCreateForeignOwnership(t *testing.T) {
+	in := fullyModeledInput()
+	in.Machine.ChassisSerial = "0123456789"
+	in.Machines = []model.MachineSnapshot{*in.Machine, {
+		ID:            uuid.MustParse("00000000-0000-0000-0000-0000000000bb"),
+		Hostname:      "host-b",
+		NetBoxSerial:  "SN-HOST-B",
+		SystemSerial:  "SN-HOST-B",
+		ChassisSerial: "0123456789",
+		SystemUUID:    "8a3c1e7b-9d1f-4c2a-b3e4-5f6a7b8c9d0e",
+	}}
+	if gaps := PreflightMachine(in, model.OpDeploy); len(gaps) != 0 {
+		t.Fatalf("hosts sharing only a placeholder chassis serial must deploy cleanly, got %v", gaps)
+	}
+}
+
 func TestPreflight_DuplicateDiskIdentityRejected(t *testing.T) {
 	in := fullyModeledInput()
 	in.Machines = append(in.Machines, model.MachineSnapshot{

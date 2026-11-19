@@ -23,31 +23,6 @@ const (
 	BIOS
 )
 
-// iPXE option ROMs. efi-virtio.rom is loaded when Firmware=UEFI so
-// OVMF doesn't pick its internal HTTPv4/v6 boot over the NIC's iPXE
-// bootstrap. The default SeaBIOS pxe-virtio.rom handles BIOS fine,
-// so we leave romfile unset in that case (empty string = QEMU
-// default).
-//
-// The ipxe-qemu package installs it under /usr/lib/ipxe/qemu on Ubuntu
-// 24.04 and under /usr/share/qemu on 26.04.
-var iPXEEFIROMCandidates = []string{
-	"/usr/lib/ipxe/qemu/efi-virtio.rom",
-	"/usr/share/qemu/efi-virtio.rom",
-}
-
-// iPXEEFIROMPath returns the first candidate that exists. With none present
-// it returns the first, so QEMU's own "failed to find romfile" error names a
-// path and the fix (install ipxe-qemu) is searchable.
-func iPXEEFIROMPath() string {
-	for _, p := range iPXEEFIROMCandidates {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return iPXEEFIROMCandidates[0]
-}
-
 // DiskType controls how a disk is presented to the guest.
 type DiskType int
 
@@ -157,6 +132,13 @@ type VMConfig struct {
 	// the agent's reconcile phase modprobes them explicitly to be
 	// safe). See bmcsim.go.
 	BMC *BMCSim
+
+	// SingleHostCPU confines the whole QEMU process, vCPU threads and I/O
+	// thread alike, to one host CPU (the first one this process may run
+	// on), so the two can never run at the same time. It reproduces on any
+	// host the starvation a busy CI runner produces now and then; see the
+	// NIC option ROM note in buildArgs.
+	SingleHostCPU bool
 }
 
 type VM struct {
@@ -258,17 +240,32 @@ func (e *Env) NewVM(t *testing.T, cfg VMConfig) *VM {
 }
 
 func (vm *VM) buildArgs() []string {
-	// NIC ROM selection:
-	// - BIOS: use QEMU's default pxe-virtio.rom (SeaBIOS chainloads
-	//   it for -boot n). Leave romfile unset.
-	// - UEFI: OVMF's default virtio ROM includes HTTPv4/v6 boot,
-	//   which tries to GET the DHCP bootfile name over HTTP and
-	//   fails against our TFTP flow. Pin the NIC ROM to
-	//   efi-virtio.rom (an iPXE build) so boot goes through iPXE
-	//   directly, matching real-hardware chainload.
+	// NIC option ROM selection:
+	// - BIOS: leave romfile unset. QEMU loads its default
+	//   pxe-virtio.rom and SeaBIOS network-boots through it.
+	// - UEFI: no option ROM (romfile= with an empty value). OVMF's own
+	//   VirtioNetDxe then drives the NIC under OVMF's PXE stack and,
+	//   after the chainload, under snponly.efi. That is the shape of a
+	//   real machine: the board firmware's NIC driver below the iPXE
+	//   slagworks serves.
+	//
+	//   QEMU's default for this device is efi-virtio.rom, the iPXE build
+	//   the distribution packages as ipxe-qemu, and its SNP driver takes
+	//   the NIC in place of OVMF's. That driver (iPXE
+	//   1.21.1+git-20220113 on Ubuntu 24.04) does not survive the QEMU
+	//   I/O thread and the vCPU being unable to run at the same time, as
+	//   on a host with no CPU to spare: during a large HTTP download a
+	//   receive buffer the virtio device still owns ends up on the
+	//   driver's free list, the next frame is written over the
+	//   allocator's list pointers, and the firmware dies in
+	//   virtio-net.efidrv, either with an "X64 Exception" dump on the
+	//   serial console or by spinning silently. The test then sees the
+	//   initrd fetch stop partway and times out on whatever marker it
+	//   was waiting for. TestUEFINetbootOnOneHostCPU reproduces the
+	//   starvation.
 	net0Device := fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s", vm.Config.MAC)
 	if vm.Config.Firmware == UEFI {
-		net0Device += ",romfile=" + iPXEEFIROMPath()
+		net0Device += ",romfile="
 	}
 	// Two serial ports, both captured.
 	//   - ttyS0: unix-socket chardev. Carries iPXE/SeaBIOS firmware
@@ -439,7 +436,18 @@ func (vm *VM) Start(ctx context.Context) {
 	// Operator debugging tip: the equivalent shell is
 	// `ip netns exec <ns> qemu-system-x86_64 ...` — handy when
 	// attaching strace to a wedged test VM.
-	fullArgs := append([]string{"netns", "exec", vm.Config.Network.NSName, "qemu-system-x86_64"}, args...)
+	fullArgs := []string{"netns", "exec", vm.Config.Network.NSName}
+	if vm.Config.SingleHostCPU {
+		// taskset execs its command, so the process the harness later
+		// kills is still QEMU itself.
+		cpu, err := firstAllowedCPU()
+		if err != nil {
+			vm.t.Fatalf("qemutest: SingleHostCPU: %v", err)
+		}
+		fullArgs = append(fullArgs, "taskset", "-c", cpu)
+	}
+	fullArgs = append(fullArgs, "qemu-system-x86_64")
+	fullArgs = append(fullArgs, args...)
 	vm.cmd = exec.CommandContext(ctx, "ip", fullArgs...)
 
 	stdout, err := vm.cmd.StdoutPipe()

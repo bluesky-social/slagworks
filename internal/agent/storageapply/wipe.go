@@ -1,7 +1,9 @@
 package storageapply
 
 import (
+	"errors"
 	"fmt"
+	"os/exec"
 	"path"
 	"regexp"
 	"sort"
@@ -213,34 +215,73 @@ func bystanderDisks(ctx *agent.Context, layout storage.Layout) ([]string, error)
 	if err != nil {
 		return nil, fmt.Errorf("wipe-all-disks: lsblk: %w", err)
 	}
-	return parseBystanderDisks(out, layout), nil
+	claimed, err := wipeAllDisksExclusions(ctx, layout)
+	if err != nil {
+		return nil, fmt.Errorf("wipe-all-disks: %w; refusing to wipe any disk", err)
+	}
+	return parseBystanderDisks(out, claimed), nil
+}
+
+// wipeAllDisksExclusions returns the whole disks --wipe-all-disks leaves
+// alone: layoutClaimedDisks plus every disk that holds a preserve member.
+// The disks holding preserve members come from the kernel (memberDisks),
+// not from the member names, because a member may be spelled as a
+// /dev/disk/by-* path or with a driver's own partition naming. A member
+// the kernel cannot place is an error: guessing wrong destroys the data
+// the layout preserves. bystanderDisks and CheckStaleArrayMembers both use
+// this set, so the stale-member check examines exactly the disks the
+// bystander wipe will not zero.
+func wipeAllDisksExclusions(ctx *agent.Context, layout storage.Layout) (map[string]bool, error) {
+	claimed := layoutClaimedDisks(layout)
+	for _, name := range preserveDeviceNames(layout) {
+		for _, member := range layout.Devices[name].Members {
+			disks, err := memberDisks(ctx, member)
+			if err != nil {
+				return nil, fmt.Errorf("cannot tell which disk holds preserve %q member %q: %w", name, member, err)
+			}
+			for _, disk := range disks {
+				claimed[disk] = true
+			}
+		}
+	}
+	return claimed, nil
 }
 
 // parseBystanderDisks is the testable selector behind bystanderDisks:
-// given `lsblk -dnlo NAME,TYPE` output, return every whole disk the
-// layout does not claim.
-func parseBystanderDisks(lsblkOut string, layout storage.Layout) []string {
-	claimed := layoutClaimedDisks(layout)
+// given `lsblk -dnlo NAME,TYPE` output, return every whole disk not in
+// claimed.
+func parseBystanderDisks(lsblkOut string, claimed map[string]bool) []string {
 	var disks []string
-	for line := range strings.SplitSeq(lsblkOut, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 || fields[1] != "disk" {
-			continue
-		}
-		name := fields[0]
+	for _, name := range parseWholeDisks(lsblkOut) {
 		if claimed[name] {
-			continue // layout target or raid/preserve member's parent disk
+			continue // layout target, raid member's parent disk, or holds a preserve member
 		}
 		disks = append(disks, name)
 	}
 	return disks
 }
 
+// parseWholeDisks returns the kernel name of every whole disk in
+// `lsblk -dnlo NAME,TYPE` output, in lsblk's order.
+func parseWholeDisks(lsblkOut string) []string {
+	var disks []string
+	for line := range strings.SplitSeq(lsblkOut, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[1] != "disk" {
+			continue
+		}
+		disks = append(disks, fields[0])
+	}
+	return disks
+}
+
 // layoutClaimedDisks returns the set of every whole-disk kernel name (bare,
-// no "/dev/" prefix) claimed by ANY device in the layout: a disk or retained
-// disk's own name, or the parent whole disk of every raid/preserve member.
-// This is the exclusion set for --wipe-all-disks. Retained disks and preserve
-// members are protected data; raid members are about to be (re)assembled.
+// no "/dev/" prefix) the layout claims by name: a disk or retained disk's own
+// name, or the parent whole disk of every raid member. With the disks that
+// hold preserve members, this is the exclusion set for
+// --wipe-all-disks (wipeAllDisksExclusions). Retained disks are protected
+// data; raid members are about to be (re)assembled. Raid members are layout names (validate requires
+// it) and may not exist yet, so they are parsed rather than looked up.
 func layoutClaimedDisks(layout storage.Layout) map[string]bool {
 	claimed := make(map[string]bool, len(layout.Devices))
 	for name, dev := range layout.Devices {
@@ -249,7 +290,7 @@ func layoutClaimedDisks(layout storage.Layout) map[string]bool {
 		}
 	}
 	for _, dev := range layout.Devices {
-		if dev.Type != "raid" && dev.Type != "preserve" {
+		if dev.Type != "raid" {
 			continue
 		}
 		for _, member := range dev.Members {
@@ -289,7 +330,9 @@ var partitionSuffix = regexp.MustCompile(`^(` + wholeDiskFamilies + `)p\d+$`)
 var bareDigitSuffix = regexp.MustCompile(`^([A-Za-z]+)\d+$`)
 
 // parentDisk returns the whole-disk kernel name that owns member, which may
-// already be a whole disk (returned unchanged) or a partition of one. It
+// already be a whole disk (returned unchanged) or a partition of one. It is
+// for raid members, which are layout names; preserve members name existing
+// devices and are resolved by the kernel instead (memberDisks). It
 // inverts internal/storage/plan.go's partName across three checks, in
 // order: (1) a name matching one of the nvme/mmcblk/loop/dm/md whole-disk
 // shapes is returned unchanged (nvme0n1, mmcblk0, loop0, dm-0, md0 are
@@ -322,9 +365,16 @@ func parentDisk(member string) string {
 // kernel currently sees them. Best-effort: returns nil on any lsblk
 // error or if the disk has no partitions.
 func LivePartitions(ctx *agent.Context, disk string) []string {
+	parts, _ := listPartitions(ctx, disk)
+	return parts
+}
+
+// listPartitions is LivePartitions with the lsblk error returned, for a
+// check that must not treat a disk it could not list as clean.
+func listPartitions(ctx *agent.Context, disk string) ([]string, error) {
 	out, err := ctx.Exec.Output("lsblk", "-nlo", "NAME", "/dev/"+disk)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var parts []string
 	for line := range strings.FieldsSeq(out) {
@@ -333,29 +383,231 @@ func LivePartitions(ctx *agent.Context, disk string) []string {
 		}
 		parts = append(parts, "/dev/"+line)
 	}
-	return parts
+	return parts, nil
 }
 
-// CheckDisksClean verifies that none of the disks in the layout contain
-// existing filesystem or partition table signatures. This prevents
-// accidentally wiping a machine that already has an OS installed.
+// CheckDisksClean is the safety check of a deploy without --destructive:
+// it refuses every layout disk that carries any signature (partition
+// table, filesystem, RAID/LVM/ZFS member, LUKS header), so a deploy never
+// partitions a machine that already holds an OS or data. A disk passes only
+// when it is known to be blank; a probe that cannot run fails the check.
+//
+// The probe is wipefs, not `blkid -p`. In its safe-probe mode blkid prints
+// nothing on stdout for a disk carrying two signatures it will not choose
+// between (an ext4 disk later given to ZFS without a wipe), just as for a
+// blank disk, and it exits 2 ("nothing found") for a blank disk and for one
+// it could not open or read alike; a check that read any blkid failure as
+// clean passed all of them. wipefs lists every signature libblkid
+// recognizes, partition tables included (it also finds a GPT whose
+// protective MBR is gone), prints nothing and exits 0 on a blank disk, and
+// exits non-zero only when it cannot probe.
+//
+// Only the whole-disk node is probed. Any partition the kernel sees comes
+// from a partition table, which wipefs reports on the whole disk; a
+// filesystem left inside a partition whose table was erased has no device
+// node at all, so no probe could reach it.
 func CheckDisksClean(ctx *agent.Context, layout storage.Layout) error {
 	for name, dev := range layout.Devices {
 		if dev.Type != "disk" {
 			continue
 		}
 		diskPath := "/dev/" + name
-		// blkid exits 2 on a signature-less (clean) disk, so err != nil
-		// is the clean case and err == nil with output is the dirty one.
-		out, err := ctx.Exec.Output("blkid", "-p", diskPath)
-		if err == nil && out != "" {
-			return fmt.Errorf("disk %s has existing data (%s); refusing to partition -- this machine may have an active OS",
-				diskPath, out)
+		out, err := ctx.Exec.Output("wipefs", "--noheadings", "--output", "TYPE,OFFSET", diskPath)
+		if err != nil {
+			return fmt.Errorf("cannot tell whether disk %s holds data: listing its signatures failed: %s; "+
+				"refusing to partition it. Check that the disk is present and readable (lsblk, dmesg) and that "+
+				"wipefs is in the deploy image, then redeploy; --destructive skips this check and overwrites the disk",
+				diskPath, probeError(err))
 		}
-		// blkid exit code 2 = no signatures found (clean disk)
+		if sigs := wipefsSignatures(out); len(sigs) > 0 {
+			return fmt.Errorf("disk %s already holds data (%s); refusing to partition it -- this machine may have an active OS. "+
+				"Redeploy with --destructive to overwrite it",
+				diskPath, strings.Join(sigs, ", "))
+		}
 		ctx.Log.Info("disk is clean", "disk", diskPath)
 	}
 	return nil
+}
+
+// wipefsSignatures summarizes `wipefs --noheadings --output TYPE,OFFSET`
+// as one entry per signature type, in the order wipefs lists them: "ext4 at
+// 0x438", or "zfs_member at 0x23c00 and 28 more" for a type that recurs
+// (wipefs lists every ZFS uberblock it finds). Every non-blank line counts:
+// a line without the expected two columns is kept verbatim, so an
+// unexpected format can only make the safety check refuse, never pass.
+func wipefsSignatures(out string) []string {
+	var types []string
+	first := map[string]string{}
+	count := map[string]int{}
+	for line := range strings.SplitSeq(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		typ, desc := strings.TrimSpace(line), strings.TrimSpace(line)
+		if len(fields) == 2 {
+			typ, desc = fields[0], fields[0]+" at "+fields[1]
+		}
+		if count[typ] == 0 {
+			types = append(types, typ)
+			first[typ] = desc
+		}
+		count[typ]++
+	}
+	sigs := make([]string, 0, len(types))
+	for _, typ := range types {
+		sig := first[typ]
+		if more := count[typ] - 1; more > 0 {
+			sig += fmt.Sprintf(" and %d more", more)
+		}
+		sigs = append(sigs, sig)
+	}
+	return sigs
+}
+
+// CheckStaleArrayMembers refuses the deploy, before any disk is touched,
+// when a device the deploy leaves unwritten carries an md member superblock
+// with the array UUID that a raid device in the layout pins (array_uuid).
+//
+// A pinned UUID is the same on every create of that array, so a member
+// superblock left by an earlier create cannot be told apart, by UUID, from
+// the array this deploy builds. The trigger is a redeploy that builds the
+// array over different disks: the disk it no longer uses keeps a member
+// superblock with that UUID. At boot, when udev offers that disk to mdadm
+// first, the stale member claims the array, the real members are refused,
+// the mount fails and the boot stops in emergency mode. Which disk udev
+// offers first is a race, so such a deploy is not bootable.
+//
+// The devices examined are every whole disk that is not a disk-type layout
+// target, and its partitions. Disk-type targets are skipped: --destructive
+// zeroes their superblocks (WipeStaleState), and without it CheckDisksClean
+// refuses any target that is not blank. Under --wipe-all-disks the
+// bystander disks are skipped too, because WipeBystanderDisks zeroes their
+// superblocks; the disks it leaves alone (retained disks and the disks of
+// preserve members) are still examined.
+//
+// The agent refuses rather than zeroing the stale member itself because the
+// flags do not authorize that write: --destructive covers the disks the
+// layout targets, and only --wipe-all-disks extends the wipe to disks
+// outside the layout (see "The --destructive and --wipe-all-disks flags" in
+// docs/dev/state-machine.md). A stale member is half of a former array and
+// can be the last copy of its data.
+//
+// mdadm --examine exits non-zero on a device with no md superblock, the
+// common case, so a failed examine counts as no superblock: a device mdadm
+// cannot read now is one boot-time assembly cannot read either.
+func CheckStaleArrayMembers(ctx *agent.Context, layout storage.Layout, wipeAllDisks bool) error {
+	pinned := pinnedArrayUUIDs(layout)
+	if len(pinned) == 0 {
+		return nil
+	}
+	out, err := ctx.Exec.Output("lsblk", "-dnlo", "NAME,TYPE")
+	if err != nil {
+		return fmt.Errorf("lsblk: %w; cannot list the disks outside the layout to check them for "+
+			"stale members of a pinned array_uuid; rerun the deploy once lsblk works", err)
+	}
+	targets := diskTypeNames(layout)
+	claimed, err := wipeAllDisksExclusions(ctx, layout)
+	if err != nil {
+		return fmt.Errorf("%w; cannot tell which disks --wipe-all-disks leaves alone to check them for "+
+			"stale members of a pinned array_uuid; check the storage script's preserve member names against lsblk on the target", err)
+	}
+	var wipeable, protected []string
+	for _, disk := range parseWholeDisks(out) {
+		if targets[disk] || (wipeAllDisks && !claimed[disk]) {
+			continue
+		}
+		parts, err := listPartitions(ctx, disk)
+		if err != nil {
+			return fmt.Errorf("lsblk /dev/%s: %w; cannot list its partitions to check them for "+
+				"stale members of a pinned array_uuid; rerun the deploy once lsblk works", disk, err)
+		}
+		for _, dev := range append([]string{"/dev/" + disk}, parts...) {
+			examine, err := ctx.Exec.Output("mdadm", "--examine", dev)
+			if err != nil {
+				continue
+			}
+			for _, got := range parseExamineArrayUUIDs(examine) {
+				for _, p := range pinned {
+					if !uuidsEqual(got, p.uuid) {
+						continue
+					}
+					conflict := fmt.Sprintf("%s (raid %q, array UUID %s)", dev, p.name, p.uuid)
+					if claimed[disk] {
+						protected = append(protected, conflict)
+					} else {
+						wipeable = append(wipeable, conflict)
+					}
+				}
+			}
+		}
+	}
+	if len(wipeable) == 0 && len(protected) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("a device this deploy does not write carries an md member superblock with an array UUID the layout pins; " +
+		"at boot that stale member can claim the array ahead of its real members and stop the boot in emergency mode")
+	if len(wipeable) > 0 {
+		fmt.Fprintf(&b, ". %s: rerun the deploy with --wipe-all-disks, which zeroes md superblocks on disks outside the layout, "+
+			"or, if that old array's data is not needed, zero it with `mdadm --zero-superblock <device>` from a --recovery boot and redeploy",
+			strings.Join(wipeable, ", "))
+	}
+	if len(protected) > 0 {
+		fmt.Fprintf(&b, ". %s: --wipe-all-disks leaves retained and preserve-member disks alone; "+
+			"if that old array's data is not needed, zero it with `mdadm --zero-superblock <device>` from a --recovery boot and redeploy, "+
+			"or detach the disk",
+			strings.Join(protected, ", "))
+	}
+	return errors.New(b.String())
+}
+
+// pinnedArray is one raid device that pins its array UUID.
+type pinnedArray struct{ name, uuid string }
+
+// pinnedArrayUUIDs returns every raid device that sets array_uuid, sorted
+// by device name so error messages are stable.
+func pinnedArrayUUIDs(layout storage.Layout) []pinnedArray {
+	var pinned []pinnedArray
+	for name, dev := range layout.Devices {
+		if dev.Type == "raid" && dev.ArrayUUID != "" {
+			pinned = append(pinned, pinnedArray{name: name, uuid: dev.ArrayUUID})
+		}
+	}
+	sort.Slice(pinned, func(i, j int) bool { return pinned[i].name < pinned[j].name })
+	return pinned
+}
+
+// parseExamineArrayUUIDs returns the array UUIDs in `mdadm --examine`
+// output: the "Array UUID" line of 1.x metadata and the "UUID" line of 0.90
+// (whose value can carry a trailing "(local to host ...)"). "Device UUID"
+// names the member, not the array, and is ignored.
+func parseExamineArrayUUIDs(examine string) []string {
+	var uuids []string
+	for line := range strings.SplitSeq(examine, "\n") {
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if k := strings.TrimSpace(key); k != "Array UUID" && k != "UUID" {
+			continue
+		}
+		if fields := strings.Fields(val); len(fields) > 0 {
+			uuids = append(uuids, fields[0])
+		}
+	}
+	return uuids
+}
+
+// probeError describes a failed probe, preferring the tool's own stderr
+// (which names the cause, e.g. an I/O error) over a bare exit status.
+func probeError(err error) string {
+	if ee, ok := errors.AsType[*exec.ExitError](err); ok {
+		if msg := strings.TrimSpace(string(ee.Stderr)); msg != "" {
+			return fmt.Sprintf("%v: %s", err, msg)
+		}
+	}
+	return err.Error()
 }
 
 // CleanupMounts unmounts every layout mount under /target before reboot,

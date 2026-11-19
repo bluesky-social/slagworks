@@ -28,8 +28,10 @@ type RebuildFunc func(ctx context.Context, slug string, gen int64) (model.SiteSn
 // equals its gather-time order by construction.
 //
 // SeqNum for a slug is owned by that slug's actor, within one
-// process. BumpSiteSnapshotMeta stays a plain increment because, and
-// only while, (a) the bumping rebuild path is unexported and
+// process. BumpSiteSnapshotMeta draws from a Postgres sequence, so a
+// value is never issued twice, even across a site_config's delete and
+// re-create; but SeqNum order matches gather-time order only because,
+// and only while, (a) the bumping rebuild path is unexported and
 // single-holder, and (b) global runs single-replica. If either
 // changes, per-slug serialization needs a pg advisory lock instead.
 type Registry struct {

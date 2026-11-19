@@ -1,8 +1,10 @@
 package snapshot
 
 import (
+	"slices"
 	"testing"
 
+	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/netbox"
 )
 
@@ -72,5 +74,70 @@ func TestL3LegRelayPools(t *testing.T) {
 		if p.Subnet != want.subnet || p.RangeStart != want.start || p.RangeEnd != want.start || p.Gateway != want.gw {
 			t.Errorf("pool[%d] = %+v, want subnet=%s range=%s gw=%s", i, p, want.subnet, want.start, want.gw)
 		}
+	}
+}
+
+// TestL3LegRelayPoolsIgnoreNetBoxOrder pins that the generated pools, and
+// so the snapshot content hash, do not depend on the order NetBox lists IP
+// addresses in. That order is not stable: the client fetches IPs in chunks
+// of interface IDs, so adding an unrelated device can move a record to a
+// different response. A different hash for the same data means a spurious
+// snapshot push and SeqNum bump.
+//
+// The records are two host legs plus the leaf end of the first leg (a leaf
+// modeled in the same site, its port addressed): every order must give the
+// same two pools, in subnet order, with the host as the offered address.
+func TestL3LegRelayPoolsIgnoreNetBoxOrder(t *testing.T) {
+	ifaces := []netbox.Interface{
+		ifacePhys(1, "eth0", "7c:c2:55:be:f6:0c"), // host leg A
+		ifacePhys(2, "eth1", "7c:c2:55:be:f6:0d"), // host leg B
+		ifacePhys(3, "swp1", "0c:42:a1:00:00:01"), // leaf port facing eth0
+	}
+	hostA := netbox.IPAddress{Address: "10.254.29.9/31", AssignedObjectID: new(1), AssignedObjectType: "dcim.interface"}
+	hostB := netbox.IPAddress{Address: "10.254.29.11/31", AssignedObjectID: new(2), AssignedObjectType: "dcim.interface"}
+	leafA := netbox.IPAddress{Address: "10.254.29.8/31", AssignedObjectID: new(3), AssignedObjectType: "dcim.interface"}
+
+	want := []model.RelayPool{
+		{Subnet: "10.254.29.8/31", RangeStart: "10.254.29.9", RangeEnd: "10.254.29.9", Gateway: "10.254.29.8"},
+		{Subnet: "10.254.29.10/31", RangeStart: "10.254.29.11", RangeEnd: "10.254.29.11", Gateway: "10.254.29.10"},
+	}
+	orders := []struct {
+		name string
+		ips  []netbox.IPAddress
+	}{
+		{"hostA hostB leafA", []netbox.IPAddress{hostA, hostB, leafA}},
+		{"hostA leafA hostB", []netbox.IPAddress{hostA, leafA, hostB}},
+		{"hostB hostA leafA", []netbox.IPAddress{hostB, hostA, leafA}},
+		{"hostB leafA hostA", []netbox.IPAddress{hostB, leafA, hostA}},
+		{"leafA hostA hostB", []netbox.IPAddress{leafA, hostA, hostB}},
+		{"leafA hostB hostA", []netbox.IPAddress{leafA, hostB, hostA}},
+	}
+
+	var wantHash string
+	for _, order := range orders {
+		t.Run(order.name, func(t *testing.T) {
+			snap, err := Build(Inputs{
+				Site:       netbox.Site{Name: "pop1", Slug: "pop1"},
+				Config:     model.SiteConfig{Slug: "pop1", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"},
+				Prefixes:   []netbox.Prefix{{Prefix: "10.0.0.0/24", CustomFields: gatewayJSON("10.0.0.1")}},
+				Interfaces: ifaces,
+				IPs:        order.ips,
+			})
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			if got := snap.DHCP.RelayPools; !slices.Equal(got, want) {
+				t.Errorf("relay pools = %+v\nwant %+v", got, want)
+			}
+			hash, err := snap.ContentHash()
+			if err != nil {
+				t.Fatalf("ContentHash: %v", err)
+			}
+			if wantHash == "" {
+				wantHash = hash
+			} else if hash != wantHash {
+				t.Errorf("content hash = %s, want %s (the hash of the first order)", hash, wantHash)
+			}
+		})
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/bluesky-social/slagworks/internal/awssecrets"
@@ -92,9 +94,9 @@ func (d *Dispatcher) SetHostnameTemplate(t HostnameTemplate) { d.hostnames = t }
 //
 // Unexported by design: this is the only path that bumps SeqNum, and
 // the Registry's per-slug actors are its only callers (NewRegistry
-// receives it at construction). Serialization per slug is what keeps
-// BumpSiteSnapshotMeta's plain increment sound — see the ownership
-// note on Registry.
+// receives it at construction). Serialization per slug is what makes
+// the order of BumpSiteSnapshotMeta's values match gather-time order —
+// see the ownership note on Registry.
 //
 // gen is the registry-observed dirtyGen; the dispatcher treats it as
 // opaque and logs it for correlation with telemetry.
@@ -419,12 +421,24 @@ func (d *Dispatcher) locationSubtreePrefixes(ctx context.Context, scope Scope) (
 // any prefix tag (slagworks-production for the fabric, slagworks-oob for
 // the management network). Results are deduped by prefix id — a prefix can
 // only be scoped to one location, but the dedup keeps the function safe if
-// NetBox ever returns overlapping pages. Iteration order over the subtree
-// set doesn't matter: Build sorts/normalizes prefixes for the content hash.
+// NetBox ever returns overlapping pages.
+//
+// The order is fixed: the config's own location first, then the rest of
+// the subtree by ascending location id, each location's prefixes in
+// NetBox's order. Build serves Prefixes[0] as the fabric DHCP subnet and
+// gateway, so this makes the config's own prefix (the one site-config
+// create requires) the primary, and keeps a rebuild over unchanged NetBox
+// data from changing the content hash.
 func (d *Dispatcher) locationSubtreePrefixesTagged(ctx context.Context, scope Scope, tag string) ([]netbox.Prefix, error) {
+	order := []int{scope.LocationID}
+	for _, id := range slices.Sorted(maps.Keys(scope.SubtreeIDs)) {
+		if id != scope.LocationID {
+			order = append(order, id)
+		}
+	}
 	var out []netbox.Prefix
 	seen := make(map[int]bool)
-	for locID := range scope.SubtreeIDs {
+	for _, locID := range order {
 		page, err := d.nb.ListLocationPrefixes(ctx, locID, tag)
 		if err != nil {
 			return nil, err
