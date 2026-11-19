@@ -553,6 +553,59 @@ func TestLocalDB_DHCPLeases_ExpiredFiltered(t *testing.T) {
 	}
 }
 
+// TestLocalDB_DHCPLeases_ExpiryJudgedByInstant pins that a persisted
+// lease's expiry is compared as an instant, not as a wall-clock reading.
+// The SQLite driver stores expires_at as text carrying the writer's UTC
+// offset, so a row read under a different offset than the one it was
+// written with reads up to an hour off: a site-worker restart around a
+// DST fall-back (an expiry after the change carries the new offset, "now"
+// before it the old one), or a restart after the host's time zone
+// changes. Each case pairs the shifted row with a control row of the
+// opposite liveness written under the current offset, so the count, the
+// load and the load's purge of expired rows each have to tell them apart.
+func TestLocalDB_DHCPLeases_ExpiryJudgedByInstant(t *testing.T) {
+	_, offset := time.Now().Zone()
+	hourBehind := time.FixedZone("hour-behind", offset-3600)
+	hourAhead := time.FixedZone("hour-ahead", offset+3600)
+	shiftedMAC, _ := net.ParseMAC("52:54:00:aa:bb:01")
+	controlMAC, _ := net.ParseMAC("52:54:00:aa:bb:02")
+
+	cases := []struct {
+		name        string
+		shifted     time.Time
+		shiftedLive bool
+	}{
+		// 20 minutes left, but its wall-clock reading is 40 minutes ago.
+		{"live lease written an hour behind", time.Now().Add(20 * time.Minute).In(hourBehind), true},
+		// Expired 20 minutes ago, but its wall-clock reading is 40 minutes ahead.
+		{"expired lease written an hour ahead", time.Now().Add(-20 * time.Minute).In(hourAhead), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			control, liveMAC := time.Now().Add(-time.Hour), shiftedMAC
+			if !tc.shiftedLive {
+				control, liveMAC = time.Now().Add(time.Hour), controlMAC
+			}
+			db.SaveDHCPLease(DHCPLease{MAC: shiftedMAC, IP: net.ParseIP("10.0.0.50"), ExpiresAt: tc.shifted})
+			db.SaveDHCPLease(DHCPLease{MAC: controlMAC, IP: net.ParseIP("10.0.0.51"), ExpiresAt: control})
+
+			if n := db.CountActiveDHCPLeases(); n != 1 {
+				t.Errorf("CountActiveDHCPLeases = %d, want 1", n)
+			}
+			if got := db.LoadDHCPLeases(); len(got) != 1 || got[0].MAC.String() != liveMAC.String() {
+				t.Errorf("LoadDHCPLeases = %v, want only %s", got, liveMAC)
+			}
+			// LoadDHCPLeases deletes the rows it judges expired.
+			var onDisk []dhcpLeaseRow
+			db.db.Find(&onDisk)
+			if len(onDisk) != 1 || onDisk[0].MAC != liveMAC.String() {
+				t.Errorf("rows left after LoadDHCPLeases = %v, want only %s", onDisk, liveMAC)
+			}
+		})
+	}
+}
+
 func TestLocalDB_DHCPLeases_Upsert(t *testing.T) {
 	db := openTestDB(t)
 

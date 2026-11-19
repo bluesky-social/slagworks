@@ -15,15 +15,16 @@ import (
 //
 // For each preserve device it:
 //
-//  1. Rejects any member whose parent whole-disk is a disk-type layout target
-//     (that disk gets sgdisk --zap-all'd, which destroys the member). This is
-//     Phase-1 roast finding #3: a member naming an UNDECLARED partition of a
-//     managed disk (e.g. nvme0n1p9 when disk nvme0n1 declares only p1-p3) is
-//     invisible to static validation -- validatePreserveMemberCollisions
-//     compares full partition names, not parent disks -- but is destroyed by
-//     the whole-disk zap. parentDisk gives an exact parent match with no
-//     fragile prefix heuristic, so this runs at Phase-2 runtime rather than
-//     static validate().
+//  1. Rejects any member held by a disk-type layout target (that disk gets
+//     sgdisk --zap-all'd, which destroys the member). This is Phase-1 roast
+//     finding #3: a member naming an UNDECLARED partition of a managed disk
+//     (e.g. nvme0n1p9 when disk nvme0n1 declares only p1-p3) is invisible to
+//     static validation -- validatePreserveMemberCollisions compares full
+//     partition names, not parent disks -- but is destroyed by the whole-disk
+//     zap. memberDisks asks the kernel which disks hold the member, so the
+//     check holds however the member is spelled (kernel name, /dev/disk/by-*
+//     path); that needs the live host, so it runs here rather than in static
+//     validate().
 //
 //  2. Assembles the array by its expected UUID from the named members
 //     (assemble is non-destructive w.r.t. member data), reads mdadm --detail,
@@ -66,15 +67,25 @@ func PreflightPreserve(ctx *agent.Context, layout storage.Layout) error {
 
 	// Guard pass FIRST, before any mdadm call: no preserve member may live
 	// on a disk-type layout target (that disk gets sgdisk --zap-all'd). This
-	// FATALs with the host untouched -- not even a stop has run yet.
+	// FATALs with the host untouched -- not even a stop has run yet. A member
+	// the kernel cannot find also FATALs here: it cannot be checked, and the
+	// assemble below would fail on it anyway.
 	for _, name := range preserveNames {
 		for _, member := range layout.Devices[name].Members {
-			parent := parentDisk(member)
-			if diskTargets[parent] {
+			disks, err := memberDisks(ctx, member)
+			if err != nil {
 				return fmt.Errorf(
-					"preserve %q: member %q lives on disk %q which the layout partitions (sgdisk --zap-all would destroy it); "+
-						"remove %q from the disk targets or from the preserve members -- they cannot be both",
-					name, member, parent, parent)
+					"preserve %q: cannot tell which disk holds member %q (%w); "+
+						"check the storage script's member names against lsblk on the target",
+					name, member, err)
+			}
+			for _, disk := range disks {
+				if diskTargets[disk] {
+					return fmt.Errorf(
+						"preserve %q: member %q lives on disk %q which the layout partitions (sgdisk --zap-all would destroy it); "+
+							"remove %q from the disk targets or from the preserve members -- they cannot be both",
+						name, member, disk, disk)
+				}
 			}
 		}
 	}
@@ -248,6 +259,43 @@ func resolveMemberPath(name string) string {
 		return name
 	}
 	return "/dev/" + name
+}
+
+// memberDisks returns the whole disks (lsblk TYPE "disk") that hold a preserve
+// member, as the kernel reports them. Member names cannot be parsed for this:
+// a /dev/disk/by-* path does not contain its disk's name, and the kernel's
+// partition naming depends on the driver (pmem0 is a whole disk, pmem0p1 its
+// partition). `lsblk -s` (inverse) lists the member and then every device
+// beneath it, following symlinks and any partition or device-mapper layer
+// down to the disks. NAME is the column bystanderDisks enumerates, so the
+// answers compare directly. A member with no disk beneath it (a loop device)
+// yields none. An error means the member is not a block device on this host,
+// or lsblk answered in a shape we cannot read; callers fail closed on it.
+func memberDisks(ctx *agent.Context, member string) ([]string, error) {
+	path := resolveMemberPath(member)
+	out, err := ctx.Exec.Output("lsblk", "-snlo", "NAME,TYPE", path)
+	if err != nil {
+		return nil, fmt.Errorf("lsblk %s: %w", path, err)
+	}
+	var disks []string
+	rows := 0
+	for line := range strings.SplitSeq(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		if len(f) != 2 {
+			return nil, fmt.Errorf("lsblk %s: unexpected row %q", path, line)
+		}
+		rows++
+		if f[1] == "disk" {
+			disks = append(disks, f[0])
+		}
+	}
+	if rows == 0 {
+		return nil, fmt.Errorf("lsblk %s: no output", path)
+	}
+	return disks, nil
 }
 
 // parseMDADMDetailUUID extracts the array UUID token from `mdadm --detail`

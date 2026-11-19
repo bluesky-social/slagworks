@@ -22,7 +22,20 @@ import (
 	"github.com/bluesky-social/slagworks/internal/ws"
 )
 
-var validMAC = regexp.MustCompile(`^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$`)
+// validMAC matches a MAC in canonical form: six lower-case hex octets,
+// colon-separated. The provider's MAC index is keyed by this form (the
+// snapshot builder lower-cases NetBox MACs), so request handlers match
+// through canonicalMAC rather than against the raw parameter.
+var validMAC = regexp.MustCompile(`^([0-9a-f]{2}:){5}[0-9a-f]{2}$`)
+
+// canonicalMAC lower-cases raw and reports whether the result is a valid
+// MAC. Either hex case is accepted (an operator may paste an upper-case MAC
+// from NetBox); passing the raw value to the provider would miss its index
+// and read as an unknown machine.
+func canonicalMAC(raw string) (string, bool) {
+	mac := strings.ToLower(raw)
+	return mac, validMAC.MatchString(mac)
+}
 
 // HandlerConfig configures the boot script handler.
 type HandlerConfig struct {
@@ -80,8 +93,8 @@ func (h *Handler) MarkVerified(mac string) {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	mac := r.URL.Query().Get("mac")
-	if mac != "" && !validMAC.MatchString(mac) {
+	mac, ok := canonicalMAC(r.URL.Query().Get("mac"))
+	if mac != "" && !ok {
 		http.Error(w, "invalid mac", http.StatusBadRequest)
 		return
 	}
@@ -906,7 +919,9 @@ func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
 
 	var machineID uuid.UUID
 	for _, nic := range payload.NICs {
-		if id, ok := s.cfg.Provider.MachineIDForMAC(nic.MAC); ok {
+		// Lower-case to the provider's key form (see canonicalMAC). A
+		// malformed MAC cannot be in the index, so it needs no separate check.
+		if id, ok := s.cfg.Provider.MachineIDForMAC(strings.ToLower(nic.MAC)); ok {
 			machineID = id
 			break
 		}
@@ -943,15 +958,16 @@ func (s *Server) buildMux() *http.ServeMux {
 	}
 
 	requireMAC := func(w http.ResponseWriter, r *http.Request) (string, bool) {
-		mac := r.URL.Query().Get("mac")
-		if mac == "" {
-			mac = r.FormValue("mac")
+		raw := r.URL.Query().Get("mac")
+		if raw == "" {
+			raw = r.FormValue("mac")
 		}
-		if mac == "" {
+		if raw == "" {
 			http.Error(w, "missing mac", http.StatusBadRequest)
 			return "", false
 		}
-		if !validMAC.MatchString(mac) {
+		mac, ok := canonicalMAC(raw)
+		if !ok {
 			http.Error(w, "invalid mac", http.StatusBadRequest)
 			return "", false
 		}

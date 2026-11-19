@@ -182,13 +182,21 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 			}
 		}
 
-		// Resolve the existing row: MAC first (physical identity),
-		// name second (MAC-less rows, virtual interfaces, or a MAC
-		// row another NIC already claimed — duplicate MACs happen on
-		// bonded/virtual NICs). A row already claimed by an earlier
-		// NIC counts as no-match at BOTH stages, so the fallback can
-		// still adopt a name row instead of POSTing into NetBox's
-		// device+name uniqueness constraint.
+		// Resolve the existing row: an exact name+MAC match first,
+		// then MAC alone (physical identity), then name alone (MAC-less
+		// rows, virtual interfaces, or a MAC row another NIC already
+		// claimed — duplicate MACs happen on bonded/virtual NICs). A
+		// row already claimed by an earlier NIC counts as no-match at
+		// every stage, so the fallback can still adopt a name row
+		// instead of POSTing into NetBox's device+name uniqueness
+		// constraint.
+		//
+		// The exact match must come first because byMAC holds only one
+		// row per MAC. Once two same-MAC NICs have been reconciled,
+		// NetBox has a row for each carrying that MAC; a MAC-first
+		// lookup could hand NIC eth0 the eth1 row, and the rename
+		// below would then refuse eth0's own MAC-bearing row as a
+		// squatter, failing every later commission of the host.
 		//
 		// A mgmt_only NIC never participates in this ordinary matching
 		// at all: its only legitimate match is the idempotency check
@@ -206,9 +214,15 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 		var match Interface
 		var ok bool
 		if !nic.MgmtOnly {
-			match, ok = byMAC[strings.ToLower(nic.MAC)]
-			if ok && consumed[match.ID] {
-				ok = false
+			if row, exists := byName[nic.Name]; exists && !consumed[row.ID] &&
+				nic.MAC != "" && strings.EqualFold(row.GetMAC(), nic.MAC) {
+				match, ok = row, true
+			}
+			if !ok {
+				match, ok = byMAC[strings.ToLower(nic.MAC)]
+				if ok && consumed[match.ID] {
+					ok = false
+				}
 			}
 			if !ok || nic.MAC == "" {
 				match, ok = byName[nic.Name]

@@ -280,6 +280,7 @@ func TestAuthoritativeSerial(t *testing.T) {
 		{"chassis fallback when system junk", "Default string", "CH119KN44BP0A95", "CH119KN44BP0A95"},
 		{"chassis fallback when system empty", "", "CSN-1", "CSN-1"},
 		{"both junk yields empty", "To Be Filled By O.E.M.", "0", ""},
+		{"unprogrammed supermicro serials yield empty", "0123456789", "0123456789", ""},
 		{"both empty yields empty", "", "", ""},
 	}
 	for _, tc := range cases {
