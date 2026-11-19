@@ -501,6 +501,13 @@ field (password/secret/key/token) anywhere under `OpParams` that lacks it.
   if it is down. Nothing reads credentials from a terminal op: a retry is
   a new op that resolves credentials afresh.
 
+Both mechanisms find a credential by its exact key, while `encoding/json`
+matches a key to a field ignoring letter case. So `model.DecodeParams`
+refuses params that spell a key on a credential path, or a transport key
+(`pdu_runtime`, `amt_runtime`), in any other case: the worker fails such an
+op rather than use a credential that operators would see and the table
+would keep.
+
 Residual exposure: an active op holds its credentials in the
 `operations` table (and in each worker's op layer and `worker.db`) for as
 long as it runs; a pending op can sit for `PendingOpTimeout` (24h).
