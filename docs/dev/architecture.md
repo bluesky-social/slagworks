@@ -980,13 +980,13 @@ passive carrier.
 
 `internal/configscript`:
 
-- `Script` (`configscript.go:19`) — `Path`, `Priority`, `Rules
+- `Script` (`configscript.go:20`) — `Path`, `Priority`, `Rules
   []MatchRule`, `Content`.
-- `Parse(path, content, validFields)` (line 38) — reads header
-  directives `# slagworks:match <field> <regex>` and
+- `Parse(path, content, validFields)` (line 45) — reads header
+  directives `# slagworks:match <field>=<value>` and
   `# slagworks:priority <int>` from the leading comment block.
-  Rejects unknown fields.
-- `Match(scripts, resolve)` (line 106) — resolves each field via a
+  Rejects unknown fields and any other `slagworks:` directive.
+- `Match(scripts, resolve)` (line 123) — resolves each field via a
   callback and picks the highest-priority script whose rules all
   match.
 
