@@ -558,14 +558,46 @@ func (r *propRun) afterComplete(ctx context.Context, i int, st propStep, vm *qem
 	if _, err := r.env.Hub.WaitForObservation(ctx, r.slug, "deploy_complete", machine.ID); err != nil {
 		r.failf(i, "no deploy_complete observation: %v", err)
 	}
-	booted := false
-	for deadline := time.Now().Add(propBootBudget); time.Now().Before(deadline); {
-		if _, err := r.env.Hub.WaitForObservation(ctx, r.slug, "phone_home", machine.ID); err == nil {
-			booted = true
-			break
+	// Wait for the phone-home, but stop at once when the console shows the
+	// machine has nowhere left to go.
+	phoned := make(chan bool, 1)
+	waitCtx, stopWait := context.WithCancel(ctx)
+	defer stopWait()
+	go func() {
+		for deadline := time.Now().Add(propBootBudget); time.Now().Before(deadline) && waitCtx.Err() == nil; {
+			if _, err := r.env.Hub.WaitForObservation(waitCtx, r.slug, "phone_home", machine.ID); err == nil {
+				phoned <- true
+				return
+			}
+		}
+		phoned <- false
+	}()
+	booted, dead := false, ""
+	cursor := 0
+wait:
+	for {
+		select {
+		case booted = <-phoned:
+			break wait
+		case <-time.After(time.Second):
+		}
+		lines := vm.Serial.Lines()
+		for ; cursor < len(lines); cursor++ {
+			for _, marker := range []string{"grub rescue>", "PXE boot failed after", "No bootable device.", "Dropping to a shell!"} {
+				if strings.Contains(lines[cursor], marker) {
+					dead = marker
+				}
+			}
+		}
+		if dead != "" {
+			break wait
 		}
 	}
+	stopWait()
 	if !booted {
+		if dead != "" {
+			t.Logf("PROPDEAD %s step=%d the first boot ended at %q", r.c.Name, i, dead)
+		}
 		t.Logf("PROPSERIAL %s step=%d tail:\n%s", r.c.Name, i, propSerialTail(vm, 120))
 		_ = vm.QMP.Quit()
 		return "noboot"

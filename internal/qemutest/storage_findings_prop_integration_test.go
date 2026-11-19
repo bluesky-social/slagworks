@@ -97,6 +97,17 @@ func propFindingCases() []propCase {
 			},
 		},
 
+		// 7. With a top-level mount besides "/", the agent's unmount order
+		// puts the root level with it; when the root goes first it fails
+		// busy and the machine reboots with the root filesystem mounted.
+		// With four such mounts the root is last only one time in five.
+		// On BIOS, GRUB cannot read what the journal still holds.
+		// Standalone: internal/agent/storageapply
+		// TestCleanupMounts_LeavesNothingMounted.
+		propTopMountsCase("bios-topmounts-xfs", "bios", "xfs"),
+		propTopMountsCase("bios-topmounts-ext4", "bios", "ext4"),
+		propTopMountsCase("uefi-topmounts-ext4", "uefi", "ext4"),
+
 		// 6. A root partition with a fixed size and free space after it is
 		// grown to the end of the disk by cloud-init on first boot.
 		{
@@ -109,6 +120,25 @@ func propFindingCases() []propCase {
 				}},
 			}},
 		},
+	}
+}
+
+func propTopMountsCase(name, firmware, rootFS string) propCase {
+	parts := []propPart{{Size: "1M", BIOSGrub: true}}
+	if firmware == "uefi" {
+		parts = append(parts, propPart{Size: "512M", FS: "vfat", ESP: true, Mount: "/boot/efi"})
+	}
+	parts = append(parts, propPart{Size: "5G", FS: rootFS, Mount: "/"})
+	for _, mp := range []string{"/data", "/srv", "/opt", "/home"} {
+		parts = append(parts, propPart{Size: "256M", FS: "ext4", Mount: mp})
+	}
+	return propCase{
+		Name: name, Firmware: firmware,
+		Disks: []propDisk{propD("d0", "virtio", 10, 0, 512, "")},
+		Steps: []propStep{{
+			Attach: []string{"d0"}, Expect: "ok", Why: "blank disk",
+			Layout: propLayout{Disks: []propDiskLayout{{Disk: "d0", Parts: parts}}},
+		}},
 	}
 }
 

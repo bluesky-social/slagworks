@@ -463,7 +463,7 @@ func (g *propGen) apply(st propStep) {
 		return
 	}
 	// certain: the storage commands ran to completion.
-	certain := st.Expect == "ok" || st.Expect == "fatal_at"
+	certain := st.Expect == "ok" || st.Expect == "fatal_at" || st.Expect == "ok|noboot"
 	target := map[string]bool{}
 	for _, dl := range st.Layout.Disks {
 		target[dl.Disk] = true
@@ -768,6 +768,15 @@ func propGenCase(seed int64) propCase {
 		}
 		st.Expect, st.Why = g.predict(st)
 		st.Hazard = g.hazard(st)
+		// Known finding: with a top-level mount besides "/", the agent may
+		// try to unmount the root first, fail, and reboot with it mounted
+		// (TestStoragePropFindings/bios-topmounts-*). On BIOS, GRUB then
+		// reads a filesystem whose journal was never replayed and may not
+		// find its own modules, so the outcome is open.
+		if bios && st.Expect == "ok" && propHasTopLevelMount(st.Layout) {
+			st.Expect = "ok|noboot"
+			st.Why = "valid layout, but the root may be left mounted at reboot (known finding)"
+		}
 		// A second boot goes PXE, then the boot-local script, which on UEFI
 		// tries the firmware's first two disks and boots whatever ESP it
 		// finds there, stale or not (two known findings, see
@@ -788,6 +797,25 @@ func propGenCase(seed int64) propCase {
 		prev = &lay
 	}
 	return c
+}
+
+// propHasTopLevelMount reports whether the layout mounts anything directly
+// under the root, such as /data.
+func propHasTopLevelMount(l propLayout) bool {
+	top := func(mp string) bool { return mp != "" && mp != "/" && strings.Count(mp, "/") == 1 }
+	for _, dl := range l.Disks {
+		for _, p := range dl.Parts {
+			if top(p.Mount) {
+				return true
+			}
+		}
+	}
+	for _, a := range l.Arrays {
+		if top(a.Mount) {
+			return true
+		}
+	}
+	return false
 }
 
 // propPlanLen is the number of storage commands a layout plans, counted from

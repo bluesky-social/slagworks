@@ -290,6 +290,8 @@ echo "@@@ df"; df -B1 --output=source,size,used,target /
 echo "@@@ efi"; efibootmgr 2>&1 | head -40
 echo "@@@ growth"
 grep -h -i -E "growpart|resizefs|resize2fs|xfs_growfs" /var/log/cloud-init.log /var/log/cloud-init-output.log 2>/dev/null | tail -12
+echo "@@@ kmsg"
+dmesg | grep -i -E "recovery|unclean|not clean|has not been unmounted" | head -20
 echo "@@@ unitlogs"
 for u in $(systemctl --failed --no-legend --plain | awk '{print $1}'); do
   journalctl -b -u "$u" --no-pager -n 12 2>&1
@@ -833,6 +835,16 @@ func propCheckTree(c propCase, st propStep, ins *propInspect) *propTreeReport {
 		}
 		if sigs := ins.Sigs[dk]; len(sigs) != 0 {
 			rep.hard("bystander %s (%s) still carries %v after --wipe-all-disks", id, dk, sigs)
+		}
+	}
+
+	// The agent unmounts every filesystem it wrote before it reboots, so the
+	// first boot must not find one in need of journal recovery. (Known
+	// finding: it can leave the root mounted; see the uefi-root-left-mounted
+	// case.)
+	for _, line := range strings.Split(ins.Sections["kmsg"], "\n") {
+		if strings.Contains(line, "recovery complete") || strings.Contains(line, "Starting recovery") {
+			rep.known("unclean-root: the first boot replayed a journal: %s", strings.TrimSpace(line))
 		}
 	}
 
