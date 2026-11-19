@@ -208,19 +208,38 @@ func WipeBystanderDisks(ctx *agent.Context, layout storage.Layout) error {
 // whole disks NOT referenced by the layout. Enumeration failures are
 // errors: if we can't list disks we can't honor --wipe-all-disks, and
 // silently wiping nothing would let the stale-md bug class through.
+//
+// The disks holding preserve members come from the kernel (memberDisks),
+// not from the member names, because a member may be spelled as a
+// /dev/disk/by-* path or with a driver's own partition naming. A member
+// the kernel cannot place is an error and nothing is wiped: guessing wrong
+// here destroys the data the layout preserves. PreflightPreserve has already
+// assembled the array from these same members, so they exist.
 func bystanderDisks(ctx *agent.Context, layout storage.Layout) ([]string, error) {
 	out, err := ctx.Exec.Output("lsblk", "-dnlo", "NAME,TYPE")
 	if err != nil {
 		return nil, fmt.Errorf("wipe-all-disks: lsblk: %w", err)
 	}
-	return parseBystanderDisks(out, layout), nil
+	claimed := layoutClaimedDisks(layout)
+	for _, name := range preserveDeviceNames(layout) {
+		for _, member := range layout.Devices[name].Members {
+			disks, err := memberDisks(ctx, member)
+			if err != nil {
+				return nil, fmt.Errorf("wipe-all-disks: cannot tell which disk holds preserve %q member %q: %w; "+
+					"refusing to wipe any disk", name, member, err)
+			}
+			for _, disk := range disks {
+				claimed[disk] = true
+			}
+		}
+	}
+	return parseBystanderDisks(out, claimed), nil
 }
 
 // parseBystanderDisks is the testable selector behind bystanderDisks:
-// given `lsblk -dnlo NAME,TYPE` output, return every whole disk the
-// layout does not claim.
-func parseBystanderDisks(lsblkOut string, layout storage.Layout) []string {
-	claimed := layoutClaimedDisks(layout)
+// given `lsblk -dnlo NAME,TYPE` output, return every whole disk not in
+// claimed.
+func parseBystanderDisks(lsblkOut string, claimed map[string]bool) []string {
 	var disks []string
 	for line := range strings.SplitSeq(lsblkOut, "\n") {
 		fields := strings.Fields(line)
@@ -229,7 +248,7 @@ func parseBystanderDisks(lsblkOut string, layout storage.Layout) []string {
 		}
 		name := fields[0]
 		if claimed[name] {
-			continue // layout target or raid/preserve member's parent disk
+			continue // layout target, raid member's parent disk, or holds a preserve member
 		}
 		disks = append(disks, name)
 	}
@@ -237,10 +256,12 @@ func parseBystanderDisks(lsblkOut string, layout storage.Layout) []string {
 }
 
 // layoutClaimedDisks returns the set of every whole-disk kernel name (bare,
-// no "/dev/" prefix) claimed by ANY device in the layout: a disk or retained
-// disk's own name, or the parent whole disk of every raid/preserve member.
-// This is the exclusion set for --wipe-all-disks. Retained disks and preserve
-// members are protected data; raid members are about to be (re)assembled.
+// no "/dev/" prefix) the layout claims by name: a disk or retained disk's own
+// name, or the parent whole disk of every raid member. With the disks
+// bystanderDisks adds for preserve members, this is the exclusion set for
+// --wipe-all-disks. Retained disks are protected data; raid members are
+// about to be (re)assembled. Raid members are layout names (validate requires
+// it) and may not exist yet, so they are parsed rather than looked up.
 func layoutClaimedDisks(layout storage.Layout) map[string]bool {
 	claimed := make(map[string]bool, len(layout.Devices))
 	for name, dev := range layout.Devices {
@@ -249,7 +270,7 @@ func layoutClaimedDisks(layout storage.Layout) map[string]bool {
 		}
 	}
 	for _, dev := range layout.Devices {
-		if dev.Type != "raid" && dev.Type != "preserve" {
+		if dev.Type != "raid" {
 			continue
 		}
 		for _, member := range dev.Members {
@@ -289,7 +310,9 @@ var partitionSuffix = regexp.MustCompile(`^(` + wholeDiskFamilies + `)p\d+$`)
 var bareDigitSuffix = regexp.MustCompile(`^([A-Za-z]+)\d+$`)
 
 // parentDisk returns the whole-disk kernel name that owns member, which may
-// already be a whole disk (returned unchanged) or a partition of one. It
+// already be a whole disk (returned unchanged) or a partition of one. It is
+// for raid members, which are layout names; preserve members name existing
+// devices and are resolved by the kernel instead (memberDisks). It
 // inverts internal/storage/plan.go's partName across three checks, in
 // order: (1) a name matching one of the nvme/mmcblk/loop/dm/md whole-disk
 // shapes is returned unchanged (nvme0n1, mmcblk0, loop0, dm-0, md0 are
