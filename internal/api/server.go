@@ -1280,6 +1280,9 @@ func (s *Server) abortMachine(c *echo.Context) error {
 	if durable {
 		s.invalidateAllSites()
 	}
+	if errors.Is(err, store.ErrMachineNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "machine not found")
+	}
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
