@@ -23,8 +23,9 @@ import (
 //   - the spine matches an independent reference model of the documented
 //     phase contract (lifecycle.go and model.go's terminal handling), with at
 //     most one spinning phase and no reached phase behind a pending one
-//   - once the op is terminal nothing spins, and a completed op shows every
-//     phase done or skipped
+//   - once the op is terminal the screen is final: nothing spins, a late
+//     phase or a second terminal changes neither the spine nor the frozen
+//     total and cause, and a completed op shows every phase done or skipped
 //   - only the watched op's envelopes (or envelopes with no op id) move the
 //     spine, set the worker or end the watch; another op's are log lines
 //   - every distinct log envelope is one log pane row, and no row carries a
@@ -270,6 +271,10 @@ func TestModel_Property_WatchReducer(t *testing.T) {
 		var nextID int64
 		var lastLogMsg tea.Msg
 		logIDs := map[int64]bool{}
+		// The first terminal signal fixes the final screen's total and cause.
+		var terminalSeen bool
+		var finalEnd time.Time
+		var finalReason string
 		for i, op := range ops {
 			clock = clock.Add(op.dt)
 			ts := clock.Add(op.tsSkew)
@@ -279,12 +284,6 @@ func TestModel_Property_WatchReducer(t *testing.T) {
 				opID = other
 			case op.noOpID:
 				opID = uuid.Nil
-			}
-			// Known defect, excluded until fixed: on a held failure screen, a
-			// phase envelope for the watched op resumes a spinner and re-marks
-			// the runway, because Observe has no terminal guard.
-			if op.kind == "phase" && !op.other && m.done && m.failed {
-				op.kind = "tick"
 			}
 			var msg tea.Msg
 			switch op.kind {
@@ -368,6 +367,13 @@ func TestModel_Property_WatchReducer(t *testing.T) {
 			}
 			if n := len(m.logs.Lines()); n != min(len(logIDs), logRingCap) {
 				t.Fatalf("step %d %v: log pane has %d lines, %d distinct envelopes delivered", i, op, n, len(logIDs))
+			}
+			switch {
+			case m.done && !terminalSeen:
+				terminalSeen, finalEnd, finalReason = true, m.endTime, m.failReason
+			case terminalSeen && (!m.endTime.Equal(finalEnd) || m.failReason != finalReason):
+				t.Fatalf("step %d %v: final screen rewritten after the terminal: end %v -> %v, reason %q -> %q",
+					i, op, finalEnd, m.endTime, finalReason, m.failReason)
 			}
 		}
 		// The run result agrees with the op's status iff a terminal for the
