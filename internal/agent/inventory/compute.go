@@ -115,7 +115,7 @@ func collectMemory(r agent.Runner) *MemoryInfo {
 		if k, v, ok := strings.Cut(line, ": "); ok {
 			switch strings.TrimSpace(k) {
 			case "Size":
-				fmt.Sscanf(v, "%d", &currentDIMM.SizeMB)
+				currentDIMM.SizeMB = parseDMISizeMB(v)
 			case "Locator":
 				currentDIMM.Locator = v
 			case "Type":
@@ -136,6 +136,30 @@ func collectMemory(r agent.Runner) *MemoryInfo {
 	}
 
 	return info
+}
+
+// parseDMISizeMB converts a dmidecode Type 17 "Size" value to MiB. dmidecode
+// prints the size in the largest binary unit that keeps it an integer
+// ("32 GB", "1536 MB", "1 TB", "2048 kB"), so the unit token decides the
+// scale. "No Module Installed", "Unknown" and any other unit return 0, which
+// leaves the slot out of the inventory.
+func parseDMISizeMB(v string) int {
+	var n int
+	var unit string
+	if _, err := fmt.Sscanf(v, "%d %s", &n, &unit); err != nil {
+		return 0
+	}
+	switch unit {
+	case "kB":
+		return n >> 10
+	case "MB":
+		return n
+	case "GB":
+		return n << 10
+	case "TB":
+		return n << 20
+	}
+	return 0
 }
 
 func collectPSUs(r agent.Runner) []PSUInfo {

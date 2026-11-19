@@ -365,7 +365,7 @@ func TestRegistryB1InterleavingImpossible(t *testing.T) {
 		time.Sleep(10 * time.Millisecond) // widen any would-be overlap window
 
 		mu.Lock()
-		seq++ // stands in for BumpSiteSnapshotMeta's plain increment
+		seq++ // stands in for BumpSiteSnapshotMeta's sequence draw
 		s := seq
 		seqs = append(seqs, s)
 		inFlight--

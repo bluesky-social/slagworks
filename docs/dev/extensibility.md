@@ -289,11 +289,15 @@ should say what is wrong in the NetBox model and what to change.
 ### Relay-pool generation
 
 `internal/snapshot/netplan.go` generates a `[]RelayPool` from the
-NetBox interfaces of DHCP-served hosts: any `/31` on a physical
-interface becomes a single-address relay pool. Only host-side `/31`s
-show up (leaves have no machine row), and the pool subnet is the
-`/31` itself so duplicates collapse by construction
-(`netplan.go:55-93`).
+NetBox interfaces of every device in the site's scope: any `/31` on a
+physical interface becomes a single-address relay pool. The pool
+subnet is the `/31` itself, so when a leaf is modeled in the same site
+its end of the link collapses into the host's pool; with both ends
+present the higher address is taken as the host side. Pools are sorted
+by subnet so the snapshot hash does not depend on NetBox's list order
+(`netplan.go:45-105`). The site worker derives both ends of a `/31`
+pool from the relayed packet's giaddr, so the recorded host side never
+changes a DHCP answer.
 
 ### Test expectation
 

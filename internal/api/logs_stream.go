@@ -23,9 +23,15 @@ type LogStreamStore interface {
 	Query(ctx context.Context, filter logstore.QueryFilter) ([]logstore.Result, error)
 }
 
-// liveTailWatermark is the lag the live-tail query applies past
+// liveTailWatermark is the lag every stream query applies past
 // global_received_at to defend against pg sequence-id-allocated-pre-
-// commit reordering.
+// commit reordering: a transaction can hold a lower id while a later
+// writer commits a higher one, and a query that returned the higher id
+// would move the cursor past the lower id for good. Backfill pages need
+// it as much as live polls, since a backfill page also reads up to the
+// newest committed row. global_received_at is the writer's transaction
+// start time, so a transaction held open longer than the watermark can
+// still be overtaken.
 const liveTailWatermark = 500 * time.Millisecond
 
 // pollInterval bounds how often live-tail polls pg between hits.
@@ -48,7 +54,9 @@ func acceptOperatorStream(c *echo.Context) (*websocket.Conn, error) {
 // client sends one ws.LogStreamSubscribeMsg, the server replies with
 // backfill (filtered by the subscribe message) and then live-tails
 // new envelopes. Cursor is the log_envelopes.id BIGSERIAL; clients
-// resume past disconnect with last_seen_id.
+// resume past disconnect with last_seen_id. Every query, backfill
+// included, holds back rows received in the last liveTailWatermark, so
+// those arrive on a later poll rather than in the first page.
 func (s *Server) handleLogsStream(c *echo.Context) error {
 	if s.logStore == nil {
 		return echo.NewHTTPError(http.StatusServiceUnavailable, "log stream not available")
@@ -96,6 +104,7 @@ func (s *Server) handleLogsStream(c *echo.Context) error {
 
 	cursor := sub.LastSeenID
 	pageSize := 500
+	filter.LiveTailWatermark = liveTailWatermark
 
 	for {
 		if ctx.Err() != nil {
@@ -104,22 +113,17 @@ func (s *Server) handleLogsStream(c *echo.Context) error {
 		filter.LastSeenID = cursor
 		filter.Limit = pageSize
 
-		// Once we've consumed the backlog (i.e. observed an empty
-		// page), apply the watermark for subsequent live polls.
-		// Backfill from --since reads committed history that's
-		// already past any reordering window; only live-tail past
-		// the cursor needs the lag. The live tail also stops bounding
-		// since on the emitter's ts alone: the cursor already bounds
-		// what is new, and a line from an emitter whose clock runs
-		// behind must stream once global has received it.
 		results, err := s.logStore.Query(ctx, filter)
 		if err != nil {
 			writeErr(ctx, conn, "query_error", err.Error())
 			return nil
 		}
 		if len(results) == 0 {
-			// Switch to live tail and sleep before the next poll.
-			filter.LiveTailWatermark = liveTailWatermark
+			// The backlog is consumed: switch to the live tail and sleep
+			// before the next poll. The live tail stops bounding since
+			// on the emitter's ts alone: the cursor already bounds what
+			// is new, and a line from an emitter whose clock runs behind
+			// must stream once global has received it.
 			filter.SinceOrReceived = true
 			select {
 			case <-ctx.Done():

@@ -586,14 +586,22 @@ func errorPaneBody(in frameInput, innerW, rows int) []string {
 // error pane. The full text is in the operation's result.
 const causeOmittedMarker = "[... lines omitted; full error: slagctl operation show <op-id>]"
 
-// wrapLines splits s on newlines and hard-wraps each line to w terminal cells
-// (cell-aware, so wide characters in a script's stderr cannot overflow the
-// row budget). Empty s yields no lines; w < 1 disables wrapping.
+// lineBreaks folds every line ending control-plane text can carry to "\n":
+// CRLF, and the bare CR that progress output (curl, dd status=progress) uses
+// to redraw a line. The frame splits rows on "\n" only, and the terminal
+// returns to column 0 on a CR, so a CR left in a row draws the rest of the
+// row over the box's left border.
+var lineBreaks = strings.NewReplacer("\r\n", "\n", "\r", "\n")
+
+// wrapLines splits s on line breaks (LF, CRLF or a bare CR) and hard-wraps
+// each line to w terminal cells (cell-aware, so wide characters in a script's
+// stderr cannot overflow the row budget). Empty s yields no lines; w < 1
+// disables wrapping.
 func wrapLines(s string, w int) []string {
 	if s == "" {
 		return nil
 	}
-	return strings.Split(ansi.Hardwrap(strings.TrimRight(s, "\n"), w, true), "\n")
+	return strings.Split(ansi.Hardwrap(strings.TrimRight(lineBreaks.Replace(s), "\n"), w, true), "\n")
 }
 
 // clampWidth truncates a line to w display cells (rune count; log lines are
