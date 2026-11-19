@@ -149,9 +149,10 @@ Secrets Manager region is fixed at `us-east-2`
 
 If the SDK configuration cannot be loaded, global logs a warning and runs
 without a secret store: operations that need a BMC credential are refused
-at creation and `slagctl machine creds` returns 503. If the configuration
-loads but no credentials are available, the same operations fail when
-global first tries to read a secret.
+at creation, PDU and AMT operations (including `slagctl power outlet`) are
+created without a credential, and `slagctl machine creds` returns 503. If
+the configuration loads but no credentials are available, the same
+operations fail when global first tries to read a secret.
 
 ## `slagworksd site`
 
@@ -358,7 +359,11 @@ Fields:
   `{"subnet","range_start","range_end","gateway"}`. The subnet must be an
   IPv4 CIDR in dotted-quad form (`10.254.27.0/24`, not IPv6 or
   IPv4-mapped notation such as `::ffff:10.254.27.0/120`); the range and
-  gateway must be IPv4 inside the subnet.
+  gateway must be IPv4 inside the subnet, and the gateway must lie outside
+  the range. On a subnet of /30 or wider the range must also exclude the
+  network and broadcast addresses. The worker leases every address in
+  the range and cannot ARP-probe a relayed subnet, so an address left in
+  the range by mistake is handed to a client.
 - **`promiscuous`** — when `true`, the fabric DHCP server answers MACs it
   does not know and TFTP stops requiring a lease. Default `false`.
 - **`last_snapshot_seq`**, **`last_snapshot_hash`**, **`created_at`** —

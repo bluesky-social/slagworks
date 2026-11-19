@@ -323,7 +323,10 @@ minutes:
 3. Tail the envelope stream with `--op <id> -f` to see live activity.
 4. If truly wedged, `slagctl machine abort <machine>` cancels active
    operations for the machine and resets its state. This does not
-   power the host off; follow with `machine power off` if needed.
+   power the host off; follow with `machine power off` if needed. An
+   agent still running on the host stops within a few seconds of the
+   abort and waits in the recovery environment (serial console:
+   `agent exited with code 3`).
 
 ## SOL session-slot exhaustion
 
