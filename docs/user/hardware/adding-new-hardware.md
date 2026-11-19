@@ -201,8 +201,10 @@ slagctl storage-script delete <id>
 ```
 
 The API parses the script through `storage.ParseScript` at upload time, so a
-typo in a match field name, a bad regex, or a lingering `slagworks:kernel_params`
-header fails loudly rather than silently never matching.
+typo in a match field name, a bad regex, a misspelled directive
+(`slagworks:mtach`, `slagworks:match:`), or a lingering `slagworks:kernel_params`
+header fails the upload instead of silently changing which hosts the script
+matches.
 
 ### Hardware-allowlist census
 
