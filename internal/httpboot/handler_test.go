@@ -1472,6 +1472,48 @@ func TestReportEndpointRejectsMachineOperationMismatch(t *testing.T) {
 	}
 }
 
+// TestReportEndpoint_OperationOverIsGone pins the status the agent's stop
+// decision rests on. A report for an operation that is over (here: failed,
+// as an operator abort leaves it) is answered 410 Gone, which no other
+// rejection uses: a real-hardware abort did not stop the installer because
+// every refused report got the same 409, which the agent ignores on its
+// best-effort reports.
+func TestReportEndpoint_OperationOverIsGone(t *testing.T) {
+	p := newTestProvider()
+	machineID, opID := uuid.New(), uuid.New()
+	p.Register("52:54:00:aa:bb:01", machineID)
+	p.SetDeployOp(machineID, &model.Operation{
+		ID: opID, MachineID: machineID, Type: model.OpDeploy, Status: model.OpRunning,
+	})
+	mux := NewServer(":0", ServerConfig{Provider: p}).buildMux()
+	post := func(report model.ProgressReport) *httptest.ResponseRecorder {
+		t.Helper()
+		body, err := json.Marshal(report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/report", strings.NewReader(string(body))))
+		return w
+	}
+	phase := model.ProgressReport{OperationID: opID.String(), MachineID: machineID.String(), Phase: "finalizing"}
+
+	if w := post(phase); w.Code != http.StatusOK {
+		t.Fatalf("report for the active operation returned %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	p.SetDeployOp(machineID, &model.Operation{
+		ID: opID, MachineID: machineID, Type: model.OpDeploy, Status: model.OpFailed,
+	})
+	if w := post(phase); w.Code != http.StatusGone {
+		t.Fatalf("report for an operation that is over returned %d, want 410: %s", w.Code, w.Body.String())
+	}
+	// The empty report is the agent's liveness check; it gets the same answer.
+	if w := post(model.ProgressReport{OperationID: opID.String(), MachineID: machineID.String()}); w.Code != http.StatusGone {
+		t.Fatalf("liveness report for an operation that is over returned %d, want 410: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestPhoneHomeEndpoint_MarksVerified(t *testing.T) {
 	p := newTestProvider()
 	mac := "52:54:00:aa:bb:01"

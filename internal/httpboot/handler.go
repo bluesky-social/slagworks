@@ -936,6 +936,21 @@ func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `{"status":"accepted"}`)
 }
 
+// reportRejectionStatus picks the status for a report the provider refused.
+// 410 Gone is the final answer: the report's operation is over (aborted,
+// failed, timed out or completed), and the agent stops on it instead of
+// carrying on with an install nobody is waiting for. Every other rejection
+// is 409 Conflict, which the agent treats as it always has: a best-effort
+// report is dropped and a final report is retried. The two must not be
+// merged, because 409 also covers a worker that restarted and has not
+// resynchronized its operations yet, where the operation may be healthy.
+func reportRejectionStatus(err error) int {
+	if errors.Is(err, model.ErrOperationNotActive) {
+		return http.StatusGone
+	}
+	return http.StatusConflict
+}
+
 func (s *Server) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
@@ -996,7 +1011,7 @@ func (s *Server) buildMux() *http.ServeMux {
 			handler.log.Warn("rejecting unbound agent report",
 				"machine_id", report.MachineID, "op_id", report.OperationID,
 				"event", report.Event, "err", err)
-			http.Error(w, err.Error(), http.StatusConflict)
+			http.Error(w, err.Error(), reportRejectionStatus(err))
 			return
 		}
 		w.WriteHeader(http.StatusOK)

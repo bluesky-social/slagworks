@@ -104,6 +104,16 @@ HTTP-boot server (see [Boot handlers](#boot-handlers)). The final
 phone-home is done by a systemd unit written by the agent
 (`generatePhoneHomeUnit`, `main.go:1484`), not by the agent itself.
 
+The report endpoint is also how an agent learns its operation is over.
+`POST /api/v1/report` answers 410 Gone for an operation the site worker
+knows has ended (aborted, failed, timed out, completed) and 409 Conflict
+for every other rejection. The agent's flush loop reports every 5
+seconds even with nothing to send, and the first 410 on any report
+halts the run: running commands are killed, nothing further is started,
+and the agent exits 3 so the boot hook holds the host in recovery
+instead of rebooting it. The state-machine doc has the contract
+([What an abort does on the host](state-machine.md#what-an-abort-does-on-the-host)).
+
 ### `slagctl`
 
 The operator CLI. Entry `cmd/slagctl/main.go:16`; root wiring in
@@ -568,7 +578,10 @@ service POSTs `/api/v1/phone-home`):
 - `RecordDeployComplete` (382), `RecordPhoneHome` (404),
   `RecordCommissionReport` (434), `RecordInventoryReport` (446).
 - `HandleProgressReport` — the entry point for `/api/v1/report`; sets
-  op phase, or marks the op failed on `report.Failed`.
+  op phase, or marks the op failed on `report.Failed`. A report for an
+  op the worker knows is over is refused with
+  `model.ErrOperationNotActive`, which the endpoint answers with 410
+  and the agent stops on; any other refusal is a 409.
 - `UpdateOpPhase` (1321) — the phase-write helper with the
   `awaiting_phone_home` clobber guard (documented in the
   state-machine doc).
