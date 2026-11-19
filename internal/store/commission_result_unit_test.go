@@ -65,3 +65,44 @@ func TestJSONSemanticallyEqualPreservesLargeIntegers(t *testing.T) {
 		t.Fatal("distinct large JSON integers compared equal")
 	}
 }
+
+// Numbers compare by exact value, not by spelling: jsonb re-spells numbers,
+// so the stored copy of a report may spell the same value differently from
+// a byte-identical redelivery.
+func TestJSONSemanticallyEqualComparesNumbersByValue(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{`1e3`, `1000`, true},
+		{`1E+3`, `1000`, true},
+		{`1e-3`, `0.001`, true},
+		{`10.0e-1`, `1`, true},
+		{`1.50`, `1.5`, true},
+		{`1.0`, `1`, true},
+		{`-0`, `0`, true},
+		{`-0.0e5`, `0`, true},
+		{`1e-7`, `0.0000001`, true},
+		{`1e+21`, `1000000000000000000000`, true},
+		{`-2.5e2`, `-250`, true},
+		{`{"a":[1e3,{"b":1e-3}]}`, `{"a":[1000,{"b":0.001}]}`, true},
+		// An exponent beyond 32 bits is compared by spelling; Postgres
+		// numeric cannot store one, so it never comes from the store.
+		{`1e9999999999`, `1e9999999999`, true},
+
+		{`1000`, `1001`, false},
+		{`1e3`, `1e4`, false},
+		{`0.1`, `0.01`, false},
+		{`10`, `1`, false},
+		{`1`, `-1`, false},
+		{`1e3`, `"1000"`, false},
+		{`{"a":[1e3]}`, `{"a":[1001]}`, false},
+	} {
+		if got := jsonSemanticallyEqual([]byte(tc.a), []byte(tc.b)); got != tc.want {
+			t.Errorf("jsonSemanticallyEqual(%s, %s) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+		if got := jsonSemanticallyEqual([]byte(tc.b), []byte(tc.a)); got != tc.want {
+			t.Errorf("jsonSemanticallyEqual(%s, %s) = %v, want %v", tc.b, tc.a, got, tc.want)
+		}
+	}
+}
