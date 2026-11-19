@@ -329,16 +329,22 @@ func (r *timeReconciler) reconcileTimezone(ctx context.Context, fam bmcFamily, m
 
 // step sets a wrong BMC clock: NTP off, Set SEL Time, NTP back on with the
 // desired servers (so a non-compliant NTP config is fixed by the same
-// write). NTP is re-enabled, and read back, whenever this disabled it,
-// even if the step failed or ctx ended, because a BMC left with NTP off is
-// worse than a failed step. Returns the failures.
+// write). NTP is re-enabled, and read back, whenever this may have
+// disabled it, even if the step failed or ctx ended, because a BMC left
+// with NTP off is worse than a failed step. A disable that got no response
+// may have applied, so it counts (re-enabling NTP that is on is harmless)
+// and is waited for like an accepted one, but only an accepted one is
+// followed by the clock step. Returns the failures.
 func (r *timeReconciler) step(ctx context.Context, fam bmcFamily, npPath, mgrPath string, servers, desired []string, ntpOK bool, res *TimeResult) []string {
 	var errs []string
-	disabled := false
+	var mayBeDisabled bool
 	if task, err := r.rf.patch(ctx, npPath, ntpBody(false, nil)); err != nil {
 		errs = append(errs, "disable NTP for the clock step: "+err.Error())
+		if mayBeDisabled = mayHaveApplied(err); mayBeDisabled {
+			_ = r.waitNTPDisabled(ctx, npPath, "")
+		}
 	} else {
-		disabled = true
+		mayBeDisabled = true
 		if err := r.waitNTPDisabled(ctx, npPath, task); err != nil {
 			errs = append(errs, "disable NTP for the clock step: the BMC accepted it but its "+err.Error()+"; stepped anyway")
 		}
@@ -348,7 +354,7 @@ func (r *timeReconciler) step(ctx context.Context, fam bmcFamily, npPath, mgrPat
 			res.ClockStepped = true
 		}
 	}
-	if disabled || !ntpOK {
+	if mayBeDisabled || !ntpOK {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reenableTimeout+2*r.settleTimeout)
 		task, err := r.rf.patch(rctx, npPath, ntpBody(true, desired))
 		var last *redfishNTP
@@ -356,11 +362,11 @@ func (r *timeReconciler) step(ctx context.Context, fam bmcFamily, npPath, mgrPat
 			// After this run's own disable, matching servers prove nothing
 			// on AMI either: the read-back must see NTP on. The ASUS flap
 			// (see run) shows a minute after an enable, past settleTimeout.
-			last, err = r.confirmNTP(rctx, npPath, task, servers, fam == familyAMI && !disabled)
+			last, err = r.confirmNTP(rctx, npPath, task, servers, fam == familyAMI && !mayBeDisabled)
 		}
 		cancel()
 		switch {
-		case err != nil && disabled && (last == nil || !ntpEnabled(last)):
+		case err != nil && mayBeDisabled && (last == nil || !ntpEnabled(last)):
 			// Unless NTP reads back enabled (on other servers), assume
 			// the disable above is what the BMC is left with.
 			errs = append(errs, "re-enable NTP after the clock step failed, so NTP is DISABLED on the BMC: "+err.Error())
@@ -392,9 +398,11 @@ func (r *timeReconciler) step(ctx context.Context, fam bmcFamily, npPath, mgrPat
 // PATCH returned one, then, up to settleTimeout, for NTP to read disabled
 // (AMI applies the PATCH asynchronously without a Task). Waiting out the
 // Task also keeps a late disable from landing after the re-enable has been
-// read back. Best effort: the step runs anyway, and the post-step clock
-// read reports a step that did not take. Returns the Task's failure, if
-// any, so the caller can report it.
+// read back, which is why step also waits, with no Task to wait for, after
+// a disable that got no response and may still be applying. Best effort:
+// the step runs anyway, and the post-step clock read reports a step that
+// did not take. Returns the Task's failure, if any, so the caller can
+// report it.
 func (r *timeReconciler) waitNTPDisabled(ctx context.Context, npPath, task string) error {
 	if task != "" {
 		if err := r.waitTask(ctx, task); err != nil {
