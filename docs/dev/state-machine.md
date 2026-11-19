@@ -60,7 +60,9 @@ the state machine:
 - `PXEEligible` (`machine.go:55`) — the operator-owned gate that
   keeps a live host from PXE-booting into an accidental reimage.
   Must be true for the boot-action decision to return anything
-  other than `BootLocal`.
+  other than `BootLocal`. Enabling it is refused while `Locked`
+  (`SetMachinePXEEligible` returns `ErrMachineLocked`, HTTP 409);
+  disabling it is always allowed.
 - `CommissionData` (`machine.go:51`) — raw JSON of the last
   commission report. Empty means the machine has never been
   commissioned; this is the signal used by `FailOperation` to
