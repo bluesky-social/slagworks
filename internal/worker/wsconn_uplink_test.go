@@ -29,7 +29,7 @@ func (g *uplinkGlobal) GetSiteWorkerByTokenHash(hash string) (*model.SiteWorker,
 	if hash != store.HashWorkerToken("tok-1") {
 		return nil, store.ErrSiteWorkerNotFound
 	}
-	return &model.SiteWorker{SiteSlug: "pop1", WorkerID: "worker-1"}, nil
+	return &model.SiteWorker{SiteSlug: "site-a", WorkerID: "worker-1"}, nil
 }
 
 func (g *uplinkGlobal) TouchSiteWorker(slug, workerID, _ string, serial *string) (*model.SiteWorker, error) {
@@ -44,7 +44,7 @@ func (g *uplinkGlobal) TouchSiteWorker(slug, workerID, _ string, serial *string)
 func (g *uplinkGlobal) ListSiteWorkers(string) ([]model.SiteWorker, error) { return nil, nil }
 
 func (g *uplinkGlobal) RebuildAndWait(context.Context, string) (model.SiteSnapshot, error) {
-	return model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"}}, nil
+	return model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "site-a"}}, nil
 }
 
 func (g *uplinkGlobal) HandleObservation(_ context.Context, o model.Observation) error {

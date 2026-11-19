@@ -195,7 +195,7 @@ func TestOperationList_ShowsMachineName(t *testing.T) {
 // the PHASE column must show escape sequences in it as text.
 func TestOperationList_EscapesTerminalControlsInPhase(t *testing.T) {
 	ops := []model.Operation{
-		{ID: uuid.New(), MachineID: uuid.New(), MachineName: "cpu1.pop1", Type: model.OpDeploy,
+		{ID: uuid.New(), MachineID: uuid.New(), MachineName: "cpu1.site-a", Type: model.OpDeploy,
 			Status: model.OpRunning, Phase: "partitioning\x1b]52;c;cHduZWQ=\x07\x1b[2J", CreatedAt: time.Now()},
 	}
 	mux := http.NewServeMux()

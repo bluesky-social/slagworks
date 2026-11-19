@@ -12,9 +12,9 @@ func TestValidHostname(t *testing.T) {
 
 	for _, s := range []string{
 		"web1",
-		"oob-gw-3-pop2",
-		"kworker-l34-1.pop1",
-		"kworker-1.internal.site1.example.net",
+		"mgmt-3-site-b",
+		"node-l34-1.site-a",
+		"node-1.internal.site1.example.net",
 		"Web1.Example.NET",
 		"1host",
 		label63,
@@ -38,7 +38,7 @@ func TestValidHostname(t *testing.T) {
 		"web1-",
 		"web1.",
 		".web1",
-		"web1..pop1",
+		"web1..site-a",
 		label63 + "a",
 		max253 + "a",
 	} {

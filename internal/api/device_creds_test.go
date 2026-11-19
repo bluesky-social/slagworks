@@ -120,7 +120,7 @@ func TestDeviceCreds_CredentialGroups(t *testing.T) {
 	registerWorker := func(t *testing.T, s *Server, workerID, token string) (int, string) {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/site-workers",
-			strings.NewReader(`{"site_slug":"pop1","worker_id":"`+workerID+`"}`))
+			strings.NewReader(`{"site_slug":"site-a","worker_id":"`+workerID+`"}`))
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()

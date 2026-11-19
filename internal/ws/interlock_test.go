@@ -437,14 +437,14 @@ func TestInterlock_NonOutletOpMalformedParams_Unaffected(t *testing.T) {
 func TestInterlock_StoreErrorResolvingRegistered_FailClosed(t *testing.T) {
 	op := outletOp(t, model.OpPowerCycle, "SN-SOMEWHERE", false)
 	auth := newFakeAuth()
-	auth.register("tok-1", "pop3", "worker-1")
+	auth.register("tok-1", "site-c", "worker-1")
 	auth.listErr = errors.New("postgres exploded")
 	cp := *op
 	cp.Status = model.OpClaimed
 	claimer := &fakeOpClaimer{op: &cp, pendingOp: op}
 	h := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, OpClaimer: claimer})
 	// The op is on this worker's site, so the claim reaches the interlock.
-	h.Push("pop3", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"},
+	h.Push("site-c", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "site-c"},
 		Machines: []model.MachineSnapshot{{ID: op.MachineID}}})
 	srv := httptest.NewServer(h)
 	defer srv.Close()

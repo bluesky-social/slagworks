@@ -72,8 +72,8 @@ func signNetBoxBody(secret, body string) string {
 // NetBox's update snapshots name site and location by id only, as here.
 func TestWebhookDeviceMoveInvalidatesTheConfigItLeft(t *testing.T) {
 	dualCage := []model.SiteConfig{
-		{Slug: "pop2-cage-a", NetBoxSite: "pop2", NetBoxLocation: "cage-a"},
-		{Slug: "pop2-cage-b", NetBoxSite: "pop2", NetBoxLocation: "cage-b"},
+		{Slug: "site-b-cage-a", NetBoxSite: "site-b", NetBoxLocation: "cage-a"},
+		{Slug: "site-b-cage-b", NetBoxSite: "site-b", NetBoxLocation: "cage-b"},
 	}
 	dualCageLocations := []netbox.Location{
 		{ID: 10, Slug: "cage-a"},
@@ -93,32 +93,32 @@ func TestWebhookDeviceMoveInvalidatesTheConfigItLeft(t *testing.T) {
 			name:      "cage-a to cage-b within one site",
 			configs:   dualCage,
 			locations: dualCageLocations,
-			data:      `{"id":7,"name":"host-7","serial":"SN-7","site":{"id":1,"slug":"pop2"},"location":{"id":20,"slug":"cage-b"}}`,
+			data:      `{"id":7,"name":"host-7","serial":"SN-7","site":{"id":1,"slug":"site-b"},"location":{"id":20,"slug":"cage-b"}}`,
 			pre:       `{"site":1,"location":10}`,
 			post:      `{"site":1,"location":20}`,
-			left:      "pop2-cage-a",
-			entered:   "pop2-cage-b",
+			left:      "site-b-cage-a",
+			entered:   "site-b-cage-b",
 		},
 		{
 			name:      "cage-a to a location no config claims",
 			configs:   dualCage,
 			locations: dualCageLocations,
-			data:      `{"id":7,"name":"host-7","serial":"SN-7","site":{"id":1,"slug":"pop2"},"location":{"id":30,"slug":"storage"}}`,
+			data:      `{"id":7,"name":"host-7","serial":"SN-7","site":{"id":1,"slug":"site-b"},"location":{"id":30,"slug":"storage"}}`,
 			pre:       `{"site":1,"location":10}`,
 			post:      `{"site":1,"location":30}`,
-			left:      "pop2-cage-a",
+			left:      "site-b-cage-a",
 		},
 		{
-			name: "pop2 to another managed site",
+			name: "site-b to another managed site",
 			configs: []model.SiteConfig{
-				{Slug: "pop2", NetBoxSite: "pop2"},
-				{Slug: "pop3", NetBoxSite: "pop3"},
+				{Slug: "site-b", NetBoxSite: "site-b"},
+				{Slug: "site-c", NetBoxSite: "site-c"},
 			},
-			data:    `{"id":7,"name":"host-7","serial":"SN-7","site":{"id":2,"slug":"pop3"}}`,
+			data:    `{"id":7,"name":"host-7","serial":"SN-7","site":{"id":2,"slug":"site-c"}}`,
 			pre:     `{"site":1,"location":null}`,
 			post:    `{"site":2,"location":null}`,
-			left:    "pop2",
-			entered: "pop3",
+			left:    "site-b",
+			entered: "site-c",
 		},
 	}
 	for _, tc := range cases {

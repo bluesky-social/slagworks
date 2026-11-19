@@ -314,7 +314,7 @@ func TestGetAdmin_CacheKeepsLaterIssuedRead(t *testing.T) {
 			results := map[int]chan string{1: make(chan string, 1), 2: make(chan string, 1)}
 			getAdmin := func(call int) {
 				go func() {
-					s, err := c.GetAdmin(ctx, "pop1")
+					s, err := c.GetAdmin(ctx, "site-a")
 					if err != nil {
 						results[call] <- "error: " + err.Error()
 						return
@@ -338,7 +338,7 @@ func TestGetAdmin_CacheKeepsLaterIssuedRead(t *testing.T) {
 				}
 			}
 
-			got, err := c.GetAdmin(ctx, "pop1")
+			got, err := c.GetAdmin(ctx, "site-a")
 			if err != nil {
 				t.Fatal(err)
 			}

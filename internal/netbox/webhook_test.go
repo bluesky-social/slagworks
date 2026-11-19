@@ -172,7 +172,7 @@ func TestWebhookDeleteKeysInvalidationOnConfigSlug(t *testing.T) {
 func TestWebhookProcessingErrorsAck200(t *testing.T) {
 	deviceBody := `{"event":"created","object_type":"dcim.device","data":{"id":777,"name":"h1","serial":"SN1","site":{"slug":"pop2"}}}`
 	deleteBody := `{"event":"deleted","object_type":"dcim.device","data":{"id":777,"site":{"slug":"pop2"}}}`
-	moveBody := `{"event":"updated","object_type":"dcim.device","data":{"id":777,"name":"h1","serial":"SN1","site":{"slug":"pop2"}},` +
+	moveBody := `{"event":"updated","object_type":"dcim.device","data":{"id":777,"name":"h1","serial":"SN1","site":{"slug":"site-b"}},` +
 		`"snapshots":{"prechange":{"site":1,"location":21},"postchange":{"site":1,"location":99}}}`
 
 	cases := []struct {
@@ -203,7 +203,7 @@ func TestWebhookProcessingErrorsAck200(t *testing.T) {
 			name: "mirror move failure",
 			h: NewWebhookHandler(
 				&fakeMirror{err: errors.New("pg down")},
-				&fakeResolver{byID: map[int][]string{777: {"pop2-old-cage"}}}, testSecret),
+				&fakeResolver{byID: map[int][]string{777: {"site-b-old-cage"}}}, testSecret),
 			body: moveBody,
 		},
 	}
@@ -455,7 +455,7 @@ func TestWebhookExternalDriftGate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mir := &fakeMirror{}
 			res := &fakeResolver{byID: map[int][]string{777: {"pop2-old-cage"}}}
-			wantSlug := "pop2-old-cage"
+			wantSlug := res.byID[777][0]
 			if tc.unclaimed {
 				res = &fakeResolver{byID: map[int][]string{}}
 				wantSlug = ""
@@ -504,7 +504,7 @@ func TestWebhookMoveInvalidatesWhenClaimResolveFails(t *testing.T) {
 	mir := &fakeMirror{}
 	h := NewWebhookHandler(mir, &fakeResolver{err: errors.New("netbox down")}, testSecret)
 
-	body := `{"event":"updated","object_type":"dcim.device","data":{"id":777,"name":"h1","serial":"SN1","site":{"slug":"pop2"}},` +
+	body := `{"event":"updated","object_type":"dcim.device","data":{"id":777,"name":"h1","serial":"SN1","site":{"slug":"site-b"}},` +
 		`"snapshots":{"prechange":{"site":1,"location":21},"postchange":{"site":1,"location":99}}}`
 	w := postWebhook(t, h, body)
 

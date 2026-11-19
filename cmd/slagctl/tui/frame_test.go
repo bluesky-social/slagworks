@@ -518,7 +518,7 @@ func TestWorkerLabel_ShortUUIDIsCanonical(t *testing.T) {
 		"{c0ffee00-0000-4000-8000-000000000001}":        "c0ffee00",
 		"\x1bc0000000-0000-4000-8000-000000000001x":     "c0000000",
 		"urn:uuid:c0ffee00-0000-4000-8000-000000000001": "c0ffee00",
-		"pop1-sw-2\x1b]52;c;cHduZWQ=\x07":               `pop1-sw-2\x1b]52;c;cHduZWQ=\x07`,
+		"site-a-sw-2\x1b]52;c;cHduZWQ=\x07":             `site-a-sw-2\x1b]52;c;cHduZWQ=\x07`,
 	} {
 		if got := workerLabel(in); got != want {
 			t.Errorf("workerLabel(%q) = %q, want %q", in, got, want)

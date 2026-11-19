@@ -498,14 +498,17 @@ func TestOnDeviceDeletedUnknownIgnored(t *testing.T) {
 // changed may have left a config the caller cannot name, so every
 // site_config is invalidated, location-scoped and whole-site alike.
 func TestOnDeviceMovedInvalidatesEveryConfig(t *testing.T) {
-	st, inv, m := withSite(t) // pop3, whole-site
-	st.configs["pop2-cage-a"] = &model.SiteConfig{Slug: "pop2-cage-a", NetBoxSite: "pop2", NetBoxLocation: "cage-a"}
-	st.configs["pop2-cage-b"] = &model.SiteConfig{Slug: "pop2-cage-b", NetBoxSite: "pop2", NetBoxLocation: "cage-b"}
+	st := newFakeStore()
+	st.addSite("site-c") // whole-site
+	inv := &fakeInvalidator{}
+	m := New(st, inv)
+	st.configs["site-b-cage-a"] = &model.SiteConfig{Slug: "site-b-cage-a", NetBoxSite: "site-b", NetBoxLocation: "cage-a"}
+	st.configs["site-b-cage-b"] = &model.SiteConfig{Slug: "site-b-cage-b", NetBoxSite: "site-b", NetBoxLocation: "cage-b"}
 
 	if err := m.OnDeviceMoved(context.Background(), 7); err != nil {
 		t.Fatal(err)
 	}
-	for _, slug := range []string{"pop3", "pop2-cage-a", "pop2-cage-b"} {
+	for _, slug := range []string{"site-c", "site-b-cage-a", "site-b-cage-b"} {
 		if inv.count(slug) != 1 {
 			t.Errorf("%s invalidated %d times, want 1", slug, inv.count(slug))
 		}
@@ -516,14 +519,17 @@ func TestOnDeviceMovedInvalidatesEveryConfig(t *testing.T) {
 // handler logs it and the reconcile tick catches up) and nothing is
 // invalidated.
 func TestOnDeviceMovedListFailure(t *testing.T) {
-	st, inv, m := withSite(t)
+	st := newFakeStore()
+	st.addSite("site-c")
+	inv := &fakeInvalidator{}
+	m := New(st, inv)
 	st.listConfigsErr = errors.New("pg down")
 
 	if err := m.OnDeviceMoved(context.Background(), 7); err == nil {
 		t.Fatal("expected the ListSiteConfigs error")
 	}
-	if inv.count("pop3") != 0 {
-		t.Fatalf("pop3 invalidated %d times, want 0", inv.count("pop3"))
+	if inv.count("site-c") != 0 {
+		t.Fatalf("site-c invalidated %d times, want 0", inv.count("site-c"))
 	}
 }
 

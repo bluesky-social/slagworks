@@ -688,7 +688,7 @@ func TestDeployBootScript_TailscaleHostnameNotAHostname(t *testing.T) {
 func TestDeployBootScript_FreeTextValuesRideAsOneArgument(t *testing.T) {
 	raw, _ := json.Marshal(model.OpParams{
 		FatalAt: "installing_bootloader", Efivarfs: "skip", DataMarker: "m-1.x_y",
-		TailscaleRuntime: &model.TailscaleRuntime{AuthKey: "tskey-auth-kABC123-abcdefghijklmnop", Hostname: "oob-gw-3-pop2"},
+		TailscaleRuntime: &model.TailscaleRuntime{AuthKey: "tskey-auth-kABC123-abcdefghijklmnop", Hostname: "mgmt-3-site-b"},
 	})
 	body := deployScriptFor(t, string(raw), func(p *model.InMemoryProvider, id uuid.UUID) {
 		p.SetSystemUUID(id, "550e8400-e29b-41d4-a716-446655440000")
@@ -701,7 +701,7 @@ func TestDeployBootScript_FreeTextValuesRideAsOneArgument(t *testing.T) {
 	}
 	for _, arg := range []string{
 		"slagworks.fatal_at=installing_bootloader", "slagworks.efivarfs=skip", "slagworks.data_marker=m-1.x_y",
-		"slagworks.tailscale_authkey=tskey-auth-kABC123-abcdefghijklmnop", "slagworks.tailscale_hostname=oob-gw-3-pop2",
+		"slagworks.tailscale_authkey=tskey-auth-kABC123-abcdefghijklmnop", "slagworks.tailscale_hostname=mgmt-3-site-b",
 		"slagworks.expect-uuid=550e8400-e29b-41d4-a716-446655440000",
 	} {
 		if !slices.Contains(args, arg) {
@@ -730,7 +730,7 @@ func TestDeployBootScript_RefusesValuesThatSplitTheKernelLine(t *testing.T) {
 		params  model.OpParams
 		sysUUID string
 	}{
-		{"auth key with a newline", ts("tskey-auth-K9\nchain http://203.0.113.9/x.ipxe", "oob-gw-3-pop2"), goodUUID},
+		{"auth key with a newline", ts("tskey-auth-K9\nchain http://203.0.113.9/x.ipxe", "mgmt-3-site-b"), goodUUID},
 		{"fatal_at with an iPXE setting reference", model.OpParams{FatalAt: "${password}"}, goodUUID},
 		{"efivarfs with a tab", model.OpParams{Efivarfs: "skip\tslagworks.destructive"}, goodUUID},
 		{"data_marker with a space", model.OpParams{DataMarker: "m slagworks.destructive"}, goodUUID},

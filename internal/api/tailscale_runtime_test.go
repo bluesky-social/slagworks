@@ -25,7 +25,7 @@ func (m *recordingMinter) Mint(_ context.Context, kr tailscale.KeyRequest) (tail
 }
 
 // tailscaleServer builds a Server with a recording minter, a testpg store
-// and a NetBox stub holding one device named devName at site pop2, and
+// and a NetBox stub holding one device named devName at site site-b, and
 // returns it with the id of the machine bound to that device.
 func tailscaleServer(t *testing.T, devName string) (*Server, uuid.UUID, *recordingMinter) {
 	t.Helper()
@@ -33,7 +33,7 @@ func tailscaleServer(t *testing.T, devName string) (*Server, uuid.UUID, *recordi
 	devID := 310
 	dev := netbox.Device{
 		ID: devID, Name: devName, Serial: "SN-TS",
-		Site: &netbox.NestedRef{ID: 2, Name: "pop2", Slug: "pop2"},
+		Site: &netbox.NestedRef{ID: 2, Name: "site-b", Slug: "site-b"},
 	}
 	f := &netboxFixture{devices: []netbox.Device{dev}, deviceByID: map[int]netbox.Device{devID: dev}}
 	nb := netbox.NewClient(netbox.ClientConfig{BaseURL: f.server(t).URL, Token: "t"})
@@ -50,7 +50,7 @@ func tailscaleServer(t *testing.T, devName string) (*Server, uuid.UUID, *recordi
 // TestResolveTailscaleRuntime_ValidName: a device named <short>.<pop> gets a
 // key minted for, and stamped with, the tailnet hostname <short>-<pop>.
 func TestResolveTailscaleRuntime_ValidName(t *testing.T) {
-	s, id, m := tailscaleServer(t, "oob-gw-3.pop2")
+	s, id, m := tailscaleServer(t, "mgmt-3.site-b")
 	var params model.OpParams
 	if err := s.resolveTailscaleRuntime(context.Background(), id, &params); err != nil {
 		t.Fatalf("resolve: %v", err)
@@ -59,8 +59,8 @@ func TestResolveTailscaleRuntime_ValidName(t *testing.T) {
 		t.Fatalf("expected one mint, got %d", len(m.reqs))
 	}
 	ts := params.TailscaleRuntime
-	if ts == nil || ts.AuthKey != "tskey-auth-K9" || ts.Hostname != "oob-gw-3-pop2" {
-		t.Errorf("tailscale_runtime = %+v, want key tskey-auth-K9, hostname oob-gw-3-pop2", ts)
+	if ts == nil || ts.AuthKey != "tskey-auth-K9" || ts.Hostname != "mgmt-3-site-b" {
+		t.Errorf("tailscale_runtime = %+v, want key tskey-auth-K9, hostname mgmt-3-site-b", ts)
 	}
 }
 
@@ -72,7 +72,7 @@ func TestResolveTailscaleRuntime_ValidName(t *testing.T) {
 func TestResolveTailscaleRuntime_NameNotAHostname(t *testing.T) {
 	for _, name := range []string{
 		"web1\nchain http://203.0.113.9/x.ipxe",
-		"web1 break x.pop2",
+		"web1 break x.site-b",
 	} {
 		s, id, m := tailscaleServer(t, name)
 		var params model.OpParams
