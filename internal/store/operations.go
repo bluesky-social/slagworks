@@ -808,6 +808,9 @@ func (s *Store) ExpirePhoneHomeOperations(timeout time.Duration) ([]OpOutcome, e
 //
 // Returns the machine row after the abort AND the post-mutation
 // outcomes (one per op that transitioned) for the op-event publisher.
+// On error the outcomes still list every op failed before the error:
+// those ops are terminal in the database and a retried abort no longer
+// sees them, so the caller publishes them whatever the error.
 func (s *Store) AbortMachine(machineID uuid.UUID) (*model.Machine, []OpOutcome, error) {
 	var existing model.Machine
 	if err := s.db.Where("id = ?", machineID).First(&existing).Error; err != nil {
@@ -822,7 +825,7 @@ func (s *Store) AbortMachine(machineID uuid.UUID) (*model.Machine, []OpOutcome, 
 	for _, op := range activeOps {
 		out, err := s.failOperationGuarded(op.ID, []byte(`{"error":"aborted by operator"}`), nil)
 		if err != nil {
-			return nil, nil, fmt.Errorf("fail op %s during abort: %w", op.ID, err)
+			return nil, outcomes, fmt.Errorf("fail op %s during abort: %w", op.ID, err)
 		}
 		if out != nil {
 			outcomes = append(outcomes, *out)
@@ -830,7 +833,7 @@ func (s *Store) AbortMachine(machineID uuid.UUID) (*model.Machine, []OpOutcome, 
 	}
 	var out model.Machine
 	if err := s.db.Where("id = ?", machineID).First(&out).Error; err != nil {
-		return nil, nil, err
+		return nil, outcomes, err
 	}
 	return &out, outcomes, nil
 }
