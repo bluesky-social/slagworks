@@ -144,8 +144,13 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 		// by name AND MAC is a rerun of a prior reconcile's own
 		// creation (e.g. the synthetic "ipmi" NICData SyncCommissionData
 		// emits every run for the BMC MAC) — SyncCommissionData promises
-		// idempotency, so this must be a no-op skip, never an error and
-		// never a patch. This check must run BEFORE the byMAC match
+		// idempotency, so this must skip the row: never a modeling-conflict
+		// error and never a field patch. The one write it may make is
+		// finishing that prior run's MAC write when it assigned the MAC
+		// object but failed before marking it primary (the MAC match
+		// below goes through GetMAC, which accepts an assigned non-primary
+		// object); ensureInterfaceMAC is a no-op once the primary is set.
+		// This check must run BEFORE the byMAC match
 		// below: on shared-LOM hardware an unprotected host row can
 		// carry the same MAC as the BMC, and byMAC (which excludes
 		// protected rows) would resolve to that host row instead,
@@ -155,6 +160,9 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 		if nic.MgmtOnly {
 			if protected, exists := findProtectedInterfaceByName(existing, nic.Name); exists &&
 				protected.MgmtOnly && nic.MAC != "" && strings.EqualFold(protected.GetMAC(), nic.MAC) {
+				if err := c.ensureInterfaceMAC(ctx, protected, nic.MAC); err != nil {
+					return fmt.Errorf("setting MAC on interface %q: %w", nic.Name, err)
+				}
 				continue
 			}
 		}
@@ -218,12 +226,10 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 			continue
 		}
 
-		var ifaceID int
-		var currentMAC string
+		var target Interface // the row nic is reconciled onto
 		if ok {
 			consumed[match.ID] = true
-			ifaceID = match.ID
-			currentMAC = match.GetMAC()
+			target = match
 			if match.Name != nic.Name && operatorNames {
 				// The PATCH below would carry the kernel name; drop it so
 				// only the non-name fields update.
@@ -295,12 +301,12 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 				return fmt.Errorf("creating interface %q: %w", nic.Name, err)
 			}
 			consumed[created.ID] = true
-			ifaceID = created.ID
+			target = created
 			c.log.Info("created interface", "name", nic.Name, "device_id", deviceID)
 		}
 
 		if nic.MAC != "" {
-			if err := c.ensureInterfaceMAC(ctx, ifaceID, currentMAC, nic.MAC); err != nil {
+			if err := c.ensureInterfaceMAC(ctx, target, nic.MAC); err != nil {
 				return fmt.Errorf("setting MAC on interface %q: %w", nic.Name, err)
 			}
 		}
@@ -424,27 +430,47 @@ func (c *Client) ListDeviceInterfaces(ctx context.Context, deviceID int) ([]Inte
 	return results, nil
 }
 
-// ensureInterfaceMAC creates a MAC address object and sets it as primary on the
-// interface. NetBox v4.3+ requires MAC addresses as separate objects.
-// currentMAC is the MAC already on the interface (avoids an extra API call).
-func (c *Client) ensureInterfaceMAC(ctx context.Context, ifaceID int, currentMAC, wantMAC string) error {
-	if strings.EqualFold(currentMAC, wantMAC) {
+// ensureInterfaceMAC makes wantMAC the primary MAC of iface. NetBox v4.3+
+// requires MAC addresses as separate objects assigned to the interface.
+// iface is the row as last listed, or as returned by its create (avoids an
+// extra API call).
+//
+// Setting a new MAC takes two writes, creating the MAC object and then
+// marking it primary, so a run that fails between them (or loses the
+// create response) leaves the object assigned but not primary. The next
+// run finds that object in iface.MACAddresses and marks it primary rather
+// than creating a duplicate. The check is on the primary, not GetMAC,
+// whose fallback to the first assigned object would read that half-done
+// state as finished on every later run.
+func (c *Client) ensureInterfaceMAC(ctx context.Context, iface Interface, wantMAC string) error {
+	if strings.EqualFold(iface.primaryMACAddress(), wantMAC) {
 		return nil
 	}
 
-	var macObj MACAddressRef
-	if err := c.Post(ctx, "/api/dcim/mac-addresses/", map[string]any{
-		"mac_address":          wantMAC,
-		"assigned_object_type": "dcim.interface",
-		"assigned_object_id":   ifaceID,
-	}, &macObj); err != nil {
-		return fmt.Errorf("creating MAC address: %w", err)
+	var macID int
+	found := false
+	for _, m := range iface.MACAddresses {
+		if strings.EqualFold(m.MACAddress, wantMAC) {
+			macID, found = m.ID, true
+			break
+		}
+	}
+	if !found {
+		var macObj MACAddressRef
+		if err := c.Post(ctx, "/api/dcim/mac-addresses/", map[string]any{
+			"mac_address":          wantMAC,
+			"assigned_object_type": "dcim.interface",
+			"assigned_object_id":   iface.ID,
+		}, &macObj); err != nil {
+			return fmt.Errorf("creating MAC address: %w", err)
+		}
+		macID = macObj.ID
 	}
 
 	var updated Interface
-	path := fmt.Sprintf("/api/dcim/interfaces/%d/", ifaceID)
+	path := fmt.Sprintf("/api/dcim/interfaces/%d/", iface.ID)
 	if err := c.Patch(ctx, path, map[string]any{
-		"primary_mac_address": macObj.ID,
+		"primary_mac_address": macID,
 	}, &updated); err != nil {
 		return fmt.Errorf("setting primary MAC: %w", err)
 	}
