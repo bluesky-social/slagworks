@@ -53,7 +53,11 @@ type propGen struct {
 	// memberOf records, per disk, that it carries a member superblock of
 	// some array and has not been wiped since.
 	memberOf map[string]bool
-	next     int
+	// heavy biases the case towards data arrays that are created and then
+	// preserved: seeds from propHeavySeed up. The plain mix reaches a
+	// preserve step about once in seventy.
+	heavy bool
+	next  int
 }
 
 func (g *propGen) pick(weights ...int) int {
@@ -271,7 +275,11 @@ func (g *propGen) genLayout(attach []string, keep []propArray, prev *propLayout)
 		if used[id] {
 			continue
 		}
-		switch g.pick(30, 45, 10, 7, 8) {
+		role := g.pick(30, 45, 10, 7, 8)
+		if g.heavy {
+			role = g.pick(10, 75, 5, 5, 5)
+		}
+		switch role {
 		case 0: // bystander
 		case 1:
 			members = append(members, id)
@@ -334,7 +342,7 @@ func (g *propGen) genLayout(attach []string, keep []propArray, prev *propLayout)
 				mounts[mp] = true
 			}
 		}
-		if g.chance(80) {
+		if g.heavy || g.chance(80) {
 			// Shipped scripts derive array_uuid from a per-host value, so
 			// the same name gets the same UUID in every step of a case.
 			a.UUID = fmt.Sprintf("5d1f0c1e-7a3b-4c2d-9e8f-0000000000%02x", slot)
@@ -584,12 +592,16 @@ func propGenCase(seed int64) propCase {
 		big: map[string]bool{}, sig: map[string]string{}, arrs: map[string]*propArrState{},
 		holders: map[string]map[string]bool{}, memberOf: map[string]bool{},
 	}
+	g.heavy = seed >= propHeavySeed
 	c.Firmware = "uefi"
-	if g.chance(40) {
+	if g.chance(40) && !g.heavy {
 		c.Firmware = "bios"
 	}
 	bios := c.Firmware == "bios"
 	nDisks := 1 + g.pick(8, 25, 27, 20, 10, 10)
+	if g.heavy {
+		nDisks = 3 + g.pick(40, 35, 25)
+	}
 	bus := []string{"virtio", "nvme", "sata", "scsi", "mixed"}[g.pick(35, 28, 12, 13, 12)]
 	fourK := g.chance(20)
 	discard := g.chance(50)
@@ -713,6 +725,8 @@ func propGenCase(seed int64) propCase {
 		mode := 1 // 0 same layout again, 1 fresh layout, 2 fresh root around kept arrays
 		switch {
 		case prev == nil:
+		case len(keepable) > 0 && g.heavy:
+			mode = 2
 		case len(keepable) > 0:
 			mode = g.pick(10, 30, 60)
 		default:
@@ -740,7 +754,7 @@ func propGenCase(seed int64) propCase {
 			}
 		case 2:
 			for _, a := range keepable {
-				if g.chance(15) {
+				if !g.heavy && g.chance(15) {
 					continue
 				}
 				// Re-creating needs the member disks declared with the
@@ -789,7 +803,7 @@ func propGenCase(seed int64) propCase {
 		}
 		st.WipeAll = st.Destructive && g.chance(30)
 		// Interruptions, never on the last step.
-		if !last && g.chance(30) {
+		if !last && g.chance(30) && !(g.heavy && i == 0) {
 			if g.chance(60) {
 				st.FatalAt = []string{"partitioning", "rsyncing_os", "rsyncing_os", "installing_bootloader", "finalizing", "finalizing"}[g.rng.Intn(6)]
 			} else {
@@ -888,6 +902,9 @@ func propPlanLen(l propLayout) int {
 
 const propGenSeeds = 2000
 
+// propHeavySeed is the first seed of the preserve-heavy family.
+const propHeavySeed = 1000
+
 func TestStoragePropGen(t *testing.T) {
 	for seed := int64(0); seed < propGenSeeds; seed++ {
 		c := propGenCase(seed)
@@ -909,9 +926,25 @@ func TestStoragePropGenShape(t *testing.T) {
 	dir := t.TempDir()
 	count := map[string]int{}
 	bump := func(k string) { count[k]++ }
-	const n = 400
-	for seed := int64(0); seed < n; seed++ {
+	// 400 seeds of the plain mix and 200 of the preserve-heavy family.
+	var seeds []int64
+	for seed := int64(0); seed < 400; seed++ {
+		seeds = append(seeds, seed)
+	}
+	for seed := int64(propHeavySeed); seed < propHeavySeed+200; seed++ {
+		seeds = append(seeds, seed)
+	}
+	for _, seed := range seeds {
 		c := propGenCase(seed)
+		if seed >= propHeavySeed {
+			for _, st := range c.Steps {
+				for _, a := range st.Layout.Arrays {
+					if a.Type == "preserve" {
+						bump("heavy: preserve steps expecting " + st.Expect)
+					}
+				}
+			}
+		}
 		bump("firmware=" + c.Firmware)
 		bump(fmt.Sprintf("disks=%d", len(c.Disks)))
 		bump(fmt.Sprintf("steps=%d", len(c.Steps)))

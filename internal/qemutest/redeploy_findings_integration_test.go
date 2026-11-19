@@ -215,10 +215,10 @@ json.dump(layout, sys.stdout)
 // members are refused, /data never appears, and the boot sits in a device
 // timeout, falls to emergency mode and continues without /data.
 //
-// Which disk udev offers first is a race, so one boot can pass by luck; the
-// property suite measures how often
-// (TestStoragePropStaleUUIDRepeat). This test checks the first boot and two
-// more.
+// Which disk udev offers first is a race, so one boot can pass by luck: the
+// property suite's TestStoragePropStaleUUIDRepeat saw the stale member win on
+// 5 of 12 boots. This test checks six boots, which all pass by luck about one
+// run in twenty.
 func TestDeploy_StaleMemberWithPinnedArrayUUID(t *testing.T) {
 	t.Parallel()
 	r := newRedeployRig(t, "stale-pinned-member", "10G", "4G", "4100M", "4200M")
@@ -235,7 +235,8 @@ func TestDeploy_StaleMemberWithPinnedArrayUUID(t *testing.T) {
 	// gets that far: it times out on the /data device and stops in
 	// emergency mode.
 	cursor := 0
-	for boot := 1; boot <= 3; boot++ {
+	const boots = 6
+	for boot := 1; boot <= boots; boot++ {
 		var line string
 		for deadline := time.Now().Add(6 * time.Minute); line == "" && time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
 			for _, l := range vmB.Serial.Lines()[cursor:] {
@@ -257,7 +258,7 @@ func TestDeploy_StaleMemberWithPinnedArrayUUID(t *testing.T) {
 				boot, src, strings.TrimSpace(line), markerField(line, "mdstat"))
 		}
 		cursor = vmB.Serial.Cursor()
-		if boot < 3 {
+		if boot < boots {
 			if err := vmB.QMP.Reset(); err != nil {
 				t.Fatalf("reset: %v", err)
 			}
