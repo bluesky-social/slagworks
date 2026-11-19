@@ -1003,8 +1003,10 @@ func TestReconcile_StoredPassword_WriteRefused(t *testing.T) {
 	fake.queueUserTest("4", "16", storedMonitorPW, userTestWrongSize)
 	fake.queueUserTest("4", "20", storedMonitorPW, userTestWrongSize)
 	for range 3 {
-		fake.queueFailure("user set password 4 "+storedMonitorPW,
-			"IPMI command failed: Unknown (0x19)\nSet User Password command failed (user 4)\n", 1)
+		fake.queueFailure("user set password 4 "+storedMonitorPW, megaRACRefusal("4"), 1)
+		// Each refusal is followed by a test: the slot still does not hold it.
+		fake.queueUserTest("4", "16", storedMonitorPW, userTestWrongSize)
+		fake.queueUserTest("4", "20", storedMonitorPW, userTestWrongSize)
 	}
 
 	res, err := Reconcile(context.Background(), storedMonitorOptions(fake, storedMonitorPW))
@@ -1161,6 +1163,161 @@ func TestReconcile_StoredPassword_DriftedMatching_FixedInPlace(t *testing.T) {
 				t.Errorf("LeftoversDisabled = %v, want [maas]", res.LeftoversDisabled)
 			}
 		})
+	}
+}
+
+// setPasswordNoResponse is ipmitool's output for a `user set password` that
+// got no response (a lost lanplus reply): no completion code, exit 1.
+func setPasswordNoResponse(slot string) string {
+	return "Set User Password command failed (user " + slot + ")\n"
+}
+
+// megaRACRefusal is AMI MegaRAC's answer to `user set password` with the
+// slot's current password, or one in its reuse history: completion code
+// 0x19, exit 1.
+func megaRACRefusal(slot string) string {
+	return "IPMI command failed: Unknown (0x19)\nSet User Password command failed (user " + slot + ")\n"
+}
+
+// writtenPasswords returns the password argument of every `user set
+// password` call, and testedPasswords that of every `user test` call.
+func writtenPasswords(calls []fakeCall) []string {
+	var out []string
+	for _, c := range calls {
+		f := strings.Fields(c.Args)
+		if i := slices.Index(f, "password"); i >= 2 && f[i-2] == "user" && f[i-1] == "set" && i+2 < len(f) {
+			out = append(out, f[i+2])
+		}
+	}
+	return out
+}
+
+func testedPasswords(calls []fakeCall) []string {
+	var out []string
+	for _, c := range calls {
+		f := strings.Fields(c.Args)
+		if i := slices.Index(f, "test"); i >= 1 && f[i-1] == "user" && i+3 < len(f) {
+			out = append(out, f[i+3])
+		}
+	}
+	return out
+}
+
+// TestReconcile_Rotate_LostWriteResponse_ReportsGeneratedPassword: a
+// --rotate-monitor run on a MegaRAC BMC whose first `user set password`
+// is applied but whose response is lost, so ipmitool exits 1. Retrying the
+// write would send the BMC its current password, which MegaRAC refuses
+// with 0x19; the run would then fail without reporting the generated
+// password the BMC now holds, and global would keep the old one (monitor
+// locked out). Instead the failed write is followed by `user test`, which
+// finds the generated password on the BMC: no retry, and the password is
+// reported for global to store.
+func TestReconcile_Rotate_LostWriteResponse_ReportsGeneratedPassword(t *testing.T) {
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+	fake.queueFailure("user set password 4 *", setPasswordNoResponse("4"), 1)
+	// What a retry would get: the generated password is now current.
+	for range 2 {
+		fake.queueFailure("user set password 4 *", megaRACRefusal("4"), 1)
+	}
+	fake.queueOutput("user test 4 16 *", userTestSuccess)
+	queueFixInPlace(fake)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+
+	opt := RemoteOptions(LANTarget{Host: "192.0.2.10", Username: "ADMIN", Password: "adminpw!"}, "") // --rotate-monitor
+	opt.IPMITool = fake.path
+	res, err := Reconcile(context.Background(), opt)
+	if err != nil {
+		var reported []ProvisionedUser
+		if res != nil {
+			reported = res.CreatedOrUpdated
+		}
+		t.Fatalf("the BMC applied the generated password but Reconcile failed, reporting %+v: %v", reported, err)
+	}
+	calls := fake.calls()
+	written := writtenPasswords(calls)
+	if len(written) != 1 {
+		t.Fatalf("got %d `user set password` calls, want 1: a write the BMC holds must not be retried", len(written))
+	}
+	if tested := testedPasswords(calls); !slices.Equal(tested, written) {
+		t.Errorf("after the failed write, `user test` checked %d password(s), want the written one", len(tested))
+	}
+	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Slot != 4 || res.CreatedOrUpdated[0].Password != written[0] {
+		t.Errorf("CreatedOrUpdated = %+v, want monitor at slot 4 carrying the generated password the BMC holds", res.CreatedOrUpdated)
+	}
+}
+
+// TestReconcile_StoredPassword_LostWriteResponse_Confirmed: the re-assert
+// path writes the stored password after `user test` finds a different one.
+// When that write is applied but its response is lost, the next test finds
+// the stored password on the BMC, so the run succeeds without a retry
+// (which MegaRAC would refuse with 0x19) instead of failing with "does not
+// hold the stored password".
+func TestReconcile_StoredPassword_LostWriteResponse_Confirmed(t *testing.T) {
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+	fake.queueUserTest("4", "16", storedMonitorPW, userTestIncorrect)
+	fake.queueFailure("user set password 4 "+storedMonitorPW, setPasswordNoResponse("4"), 1)
+	for range 2 {
+		fake.queueFailure("user set password 4 "+storedMonitorPW, megaRACRefusal("4"), 1)
+	}
+	fake.queueUserTest("4", "16", storedMonitorPW, userTestSuccess) // after the failed write
+	fake.queueUserTest("4", "16", storedMonitorPW, userTestSuccess) // re-assert's confirmation
+	queueFixInPlace(fake)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+
+	res, err := Reconcile(context.Background(), storedMonitorOptions(fake, storedMonitorPW))
+	if err != nil {
+		t.Fatalf("the BMC holds the stored password after the write, but Reconcile failed: %v", err)
+	}
+	if n := countCalls(fake.calls(), "user set password"); n != 1 {
+		t.Errorf("got %d `user set password` calls, want 1: a write the BMC holds must not be retried", n)
+	}
+	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Slot != 4 || res.CreatedOrUpdated[0].Password != "" {
+		t.Errorf("CreatedOrUpdated = %+v, want monitor written at slot 4 with no generated password", res.CreatedOrUpdated)
+	}
+}
+
+// TestReconcile_StoredPassword_CreateIntoSlotAlreadyHoldingIt: creating the
+// monitor writes the stored password to a free slot without testing first.
+// When that slot already holds it (an un-named slot that kept a previous
+// monitor's password), MegaRAC refuses the write with 0x19. The test after
+// the refusal finds the password in place, so the account is created
+// rather than the run failing on a write that had nothing to change.
+func TestReconcile_StoredPassword_CreateIntoSlotAlreadyHoldingIt(t *testing.T) {
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "", ""},
+	))
+	fake.queueOutput("user set name 3 monitor", "")
+	for range 3 {
+		fake.queueFailure("user set password 3 "+storedMonitorPW, megaRACRefusal("3"), 1)
+	}
+	fake.queueUserTest("3", "16", storedMonitorPW, userTestSuccess)
+	for _, cmd := range []string{
+		"user priv 3 2 1",
+		"channel setaccess 1 3 callin=on ipmi=on link=on privilege=2",
+		"user enable 3",
+	} {
+		fake.queueOutput(cmd, "")
+	}
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "monitor", "USER"},
+	))
+
+	res, err := Reconcile(context.Background(), storedMonitorOptions(fake, storedMonitorPW))
+	if err != nil {
+		t.Fatalf("slot 3 already holds the stored password, but Reconcile failed: %v", err)
+	}
+	if n := countCalls(fake.calls(), "user set password"); n != 1 {
+		t.Errorf("got %d `user set password` calls, want 1: a password the slot holds must not be retried", n)
+	}
+	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Slot != 3 || res.CreatedOrUpdated[0].Password != "" {
+		t.Errorf("CreatedOrUpdated = %+v, want monitor created at slot 3 with no generated password", res.CreatedOrUpdated)
 	}
 }
 
@@ -1425,13 +1582,15 @@ func TestReconcile_Remote_EndToEnd(t *testing.T) {
 }
 
 // TestSetPassword_ErrorRedactsPassword: when every `user set password`
-// attempt fails, the returned error (which becomes an op result and a log
-// line) must not carry the password, even though ipmitool's command line
-// and output would otherwise echo it.
+// attempt fails (and the `user test` after each shows the slot does not
+// hold the password), the returned error (which becomes an op result and a
+// log line) must not carry the password, even though ipmitool's command
+// line and output would otherwise echo it.
 func TestSetPassword_ErrorRedactsPassword(t *testing.T) {
 	fake := newFakeIPMITool(t)
 	for range 3 {
 		fake.queueFailure("user set password 4 *", "rejected "+storedMonitorPW, 1)
+		fake.queueUserTest("4", "16", storedMonitorPW, userTestIncorrect)
 	}
 	err := setPassword(context.Background(), Options{
 		IPMITool: fake.path, IPMIInterface: "open",
@@ -1439,8 +1598,12 @@ func TestSetPassword_ErrorRedactsPassword(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the set-password failure to surface")
 	}
-	if calls := fake.calls(); len(calls) != 3 {
-		t.Fatalf("expected 3 set-password attempts, got %d", len(calls))
+	calls := fake.calls()
+	if n := countCalls(calls, "user set password"); n != 3 {
+		t.Fatalf("expected 3 set-password attempts, got %d", n)
+	}
+	if n := countCalls(calls, "user test 4 16"); n != 3 {
+		t.Errorf("expected a `user test` after each failed attempt, got %d", n)
 	}
 	if strings.Contains(err.Error(), storedMonitorPW) {
 		t.Errorf("error leaks the password: %v", err)
