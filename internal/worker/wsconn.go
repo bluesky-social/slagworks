@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/url"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/dhcp"
@@ -26,7 +27,8 @@ import (
 )
 
 // WSConn is the site worker's WebSocket connection to the global API.
-// It speaks the Plan 2 protocol: authenticate via ?token=, send a hello
+// It speaks the Plan 2 protocol: authenticate with the worker token in
+// the upgrade's Authorization header, send a hello
 // carrying the last-applied snapshot SeqNum, accept either a fresh
 // snapshot or a no_change ack, then enter the steady-state outbox
 // drain + heartbeat + log forward loop.
@@ -340,8 +342,7 @@ func (w *WSConn) Run(ctx context.Context) error {
 }
 
 func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) {
-	wsURL := w.buildURL()
-	conn, err := ws.Dial(ctx, wsURL, nil)
+	conn, err := ws.Dial(ctx, w.buildURL(), w.dialOptions())
 	if err != nil {
 		return false, fmt.Errorf("dial: %w", err)
 	}
@@ -366,9 +367,9 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 	w.conn = conn
 	w.connMu.Unlock()
 
-	// Site worker reads can be up to 16MB (full snapshot with
-	// commission data for all machines at the site).
-	conn.SetReadLimit(16 << 20)
+	// Site worker reads can be up to ws.MaxMessageBytes (full snapshot
+	// with commission data for all machines at the site).
+	conn.SetReadLimit(ws.MaxMessageBytes)
 
 	// Send hello first. The hub uses last_seq_num to decide whether to
 	// reply with a fresh snapshot or a no_change ack.
@@ -400,7 +401,9 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 		if err := w.checkReplyProto(ws.TypeSnapshot, env.Data); err != nil {
 			return false, err
 		}
-		if err := w.applySnapshot(env.Data); err != nil {
+		// The first snapshot on a connection is global's current view of
+		// the site: adopt it even when its SeqNum is lower than ours.
+		if err := w.applySnapshot(env.Data, true); err != nil {
 			return false, err
 		}
 	case ws.TypeNoChange:
@@ -462,7 +465,7 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 
 		switch env.Type {
 		case ws.TypeSnapshot:
-			if err := w.applySnapshot(env.Data); err != nil {
+			if err := w.applySnapshot(env.Data, false); err != nil {
 				return true, err
 			}
 		case ws.TypeNoChange:
@@ -510,7 +513,7 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 }
 
 // buildURL constructs the WS upgrade URL. Scheme is converted
-// http→ws, https→wss; token is the single query parameter.
+// http→ws, https→wss. The URL carries no credential: see dialOptions.
 func (w *WSConn) buildURL() string {
 	base := w.config.GlobalURL
 	switch {
@@ -519,11 +522,18 @@ func (w *WSConn) buildURL() string {
 	case strings.HasPrefix(base, "http://"):
 		base = "ws://" + strings.TrimPrefix(base, "http://")
 	}
-	u, _ := url.Parse(base + "/api/v1/ws/site")
-	q := u.Query()
-	q.Set("token", w.config.Token)
-	u.RawQuery = q.Encode()
-	return u.String()
+	return base + "/api/v1/ws/site"
+}
+
+// dialOptions sends the worker token in the upgrade request's
+// Authorization header. It must never ride the URL: a transport-level
+// dial failure returns a *url.Error quoting the full request URL, Run logs
+// that error, and the worker's log is forwarded to global and readable by
+// every operator. Request loggers (global's included) record the URL too.
+func (w *WSConn) dialOptions() *websocket.DialOptions {
+	return &websocket.DialOptions{HTTPHeader: http.Header{
+		"Authorization": {"Bearer " + w.config.Token},
+	}}
 }
 
 // checkReplyProto enforces the op-stream skew gate on a hello reply: the
@@ -596,16 +606,24 @@ func (w *WSConn) applyOpRemoved(data json.RawMessage) {
 	w.cache.ApplyOpRemoved(msg.OperationID, msg.MachineID, msg.Version, msg.MachineState)
 }
 
-// applySnapshot decodes a snapshot message, applies it to the cache,
-// and persists the new SeqNum via LocalDB. Also triggers an
-// auto-upgrade check if the global advertises a different build SHA.
-func (w *WSConn) applySnapshot(data json.RawMessage) error {
+// applySnapshot decodes a snapshot message and applies it to the cache:
+// with adopt (the first snapshot on a connection) via Cache.AdoptSnapshot,
+// otherwise via Cache.ApplySnapshot, which drops one older than the
+// cache's. Persists the new SeqNum via LocalDB when the snapshot was
+// applied. Also triggers an auto-upgrade check if the global advertises
+// a different build SHA.
+func (w *WSConn) applySnapshot(data json.RawMessage, adopt bool) error {
 	var msg ws.SnapshotMsg
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return fmt.Errorf("decode snapshot: %w", err)
 	}
-	w.cache.ApplySnapshot(&msg.Snapshot)
-	if w.localDB != nil {
+	applied := true
+	if adopt {
+		w.cache.AdoptSnapshot(&msg.Snapshot)
+	} else {
+		applied = w.cache.ApplySnapshot(&msg.Snapshot)
+	}
+	if applied && w.localDB != nil {
 		w.localDB.SetSyncCursor(msg.Snapshot.SeqNum)
 	}
 	w.checkVersion(globalBuild{SHA: msg.Version, PackageVersion: msg.PackageVersion})
@@ -776,25 +794,36 @@ func (w *WSConn) drainLoop(ctx context.Context, conn *ws.Conn) {
 	}
 }
 
+// Bounds on one log_batch message. logBatchMaxBytes keeps a batch far
+// below ws.MaxMessageBytes whatever the envelope sizes (Ring.Drain drops
+// an envelope larger than the whole budget), with ample room for the
+// message wrapper. A quarter of the limit rather than all of it bounds
+// what one failed write loses and how long the hub's synchronous
+// log_batch dispatch holds up the connection, and still fits about 250
+// envelopes carrying a full 16 KiB exec capture each.
+const (
+	logBatchMaxEnvelopes       = 256
+	logBatchMaxBytes     int64 = ws.MaxMessageBytes / 4
+)
+
 // logRingDrainLoop is a per-connection goroutine that pumps log
 // envelopes from w.logRing to global as TypeLogBatch messages.
-// Drains in batches of up to logRingBatchMax envelopes per WS write;
-// blocks on Ring.Wait between batches. On send failure the batch is
-// dropped (the ring is the operator-facing buffer; we don't double-
-// buffer).
+// Drains up to logBatchMaxEnvelopes envelopes and logBatchMaxBytes
+// bytes per WS write; blocks on Ring.Wait between batches. On send
+// failure the batch is dropped (the ring is the operator-facing
+// buffer; we don't double-buffer).
 func (w *WSConn) logRingDrainLoop(ctx context.Context, conn *ws.Conn) {
-	const batchMax = 256
 	for {
 		if !w.logRing.Wait(ctx) {
 			// SIGTERM-flush: drain whatever's left so a routine
 			// restart doesn't unnecessarily lose buffered envelopes.
-			batch := w.logRing.Drain(batchMax)
+			batch := w.logRing.Drain(logBatchMaxEnvelopes, logBatchMaxBytes)
 			if len(batch) > 0 {
 				_ = w.sendLogBatch(ctx, conn, batch)
 			}
 			return
 		}
-		batch := w.logRing.Drain(batchMax)
+		batch := w.logRing.Drain(logBatchMaxEnvelopes, logBatchMaxBytes)
 		if len(batch) == 0 {
 			continue
 		}
@@ -834,13 +863,31 @@ func (w *WSConn) drainOnce(ctx context.Context, conn *ws.Conn) {
 	// Postgres writes succeeded.
 	for i, p := range obs {
 		reqID := uuid.New().String()
+		frame, err := observationFrame(reqID, p.Obs)
+		if err == nil && len(frame) > ws.MaxMessageBytes {
+			err = fmt.Errorf("encoded message is %d bytes, over the %d-byte limit global reads",
+				len(frame), ws.MaxMessageBytes)
+		}
+		if err != nil {
+			// No retry can deliver this row. Global closes the
+			// connection on an oversized message without answering
+			// it, and the reconnect's ReloadOutboxFromDisk puts the
+			// row back first, so sending or requeueing it would cut
+			// every later observation and op_update off from global
+			// for good. Drop it, as a terminal rejection does.
+			w.log.Error("dropping outbox observation that cannot be sent to global",
+				"event", p.Obs.Event, "machine_id", p.Obs.MachineID, "op_id", p.Obs.OperationID,
+				"row_id", p.RowID, "err", err)
+			w.cache.AckObservation(p.RowID)
+			continue
+		}
 		// Track BEFORE sending: otherwise the global can process
 		// the observation and write rpc_response back faster than
-		// we return from WriteTyped, and the read loop drops the
+		// we return from WriteFrame, and the read loop drops the
 		// ack because ackPending doesn't know about reqID yet.
 		// Untrack on send failure so we don't leak the entry.
 		w.trackAck(reqID, p)
-		if err := w.sendObservationWithID(ctx, conn, reqID, p.Obs); err != nil {
+		if err := conn.WriteFrame(ctx, frame); err != nil {
 			w.untrackAck(reqID)
 			w.log.Warn("send observation failed, requeueing remainder", "err", err, "unsent", len(obs)-i)
 			w.cache.RequeueOutbox(obs[i:], updates)
@@ -1292,7 +1339,9 @@ func (w *WSConn) ResumeOffsetUs(ctx context.Context, machineID uuid.UUID) (int64
 	return w.CastResumeOffset(ctx, machineID)
 }
 
-func (w *WSConn) sendObservationWithID(ctx context.Context, conn *ws.Conn, reqID string, obs model.Observation) error {
+// observationFrame encodes an outbox observation as the message drainOnce
+// sends, so its size can be checked against ws.MaxMessageBytes first.
+func observationFrame(reqID string, obs model.Observation) ([]byte, error) {
 	msg := ws.ObservationMsg{
 		MachineID:   obs.MachineID,
 		OperationID: obs.OperationID,
@@ -1300,7 +1349,7 @@ func (w *WSConn) sendObservationWithID(ctx context.Context, conn *ws.Conn, reqID
 		Timestamp:   obs.Timestamp.Format(time.RFC3339),
 		Data:        obs.Data,
 	}
-	return conn.WriteTyped(ctx, ws.TypeObservation, reqID, msg)
+	return ws.EncodeTyped(ws.TypeObservation, reqID, msg)
 }
 
 // trackAck records that a request_id corresponds to a particular

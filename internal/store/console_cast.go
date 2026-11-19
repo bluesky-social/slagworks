@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -210,17 +211,22 @@ func (s *Store) SinceFloorByDuration(ctx context.Context, castID int64, d time.D
 }
 
 // ScanCastEventsForNonce searches recent events under the given
-// machine's cast for a substring match against `nonce`. Returns true
-// on first match. Used by the console probe verification flow
-// — the agent emits a marker `SLAG-CONSOLE-PROBE-<machine>-<nonce>`
-// to the configured tty during commission, those bytes ride the BMC
-// SOL session up into console_cast_events, and operator-facing
-// verification asks "did our nonce arrive?" within `lookback`.
+// machine's cast for `nonce` as a literal byte substring (no byte is a
+// wildcard). Returns true on first match. Used by the console probe
+// verification flow and the commission console sweep — the agent
+// emits a marker `SLAG-CONSOLE-PROBE-<machine>-<nonce>` to a tty
+// during commission, those bytes ride the BMC SOL session up into
+// console_cast_events, and the caller asks "did our nonce arrive?"
+// within `lookback`.
 //
-// Returns ErrConsoleCastNotFound when no cast row exists for the
-// machine yet (no SOL bytes ever observed). Returns false, nil when
-// the cast exists but no event in the window matches.
+// An empty nonce names no marker and returns false, nil. Returns
+// ErrConsoleCastNotFound when no cast row exists for the machine yet
+// (no SOL bytes ever observed). Returns false, nil when the cast
+// exists but no event in the window matches.
 func (s *Store) ScanCastEventsForNonce(ctx context.Context, machineID uuid.UUID, nonce string, lookback time.Duration) (bool, error) {
+	if nonce == "" {
+		return false, nil
+	}
 	if lookback < 0 {
 		lookback = 0
 	}
@@ -231,20 +237,25 @@ func (s *Store) ScanCastEventsForNonce(ctx context.Context, machineID uuid.UUID,
 		}
 		return false, fmt.Errorf("select cast: %w", err)
 	}
-	// Use a server-side LIKE so we don't have to ship the entire
+	// Search server-side so we don't have to ship the entire
 	// recent-event window over the wire just to grep it. The
 	// (cast_id, received_at) index handles the time predicate; the
-	// LIKE runs only on rows the index already filtered down.
+	// search runs only on rows the index already filtered down.
 	var hit bool
 	intervalArg := fmt.Sprintf("%d microseconds", lookback.Microseconds())
-	// `data` is bytea; pgx will not coerce a text param into bytea
-	// for LIKE, so bind the pattern as []byte explicitly.
+	// position() rather than LIKE: the nonce reaches here from
+	// agent-written reports, and LIKE would treat '%' and '_' in it as
+	// wildcards that match any console output. `data` is bytea, so the
+	// needle must be bytea too; it is bound hex-encoded and decoded
+	// server-side because gorm expands a slice placeholder that directly
+	// follows '(' (its `IN (?)` form), which would split a []byte into
+	// one parameter per byte.
 	//
-	// Aggregate before LIKE: the SOL stream is sliced into rows by the
-	// pump's 100ms / 4KB flush timer, so a marker crossing a flush
-	// boundary lands in two adjacent rows. A row-by-row LIKE would
+	// Aggregate before searching: the SOL stream is sliced into rows by
+	// the pump's 100ms / 4KB flush timer, so a marker crossing a flush
+	// boundary lands in two adjacent rows. A row-by-row search would
 	// miss it. string_agg(data, ''::bytea) reassembles the window so
-	// the LIKE sees the contiguous byte stream.
+	// the search sees the contiguous byte stream.
 	err := s.db.WithContext(ctx).
 		Raw(`SELECT EXISTS (
 		         SELECT 1 FROM (
@@ -252,8 +263,8 @@ func (s *Store) ScanCastEventsForNonce(ctx context.Context, machineID uuid.UUID,
 		                               ORDER BY t_us, id) AS full_data
 		             FROM console_cast_events
 		             WHERE cast_id = ? AND received_at >= now() - ?::interval
-		         ) sub WHERE full_data LIKE ?
-		     )`, cast.ID, intervalArg, []byte("%"+nonce+"%")).
+		         ) sub WHERE position(decode(?, 'hex') IN full_data) > 0
+		     )`, cast.ID, intervalArg, hex.EncodeToString([]byte(nonce))).
 		Scan(&hit).Error
 	if err != nil {
 		return false, fmt.Errorf("scan events: %w", err)

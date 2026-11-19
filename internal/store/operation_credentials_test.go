@@ -210,6 +210,26 @@ func TestScrubTerminalOperationCredentials_OddShapesDoNotBlock(t *testing.T) {
 	}
 }
 
+// TestScrubTerminalOperationCredentials_CaseVariantKeyYieldsNoCredential: the
+// scrub removes credentials by exact jsonb path, so a terminal op whose params
+// spell a credential key in another letter case keeps that value. Whatever
+// the scrub leaves must not decode to a credential.
+func TestScrubTerminalOperationCredentials_CaseVariantKeyYieldsNoCredential(t *testing.T) {
+	st := testStore(t)
+	op := seedOp(t, st, model.OpCompleted,
+		json.RawMessage(`{"bmc_runtime":{"expected_chassis_serial":"SN1","username":"ADMIN","Password":"fixture-bmc-pw","extra_config":{}}}`))
+	if _, err := st.ScrubTerminalOperationCredentials(); err != nil {
+		t.Fatalf("scrub: %v", err)
+	}
+	got, err := st.GetOperation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, err := got.DecodeParams(); err == nil && p.BMCRuntime != nil && p.BMCRuntime.Password != "" {
+		t.Error("a completed op still decodes to a BMC credential after the scrub")
+	}
+}
+
 func jsonEqual(t *testing.T, a, b json.RawMessage) bool {
 	t.Helper()
 	if len(a) == 0 || len(b) == 0 {

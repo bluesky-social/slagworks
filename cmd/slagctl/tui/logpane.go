@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluesky-social/slagworks/cmd/slagctl/format"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 )
 
@@ -125,6 +126,11 @@ func (p *logPane) format(env slogkit.Envelope) string {
 	if env.Phase != "" {
 		body = fmt.Sprintf("phase=%s %s", env.Phase, body)
 	}
+	// Every string field is text the sending host chose (agent envelopes
+	// arrive through the site's unauthenticated /logs/ingest). Line breaks
+	// fold to a visible marker so the envelope stays on one row, then the
+	// line is escaped as a whole: any other control sequence in it renders
+	// as visible text.
 	line := fmt.Sprintf("%s [%-6s] %s", ts, env.Source, body)
-	return strings.ReplaceAll(strings.TrimRight(lineBreaks.Replace(line), "\n"), "\n", " ⏎ ")
+	return format.Untrusted(strings.ReplaceAll(strings.TrimRight(lineBreaks.Replace(line), "\n"), "\n", " ⏎ "))
 }

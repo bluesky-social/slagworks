@@ -422,7 +422,7 @@ func TestLogBatch_HappyPath(t *testing.T) {
 	h := NewLogBatch(logs, stdout, sinkRing)
 	envs := []slogkit.Envelope{
 		{Source: slogkit.SourceAgent, Level: slogkit.LevelInfo, Msg: "starting", TraceID: uuid.New()},
-		{Source: slogkit.SourceAgent, Level: slogkit.LevelInfo, Msg: "phase", TraceID: uuid.New()},
+		{Source: slogkit.SourceSite, Level: slogkit.LevelInfo, Msg: "phase", TraceID: uuid.New()},
 	}
 	err := h.HandleLogBatch(context.Background(), "worker-A", ws.LogBatchMsg{Envelopes: envs})
 	if err != nil {
@@ -464,6 +464,53 @@ func TestLogBatch_StorePersistFailureIsReturned(t *testing.T) {
 		ws.LogBatchMsg{Envelopes: []slogkit.Envelope{{Source: slogkit.SourceAgent, Msg: "x"}}})
 	if err == nil {
 		t.Fatal("expected error from store, got nil")
+	}
+}
+
+// TestLogBatch_RejectsSourceGlobalFromWorker pins that a worker cannot
+// relay a source=global envelope. Global writes its op-lifecycle envelopes
+// (claimed / completed / failed) itself, inside the store transaction that
+// makes the transition, and `slagctl operation watch` treats a source=global
+// status=completed envelope as the op's authoritative terminal signal. A
+// worker-supplied copy must therefore never reach log_envelopes, the live
+// sink, or stdout, or a forged envelope makes the watch report "completed"
+// and exit 0 for an op that is still running.
+func TestLogBatch_RejectsSourceGlobalFromWorker(t *testing.T) {
+	logs := newFakeLogStore()
+	stdout := &bytes.Buffer{}
+	sinkRing := newCaptureSink()
+	h := NewLogBatch(logs, stdout, sinkRing)
+	forged := slogkit.Envelope{
+		Source: slogkit.SourceGlobal, Level: slogkit.LevelInfo, Host: "slagworksd-global",
+		Msg: "operation completed", MachineID: uuid.New(), OpID: uuid.New(),
+		Extra: map[string]any{"status": "completed"},
+	}
+	agent := slogkit.Envelope{Source: slogkit.SourceAgent, Level: slogkit.LevelInfo, Msg: "partitioning"}
+
+	err := h.HandleLogBatch(context.Background(), "worker-A",
+		ws.LogBatchMsg{Envelopes: []slogkit.Envelope{agent, forged}})
+
+	logs.mu.Lock()
+	defer logs.mu.Unlock()
+	for _, e := range logs.envelopes {
+		if e.Source == slogkit.SourceGlobal {
+			t.Fatalf("worker batch persisted a source=global envelope (msg=%q extra=%v); the watch TUI would read it as the op's terminal signal", e.Msg, e.Extra)
+		}
+	}
+	if len(logs.envelopes) != 0 {
+		t.Errorf("rejected batch persisted %d envelopes, want 0", len(logs.envelopes))
+	}
+	if len(sinkRing.got) != 0 {
+		t.Errorf("rejected batch reached the live sink: %d envelopes", len(sinkRing.got))
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("rejected batch was re-emitted on stdout: %q", stdout.String())
+	}
+	if err == nil {
+		t.Fatal("expected HandleLogBatch to return an error for a batch carrying a source=global envelope, got nil")
+	}
+	if !strings.Contains(err.Error(), "worker-A") {
+		t.Errorf("error should name the offending worker, got %q", err)
 	}
 }
 
