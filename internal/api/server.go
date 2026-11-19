@@ -573,10 +573,10 @@ func (s *Server) registerRoutes() {
 
 	// Structured-log stream for `slagctl machine logs` and the watch
 	// view. Reads log_envelopes via logstore.Store, with a 500ms
-	// watermark for live-tail (defends against pg
-	// sequence-id-allocated-pre-commit reordering). Operator auth like
-	// every other read: the bearer token rides the upgrade request's
-	// Authorization header.
+	// watermark on every query, backfill and live tail alike (defends
+	// against pg sequence-id-allocated-pre-commit reordering). Operator
+	// auth like every other read: the bearer token rides the upgrade
+	// request's Authorization header.
 	if s.logStore != nil {
 		read.GET("/logs/stream", s.handleLogsStream)
 	}

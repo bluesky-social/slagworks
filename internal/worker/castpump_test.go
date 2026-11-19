@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -269,6 +270,123 @@ func TestCastPump_TUsMonotonic(t *testing.T) {
 		}
 		prev = f.TUs
 	}
+}
+
+// memStream is a CastSession stream over an in-memory buffer: Read never
+// blocks and returns io.EOF when the buffer is drained, so the pump's read
+// loop runs flat out, as it does draining a console backlog.
+type memStream struct{ r *bytes.Reader }
+
+func (s *memStream) Read(p []byte) (int, error)  { return s.r.Read(p) }
+func (s *memStream) Write(p []byte) (int, error) { return len(p), nil }
+func (s *memStream) Close() error                { return nil }
+
+type memDialer struct{ data []byte }
+
+func (d memDialer) Dial(context.Context, uuid.UUID) (CastSession, error) {
+	return CastSession{Stream: &memStream{r: bytes.NewReader(d.data)}}, nil
+}
+
+// TestCastPump_BacklogFramesGetDistinctTUs: draining a backlog flushes
+// frames back to back, many inside one microsecond. Each frame must still
+// get a t_us strictly greater than the one before it: the console stream
+// pages with cursor = last t_us + 1, so a frame sharing its predecessor's
+// t_us across a page boundary is never delivered. FlushSize = ReadBufSize
+// = 1 makes every byte its own frame over a stream that never blocks, so
+// frames come out faster than one per microsecond and, without a guard,
+// many share a t_us.
+func TestCastPump_BacklogFramesGetDistinctTUs(t *testing.T) {
+	const n = 20000
+	sink := &collectingSink{}
+	pump := NewCastPump(CastPumpConfig{
+		MachineID:           uuid.New(),
+		Dialer:              memDialer{data: bytes.Repeat([]byte("x"), n)},
+		Resume:              fixedResume{v: 0},
+		Sink:                sink,
+		FlushSize:           1,
+		ReadBufSize:         1,
+		ReconnectBackoff:    time.Hour,
+		MaxReconnectBackoff: time.Hour,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); pump.Run(ctx) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for len(sink.Frames()) < n && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	frames := sink.Frames()
+	if len(frames) != n {
+		t.Fatalf("got %d frames, want %d (one per byte)", len(frames), n)
+	}
+	for i := 1; i < len(frames); i++ {
+		if frames[i].TUs <= frames[i-1].TUs {
+			t.Fatalf("frame %d t_us=%d is not after frame %d t_us=%d; the console stream's t_us+1 cursor would skip it",
+				i, frames[i].TUs, i-1, frames[i-1].TUs)
+		}
+	}
+}
+
+// TestCastPump_TUsMonotonicAcrossStaleResume: a resume offset behind what
+// this pump already emitted (its last frames still in flight to global
+// when the next session's resume RPC runs) must not send t_us backwards
+// or repeat a value. The pump remembers its last t_us across sessions.
+func TestCastPump_TUsMonotonicAcrossStaleResume(t *testing.T) {
+	dialer := &fakeCastDialer{
+		scripts: [][]byte{[]byte("first\n"), []byte("second\n")},
+		exitDur: 20 * time.Millisecond,
+	}
+	sink := &collectingSink{}
+	// The first session starts at 1s; the second is told 0, as if none of
+	// the first session's frames had reached global yet.
+	resume := &steppedResume{offsets: []int64{1_000_000, 0}}
+	pump := NewCastPump(CastPumpConfig{
+		MachineID:        uuid.New(),
+		Dialer:           dialer,
+		Resume:           resume,
+		Sink:             sink,
+		FlushInterval:    5 * time.Millisecond,
+		ReconnectBackoff: 5 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); pump.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(sink.Frames()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	frames := sink.Frames()
+	if len(frames) < 2 {
+		t.Fatalf("got %d frames, want at least 2 (one per session)", len(frames))
+	}
+	for i := 1; i < len(frames); i++ {
+		if frames[i].TUs <= frames[i-1].TUs {
+			t.Fatalf("frame %d (%q) t_us=%d is not after frame %d (%q) t_us=%d",
+				i, frames[i].Data, frames[i].TUs, i-1, frames[i-1].Data, frames[i-1].TUs)
+		}
+	}
+}
+
+// steppedResume returns offsets[i] on the i-th call, then repeats the
+// last one.
+type steppedResume struct {
+	mu      sync.Mutex
+	offsets []int64
+	calls   int
+}
+
+func (r *steppedResume) ResumeOffsetUs(context.Context, uuid.UUID) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	i := min(r.calls, len(r.offsets)-1)
+	r.calls++
+	return r.offsets[i], nil
 }
 
 // TestCastPump_RespectsContext: canceling the parent context exits

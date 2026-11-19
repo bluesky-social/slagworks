@@ -28,8 +28,10 @@ import (
 // destined for global's console_cast_events table.
 //
 // TUs is monotonic-per-cast microseconds, computed by the pump as
-// `prev_max_us + monotonic_since_pump_start`. Monotonicity must be
-// preserved across pump restarts and site-host clock changes.
+// `prev_max_us + monotonic_since_pump_start` and bumped to one past the
+// pump's previous frame when that would not advance it. Strict
+// monotonicity must be preserved across pump restarts and site-host
+// clock changes: the console stream pages with cursor = t_us + 1.
 type CastFrame struct {
 	MachineID uuid.UUID
 	TUs       int64
@@ -183,6 +185,12 @@ func (c *CastPumpConfig) defaults() {
 // pulled from Resume on each session start ensures this).
 type CastPump struct {
 	cfg CastPumpConfig
+
+	// lastTUs is the t_us of the last frame this pump emitted, across all
+	// of its sessions. Only flush touches it, always under the current
+	// session's mu; sessions run one at a time and each joins its ticker
+	// goroutine before returning, so no two sessions overlap on it.
+	lastTUs int64
 }
 
 // NewCastPump constructs a pump but does not start it. Call Run.
@@ -352,7 +360,18 @@ func (p *CastPump) session(ctx context.Context, log *slog.Logger) error {
 		data := make([]byte, buf.Len())
 		copy(data, buf.Bytes())
 		buf.Reset()
+		// Two flushes inside one microsecond (a backlog drained one full
+		// read after another, or the ticker flush racing a full read)
+		// read the same elapsed time, and a resume offset that lags this
+		// pump's own frames (still in flight to global) can start a
+		// session behind them. Either would repeat or rewind t_us, so
+		// step one past the previous frame instead until the clock
+		// passes it again.
 		t := time.Since(pumpStart).Microseconds() + prevMaxUs
+		if t <= p.lastTUs {
+			t = p.lastTUs + 1
+		}
+		p.lastTUs = t
 		p.cfg.Sink.PushCastFrame(CastFrame{
 			MachineID: p.cfg.MachineID,
 			TUs:       t,
