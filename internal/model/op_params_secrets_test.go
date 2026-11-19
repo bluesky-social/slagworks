@@ -279,6 +279,56 @@ func TestRedactParams_FailsClosed(t *testing.T) {
 	}
 }
 
+// TestRedactParams_RepeatedKeyDropsEarlierMembers: JSON allows an object to
+// repeat a key, and DecodeParams merges the repeated members field by field,
+// so a credential in an earlier member still reaches the worker. The
+// operator view must not carry it, even when the last member holds no
+// credential: it keeps only the last member of the repeated key, the same
+// view RedactParams gives when the last member does hold one.
+func TestRedactParams_RepeatedKeyDropsEarlierMembers(t *testing.T) {
+	cases := map[string]struct {
+		in, want string
+	}{
+		"runtime repeated, last has no password": {
+			`{"bmc_runtime":{"username":"ADMIN","password":"fixture-bmc-pw"},"bmc_runtime":{"username":"ADMIN"}}`,
+			`{"bmc_runtime":{"username":"ADMIN"}}`,
+		},
+		"runtime repeated, last is null": {
+			`{"monitor_runtime":{"password":"fixture-monitor-pw"},"monitor_runtime":null}`,
+			`{"monitor_runtime":null}`,
+		},
+		"password repeated, last is empty": {
+			`{"amt_runtime":{"host":"h","username":"u","password":"fixture-amt-pw","password":""}}`,
+			`{"amt_runtime":{"host":"h","password":"","username":"u"}}`,
+		},
+		"repeat spelled with an escape": {
+			`{"tailscale_runtime":{"auth_key":"fixture-tskey","auth_key":"","hostname":"h"}}`,
+			`{"tailscale_runtime":{"auth_key":"","hostname":"h"}}`,
+		},
+		"outlets repeated, last is empty": {
+			`{"pdu_runtime":{"outlets":[{"pdu_host":"h","outlet":1,"password":"fixture-pdu-pw-1"}],"outlets":[]}}`,
+			`{"pdu_runtime":{"outlets":[]}}`,
+		},
+		"password repeated inside an outlet": {
+			`{"pdu_runtime":{"outlets":[{"outlet":1,"password":"fixture-pdu-pw-1","password":""}]}}`,
+			`{"pdu_runtime":{"outlets":[{"outlet":1,"password":""}]}}`,
+		},
+	}
+	for name, tc := range cases {
+		if !json.Valid([]byte(tc.in)) {
+			t.Fatalf("%s: fixture is not valid JSON", name)
+		}
+		got := RedactParams(json.RawMessage(tc.in))
+		if n := leakedFixtureSecrets(got); n > 0 {
+			t.Errorf("%s: the operator view still carries %d credential(s)", name, n)
+			continue
+		}
+		if string(got) != tc.want {
+			t.Errorf("%s: got %s, want %s", name, got, tc.want)
+		}
+	}
+}
+
 // TestRedactParams_DoesNotMutateInput: the worker-facing publish shares the
 // op's Params bytes with the operator response, so redaction must never
 // write into its input.
