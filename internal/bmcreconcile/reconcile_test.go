@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -46,6 +47,25 @@ func TestParseUserList(t *testing.T) {
 				{Slot: 2, Name: "ADMIN", Privilege: PrivAdmin, Enabled: true},
 			},
 		},
+		{
+			// The bytes ipmitool itself writes into the pipe, TAB header
+			// included. Names up to IPMI's 16-byte maximum come through
+			// whole: HPE ships "Administrator" at slot 2.
+			name: "ipmitool raw output, TAB header",
+			in: ipmitoolUserListHeader +
+				ipmitoolUserRow(1, "", "true", "false", "false", "ADMINISTRATOR") +
+				ipmitoolUserRow(2, "Administrator", "true", "true", "true", "ADMINISTRATOR") +
+				ipmitoolUserRow(3, "monitor", "true", "true", "true", "USER") +
+				ipmitoolUserRow(4, "ipmi-exporter-ro", "true", "true", "true", "OPERATOR") +
+				ipmitoolUserRow(5, "", "true", "false", "false", "NO ACCESS"),
+			want: []User{
+				{Slot: 1, Name: "", Privilege: PrivAdmin, Enabled: true},
+				{Slot: 2, Name: "Administrator", Privilege: PrivAdmin, Enabled: true},
+				{Slot: 3, Name: "monitor", Privilege: PrivUser, Enabled: true},
+				{Slot: 4, Name: "ipmi-exporter-ro", Privilege: PrivOperator, Enabled: true},
+				{Slot: 5, Name: "", Privilege: 0, Enabled: false},
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -60,6 +80,56 @@ func TestParseUserList(t *testing.T) {
 			for i := range got {
 				if got[i] != tc.want[i] {
 					t.Errorf("row %d: got %+v, want %+v", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// ipmitoolUserListHeader is the header row ipmitool writes for `user list`,
+// byte for byte. It is a C string literal (lib/ipmi_user.c,
+// dump_user_access) holding two TABs; a terminal expands them to 8-column
+// stops, which puts each heading over its data column. The space-separated
+// headers elsewhere in this file are that terminal rendering.
+const ipmitoolUserListHeader = "ID  Name\t     Callin  Link Auth\tIPMI Msg   Channel Priv Limit\n"
+
+// ipmitoolUserRow renders one `user list` data row as ipmitool does:
+// printf("%-4d%-17s%-8s%-11s%-11s%-s\n"), space-padded with no TABs.
+func ipmitoolUserRow(slot int, name, callin, linkAuth, ipmiMsg, priv string) string {
+	return fmt.Sprintf("%-4d%-17s%-8s%-11s%-11s%-s\n", slot, name, callin, linkAuth, ipmiMsg, priv)
+}
+
+// TestReconcile_RawIpmitoolOutput_InBandRedeployIsNoOp runs an in-band
+// redeploy against the bytes real ipmitool writes (ipmitoolUserListHeader).
+// The monitor account is already provisioned, so provision-once means no
+// write of any kind but the boot order, and the slot-2 gate must accept the
+// bmc-creds-admin account at slot 2 whatever its length.
+func TestReconcile_RawIpmitoolOutput_InBandRedeployIsNoOp(t *testing.T) {
+	for _, admin := range []string{"ADMIN", "Administrator"} {
+		t.Run(admin, func(t *testing.T) {
+			fake := newFakeIPMITool(t)
+			table := ipmitoolUserListHeader +
+				ipmitoolUserRow(1, "", "true", "false", "false", "ADMINISTRATOR") +
+				ipmitoolUserRow(2, admin, "true", "true", "true", "ADMINISTRATOR") +
+				ipmitoolUserRow(3, "monitor", "true", "true", "true", "USER")
+			fake.queueOutput("user list 1", table)
+			fake.queueOutput("chassis bootparam set bootflag force_pxe options=PEF,timestamp,reset_persistence", "")
+			fake.queueOutput("user list 1", table)
+
+			res, err := Reconcile(context.Background(), Options{
+				IPMITool:  fake.path,
+				Desired:   []DesiredUser{{Name: MonitorUser, Privilege: PrivUser}},
+				AdminUser: admin,
+			})
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if len(res.CreatedOrUpdated) != 0 {
+				t.Errorf("redeploy rewrote a provisioned account's password: %+v", res.CreatedOrUpdated)
+			}
+			for _, c := range fake.calls() {
+				if !strings.Contains(c.Args, "user list 1") && !strings.Contains(c.Args, "bootparam") {
+					t.Errorf("redeploy of a compliant BMC issued %q", c.Args)
 				}
 			}
 		})
