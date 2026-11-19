@@ -87,7 +87,7 @@ func TestPlan_WipesPartitionsItDoesNotFormat(t *testing.T) {
 		},
 		Mounts: map[string]Mount{"/": {Device: "mdroot"}, "/boot/efi": {Device: "vdb2"}},
 	}
-	cmds, err := Plan(layout, []BlockDevice{{Name: "vda"}, {Name: "vdb"}})
+	cmds, err := Plan(layout, []BlockDevice{{Name: "vda", LogicalSectorBytes: 512}, {Name: "vdb", LogicalSectorBytes: 512}})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestPlan_WipesRAIDArrayItDoesNotFormat(t *testing.T) {
 		},
 		Mounts: map[string]Mount{"/": {Device: "vda2"}, "/boot/efi": {Device: "vda1"}},
 	}
-	cmds, err := Plan(layout, []BlockDevice{{Name: "vda"}, {Name: "vdb"}, {Name: "vdc"}})
+	cmds, err := Plan(layout, []BlockDevice{{Name: "vda", LogicalSectorBytes: 512}, {Name: "vdb", LogicalSectorBytes: 512}, {Name: "vdc", LogicalSectorBytes: 512}})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestPlan_NeverWipesPreservedOrRetainedDevices(t *testing.T) {
 			"/data": { "device": "mddata" }
 		}
 	}`)
-	cmds, err := Plan(layout, []BlockDevice{{Name: "nvme0n1"}, {Name: "nvme1n1"}, {Name: "nvme4n1"}})
+	cmds, err := Plan(layout, []BlockDevice{{Name: "nvme0n1", LogicalSectorBytes: 512}, {Name: "nvme1n1", LogicalSectorBytes: 512}, {Name: "nvme4n1", LogicalSectorBytes: 512}})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
