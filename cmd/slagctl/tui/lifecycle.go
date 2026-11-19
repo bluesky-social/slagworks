@@ -163,7 +163,16 @@ func newLifecyclePaneClock(opType model.OperationType, now func() time.Time) *li
 // finalizes the prior phase (deriving its duration) and backfills any unseen
 // earlier phases as skipped. Unknown phases are ignored — the spine is the
 // authority on what's renderable.
+//
+// Once the op has failed the spine is final and observations are ignored: a
+// held screen keeps receiving envelopes, and a phase reported after the
+// failure would otherwise start spinning under the FAILED header and
+// skip-mark the runway Fail leaves pending. Completion needs no such guard:
+// observing terminalCompleted leaves no pending phase for a later one to claim.
 func (l *lifecyclePane) Observe(phase string, at time.Time) {
+	if l.failed {
+		return
+	}
 	idx, ok := l.index[phase]
 	if !ok {
 		return
@@ -253,8 +262,9 @@ func (l *lifecyclePane) FailedPhase() string { return l.failedPhase }
 
 // Fail marks the current phase failed at time at. The remaining runway stays
 // pending (○), matching the failure mockup: we don't skip-mark phases the op
-// never got to. If no phase is current (failure before any phase arrived, or
-// after completion) it only records the failed flag.
+// never got to, and Observe ignores phases reported after this. If no phase is
+// current (failure before any phase arrived, or after completion) it only
+// records the failed flag.
 func (l *lifecyclePane) Fail(at time.Time) {
 	if l.curIdx >= 0 {
 		cur := &l.rows[l.curIdx]
