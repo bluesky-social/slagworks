@@ -100,23 +100,6 @@ type phaseState struct {
 	started time.Time
 }
 
-// bootPrefixPhases are the phases the boot spine reports as a host powers
-// on and PXE/iPXE-boots (toward the agent). They must NOT clobber
-// awaiting_phone_home: once a deploy install is done and the op is awaiting
-// phone-home, the host's reboots are booting its freshly installed DISK,
-// and its firmware-PXE DHCP/iPXE traffic (PXE is boot order #1) would
-// otherwise reset the phase off awaiting_phone_home. That reset makes
-// BootActionForMAC return BootDeploy again and the host re-deploys in a
-// loop, re-wiping the disk it just installed. Only phone_home (op
-// completes) or the phone-home timeout (op fails) may leave
-// awaiting_phone_home.
-var bootPrefixPhases = map[string]bool{
-	"pxe_booting": true,
-	"dhcp_ack":    true,
-	"ipxe_dhcp":   true,
-	"ipxe_loaded": true,
-}
-
 // keepTerminalWait holds a locally reached awaiting_phone_home on a deploy
 // op that global's incoming row still shows active at an earlier phase.
 // Local phase writes don't bump Version, so global's echo of an EARLIER
@@ -126,7 +109,7 @@ var bootPrefixPhases = map[string]bool{
 // post-install PXE gets BootDeploy, and the host re-deploys over the disk it
 // just installed (leaf-5.pop1 2026-10-24). Only completion
 // (op_removed) or failure may leave awaiting_phone_home — the same rule
-// updatePhase enforces against boot-prefix phases.
+// updatePhase enforces against local phase writes.
 func keepTerminalWait(existing, incoming *model.Operation) {
 	if existing == nil || existing.Phase != "awaiting_phone_home" {
 		return
@@ -930,12 +913,20 @@ func (o *opState) updatePhase(opID, phase string) phaseUpdate {
 		return phaseUpdate{}
 	}
 
-	// A deploy op awaiting phone-home is in a terminal wait; the
-	// host is (re)booting its installed disk. Drop boot-prefix phase reports
-	// (from DHCP OnACK / the boot-script handler) that would knock it back
-	// to a PXE phase and re-trigger BootDeploy.
-	if op, ok := o.ops[opID]; ok &&
-		op.Phase == "awaiting_phone_home" && bootPrefixPhases[phase] {
+	// A deploy op awaiting phone-home is in a terminal wait: the install is
+	// done and the host is (re)booting its freshly installed disk.
+	// BootActionForMAC keys BootLocal on this phase, so any write that moves
+	// the op off it hands the next PXE BootDeploy and the host reinstalls
+	// over that disk. The writers that can still arrive here are the
+	// post-install firmware PXE (DHCP OnACK, the boot-script handler), the
+	// executor's power_cycle/pxe_booting when it drives an op whose install
+	// finished while the op was still pending, and an agent phase report
+	// processed after deploy_complete. Completion goes through
+	// RecordPhoneHome, not a phase write, so the only phase allowed to leave
+	// is the agent's "failed" (HandleProgressReport writes it just before
+	// MarkOpFailed). A same-phase write falls through to the dedup below.
+	if op, ok := o.ops[opID]; ok && op.Phase == "awaiting_phone_home" &&
+		phase != "awaiting_phone_home" && phase != "failed" {
 		return phaseUpdate{}
 	}
 

@@ -711,23 +711,30 @@ latch, that PXE would land back in `Cache.BootActionForMAC` while
 the machine was still `deploying`, get `BootDeploy` again, and the
 agent would wipe the disk it just wrote.
 
-The fix is a per-phase clobber guard.
+The fix is a clobber guard on the op's phase.
 
-`Cache.HandleProgressReport` (`internal/worker/cache.go:1517`)
+`Cache.HandleProgressReport` (`internal/worker/cache.go`)
 recognizes the `deploy_complete` event and calls
-`UpdateOpPhase(opID, "awaiting_phone_home")` (line 1525).
+`UpdateOpPhase(opID, "awaiting_phone_home")`.
 
-`Cache.UpdateOpPhase` (`cache.go:1321`) then refuses to overwrite
-`awaiting_phone_home` with a phase from the `bootPrefixPhases` set
-(`cache.go:1314`):
-
-```text
-pxe_booting, dhcp_ack, ipxe_dhcp, ipxe_loaded
-```
-
-The reasoning is documented in the block comment at `cache.go:1301`.
-Test: `TestUpdateOpPhase_AwaitingPhoneHomeNotClobbered`
-(`cache_test.go:190`).
+`Cache.UpdateOpPhase` then refuses every phase write that would move
+the op off `awaiting_phone_home`, except `failed`, which
+`HandleProgressReport` writes just before `MarkOpFailed` on an agent
+failure report. The guard lives in `opState.updatePhase`
+(`internal/worker/opstate_cache.go`). The writers it stops are the
+post-install firmware PXE (`pxe_booting`, `dhcp_ack`, `ipxe_dhcp`,
+`ipxe_loaded`), the executor's `power_cycle` and `pxe_booting` when it
+claims an op whose install finished while the op was still pending,
+and an agent phase report the worker processes after
+`deploy_complete`. Completion never needs a phase write: it goes
+through `RecordPhoneHome`. A dropped write is not queued for global
+either, so the op stays on the phone-home timeout. Tests:
+`TestUpdateOpPhase_AwaitingPhoneHomeNotClobbered` and
+`TestUpdateOpPhase_AwaitingPhoneHomeOnlyLeftByFailure`
+(`cache_test.go`). `keepTerminalWait` holds the phase the same way
+against a claimed or running deploy row in an op_delta or op_resync
+from global (`TestStaleEchoKeepsAwaitingPhoneHome`,
+`opstream_test.go`).
 
 `Cache.BootActionForMAC` reads the phase and returns `BootLocal`
 whenever `state = deploying` and `phase = awaiting_phone_home`

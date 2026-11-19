@@ -1008,7 +1008,7 @@ func (c *Cache) PrepareDeployLogs(machineID, operationID string) {
 // source:"phase" log entry, and queues the update for push to central.
 // If the operation has been marked failed, the update is rejected. The
 // awaiting_phone_home clobber guard and same-phase dedup live in
-// opState.updatePhase; see bootPrefixPhases (opstate_cache.go) for why.
+// opState.updatePhase (opstate_cache.go), which documents why.
 func (c *Cache) UpdateOpPhase(opID, phase string) {
 	upd := c.opState.updatePhase(opID, phase)
 	if !upd.proceed {
