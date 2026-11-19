@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 
+	"github.com/bluesky-social/slagworks/cmd/slagctl/format"
 	"github.com/bluesky-social/slagworks/internal/model"
 )
 
@@ -444,16 +445,20 @@ func renderHeader(in frameInput, maxW int) string {
 // workerLabel renders the claiming worker for the header/summary. claimed_by
 // may be a worker UUID or a friendly worker name. Em dash before it's known;
 // a UUID is shortened to its first 8 chars (operators map it via
-// `slagctl worker list`); a friendly name is shown verbatim (the box width
-// truncates if needed — we don't chop a real name at 8).
+// `slagctl worker list`); a friendly name is shown in full (the box width
+// truncates if needed — we don't chop a real name at 8). claimed_by arrives
+// off the log stream like any envelope field and an unknown ID passes the
+// resolver unchanged, so the name is escaped for the terminal, and the short
+// UUID is cut from the parsed value: uuid.Parse also accepts braced and
+// urn:uuid: forms and does not check the bytes it strips from the braced one.
 func workerLabel(worker string) string {
 	if worker == "" {
 		return "—"
 	}
-	if _, err := uuid.Parse(worker); err == nil {
-		return worker[:8]
+	if id, err := uuid.Parse(worker); err == nil {
+		return id.String()[:8]
 	}
-	return worker
+	return format.Untrusted(worker)
 }
 
 // renderSummary is the derived-state box under the lifecycle column: current
@@ -596,12 +601,18 @@ var lineBreaks = strings.NewReplacer("\r\n", "\n", "\r", "\n")
 // wrapLines splits s on line breaks (LF, CRLF or a bare CR) and hard-wraps
 // each line to w terminal cells (cell-aware, so wide characters in a script's
 // stderr cannot overflow the row budget). Empty s yields no lines; w < 1
-// disables wrapping.
+// disables wrapping. s is a failure cause, usually the target agent's own
+// report, so each line is escaped for the terminal before wrapping; only the
+// line breaks between them survive.
 func wrapLines(s string, w int) []string {
 	if s == "" {
 		return nil
 	}
-	return strings.Split(ansi.Hardwrap(strings.TrimRight(lineBreaks.Replace(s), "\n"), w, true), "\n")
+	lines := strings.Split(strings.TrimRight(lineBreaks.Replace(s), "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = format.Untrusted(l)
+	}
+	return strings.Split(ansi.Hardwrap(strings.Join(lines, "\n"), w, true), "\n")
 }
 
 // clampWidth truncates a line to w display cells (rune count; log lines are
@@ -629,7 +640,7 @@ func smallTerminalMessage(in frameInput) string {
 	var msg string
 	switch {
 	case in.done && in.failed:
-		reason := in.failReason
+		reason := format.Untrusted(in.failReason)
 		if reason == "" {
 			reason = in.lifecycle.FailedPhase()
 		}

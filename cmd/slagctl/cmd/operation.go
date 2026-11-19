@@ -120,8 +120,9 @@ func renderOperations(out io.Writer, ops []model.Operation) error {
 		// Completed ops keep their last phase in the DB; showing
 		// "finalizing" next to status=completed reads as stuck, so blank
 		// it. Failed ops KEEP the phase — "failed at partitioning" is the
-		// single most useful triage datum.
-		phase := op.Phase
+		// single most useful triage datum. The phase is whatever the
+		// target's agent reported, so it is escaped for the terminal.
+		phase := format.Untrusted(op.Phase)
 		if op.Status == model.OpCompleted {
 			phase = ""
 		}

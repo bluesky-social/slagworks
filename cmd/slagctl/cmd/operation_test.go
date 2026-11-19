@@ -190,6 +190,29 @@ func TestOperationList_ShowsMachineName(t *testing.T) {
 	}
 }
 
+// TestOperationList_EscapesTerminalControlsInPhase: an op's phase is
+// whatever the target's agent reported to the site (/api/v1/report), so
+// the PHASE column must show escape sequences in it as text.
+func TestOperationList_EscapesTerminalControlsInPhase(t *testing.T) {
+	ops := []model.Operation{
+		{ID: uuid.New(), MachineID: uuid.New(), MachineName: "cpu1.pop1", Type: model.OpDeploy,
+			Status: model.OpRunning, Phase: "partitioning\x1b]52;c;cHduZWQ=\x07\x1b[2J", CreatedAt: time.Now()},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/operations", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(ops)
+	})
+	cl := testServer(t, mux)
+	out, err := execCmd(t, cl, "operation", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoTerminalControls(t, out)
+	if want := `partitioning\x1b]52;c;cHduZWQ=\x07\x1b[2J`; !strings.Contains(out, want) {
+		t.Errorf("expected the escaped phase %q in output, got: %q", want, out)
+	}
+}
+
 func TestOperationShow_JSON(t *testing.T) {
 	opID := uuid.New()
 	op := model.Operation{ID: opID, Type: model.OpCommission, Status: model.OpCompleted}

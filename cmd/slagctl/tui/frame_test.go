@@ -2,13 +2,16 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
 	"github.com/bluesky-social/slagworks/internal/model"
+	"github.com/bluesky-social/slagworks/internal/slogkit"
 )
 
 // TestSyncedSince_LockstepAcrossAnchors is the bug-2 guard: timers with
@@ -449,6 +452,77 @@ func TestFrame_LogLineBreaksKeepFrameShape(t *testing.T) {
 				t.Errorf("want %q and %q on one row:\n%s", tc.first, tc.second, strings.Join(rows, "\n"))
 			}
 		})
+	}
+}
+
+// sgr matches the Select Graphic Rendition sequences the TUI's own styles and
+// box borders emit.
+var sgr = regexp.MustCompile(`\x1b\[[0-9;:]*m`)
+
+// assertNoTerminalControls fails if s, with the TUI's own styling removed,
+// still carries a control character other than a line feed: such a byte came
+// from streamed data and would reach the operator's terminal.
+func assertNoTerminalControls(t *testing.T, s string) {
+	t.Helper()
+	for _, line := range strings.Split(sgr.ReplaceAllString(s, ""), "\n") {
+		for _, r := range line {
+			if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+				t.Errorf("frame carries terminal control %U: %q", r, line)
+				break
+			}
+		}
+	}
+}
+
+// TestFrame_EscapesTerminalControlsFromStream: the claiming worker, log lines
+// and failure cause all arrive off the log stream and the op row, and the cause
+// is the target agent's own report. Escape sequences in them must reach the
+// frame as visible text, at full size and on the small-terminal path. The cell
+// renderer Bubble Tea puts between the frame and the terminal drops some
+// sequences (OSC 52, CSI) but passes OSC 8 hyperlinks and APC strings through,
+// so the frame itself must be clean.
+func TestFrame_EscapesTerminalControlsFromStream(t *testing.T) {
+	m := newTestModel(fixedClock(at(42 * time.Second)))
+	m.startedAt = at(0)
+	m.holdOnTerminal = true
+	m = send(m, phaseMsg{phase: "power_cycle", at: at(0)})
+	m = send(m, claimedMsg{worker: "\x1b]52;c;ZWNobyBwd25lZAo=\x07worker"})
+	m = send(m, logEnvelopeMsg{id: 1, env: slogkit.Envelope{TS: at(time.Second), Source: slogkit.SourceAgent,
+		Msg: "ok\x1b]8;;http://evil.example/\x07click\x1b]8;;\x07"}})
+	m = send(m, opTerminalMsg{failed: true, at: at(42 * time.Second),
+		reason: "net: script failed\nERROR: \x1b_apc\x1b\\missing bond\r\x1b[2K\x1b]8;;http://evil.example/\x07fix"})
+
+	frame := m.View().Content
+	assertNoTerminalControls(t, frame)
+	for _, want := range []string{`\x1b]52;c;`, `ok\x1b]8;;http://evil.example/\x07click`, "net: script failed", `ERROR: \x1b_apc\x1b\missing bond`, `\x1b[2K\x1b]8;;http://evil.example/\x07fix`} {
+		if !strings.Contains(plain(frame), want) {
+			t.Errorf("frame missing %q:\n%s", want, plain(frame))
+		}
+	}
+
+	m = send(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	small := m.View().Content
+	assertNoTerminalControls(t, small)
+	if !strings.Contains(small, `net: script failed\nERROR: \x1b_apc`) {
+		t.Errorf("small-terminal message missing the escaped cause: %q", small)
+	}
+}
+
+// TestWorkerLabel_ShortUUIDIsCanonical: uuid.Parse also accepts the 38-byte
+// braced form without checking the bytes it strips and the urn:uuid: form, so
+// the short label is cut from the parsed UUID, never from the raw claimed_by:
+// "\x1bc0000000-...x" parses, and its first 8 raw bytes are ESC c (reset).
+func TestWorkerLabel_ShortUUIDIsCanonical(t *testing.T) {
+	for in, want := range map[string]string{
+		"c0ffee00-0000-4000-8000-000000000001":          "c0ffee00",
+		"{c0ffee00-0000-4000-8000-000000000001}":        "c0ffee00",
+		"\x1bc0000000-0000-4000-8000-000000000001x":     "c0000000",
+		"urn:uuid:c0ffee00-0000-4000-8000-000000000001": "c0ffee00",
+		"pop1-sw-2\x1b]52;c;cHduZWQ=\x07":               `pop1-sw-2\x1b]52;c;cHduZWQ=\x07`,
+	} {
+		if got := workerLabel(in); got != want {
+			t.Errorf("workerLabel(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
