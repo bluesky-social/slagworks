@@ -197,7 +197,7 @@ func TestPatch_FormBodyIsRefused(t *testing.T) {
 	}
 	if err := st.CreateSiteConfig(&model.SiteConfig{
 		Slug: "pop-a", NetBoxSite: "pop-a", EphemeralPoolStart: "10.0.0.10", EphemeralPoolEnd: "10.0.0.250",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	s := bodyTestServer(t, Config{Store: st})

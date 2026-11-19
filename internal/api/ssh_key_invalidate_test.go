@@ -38,7 +38,7 @@ func TestSSHKeyMutations_InvalidateAllSites(t *testing.T) {
 			NetBoxSite:         slug,
 			EphemeralPoolStart: "10.0.0.10",
 			EphemeralPoolEnd:   "10.0.0.250",
-		}); err != nil {
+		}, nil); err != nil {
 			t.Fatalf("seed site_config %s: %v", slug, err)
 		}
 	}

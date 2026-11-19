@@ -2,16 +2,67 @@ package store
 
 import (
 	"errors"
+	"fmt"
+
+	"gorm.io/gorm"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 )
 
-// CreateSiteConfig inserts a SiteConfig after validating the payload.
-func (s *Store) CreateSiteConfig(cfg *model.SiteConfig) error {
+// SiteConfigAdmit decides whether a site config may be written, given every
+// site_configs row as it stands at the moment of the write (the config's own
+// row included, when it exists). A non-nil error refuses the write and is
+// returned to the caller unchanged.
+type SiteConfigAdmit func(existing []model.SiteConfig) error
+
+// siteConfigScopeLock is the advisory-lock key that serializes every write
+// of a site config's scope (netbox_site, netbox_location). The prefix keeps
+// it apart from the other advisory-lock domains (WithPopAdvisoryLock).
+const siteConfigScopeLock = "slagworks-site-config-scope"
+
+// writeSiteConfig runs admit and write in one transaction that holds the
+// site-config scope advisory lock.
+//
+// No two site configs may claim the same device, and whether a config may be
+// written depends on every other row: a row lock on the config being written
+// cannot stop a second writer from inserting or re-scoping a different row
+// between the check and the write, after which both pass and both land. The
+// lock is in Postgres rather than in the process so that it also holds
+// between slagworksd replicas sharing the database. It is released when the
+// transaction ends. Under READ COMMITTED the list below is a new statement,
+// so it sees everything the previous holder committed.
+//
+// Deletes do not take the lock: removing a config can only shrink the set of
+// claimed devices.
+func (s *Store) writeSiteConfig(admit SiteConfigAdmit, write func(tx *gorm.DB) error) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", siteConfigScopeLock).Error; err != nil {
+			return fmt.Errorf("acquire advisory lock %q: %w", siteConfigScopeLock, err)
+		}
+		if admit != nil {
+			var existing []model.SiteConfig
+			if err := tx.Find(&existing).Error; err != nil {
+				return fmt.Errorf("list site configs: %w", err)
+			}
+			if err := admit(existing); err != nil {
+				return err
+			}
+		}
+		return write(tx)
+	})
+}
+
+// CreateSiteConfig inserts a SiteConfig after validating the payload. admit,
+// when non-nil, is asked whether the config may be created; the question and
+// the insert are atomic with respect to every other site-config create and
+// update (see writeSiteConfig).
+func (s *Store) CreateSiteConfig(cfg *model.SiteConfig, admit SiteConfigAdmit) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	return s.db.Create(cfg).Error
+	return s.writeSiteConfig(admit, func(tx *gorm.DB) error {
+		return tx.Create(cfg).Error
+	})
 }
 
 func (s *Store) GetSiteConfig(slug string) (*model.SiteConfig, error) {
@@ -69,21 +120,27 @@ var ErrSiteConfigNotFound = errors.New("site config not found")
 // committed in between, and the next rebuild would reissue a SeqNum the
 // worker has already applied and will drop. Returns ErrSiteConfigNotFound
 // when no row matches, so a config deleted mid-request stays deleted.
-func (s *Store) UpdateSiteConfig(cfg *model.SiteConfig) error {
+//
+// admit, when non-nil, is asked whether the config may be written as cfg has
+// it; the question and the write are atomic with respect to every other
+// site-config create and update (see writeSiteConfig).
+func (s *Store) UpdateSiteConfig(cfg *model.SiteConfig, admit SiteConfigAdmit) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	res := s.db.Model(&model.SiteConfig{}).Where("slug = ?", cfg.Slug).
-		Select("netbox_site", "netbox_location", "ephemeral_pool_start",
-			"ephemeral_pool_end", "relay_pools", "promiscuous").
-		Updates(cfg)
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrSiteConfigNotFound
-	}
-	return nil
+	return s.writeSiteConfig(admit, func(tx *gorm.DB) error {
+		res := tx.Model(&model.SiteConfig{}).Where("slug = ?", cfg.Slug).
+			Select("netbox_site", "netbox_location", "ephemeral_pool_start",
+				"ephemeral_pool_end", "relay_pools", "promiscuous").
+			Updates(cfg)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrSiteConfigNotFound
+		}
+		return nil
+	})
 }
 
 func (s *Store) DeleteSiteConfig(slug string) error {

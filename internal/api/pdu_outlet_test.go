@@ -840,7 +840,7 @@ func TestPowerPDUOutlet_SelfFeedCycle_SelfIsNotAPartnerAcrossSerialCase(t *testi
 	if err := st.CreateSiteConfig(&model.SiteConfig{
 		Slug: "pop1", NetBoxSite: "pop1",
 		EphemeralPoolStart: "10.0.0.10", EphemeralPoolEnd: "10.0.0.250",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("seed site_config: %v", err)
 	}
 	s.powerStatusRPC = fakeOutletRPC{serials: map[string][]string{"pop1": {"sn-kworker1"}}}
@@ -901,7 +901,7 @@ func TestPowerPDUOutlet_SelfFeedCycle_EligiblePartnerConnected_Created(t *testin
 	if err := st.CreateSiteConfig(&model.SiteConfig{
 		Slug: "pop1", NetBoxSite: "pop1",
 		EphemeralPoolStart: "10.0.0.10", EphemeralPoolEnd: "10.0.0.250",
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("seed site_config: %v", err)
 	}
 	// A connected partner with a distinct verified serial.

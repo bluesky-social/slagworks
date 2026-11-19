@@ -2331,10 +2331,14 @@ func (s *Server) createSiteConfig(c *echo.Context) error {
 	if cfg.NetBoxSite == "" {
 		cfg.NetBoxSite = cfg.Slug
 	}
-	if herr := s.validateSiteConfigNetBox(c, &cfg); herr != nil {
+	admit, herr := s.validateSiteConfigNetBox(c, &cfg)
+	if herr != nil {
 		return herr
 	}
-	if err := s.store.CreateSiteConfig(&cfg); err != nil {
+	if err := s.store.CreateSiteConfig(&cfg, admit); err != nil {
+		if herr, ok := errors.AsType[*echo.HTTPError](err); ok {
+			return herr
+		}
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 
@@ -2367,27 +2371,38 @@ func (s *Server) createSiteConfig(c *echo.Context) error {
 // create or update: the netbox_site must exist; the config's scope
 // (whole-site or its location) must have a slagworks-production prefix
 // so the first snapshot build can't fail with "no production prefix";
-// a location-scoped config's location must belong to the site; and the
-// config must not overlap an existing config on the same site (ruling 2
-// create/update half). Returns a *echo.HTTPError on failure, nil on
-// success. No-op when NetBox isn't wired (tests).
-func (s *Server) validateSiteConfigNetBox(c *echo.Context, cfg *model.SiteConfig) *echo.HTTPError {
+// and a location-scoped config's location must belong to the site. Returns
+// a *echo.HTTPError when one of those fails.
+//
+// The last precondition, that the config must not overlap an existing
+// config on the same site (ruling 2 create/update half), is returned as a
+// store.SiteConfigAdmit for the caller to pass to the store write rather
+// than checked here: the store runs it against the rows as they stand at
+// the write, with every other site-config write held off, so two requests
+// cannot each pass the check against rows that predate the other's write.
+// The admit refuses with a 409 *echo.HTTPError. It closes over the
+// locations fetched here; NetBox is not re-read while the store's lock is
+// held, and CheckOverlap fails closed on a config whose location is
+// missing from that list.
+//
+// Both results are nil when NetBox isn't wired (tests).
+func (s *Server) validateSiteConfigNetBox(c *echo.Context, cfg *model.SiteConfig) (store.SiteConfigAdmit, *echo.HTTPError) {
 	if s.netbox == nil {
-		return nil
+		return nil, nil
 	}
 	ctx := c.Request().Context()
 	site, err := s.netbox.GetSiteBySlug(ctx, cfg.NetBoxSite)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
+		return nil, echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
 	}
 	if site == nil {
-		return echo.NewHTTPError(http.StatusPreconditionFailed,
+		return nil, echo.NewHTTPError(http.StatusPreconditionFailed,
 			fmt.Sprintf("netbox site %q not found; create the site in NetBox first", cfg.NetBoxSite))
 	}
 
 	locations, err := s.netbox.ListLocationsForSite(ctx, cfg.NetBoxSite)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
+		return nil, echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
 	}
 	// Belongs-to: a location-scoped config's location must be in the site.
 	if cfg.LocationScoped() {
@@ -2400,38 +2415,37 @@ func (s *Server) validateSiteConfigNetBox(c *echo.Context, cfg *model.SiteConfig
 			}
 		}
 		if !found {
-			return echo.NewHTTPError(http.StatusPreconditionFailed,
+			return nil, echo.NewHTTPError(http.StatusPreconditionFailed,
 				fmt.Sprintf("netbox location %q not found in site %q", cfg.NetBoxLocation, cfg.NetBoxSite))
 		}
 		prefixes, err := s.netbox.ListLocationPrefixes(ctx, locID, "slagworks-production")
 		if err != nil {
-			return echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
+			return nil, echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
 		}
 		if len(prefixes) == 0 {
-			return echo.NewHTTPError(http.StatusPreconditionFailed,
+			return nil, echo.NewHTTPError(http.StatusPreconditionFailed,
 				fmt.Sprintf("netbox location %q has no prefix tagged 'slagworks-production' scoped to it; tag+scope one before site-config create", cfg.NetBoxLocation))
 		}
 	} else {
 		prefixes, err := s.netbox.ListSitePrefixes(ctx, cfg.NetBoxSite, "slagworks-production")
 		if err != nil {
-			return echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
+			return nil, echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
 		}
 		if len(prefixes) == 0 {
-			return echo.NewHTTPError(http.StatusPreconditionFailed,
+			return nil, echo.NewHTTPError(http.StatusPreconditionFailed,
 				fmt.Sprintf("netbox site %q has no prefix tagged 'slagworks-production'; create one (with gateway_ip custom field) before site-config create", cfg.NetBoxSite))
 		}
 	}
 
 	// Overlap: reject a config that could claim the same devices as an
 	// existing one on this site.
-	existing, err := s.store.ListSiteConfigs()
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-	if err := snapshot.CheckOverlap(*cfg, existing, locations); err != nil {
-		return echo.NewHTTPError(http.StatusConflict, err.Error())
-	}
-	return nil
+	candidate := *cfg
+	return func(existing []model.SiteConfig) error {
+		if err := snapshot.CheckOverlap(candidate, existing, locations); err != nil {
+			return echo.NewHTTPError(http.StatusConflict, err.Error())
+		}
+		return nil
+	}, nil
 }
 
 func (s *Server) updateSiteConfig(c *echo.Context) error {
@@ -2476,12 +2490,18 @@ func (s *Server) updateSiteConfig(c *echo.Context) error {
 	// the merged config — an update that changes netbox_site/location
 	// must satisfy the same invariants a create does. CheckOverlap skips
 	// this config's own row by slug, so a no-scope-change update passes.
-	if herr := s.validateSiteConfigNetBox(c, cfg); herr != nil {
+	// The overlap half runs inside the store write (see
+	// validateSiteConfigNetBox).
+	admit, herr := s.validateSiteConfigNetBox(c, cfg)
+	if herr != nil {
 		return herr
 	}
-	if err := s.store.UpdateSiteConfig(cfg); err != nil {
+	if err := s.store.UpdateSiteConfig(cfg, admit); err != nil {
 		if errors.Is(err, store.ErrSiteConfigNotFound) {
 			return echo.NewHTTPError(http.StatusNotFound, "site_config not found")
+		}
+		if herr, ok := errors.AsType[*echo.HTTPError](err); ok {
+			return herr
 		}
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
