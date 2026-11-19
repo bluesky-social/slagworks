@@ -563,9 +563,10 @@ func (s *Server) registerRoutes() {
 		api.POST("/hooks/netbox", s.webhookHandler.HandleWebhook)
 	}
 
-	// Site-worker WebSocket hub. The hub authenticates via ?token=
-	// internally against site_workers.token_hash, so we don't wrap it
-	// in the adminAuth middleware — that's a different token class.
+	// Site-worker WebSocket hub. The hub authenticates the worker's
+	// bearer token internally against site_workers.token_hash, so we
+	// don't wrap it in the adminAuth middleware — that's a different
+	// token class.
 	// GET is the only method a browser/client would use to upgrade.
 	if s.wsHub != nil {
 		api.GET("/ws/site", echo.WrapHandler(s.wsHub))

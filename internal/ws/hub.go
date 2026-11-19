@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +21,7 @@ import (
 )
 
 // WorkerAuthenticator authenticates a site worker by the plaintext
-// token value pulled off the ?token= query string at WS upgrade time.
+// token value pulled off the Authorization header at WS upgrade time.
 // Returns ErrSiteWorkerNotFound on invalid/missing token; callers 401
 // without disambiguating.
 type WorkerAuthenticator interface {
@@ -339,7 +340,8 @@ type HubConfig struct {
 
 // Hub is the server-side endpoint for the worker-facing WebSocket
 // protocol. It:
-//   - authenticates each connection at upgrade time via ?token=
+//   - authenticates each connection at upgrade time by the bearer token
+//     in its Authorization header
 //   - tracks connected workers per site slug (many-per-slug for HA)
 //   - accepts Push(slug, snap) from the snapshot dispatcher and fans
 //     out to all connected workers for that slug
@@ -572,17 +574,20 @@ func (h *Hub) sendOpMessage(c *workerConn, msgType string, payload any, kind, op
 }
 
 // ServeHTTP upgrades the incoming request to a WebSocket connection
-// for a site worker. The request must include ?token=<plaintext>;
-// authentication resolves (site_slug, worker_id) from
-// site_workers.token_hash.
+// for a site worker. The request must carry the plaintext worker token
+// as "Authorization: Bearer <token>"; authentication resolves
+// (site_slug, worker_id) from site_workers.token_hash. The token is
+// never read from the URL: request loggers and net/http dial errors
+// quote URLs, so a URL-borne token ends up in logs.
 //
 // On success the call blocks until the worker disconnects or ctx is
 // cancelled, so this is intended to be wired under a long-lived
 // handler (e.g. echo.WrapHandler) rather than a request-scoped one.
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
-	if token == "" {
-		http.Error(w, "missing token", http.StatusUnauthorized)
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	token = strings.TrimSpace(token)
+	if !ok || token == "" {
+		http.Error(w, "missing worker token: send it as Authorization: Bearer <token>", http.StatusUnauthorized)
 		return
 	}
 	worker, err := h.cfg.Auth.GetSiteWorkerByTokenHash(store.HashWorkerToken(token))

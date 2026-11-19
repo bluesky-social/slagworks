@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
 
@@ -122,7 +123,8 @@ func TestOperatorReadsRedactCredentials_WorkerStillReceivesThem(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	worker, err := ws.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/api/v1/ws/site?token="+workerToken, nil)
+	worker, err := ws.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/api/v1/ws/site",
+		&websocket.DialOptions{HTTPHeader: http.Header{"Authorization": {"Bearer " + workerToken}}})
 	if err != nil {
 		t.Fatalf("worker dial: %v", err)
 	}

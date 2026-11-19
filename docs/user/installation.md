@@ -137,6 +137,13 @@ package version, the worker logs that it cannot auto-upgrade to an
 unpackaged build and stays put. Without the variable the worker logs the
 mismatch and stays on its version.
 
+A worker learns global's build only once global has accepted its
+connection. A worker that global refuses (an older build across a
+release whose changelog marks a breaking change to the worker protocol
+or its authentication, for example) never sees that build and cannot
+auto-upgrade: install the matching packages on it by hand, as the
+release's breaking-change note says.
+
 ## Infrastructure required per mode
 
 ### `slagworksd global`

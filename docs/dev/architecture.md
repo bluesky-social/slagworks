@@ -166,9 +166,12 @@ Site-only components (constructed in `runSite`):
 - VIP monitor (`internal/worker/ha.go`).
 
 The site worker connects up over WebSocket. URL is built in
-`internal/worker/wsconn.go:443` (`buildURL`): it takes `GlobalURL`
+`internal/worker/wsconn.go:515` (`buildURL`): it takes `GlobalURL`
 (`SLAGWORKS_API_URL`), rewrites `http[s]://` to `ws[s]://`, and
-appends `/api/v1/ws/site?token=<SLAGWORKS_TOKEN>`. The token is
+appends `/api/v1/ws/site`. The worker sends `SLAGWORKS_TOKEN` in the
+upgrade request's `Authorization: Bearer` header (`dialOptions`), never
+in the URL: net/http quotes the full URL in dial errors, which the worker
+logs and forwards to global, and request loggers record it. The token is
 opaque; the hub looks it up in `site_workers.token_hash` (via
 `store.HashWorkerToken`) and derives the site slug from the row, so a
 worker cannot claim a site it does not own. On connect the worker
@@ -700,8 +703,8 @@ Unauthenticated:
 - `GET /metrics` — Prometheus.
 - `GET /api/v1/client-config` — the OIDC issuer and public client ID
   `slagctl auth login` reads before it has a token.
-- `GET /api/v1/ws/site` — the hub mount. Auth is `?token=`, checked
-  by the hub itself.
+- `GET /api/v1/ws/site` — the hub mount. Auth is the worker token in
+  the `Authorization: Bearer` header, checked by the hub itself.
 - `POST /api/v1/hooks/netbox` — the NetBox webhook. HMAC-signed.
 
 OIDC-protected under `/api/v1` (middleware in `internal/api/oidcauth.go`):

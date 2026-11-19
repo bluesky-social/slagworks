@@ -36,7 +36,7 @@ The Auth column in the tables below uses these classes:
 |---|---|
 | `read`, `admin` | OIDC bearer token: `Authorization: Bearer <JWT>`, on WebSocket upgrades too. Verified against `SLAGWORKS_OIDC_ISSUER`, `SLAGWORKS_OIDC_AUDIENCE` and the JWKS (`SLAGWORKS_OIDC_JWKS_URL`, default `<issuer>/jwks/`); the token must carry at least one of `SLAGWORKS_OIDC_REQUIRED_GROUPS` (required; global refuses to start without one). 401 for a missing, malformed, invalid or expired token; 403 for a valid token outside the required groups. |
 | `creds` | As `read`, and when `SLAGWORKS_OIDC_CREDENTIAL_GROUPS` is set the token must also carry at least one of those groups; otherwise 403 with a message naming that setting (the body echoes no group names; the refusal is logged at Info with the subject and both group lists). Unset, the same as `read`. |
-| `worker` | Per-worker token minted by `POST /api/v1/site-workers`, passed as `?token=` on the WebSocket upgrade. Checked against `site_workers.token_hash` (SHA-256); a bad token gets 401 before the upgrade. |
+| `worker` | Per-worker token minted by `POST /api/v1/site-workers`, passed as `Authorization: Bearer <token>` on the WebSocket upgrade, never in the URL (a token in the query is ignored). Checked against `site_workers.token_hash` (SHA-256); a missing or bad token gets 401 before the upgrade. |
 | `hmac` | `X-Hook-Signature` header: hex HMAC-SHA512 of the body keyed with `SLAGWORKS_WEBHOOK_SECRET`; a missing or wrong signature gets 403. When that secret is empty every delivery gets 503 and nothing is processed. |
 | `none` | No authentication. |
 
@@ -233,7 +233,8 @@ Request/reply pairs share a `request_id`.
 
 Connection setup:
 
-1. The worker connects with `?token=`.
+1. The worker connects with its token in the `Authorization: Bearer`
+   header.
 2. Its first message must be `hello`. Global rejects the connection when
    `hello.worker_id` differs from the token's worker, when `proto` is below
    the current op-stream protocol (`OpStreamProto`, 1), or, when NetBox is
