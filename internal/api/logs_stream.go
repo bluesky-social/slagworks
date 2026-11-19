@@ -127,6 +127,12 @@ func (s *Server) handleLogsStream(c *echo.Context) error {
 			return nil
 		}
 		if len(results) == 0 {
+			// The backlog is consumed: switch to the live tail and sleep
+			// before the next poll. The live tail stops bounding since
+			// on the emitter's ts alone: the cursor already bounds what
+			// is new, and a line from an emitter whose clock runs behind
+			// must stream once global has received it.
+			filter.SinceOrReceived = true
 			select {
 			case <-ctx.Done():
 				return nil
@@ -152,6 +158,9 @@ func buildFilter(sub ws.LogStreamSubscribeMsg) (logstore.QueryFilter, error) {
 		Sources:     normalizeSources(sub.Sources),
 		MinLevel:    strings.ToLower(sub.MinLevel),
 		LastSeenID:  sub.LastSeenID,
+		// A resume continues the live tail past the client's cursor, so
+		// it bounds since the way the live tail does.
+		SinceOrReceived: sub.LastSeenID > 0,
 	}
 	if err := logstore.ValidateMinLevel(sub.MinLevel); err != nil {
 		return f, err

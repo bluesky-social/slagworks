@@ -134,7 +134,9 @@ detail; this is the map.
   `now()` so an in-flight transaction can't allocate a sequence id
   inside the read window and get skipped. Emitter clocks
   can be arbitrarily skewed (agents pre-NTP); the watermark uses
-  `global_received_at`, which is server-assigned.
+  `global_received_at`, which is server-assigned, and the live tail
+  admits a row when either `ts` or `global_received_at` is at or after
+  the subscriber's `since`.
 - `console_casts(id bigserial, machine_id UUID UNIQUE, cast_started_at,
   width, height)` and `console_cast_events(id bigserial, cast_id,
   t_us bigint, received_at, data bytea)` — one perpetual asciicast

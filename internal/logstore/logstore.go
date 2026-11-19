@@ -126,6 +126,15 @@ type QueryFilter struct {
 	MinLevel    string
 	Since       time.Time
 
+	// SinceOrReceived widens Since for reads past a stream cursor (the
+	// live tail and a resume): a row passes when its emitter ts or its
+	// global_received_at is at or after Since. ts alone would hide every
+	// line from an emitter whose clock runs behind (agents before clock
+	// sync, see migration 00016); global_received_at alone would hide a
+	// line whose emitter agrees with the caller while global's clock
+	// lags. The seed backfill leaves it unset and bounds on ts.
+	SinceOrReceived bool
+
 	// LastSeenID, when > 0, restricts to rows with id > LastSeenID.
 	LastSeenID int64
 
@@ -191,7 +200,12 @@ func (s *Store) Query(ctx context.Context, filter QueryFilter) ([]Result, error)
 		q = q.Where("level IN ?", levels)
 	}
 	if !filter.Since.IsZero() {
-		q = q.Where("ts >= ?", filter.Since)
+		if filter.SinceOrReceived {
+			// Parenthesized for the same reason as the machine/op OR.
+			q = q.Where("(ts >= ? OR global_received_at >= ?)", filter.Since, filter.Since)
+		} else {
+			q = q.Where("ts >= ?", filter.Since)
+		}
 	}
 	if filter.LastSeenID > 0 {
 		q = q.Where("id > ?", filter.LastSeenID)
