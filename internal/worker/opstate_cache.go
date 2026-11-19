@@ -126,7 +126,9 @@ var bootPrefixPhases = map[string]bool{
 // post-install PXE gets BootDeploy, and the host re-deploys over the disk it
 // just installed (leaf-5.pop1 2026-10-24). Only completion
 // (op_removed) or failure may leave awaiting_phone_home — the same rule
-// updatePhase enforces against boot-prefix phases.
+// updatePhase enforces against boot-prefix phases. Active includes pending:
+// a host that boots before the claim lands writes its phases onto the
+// pending row, and global echoes that row back the same way.
 func keepTerminalWait(existing, incoming *model.Operation) {
 	if existing == nil || existing.Phase != "awaiting_phone_home" {
 		return
@@ -134,7 +136,7 @@ func keepTerminalWait(existing, incoming *model.Operation) {
 	if incoming.Type != model.OpDeploy {
 		return
 	}
-	if incoming.Status != model.OpClaimed && incoming.Status != model.OpRunning {
+	if incoming.Status == model.OpCompleted || incoming.Status == model.OpFailed {
 		return
 	}
 	if incoming.Phase == "failed" {

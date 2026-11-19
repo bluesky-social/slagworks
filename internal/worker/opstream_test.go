@@ -489,6 +489,62 @@ func TestFailedDeltaLeavesAwaitingPhoneHome(t *testing.T) {
 	}
 }
 
+// TestPendingEchoKeepsAwaitingPhoneHome: a host can PXE-boot and install
+// while its deploy op is still pending at global (the claim is delayed). The
+// worker's phase writes reach global, which stores them on the pending row
+// and echoes the row back with a bumped version. That echo, whether it
+// arrives as an op_delta or in a reconnect resync, carries an older phase at
+// a higher version, the same shape as the claimed-row echo in
+// TestStaleEchoKeepsAwaitingPhoneHome, and must not knock the op off
+// awaiting_phone_home: once the claim moves the machine to deploying, the
+// post-install PXE would otherwise get BootDeploy.
+func TestPendingEchoKeepsAwaitingPhoneHome(t *testing.T) {
+	for name, deliver := range map[string]func(c *Cache, echo model.Operation){
+		"delta":  func(c *Cache, echo model.Operation) { c.ApplyOpDelta(echo, "") },
+		"resync": func(c *Cache, echo model.Operation) { c.ApplyOpResync([]model.Operation{echo}, nil) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := NewCache(nil)
+			id, opID := uuid.New(), uuid.New()
+			mac := "52:54:00:15:10:57"
+			c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 1, Machines: []model.MachineSnapshot{{
+				ID: id, State: model.MachineStateCommissioned, PXEEligible: true,
+				Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}},
+			}}})
+			seedOpsResync(c, model.Operation{ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpPending})
+
+			// The host boots the agent and installs while the op is pending.
+			for _, r := range []model.ProgressReport{{Phase: "agent_starting"}, {Event: "deploy_complete"}} {
+				r.MachineID, r.OperationID = id.String(), opID.String()
+				if err := c.HandleProgressReport(&r); err != nil {
+					t.Fatalf("report %+v: %v", r, err)
+				}
+			}
+			if op := c.GetOperation(opID.String()); op == nil || op.Phase != "awaiting_phone_home" {
+				t.Fatalf("precondition: op = %+v, want phase awaiting_phone_home", op)
+			}
+
+			// Global's echo of the agent_starting write, still pending.
+			deliver(c, model.Operation{
+				ID: opID, MachineID: id, Type: model.OpDeploy,
+				Status: model.OpPending, Phase: "agent_starting", Version: 1,
+			})
+			if op := c.GetOperation(opID.String()); op == nil || op.Version != 1 || op.Phase != "awaiting_phone_home" {
+				t.Errorf("after pending-status echo: op = %+v, want version 1 phase awaiting_phone_home", op)
+			}
+
+			// The claim lands: claimed, machine deploying.
+			c.ApplyOpDelta(model.Operation{
+				ID: opID, MachineID: id, Type: model.OpDeploy,
+				Status: model.OpClaimed, Phase: "agent_starting", Version: 2,
+			}, model.MachineStateDeploying)
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("post-install PXE (machine deploying): got %d, want BootLocal (%d)", got, model.BootLocal)
+			}
+		})
+	}
+}
+
 // TestRehydratedViewAcceptsEqualSeqOnce reproduces the pop1 rollout of
 // 2026-10-24: an older worker decoded snapshot N without a field it didn't
 // know and persisted it; after upgrading, the restarted worker rehydrated
