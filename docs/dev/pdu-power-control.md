@@ -342,12 +342,14 @@ stopping early would defeat redundancy by leaving a reachable feed un-powered. O
 | mixed (all readable) | `StateOn` + WARN |
 | any `On`, others errored | `StateOn` + WARN (box is definitely powered) |
 | no `On` confirmed, ≥1 errored | `StateUnknown` + error |
+| no `On` confirmed, none errored, ≥1 neither `On` nor `Off` | `StateUnknown` |
 
 *Any confirmed-live feed pins `StateOn`: a dual-fed box is powered as long as one
 feed is live, and reporting `Off`/`Unknown` while a feed is confirmed up is a lie
-that could send an operator to touch live hardware. `StateUnknown` is reserved for
-"no live feed confirmed AND a read errored" — we can't rule out a feed we couldn't
-reach.*
+that could send an operator to touch live hardware. `StateOff` needs every feed to
+read `Off`. With no live feed confirmed, `StateUnknown` covers a read that errored
+(we can't rule out a feed we couldn't reach) and an outlet whose `SwitchedState` is
+missing or unrecognized (we can't rule out a feed we couldn't interpret).*
 
 **Failure handling (per CLAUDE.md "trigger/preconditions/failure/rollback"):**
 
