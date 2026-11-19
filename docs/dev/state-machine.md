@@ -802,6 +802,16 @@ and consumes them:
   layout (`main.go:324`, `wipeStaleState`).
 - Wipe bystander disks when `--wipe-all-disks`, gated by
   `--destructive` (`main.go:332`).
+- Before wiping anything, refuse the deploy when a disk it leaves
+  unwritten carries an md member superblock with an array UUID a raid
+  device pins (`array_uuid`), typically the disk a redeploy moved the
+  array off (`storageapply.CheckStaleArrayMembers`). At boot such a
+  stale member can claim the array ahead of its real members. Under
+  `--wipe-all-disks` bystander disks are not examined, because the
+  bystander wipe zeroes them; retained and preserve-member disks
+  always are. The agent refuses rather than zeroing the member
+  itself: `--destructive` covers only the disks the layout targets,
+  and only `--wipe-all-disks` authorizes writes outside the layout.
 
 The legacy `slagworks.force` kernel argument was renamed to
 `slagworks.destructive` and the tests explicitly assert the old
