@@ -5,9 +5,11 @@
 package target
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -72,8 +74,9 @@ func preserveMountpoints(layout storage.Layout) []string {
 
 // ConfigureRAID writes mdadm.conf and regenerates the initrd if any md
 // arrays are active. Without this, the stock initrd can't assemble the
-// arrays on boot and root=UUID fails.
-func ConfigureRAID(ctx *agent.Context) error {
+// arrays on boot and root=UUID fails. root is the mounted target tree
+// (/target in a deploy).
+func ConfigureRAID(ctx *agent.Context, root string) (err error) {
 	// Check if any md arrays exist. A probe FAILURE is not "no RAID":
 	// a missing/broken mdadm on a RAID-root install would silently skip
 	// mdadm.conf + initramfs regeneration and ship an unbootable host.
@@ -86,36 +89,51 @@ func ConfigureRAID(ctx *agent.Context) error {
 	}
 
 	ctx.Log.Info("configuring RAID for local boot")
-	_ = os.MkdirAll("/target/etc/mdadm", 0755)
-	if err := os.WriteFile("/target/etc/mdadm/mdadm.conf", []byte(out+"\n"), 0644); err != nil {
+	_ = os.MkdirAll(root+"/etc/mdadm", 0755)
+	if err := os.WriteFile(root+"/etc/mdadm/mdadm.conf", []byte(out+"\n"), 0644); err != nil {
 		return fmt.Errorf("write mdadm.conf: %w", err)
 	}
 
-	// Regenerate initrd so it includes mdadm array assembly
-	// Bind-mount pseudo-filesystems for chroot operations
+	// Regenerate initrd so it includes mdadm array assembly, with the
+	// pseudo-filesystems bind-mounted for the chroot. The chroot can mount
+	// beneath a bind, and on UEFI it does: Debian's mdadm initramfs hook
+	// mounts efivarfs at /sys/firmware/efi/efivars when it finds that
+	// directory empty, which it is under a non-recursive bind of /sys. So
+	// each bind is unmounted recursively, and a failure is returned: a bind
+	// left behind keeps the target root from unmounting before reboot.
+	var mounted []string
+	defer func() {
+		for _, m := range slices.Backward(mounted) {
+			if uerr := ctx.Exec.Run("umount", "--recursive", m); uerr != nil {
+				err = errors.Join(err, fmt.Errorf("unmount chroot bind %s after update-initramfs: %w; "+
+					"while it stays mounted the target root cannot be unmounted for reboot", m, uerr))
+			}
+		}
+	}()
 	for _, m := range []struct{ src, dst string }{
-		{"/dev", "/target/dev"},
-		{"/proc", "/target/proc"},
-		{"/sys", "/target/sys"},
+		{"/dev", root + "/dev"},
+		{"/proc", root + "/proc"},
+		{"/sys", root + "/sys"},
 	} {
-		_ = os.MkdirAll(m.dst, 0755)
-		_ = ctx.Exec.Run("mount", "--bind", m.src, m.dst)
+		if err := os.MkdirAll(m.dst, 0755); err != nil {
+			return fmt.Errorf("create bind-mount target %s: %w", m.dst, err)
+		}
+		if err := ctx.Exec.Run("mount", "--bind", m.src, m.dst); err != nil {
+			return fmt.Errorf("bind-mount %s: %w", m.dst, err)
+		}
+		mounted = append(mounted, m.dst)
 	}
 
 	ctx.Log.Info("regenerating initrd with RAID support")
-	if err := ctx.Exec.Run("chroot", "/target", "update-initramfs", "-u"); err != nil {
+	if err := ctx.Exec.Run("chroot", root, "update-initramfs", "-u"); err != nil {
 		return fmt.Errorf("update-initramfs: %w", err)
-	}
-
-	for _, dst := range []string{"/target/sys", "/target/proc", "/target/dev"} {
-		_ = ctx.Exec.Run("umount", dst)
 	}
 
 	// Copy the regenerated initrd to the ESP (replaces the stock one
 	// downloaded by the bootloader install)
-	matches, _ := filepath.Glob("/target/boot/initrd.img-*")
+	matches, _ := filepath.Glob(root + "/boot/initrd.img-*")
 	if len(matches) > 0 {
-		espInitrd := "/target/boot/efi/slagworks/initrd.img"
+		espInitrd := root + "/boot/efi/slagworks/initrd.img"
 		if err := ctx.Exec.Run("cp", matches[0], espInitrd); err != nil {
 			return fmt.Errorf("copy initrd to ESP: %w", err)
 		}
