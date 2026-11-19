@@ -542,12 +542,12 @@ func TestModel_LastUpdateFrozenAfterTerminal(t *testing.T) {
 func TestModel_LatePhaseAfterFailureLeavesSpineFrozen(t *testing.T) {
 	m := newModelAt(model.OpDeploy, "host", "op", at(0), time.UTC, fixedClock(at(90*time.Second)))
 	m.holdOnTerminal = true
-	m = send(m, translateEnvelope(1, mkEnv("agent", at(10*time.Second), "partitioning", "partitioning", nil)))
+	m = send(m, translateEnvelope(1, mkEnv("agent", at(10*time.Second), "partitioning", "partitioning", nil), watchedOp))
 	m = send(m, translateEnvelope(2, mkEnv("global", at(30*time.Second), "", "operation failed",
-		map[string]any{"status": "failed", "error": "op timeout"})))
+		map[string]any{"status": "failed", "error": "op timeout"}), watchedOp))
 	before := plain(m.lifecycle.Render(40, "@"))
 
-	m = send(m, translateEnvelope(3, mkEnv("agent", at(40*time.Second), "rsyncing_os", "rsync started", nil)))
+	m = send(m, translateEnvelope(3, mkEnv("agent", at(40*time.Second), "rsyncing_os", "rsync started", nil), watchedOp))
 
 	if got := m.lifecycle.CurrentPhase(); got != "" {
 		t.Fatalf("failed op shows phase %q spinning after a late envelope", got)
@@ -580,17 +580,17 @@ func TestModel_SecondTerminalDoesNotRewriteFinalScreen(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newModelAt(model.OpDeploy, "host", "op", at(0), time.UTC, fixedClock(at(90*time.Second)))
 			m.holdOnTerminal = true
-			m = send(m, translateEnvelope(1, mkEnv("agent", at(10*time.Second), "partitioning", "partitioning", nil)))
+			m = send(m, translateEnvelope(1, mkEnv("agent", at(10*time.Second), "partitioning", "partitioning", nil), watchedOp))
 			status, reason, pollReason := "completed", "", ""
 			if tc.failed {
 				status, reason, pollReason = "failed", "op timeout", "op timeout (from the op row)"
 			}
 			m = send(m, translateEnvelope(2, mkEnv("global", at(30*time.Second), "", "operation "+status,
-				map[string]any{"status": status, "error": reason})))
+				map[string]any{"status": status, "error": reason}), watchedOp))
 			wantResult := m.runResult()
 			wantSpine := plain(m.lifecycle.Render(40, "@"))
 
-			m = send(m, translateEnvelope(3, mkEnv("agent", at(40*time.Second), "rsyncing_os", "rsync started", nil)))
+			m = send(m, translateEnvelope(3, mkEnv("agent", at(40*time.Second), "rsyncing_os", "rsync started", nil), watchedOp))
 			m = send(m, opTerminalMsg{failed: tc.failed, reason: pollReason, at: at(50 * time.Second)})
 
 			if !m.endTime.Equal(at(30 * time.Second)) {
