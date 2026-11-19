@@ -333,7 +333,12 @@ What the agent actually does, in order:
   config script (with NetBox facts injected), write the hostname, disable
   first-boot apt timers, write operator SSH keys, enroll on tailscale (if
   an auth key rode the cmdline), and write the
-  `slagworks-phone-home.service` unit.
+  `slagworks-phone-home.service` unit. Then unmount every target
+  filesystem, deepest first and the root last. A filesystem that will not
+  unmount fails the deploy here, before BMC reconcile and
+  `deploy_complete`: rebooting with it mounted would leave it dirty, and
+  GRUB does not replay a journal, so a dirty xfs root stops a BIOS host's
+  next boot at the `grub rescue>` prompt.
 - `bmc_reconcile`: reconcile BMC users and persistent boot order —
   this is what gets the `slagworks` and `monitor` accounts onto the BMC
   and keeps them in sync on every redeploy. Failure is a soft error on

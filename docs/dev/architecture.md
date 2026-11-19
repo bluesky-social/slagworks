@@ -95,7 +95,8 @@ Modes (dispatched from `main.go` around line 165):
   image, installs a bootloader, configures RAID, writes fstab, seeds
   cloud-init, writes the rendered network configuration into the
   target, writes the hostname, installs SSH keys,
-  enrolls in Tailscale, writes the phone-home unit, reconciles the
+  enrolls in Tailscale, writes the phone-home unit, unmounts the target
+  (a filesystem that will not unmount fails the deploy), reconciles the
   BMC, reports `deploy_complete`, and reboots.
 
 All agent-to-site traffic is plain HTTP against the site worker's
