@@ -1103,11 +1103,20 @@ func (c *workerConn) serve(ctx context.Context) error {
 	c.fqdn = hello.FQDN
 	c.smcipmitool = hello.SMCIPMITool
 
+	// Persist the serial BEFORE the conn registers, and refuse the hello if
+	// that fails. The outlet-op interlock (INV-1) and the API's creation-time
+	// check decide which devices are serving site workers from
+	// site_workers.serial, not from live connections, so a worker connected
+	// under a serial the store does not hold is invisible to both: an outlet
+	// off for its own feed would be created and granted to a partner. The
+	// worker reconnects and its next hello retries the write. (Heartbeat
+	// touches carry no serial and stay non-fatal.)
 	if _, err := c.hub.cfg.Auth.TouchSiteWorker(c.slug, c.workerID, hello.FQDN, &hello.Serial); err != nil {
-		c.log.Warn("touch site_worker failed", "err", err)
-		// Non-fatal; the worker is already authenticated and we don't
-		// want to drop the connection over a last_seen_at bookkeeping
-		// hiccup.
+		c.log.Error("recording worker hello in site_workers failed; refusing connection",
+			"serial", hello.Serial, "err", err)
+		c.writeError(ctx, "serial_persist_failed",
+			fmt.Sprintf("global could not record this worker's hardware serial %q in site_workers: %v; the worker reconnects and retries, check global's database if this persists", hello.Serial, err))
+		return fmt.Errorf("record hello serial (serial=%q slug=%q): %w", hello.Serial, c.slug, err)
 	}
 
 	// Phase 1 of version-pin: log every connecting worker's build SHA
@@ -1816,10 +1825,12 @@ func (c *workerConn) outletClaimEligible(opID uuid.UUID) (bool, string, error) {
 
 // registeredWorkerSerials returns the set of non-empty verified hardware
 // serials for the workers registered against this conn's slug (connected or
-// not), for the INV-1 serving-worker check. An unverified worker (serial "")
-// contributes no entry — it can't be matched as a downstream anyway. Entries
-// keep the workers' SMBIOS spelling; outletClaimEligibility matches them
-// against the NetBox downstream serial ignoring case.
+// not), for the INV-1 serving-worker check. It covers every connected worker
+// because serve() refuses a hello whose serial it cannot persist. An
+// unverified worker (serial "") contributes no entry — it can't be matched as
+// a downstream anyway. Entries keep the workers' SMBIOS spelling;
+// outletClaimEligibility matches them against the NetBox downstream serial
+// ignoring case.
 func (c *workerConn) registeredWorkerSerials() (map[string]bool, error) {
 	workers, err := c.hub.cfg.Auth.ListSiteWorkers(c.slug)
 	if err != nil {
