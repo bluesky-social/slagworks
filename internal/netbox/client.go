@@ -34,7 +34,8 @@ type Client struct {
 }
 
 type ClientConfig struct {
-	// BaseURL is the NetBox instance URL (e.g., "https://netbox.example.com").
+	// BaseURL is the NetBox instance URL (e.g., "https://netbox.example.com"),
+	// optionally with a path ("https://netbox.example.com/netbox").
 	BaseURL string
 	// Token is the NetBox API token.
 	Token string
@@ -46,7 +47,9 @@ type ClientConfig struct {
 	APIVersion string
 	// Timeout for individual HTTP requests (default 10s).
 	Timeout time.Duration
-	// MaxRetries for rate-limited (429) responses (default 3).
+	// MaxRetries is how many times a request answered with 429 is retried
+	// after the first attempt, with exponential backoff starting at 1s
+	// (default 3: up to 4 requests over 1s+2s+4s of waiting).
 	MaxRetries int
 	// HTTPClient allows injecting a custom client for testing.
 	HTTPClient *http.Client
@@ -130,12 +133,11 @@ func (c *Client) listInto(ctx context.Context, path string, query url.Values, de
 	}
 
 	var allResults []json.RawMessage
-	currentPath := path
 	currentQuery := query
 
 	for {
 		var page ListResponse[json.RawMessage]
-		if err := c.do(ctx, http.MethodGet, currentPath, currentQuery, nil, &page); err != nil {
+		if err := c.do(ctx, http.MethodGet, path, currentQuery, nil, &page); err != nil {
 			return err
 		}
 		allResults = append(allResults, page.Results...)
@@ -144,12 +146,17 @@ func (c *Client) listInto(ctx context.Context, path string, query url.Values, de
 			break
 		}
 
-		// Parse the next URL to extract path and query for the next request.
-		nextPath, nextQuery, err := c.parseNextURL(*page.Next)
+		// NetBox builds the next link from the absolute request URI and
+		// changes only its query (offset, or start in cursor mode), so the
+		// next page is at the same endpoint: take only the query. The
+		// link's host is NetBox's view of itself (possibly an internal name
+		// behind a proxy), and its path includes the base URL's path prefix
+		// when NetBox runs under BASE_PATH but not behind a prefix-stripping
+		// proxy, so neither can be joined onto the configured base URL.
+		nextQuery, err := nextPageQuery(*page.Next)
 		if err != nil {
 			return fmt.Errorf("parsing pagination next URL: %w", err)
 		}
-		currentPath = nextPath
 		currentQuery = nextQuery
 	}
 
@@ -161,12 +168,12 @@ func (c *Client) listInto(ctx context.Context, path string, query url.Values, de
 	return json.Unmarshal(collected, dest)
 }
 
-func (c *Client) parseNextURL(nextURL string) (string, url.Values, error) {
+func nextPageQuery(nextURL string) (url.Values, error) {
 	u, err := url.Parse(nextURL)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
-	return u.Path, u.Query(), nil
+	return u.Query(), nil
 }
 
 // APIError represents a non-success HTTP response from NetBox.
@@ -184,7 +191,7 @@ func (e *APIError) Error() string {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, body, dest any) error {
-	var attempt int
+	var retries int
 	for {
 		err := c.doOnce(ctx, method, path, query, body, dest)
 		if err == nil {
@@ -196,13 +203,15 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 			return err
 		}
 
-		attempt++
-		if attempt >= c.maxRetries {
+		// The first request is not a retry: give up only once maxRetries
+		// retries have already been spent.
+		if retries >= c.maxRetries {
 			return err
 		}
+		retries++
 
-		wait := c.retryBaseWait * time.Duration(1<<(attempt-1))
-		c.log.Warn("netbox rate limited, retrying", "attempt", attempt, "wait", wait)
+		wait := c.retryBaseWait * time.Duration(1<<(retries-1))
+		c.log.Warn("netbox rate limited, retrying", "retry", retries, "max_retries", c.maxRetries, "wait", wait)
 
 		select {
 		case <-ctx.Done():

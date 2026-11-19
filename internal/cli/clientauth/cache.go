@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -15,9 +16,11 @@ import (
 
 // Token cache layout: a single JSON file holding the full oauth2.Token
 // (access + refresh + expiry), 0600 in a 0700 dir. A sibling .lock file
-// serializes refreshes across concurrent invocations of the CLI. The path
-// itself comes from userpath (~/.config/<AppName>/token.json on all
-// platforms); read/write of the 0600 file go through userpath too.
+// serializes every change to the cache across concurrent invocations of the
+// CLI: a refresh (read, rotate, write back), a login's write and a logout's
+// delete (see lockCache). The path itself comes from userpath
+// (~/.config/<AppName>/token.json on all platforms); read/write of the 0600
+// file go through userpath too.
 
 func readCache(path string) (*oauth2.Token, error) {
 	b, err := userpath.ReadFile(path)
@@ -45,14 +48,59 @@ func writeCache(path string, tok *oauth2.Token) error {
 	return userpath.WriteFile(path, b)
 }
 
+// deleteCache removes the cached token. The lock file stays: unlinking it
+// while another invocation holds or waits on it would let the next invocation
+// create and lock a fresh file alongside it, ending mutual exclusion.
 func deleteCache(path string) error {
 	err := os.Remove(path)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	// best-effort: also drop the lock file
-	_ = os.Remove(path + ".lock")
 	return nil
+}
+
+// lockCache takes the exclusive cross-process lock on the token cache at
+// path and returns its release. A refresh holds it across the token-endpoint
+// round trip and then writes the rotated token back, so anything else that
+// changes the cache must hold it too: a login or logout that skipped it could
+// land inside that window and then be overwritten by the refresh of the old
+// session. Waiting aborts when ctx is done; the 100ms poll is the retry
+// cadence flock uses while waiting.
+func lockCache(ctx context.Context, path string) (unlock func(), err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("creating token cache dir: %w", err)
+	}
+	lock := flock.New(path + ".lock")
+	locked, err := lock.TryLockContext(ctx, 100*time.Millisecond)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring token lock: %w", err)
+	}
+	if !locked {
+		return nil, fmt.Errorf("acquiring token lock: %w", ctx.Err())
+	}
+	return func() { _ = lock.Unlock() }, nil
+}
+
+// storeToken replaces the cached token with a freshly obtained one (a login)
+// under the cache lock, so it lands after any refresh already in flight.
+func storeToken(ctx context.Context, path string, tok *oauth2.Token) error {
+	unlock, err := lockCache(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return writeCache(path, tok)
+}
+
+// removeToken deletes the cached token (a logout) under the cache lock, so a
+// refresh already in flight cannot write the session back afterwards.
+func removeToken(ctx context.Context, path string) error {
+	unlock, err := lockCache(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return deleteCache(path)
 }
 
 // persistingTokenSource is an oauth2.TokenSource that refreshes under a file
@@ -84,19 +132,14 @@ func newPersistingTokenSource(ctx context.Context, oc *oauth2.Config, cachePath 
 }
 
 func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
-	lock := flock.New(p.cachePath + ".lock")
 	// Acquire the lock under the context: if the operator Ctrl-C's (or a
 	// timeout fires) while a concurrent invocation is holding the lock through
-	// a slow/hung refresh, we abort instead of blocking indefinitely. The
-	// 100ms poll is the retry cadence flock uses while waiting.
-	locked, err := lock.TryLockContext(p.ctx, 100*time.Millisecond)
+	// a slow/hung refresh, we abort instead of blocking indefinitely.
+	unlock, err := lockCache(p.ctx, p.cachePath)
 	if err != nil {
-		return nil, fmt.Errorf("acquiring token lock: %w", err)
+		return nil, err
 	}
-	if !locked {
-		return nil, fmt.Errorf("acquiring token lock: %w", p.ctx.Err())
-	}
-	defer func() { _ = lock.Unlock() }()
+	defer unlock()
 
 	// Read INSIDE the lock so a process that was waiting picks up whatever the
 	// previous holder just wrote.

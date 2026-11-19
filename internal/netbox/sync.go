@@ -136,8 +136,23 @@ func (c *Client) SyncCommissionData(ctx context.Context, sync CommissionSync) er
 		"serial":        serial,
 		"asset_tag":     emptyToNil(sync.AssetTag),
 		"custom_fields": cf,
-		"tags":          []map[string]string{{"slug": "slagworks-managed"}},
 	}
+
+	// Tags are shared with the operator. NetBox takes `tags` on a PATCH as
+	// the device's complete tag set (add_tags only arrived in 4.6), so
+	// sending slagworks-managed alone strips every operator tag. Read the
+	// current set and write it back with slagworks-managed added. Once the
+	// device carries the tag (every recommission and report retry), leave
+	// tags out of the PATCH entirely so an operator tag edit racing the
+	// sync is never overwritten.
+	dev, err := c.GetDevice(ctx, sync.DeviceID)
+	if err != nil {
+		return fmt.Errorf("reading device %d tags: %w", sync.DeviceID, err)
+	}
+	if tags, ok := addTag(dev.Tags, "slagworks-managed"); ok {
+		deviceFields["tags"] = tags
+	}
+
 	if sync.Hostname != "" {
 		deviceFields["name"] = sync.Hostname
 	}
@@ -180,6 +195,20 @@ func (c *Client) SyncCommissionData(ctx context.Context, sync CommissionSync) er
 
 	c.log.Info("commission data synced to NetBox", "device_id", sync.DeviceID)
 	return nil
+}
+
+// addTag returns the tag list to PATCH so a device keeps its existing tags
+// and gains slug, or false when the device already carries slug and its tag
+// set needs no write.
+func addTag(existing []NestedTag, slug string) ([]map[string]string, bool) {
+	tags := make([]map[string]string, 0, len(existing)+1)
+	for _, t := range existing {
+		if t.Slug == slug {
+			return nil, false
+		}
+		tags = append(tags, map[string]string{"slug": t.Slug})
+	}
+	return append(tags, map[string]string{"slug": slug}), true
 }
 
 // CommissionToSync converts the agent's CommissionResult JSON into a CommissionSync.

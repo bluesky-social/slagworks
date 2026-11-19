@@ -89,6 +89,13 @@ type budgetsT struct {
 	// PAUSED boot -> DHCP -> TFTP -> HTTP boot-script fetch, a few
 	// seconds; generous floor for the full PXE stack.
 	PXEBootMarker time.Duration
+
+	// KernelStartOneCPU: time from QEMU start to the netbooted kernel's
+	// first line ("Linux version") for a UEFI VM confined to one host
+	// CPU: firmware, DHCP, TFTP of iPXE, then the kernel and initrd over
+	// HTTP. Observed 13.7-13.9s on an idle KVM host and 19-23s with
+	// eight such VMs sharing two CPUs.
+	KernelStartOneCPU time.Duration
 }
 
 // Budgets is the global table; tests reference it directly.
@@ -117,4 +124,7 @@ var Budgets = budgetsT{
 	BMCOpUpdate:          60 * time.Second,
 	BMCPowerCycleMarker:  30 * time.Second,
 	PXEBootMarker:        90 * time.Second,
+	// A hosted CI runner is several times slower than the hosts the
+	// observations come from, and the VM gets a single CPU of it.
+	KernelStartOneCPU: 2 * time.Minute,
 }

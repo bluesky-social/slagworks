@@ -245,8 +245,11 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 		}
 	}
 
-	if err := target.ConfigureRAID(ctx, "/target"); err != nil {
-		ctx.Log.Warn("RAID configuration", "err", err)
+	// The installed system's mdadm.conf decides which arrays its initramfs
+	// assembles; a host whose initramfs lacks it can boot into an array the
+	// layout does not name, or lose its root array to one. Hard fail.
+	if err := target.ConfigureRAID(ctx, "/target", layout); err != nil {
+		fatal("configuring RAID", err)
 	}
 
 	setPhase("finalizing")
@@ -378,7 +381,7 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 	close(p.done)
 
 	// Reboot into the freshly-installed OS. The boot-action's
-	// "deploying + awaiting_phone_home → BootLocal" clause makes the
+	// "awaiting_phone_home → BootLocal" clause makes the
 	// post-deploy PXE iteration sanboot from disk, the OS comes up,
 	// the slagworks-phone-home.service unit POSTs to /api/v1/report,
 	// and the deploy op completes (machine → running). Without this

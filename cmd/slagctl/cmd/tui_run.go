@@ -59,7 +59,7 @@ func runDeployTUI(ctx context.Context, opID string, holdFlag, noHoldFlag bool) e
 	cfg := tui.RunConfig{
 		OpType:        op.Type,
 		Machine:       machine,
-		OpID:          shortID(opID),
+		OpID:          op.ID,
 		OpStartedAt:   op.CreatedAt,                // server-side op-create time; anchors the header "elapsed" to the same clock as the phase durations
 		Command:       opCommandLine(op, machine),  // human-readable invocation (replaces the raw op UUID)
 		Worker:        resolveWorker(op.ClaimedBy), // attach-after-claim backfill (plan D6), UUID -> hostname

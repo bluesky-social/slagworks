@@ -1,6 +1,8 @@
 package store
 
 import (
+	"errors"
+
 	"github.com/bluesky-social/slagworks/internal/model"
 )
 
@@ -56,25 +58,53 @@ func (s *Store) AnySiteConfigForNetBoxSite(netboxSite string) (bool, error) {
 	return count > 0, nil
 }
 
+// ErrSiteConfigNotFound is returned when an update targets a slug with no
+// site_configs row.
+var ErrSiteConfigNotFound = errors.New("site config not found")
+
+// UpdateSiteConfig writes the operator-owned columns of cfg (the ones
+// PATCH /site-configs/:slug accepts) and nothing else. The caller loaded
+// cfg earlier, and the snapshot dispatcher owns last_snapshot_seq and
+// last_snapshot_hash: writing the loaded values back would undo a bump
+// committed in between, and the next rebuild would reissue a SeqNum the
+// worker has already applied and will drop. Returns ErrSiteConfigNotFound
+// when no row matches, so a config deleted mid-request stays deleted.
 func (s *Store) UpdateSiteConfig(cfg *model.SiteConfig) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	return s.db.Save(cfg).Error
+	res := s.db.Model(&model.SiteConfig{}).Where("slug = ?", cfg.Slug).
+		Select("netbox_site", "netbox_location", "ephemeral_pool_start",
+			"ephemeral_pool_end", "relay_pools", "promiscuous").
+		Updates(cfg)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrSiteConfigNotFound
+	}
+	return nil
 }
 
 func (s *Store) DeleteSiteConfig(slug string) error {
 	return s.db.Delete(&model.SiteConfig{}, "slug = ?", slug).Error
 }
 
-// BumpSiteSnapshotMeta atomically bumps last_snapshot_seq by 1 and sets
-// last_snapshot_hash in one UPDATE, returning the new seq. Called by the
-// snapshot dispatcher after determining the snapshot content changed.
+// BumpSiteSnapshotMeta sets last_snapshot_seq to the next value of the
+// site_snapshot_seq sequence and last_snapshot_hash to newHash in one
+// UPDATE, returning the new seq. Called by the snapshot dispatcher after
+// determining the snapshot content changed.
+//
+// The value comes from the sequence, not the row, so it is above every
+// SeqNum issued before, for this slug or any other. A slug's workers keep
+// their persisted SeqNum when its row is deleted, and drop any snapshot
+// whose SeqNum is not above it; a per-row counter would restart at 1 when
+// the row is re-created.
 func (s *Store) BumpSiteSnapshotMeta(slug, newHash string) (int64, error) {
 	var newSeq int64
 	err := s.db.Raw(`
 		UPDATE site_configs
-		SET last_snapshot_seq = last_snapshot_seq + 1,
+		SET last_snapshot_seq = nextval('site_snapshot_seq'),
 		    last_snapshot_hash = ?
 		WHERE slug = ?
 		RETURNING last_snapshot_seq

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/slagworks/cmd/slagctl/format"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestHumanDuration(t *testing.T) {
@@ -105,15 +106,15 @@ func TestPrintTable_ANSIAlignment(t *testing.T) {
 	// environments, so we inject raw ANSI strings to simulate real
 	// terminal output. The test verifies that after stripping ANSI from
 	// the rendered output, all column start positions match across rows.
-	ansi := func(s string) string {
+	styled := func(s string) string {
 		return "\033[1;38;5;10m" + s + "\033[0m"
 	}
 
 	var buf strings.Builder
 	headers := []string{"ID", "STATE", "AGE"}
 	rows := [][]string{
-		{"3aedce78-e1a2-4d4a-b2c3-0a1d700e111e", ansi("● ready"), "1h"},
-		{"f00dcafe-0000-0000-0000-000000000000", ansi("⟳ commissioning"), "2d"},
+		{"3aedce78-e1a2-4d4a-b2c3-0a1d700e111e", styled("● ready"), "1h"},
+		{"f00dcafe-0000-0000-0000-000000000000", styled("⟳ commissioning"), "2d"},
 	}
 	format.PrintTable(&buf, headers, rows)
 	output := buf.String()
@@ -126,7 +127,7 @@ func TestPrintTable_ANSIAlignment(t *testing.T) {
 	var allStarts [][]int
 	var strippedLines []string
 	for _, line := range lines {
-		s := stripANSI(line)
+		s := ansi.Strip(line)
 		strippedLines = append(strippedLines, s)
 		allStarts = append(allStarts, columnStarts(s))
 	}
@@ -151,6 +152,55 @@ func TestPrintTable_ANSIAlignment(t *testing.T) {
 	}
 }
 
+// TestPrintTable_WideCellsKeepColumnsAligned: terminals lay text out in
+// display cells, and a CJK character occupies two. "主机1" is 3 runes but 5
+// cells wide, so padding it by rune count starts the next column two cells
+// to the right of where the header and the ASCII row start it. Free-text
+// cells reach PrintTable from operator input (an SSH key comment) and from
+// NetBox object names.
+func TestPrintTable_WideCellsKeepColumnsAligned(t *testing.T) {
+	var buf strings.Builder
+	format.PrintTable(&buf, []string{"HOST", "STATE"}, [][]string{
+		{"主机1", "running"},
+		{"cpu1", "new"},
+	})
+	assertTableText(t, buf.String(), []string{
+		"HOST   STATE",
+		"主机1  running",
+		"cpu1   new",
+	})
+}
+
+// TestPrintTable_OSCHyperlinkCellKeepsColumnsAligned: an OSC 8 hyperlink is
+// invisible apart from its link text, so the cell is as wide as "link". An
+// escape parser that ends every sequence at the first ASCII letter instead
+// measures most of the URL as visible text and pads every other row to it.
+func TestPrintTable_OSCHyperlinkCellKeepsColumnsAligned(t *testing.T) {
+	hyperlink := "\x1b]8;;https://example.com/x\x1b\\link\x1b]8;;\x1b\\"
+	var buf strings.Builder
+	format.PrintTable(&buf, []string{"NAME", "STATE"}, [][]string{
+		{hyperlink, "running"},
+		{"cpu1", "new"},
+	})
+	assertTableText(t, buf.String(), []string{
+		"NAME  STATE",
+		"link  running",
+		"cpu1  new",
+	})
+}
+
+// assertTableText compares PrintTable output, with escape sequences removed,
+// against the wanted lines. The header style emits SGR codes only when
+// stdout is a terminal, so stripping keeps the comparison independent of how
+// the test is run.
+func assertTableText(t *testing.T, output string, wantLines []string) {
+	t.Helper()
+	got := strings.TrimSuffix(ansi.Strip(output), "\n")
+	if want := strings.Join(wantLines, "\n"); got != want {
+		t.Fatalf("table text mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 // columnStarts returns the rune offsets where columns begin. A column start
 // is position 0 (if non-space) or a non-space character preceded by 2+
 // consecutive spaces (matching tabwriter's minimum padding).
@@ -169,26 +219,6 @@ func columnStarts(s string) []int {
 		spaceRun = 0
 	}
 	return starts
-}
-
-// stripANSI removes ANSI escape sequences from a string.
-func stripANSI(s string) string {
-	var out strings.Builder
-	inEscape := false
-	for _, r := range s {
-		if r == '\033' {
-			inEscape = true
-			continue
-		}
-		if inEscape {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inEscape = false
-			}
-			continue
-		}
-		out.WriteRune(r)
-	}
-	return out.String()
 }
 
 func TestOperationStatusLabel(t *testing.T) {
