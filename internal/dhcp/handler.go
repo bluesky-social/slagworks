@@ -896,6 +896,12 @@ func (h *Handler) classifyRequest(mac net.HardwareAddr, reqIP, reserved net.IP, 
 // buildNAK constructs a DHCPNAK for a request. A NAK carries the server-id
 // (this interface's serverIP) and no address; the client discards its lease
 // and restarts at DISCOVER.
+//
+// For a relayed request (giaddr set) the NAK always has the broadcast bit
+// set, per RFC 2131 4.3.2, instead of copying the client's flags as
+// NewReplyFromRequest does. The NAK has no yiaddr, so a relay that honors a
+// clear bit has nowhere to unicast it. On a direct NAK the bit steers no
+// relay (Server picks the destination itself), so it stays as copied.
 func (h *Handler) buildNAK(req *dhcpv4.DHCPv4, view ifaceView, log *slog.Logger) *dhcpv4.DHCPv4 {
 	nak, err := dhcpv4.NewReplyFromRequest(req,
 		dhcpv4.WithMessageType(dhcpv4.MessageTypeNak),
@@ -904,6 +910,9 @@ func (h *Handler) buildNAK(req *dhcpv4.DHCPv4, view ifaceView, log *slog.Logger)
 	if err != nil {
 		log.Error("failed to build DHCP NAK", "err", err)
 		return nil
+	}
+	if gi := req.GatewayIPAddr; gi != nil && !gi.IsUnspecified() {
+		nak.SetBroadcast()
 	}
 	h.cfg.Metrics.drop(DropNAK)
 	return nak

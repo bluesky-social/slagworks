@@ -634,6 +634,33 @@ func TestRelay_GiaddrInDirectSubnet_UsesDirectPool(t *testing.T) {
 	}
 }
 
+// TestRelay_NAKSetsBroadcastBit: RFC 2131 4.3.2 says "If 'giaddr' is set in
+// the DHCPREQUEST message, the client is on a different subnet. The server
+// MUST set the broadcast bit in the DHCPNAK, so that the relay agent will
+// broadcast the DHCPNAK to the client". A NAK carries no yiaddr, so a relay
+// that honors a clear bit has no address to unicast it to and the client
+// never hears it. The request here leaves the bit clear, as an INIT-REBOOT
+// client normally does, so the NAK must set it rather than copy it.
+func TestRelay_NAKSetsBroadcastBit(t *testing.T) {
+	h := NewHandler(relayConfig())
+	mac, _ := net.ParseMAC("52:54:00:aa:bb:41")
+
+	// INIT-REBOOT through the relay for an address from some other network.
+	req := initReboot(t, mac, "192.168.7.7")
+	req.GatewayIPAddr = net.ParseIP("10.99.2.1")
+	if req.IsBroadcast() {
+		t.Fatal("setup: request must leave the broadcast bit clear")
+	}
+
+	reply := h.HandlePacket(req)
+	if !isNAK(reply) {
+		t.Fatalf("setup: want DHCPNAK for a wrong-network INIT-REBOOT, got %v", reply)
+	}
+	if !reply.IsBroadcast() {
+		t.Fatalf("relayed DHCPNAK flags = %#04x, want broadcast bit 0x8000 set (RFC 2131 4.3.2)", reply.Flags)
+	}
+}
+
 func TestRelay_DirectAndRelayedClientsGetSeparatePools(t *testing.T) {
 	h := NewHandler(relayConfig())
 	mac1, _ := net.ParseMAC("52:54:00:aa:bb:01")
