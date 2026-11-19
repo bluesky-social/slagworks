@@ -65,6 +65,10 @@ const (
 	PrivAdmin    PrivLevel = 4
 )
 
+// privNoAccess is the NO ACCESS privilege limit (0Fh), which `user list`
+// shows as NO ACCESS and parseUserList reads as a disabled user.
+const privNoAccess PrivLevel = 15
+
 func (p PrivLevel) String() string {
 	switch p {
 	case PrivCallback:
@@ -154,7 +158,9 @@ type Result struct {
 	// neither the managed account for a desired name nor reserved
 	// (vendor admin at slot 2, anonymous slot 1). The reconciler
 	// disabled each and cleared its name where the BMC allowed it (see
-	// NamesNotCleared); the names are reported back for audit.
+	// NamesNotCleared), or, when no empty slot was left for a missing
+	// desired account, renamed the slot to that account; the names are
+	// reported back for audit.
 	LeftoversDisabled []string
 
 	// NamesNotCleared lists leftovers that were disabled but whose name
@@ -314,7 +320,9 @@ var reservedSlots = map[int]bool{
 //  2. With AdminUser set, refuse (before any write) unless it is the
 //     slot-2 account.
 //  3. Add any user in Options.Desired that's missing (and re-password the
-//     ones that exist when they carry a Password or Rotate).
+//     ones that exist when they carry a Password or Rotate), in an empty
+//     slot or, when none is left, in a leftover's slot (disabled and set
+//     to NO ACCESS first).
 //  4. Disable + clear name on any user that's not the managed account
 //     for a Desired name and not in a reserved slot (slot 1 anon, slot 2
 //     vendor admin). A second account sharing a Desired name is a
@@ -374,14 +382,12 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 		}
 	}
 
-	// Plan: which Desired entries need a write? managedSlot records the
-	// slot each Desired name ends up owning, so the leftover pass spares
-	// exactly that account.
-	desiredSet := map[string]bool{}
-	managedSlot := map[string]int{}
+	// Plan: which Desired entries need a write? managed records the slot
+	// each Desired name ends up owning, so slot allocation and the leftover
+	// pass spare exactly those accounts.
+	managed := map[int]bool{}
 	var plans []plan
 	for _, d := range opt.Desired {
-		desiredSet[strings.ToLower(d.Name)] = true
 		if existing, ok := byName[strings.ToLower(d.Name)]; ok {
 			// Refuse to update a user that lives in a reserved slot,
 			// even if the name happens to match a Desired entry. The
@@ -396,7 +402,7 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 					"slot 2 is the bmc-creds-admin account; remove it from Options.Desired",
 					existing.Slot, existing.Name)
 			}
-			managedSlot[strings.ToLower(d.Name)] = existing.Slot
+			managed[existing.Slot] = true
 			if d.Password != "" || d.Rotate {
 				// Re-assert the caller's password, or rotate: write it
 				// whatever state the account is in.
@@ -433,20 +439,28 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 		}
 	}
 
-	// Allocate slots for the new users. We need slots that are
-	// either unused on the BMC OR were the slot of an existing
-	// user we're updating.
+	// Allocate slots for the new users: empty slots first, then slots
+	// holding a leftover (see freeSlots).
 	if needAlloc := countSlots(plans); needAlloc > 0 {
-		free := freeSlots(current, needAlloc, plans)
+		free := freeSlots(current, needAlloc, managed)
 		if len(free) < needAlloc {
-			return nil, fmt.Errorf("bmcreconcile: need %d free slots, found %d (total slots: %d)",
-				needAlloc, len(free), len(current))
+			var names []string
+			for _, p := range plans {
+				if p.slot == -1 {
+					names = append(names, strconv.Quote(p.desired.Name))
+				}
+			}
+			return nil, fmt.Errorf("bmcreconcile: need a user slot for each of %s, but only %d slot(s) outside the reserved "+
+				"slots 1 and 2 hold no desired account (total slots: %d); the BMC's user table is too small for the desired "+
+				"accounts: remove an entry from Options.Desired, or provision this BMC's accounts by hand",
+				strings.Join(names, ", "), len(free), len(current))
 		}
 		i := 0
 		for j := range plans {
 			if plans[j].slot == -1 {
-				plans[j].slot = free[i]
-				managedSlot[strings.ToLower(plans[j].desired.Name)] = free[i]
+				plans[j].slot = free[i].Slot
+				plans[j].replaces = strings.TrimSpace(free[i].Name)
+				managed[free[i].Slot] = true
 				i++
 			}
 		}
@@ -479,6 +493,28 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			// written is reported before its priv/enable writes, so a
 			// named-but-misconfigured slot with a known password is still
 			// reported when those fail.
+			if p.replaces != "" {
+				// Taking over a leftover's slot: disable it and drop its
+				// channel-1 privilege to NO ACCESS before the rename, so a
+				// run that dies before the password write leaves a slot
+				// `user list` shows as disabled, which the next run
+				// re-provisions with a fresh password as a partial create.
+				// Disabling alone is not enough: parseUserList reads the
+				// enabled state from the privilege column, which some
+				// firmware keeps showing for a disabled user, so the slot
+				// would read as an enabled desired account and keep the
+				// leftover's password.
+				if err := runIPMIToolVoid(ctx, opt, "user", "disable", strconv.Itoa(p.slot)); err != nil {
+					return res, fmt.Errorf("bmcreconcile: disable leftover slot %d (%s) to reuse it for %s: %w",
+						p.slot, p.replaces, p.desired.Name, err)
+				}
+				res.LeftoversDisabled = append(res.LeftoversDisabled, p.replaces)
+				if err := runIPMIToolVoid(ctx, opt, "user", "priv", strconv.Itoa(p.slot),
+					strconv.Itoa(int(privNoAccess)), "1"); err != nil {
+					return res, fmt.Errorf("bmcreconcile: set leftover slot %d (%s) to NO ACCESS to reuse it for %s: %w",
+						p.slot, p.replaces, p.desired.Name, err)
+				}
+			}
 			if !p.exists {
 				if err := runIPMIToolVoid(ctx, opt, "user", "set", "name",
 					strconv.Itoa(p.slot), p.desired.Name); err != nil {
@@ -530,19 +566,15 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 
 	// Disable any user that's not the managed account for a desired name
 	// and not in a reserved slot. Reading from the pre-write `current`
-	// list is fine: a slot we just provisioned is the managed slot for
-	// its name, and the reserved slots are excluded by slot number
-	// regardless of current name.
+	// list is fine because both exclusions go by slot number, whatever
+	// name `current` shows there: a slot we just provisioned (including a
+	// leftover's slot we took over) is a managed slot.
 	for _, u := range current {
-		if reservedSlots[u.Slot] {
+		if reservedSlots[u.Slot] || managed[u.Slot] {
 			continue
 		}
 		name := strings.TrimSpace(u.Name)
 		if name == "" {
-			continue
-		}
-		lower := strings.ToLower(name)
-		if desiredSet[lower] && managedSlot[lower] == u.Slot {
 			continue
 		}
 		// Disable first so an in-flight session can't auth, then
@@ -805,33 +837,28 @@ func parsePriv(s string) PrivLevel {
 	}
 }
 
-// freeSlots returns up to `n` slot numbers that aren't currently
-// occupied by a named user AND aren't already claimed by an existing
-// plan entry (so we don't double-allocate). Reserved slots (1, 2) are
-// always excluded.
-func freeSlots(users []User, n int, plans []plan) []int {
-	taken := map[int]bool{}
-	for _, p := range plans {
-		if p.slot > 0 {
-			taken[p.slot] = true
-		}
-	}
-	var free []int
+// freeSlots returns up to n slots for new accounts, never a reserved slot
+// (1, 2) or a managed one (a desired account's): empty slots first, then
+// slots holding a leftover, which the leftover pass would disable anyway.
+// Falling back to a leftover's slot is what lets a BMC whose every
+// non-reserved slot is named (strays on an inherited host, or Supermicro
+// leftovers disabled earlier whose names the BMC refused to clear)
+// converge instead of refusing on every run until an operator deletes an
+// account by hand.
+func freeSlots(users []User, n int, managed map[int]bool) []User {
+	var empty, leftovers []User
 	for _, u := range users {
-		if reservedSlots[u.Slot] {
-			continue
-		}
-		if taken[u.Slot] {
+		if reservedSlots[u.Slot] || managed[u.Slot] {
 			continue
 		}
 		if strings.TrimSpace(u.Name) == "" {
-			free = append(free, u.Slot)
-			if len(free) == n {
-				break
-			}
+			empty = append(empty, u)
+		} else {
+			leftovers = append(leftovers, u)
 		}
 	}
-	return free
+	empty = append(empty, leftovers...)
+	return empty[:min(n, len(empty))]
 }
 
 // countSlots returns how many plans still need a slot allocated.
@@ -845,12 +872,16 @@ func countSlots(plans []plan) int {
 	return n
 }
 
-// plan is a private alias inside this package to keep the count/free
-// helpers' signatures stable across refactors.
+// plan is the write one Desired entry needs.
 type plan struct {
 	desired DesiredUser
 	slot    int
 	exists  bool
+	// replaces is the leftover account whose slot this new account takes
+	// over because no empty slot was left ("" for an empty slot or an
+	// existing account). It is disabled and set to NO ACCESS before the
+	// rename, and reported in LeftoversDisabled.
+	replaces string
 	// needsPassword is true when this slot must get a password written: an
 	// absent user, an existing-but-disabled slot left by a partial create,
 	// or any existing user whose Desired entry carries a Password or Rotate.
