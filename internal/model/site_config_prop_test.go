@@ -28,7 +28,8 @@ import (
 // documented contract (docs/user/configuration.md "Site-config model" and the
 // Validate comments): slug and netbox_site required; ephemeral pool start/end
 // IPv4 with start <= end; each relay pool's range and gateway IPv4 inside an
-// IPv4 subnet, start <= end.
+// IPv4 subnet, start <= end, the gateway outside the range, and on a subnet
+// of /30 or wider the range clear of the network and broadcast addresses.
 //
 // Accepted configs are then fed to the real consumer, the DHCP handler, the
 // same way cmd/slagworksd buildPoolConfig converts them, to check that what
@@ -259,37 +260,24 @@ func oracleRelay(p model.RelayPool) string {
 	if !pfx.Contains(g) {
 		return "gateway outside subnet"
 	}
-	if addrToU32(s) > addrToU32(e) {
+	su, eu, gu := addrToU32(s), addrToU32(e), addrToU32(g)
+	if su > eu {
 		return "range reversed"
 	}
-	return ""
-}
-
-// coversReserved reports whether the pool's range includes its own gateway
-// or, on a subnet of /30 or wider, the network or broadcast address.
-// Validate accepts such a pool although the DHCP handler leases every address
-// in the range and cannot ARP-probe a relayed subnet, so the first relayed
-// client is offered the router (or network) address. The properties below
-// leave this one pattern undecided: they neither require Validate to accept
-// it nor check what the handler offers for it.
-func (r genRelay) coversReserved() bool {
-	if r.start <= r.gw && r.gw <= r.end {
-		return true
+	// The DHCP handler leases every address in the range and cannot
+	// ARP-probe a relayed subnet, so the range must hold only addresses a
+	// client can own.
+	if su <= gu && gu <= eu {
+		return "gateway inside range"
 	}
-	if r.bits > 30 {
-		return false
-	}
-	bcast := r.base + uint32((uint64(1)<<(32-r.bits))-1)
-	return r.start == r.base || r.end == bcast
-}
-
-func anyCoversReserved(relays []genRelay) bool {
-	for _, r := range relays {
-		if r.coversReserved() {
-			return true
+	if bits := pfx.Bits(); bits <= 30 {
+		network := addrToU32(pfx.Addr())
+		broadcast := network + uint32((uint64(1)<<(32-bits))-1)
+		if su == network || eu == broadcast {
+			return "range covers network or broadcast address"
 		}
 	}
-	return false
+	return ""
 }
 
 func oracleConfig(c model.SiteConfig) string {
@@ -344,21 +332,15 @@ func configHasMapped(c model.SiteConfig) bool {
 // TestPropSiteConfigValidateMatchesOracle: Validate accepts exactly the
 // configs the documented contract accepts. IPv4-mapped spellings are
 // recorded but not failed here (servedRelay notes what the consumer does
-// with a mapped subnet). A config the oracle accepts whose relay
-// range covers a reserved address is likewise left undecided (see
-// coversReserved).
+// with a mapped subnet).
 func TestPropSiteConfigValidateMatchesOracle(t *testing.T) {
-	var accepted, rejected, mapped, undecided atomic.Int64
+	var accepted, rejected, mapped atomic.Int64
 	rapid.Check(t, func(t *rapid.T) {
-		cfg, relays := drawSiteConfig(t)
+		cfg, _ := drawSiteConfig(t)
 		got := cfg.Validate()
 		want := oracleConfig(cfg)
 		if configHasMapped(cfg) {
 			mapped.Add(1)
-			return
-		}
-		if want == "" && anyCoversReserved(relays) {
-			undecided.Add(1)
 			return
 		}
 		if got == nil {
@@ -370,7 +352,7 @@ func TestPropSiteConfigValidateMatchesOracle(t *testing.T) {
 			t.Fatalf("Validate=%v oracle=%q for %+v", got, want, cfg)
 		}
 	})
-	t.Logf("accepted=%d rejected=%d mapped-spelling=%d reserved-in-range=%d", accepted.Load(), rejected.Load(), mapped.Load(), undecided.Load())
+	t.Logf("accepted=%d rejected=%d mapped-spelling=%d", accepted.Load(), rejected.Load(), mapped.Load())
 }
 
 // TestPropSiteConfigDefectInjection: start from a valid config, break
@@ -464,9 +446,8 @@ func offerFor(t *rapid.T, rs dhcp.RelaySubnet, giaddr net.IP) *dhcpv4.DHCPv4 {
 // few attempts, in which case the offer is nil) and serves one relayed
 // DISCOVER for it with giaddr = the pool's gateway.
 //
-// Two accepted patterns are not served: a range covering a reserved address
-// (see coversReserved), and a subnet spelled as an IPv4-mapped IPv6 CIDR
-// ("::ffff:10.0.0.0/104"). Validate accepts the latter although
+// One accepted pattern is not served: a subnet spelled as an IPv4-mapped
+// IPv6 CIDR ("::ffff:10.0.0.0/104"). Validate accepts it although
 // net.ParseCIDR gives it a 16-byte mask, which the DHCP subnet-mask option
 // truncates to 255.255.255.255.
 func servedRelay(t *rapid.T) (genRelay, *dhcpv4.DHCPv4) {
@@ -478,7 +459,7 @@ func servedRelay(t *rapid.T) (genRelay, *dhcpv4.DHCPv4) {
 		exoticForms = true
 		cfg := model.SiteConfig{Slug: "s", NetBoxSite: "s", EphemeralPoolStart: "10.200.0.1", EphemeralPoolEnd: "10.200.0.9",
 			RelayPools: []model.RelayPool{r.pool}}
-		if cfg.Validate() == nil && !r.coversReserved() && !isMappedSpelling(r.pool.Subnet) {
+		if cfg.Validate() == nil && !isMappedSpelling(r.pool.Subnet) {
 			ok = true
 			break
 		}

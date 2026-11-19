@@ -36,10 +36,8 @@ func TestPropImagesMatchModel(t *testing.T) {
 		if err := s.db.Exec("DELETE FROM images").Error; err != nil {
 			rt.Fatal(err)
 		}
-		// A name that parses as a UUID is legal (images.name is free text).
-		// Such an image is created, upserted, listed and deleted by id here,
-		// but never deleted by name: DeleteImage looks a UUID-shaped ident up
-		// only as an id, so it reports the image as not found.
+		// A name that parses as a UUID is legal (images.name is free text)
+		// and exercises DeleteImage's ident disambiguation.
 		names := []string{"noble-pxe", "jammy-pxe", "6f1c5f2e-1d2b-4c3a-9e4f-0a1b2c3d4e5f"}
 		ref := map[string]*refImage{}
 		var deadIDs []uuid.UUID
@@ -80,9 +78,6 @@ func TestPropImagesMatchModel(t *testing.T) {
 					ref[name] = &refImage{id: img.ID, version: ver, arch: "amd64", sha: img.SHA256, url: img.URL, createdAt: img.CreatedAt}
 				}
 			case 3: // delete by name
-				if _, perr := uuid.Parse(name); perr == nil {
-					continue
-				}
 				err := s.DeleteImage(name)
 				if r, ok := ref[name]; ok {
 					if err != nil {
@@ -186,11 +181,12 @@ func TestPropSiteWorkersMatchModel(t *testing.T) {
 				hash := HashWorkerToken(token)
 				if r, ok := ref[k]; ok {
 					st.rotations++
-					// The id and first_seen_at RegisterSiteWorker returns on
-					// a re-registration are not compared with the row: it
-					// returns the fresh values of the insert it attempted,
-					// while the row keeps its original ones. Every later
-					// operation here uses the model's (persisted) id.
+					if w.ID != r.id {
+						rt.Fatalf("re-register of %v returned id %s, persisted row id %s", k, w.ID, r.id)
+					}
+					if !sameDBTime(w.FirstSeenAt, r.firstSeen) {
+						rt.Fatalf("re-register of %v returned first_seen_at %v, persisted %v", k, w.FirstSeenAt, r.firstSeen)
+					}
 					r.oldHashes = append(r.oldHashes, r.tokenHash)
 					r.tokenHash, r.fqdn = hash, fqdn
 				} else {
