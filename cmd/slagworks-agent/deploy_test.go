@@ -42,7 +42,7 @@ func (r *noDiskRunner) Run(name string, args ...string) error {
 
 func (r *noDiskRunner) Output(name string, _ ...string) (string, error) {
 	if name == "lsblk" {
-		return `{"blockdevices":[{"name":"sda","size":107374182400,"tran":"sata","model":"TestDisk"}]}`, nil
+		return `{"blockdevices":[{"name":"sda","size":107374182400,"tran":"sata","model":"TestDisk","log-sec":512}]}`, nil
 	}
 	return "", errors.New(name + " not available in test")
 }

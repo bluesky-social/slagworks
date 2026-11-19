@@ -167,10 +167,10 @@ func TestRS501APreserveScript_DerivesSameArrayUUIDAsCreate(t *testing.T) {
 // rs501aBlockDevices mirrors rs501aInventoryJSON's disk shape as
 // storage.BlockDevice, for feeding storage.Plan's inventory check.
 var rs501aBlockDevices = []storage.BlockDevice{
-	{Name: "nvme0n1", SizeBytes: 4000000000000, Transport: "nvme"},
-	{Name: "nvme1n1", SizeBytes: 4000000000000, Transport: "nvme"},
-	{Name: "nvme2n1", SizeBytes: 15000000000000, Transport: "nvme"},
-	{Name: "nvme3n1", SizeBytes: 15000000000000, Transport: "nvme"},
+	{Name: "nvme0n1", SizeBytes: 4000000000000, LogicalSectorBytes: 512, Transport: "nvme"},
+	{Name: "nvme1n1", SizeBytes: 4000000000000, LogicalSectorBytes: 512, Transport: "nvme"},
+	{Name: "nvme2n1", SizeBytes: 15000000000000, LogicalSectorBytes: 512, Transport: "nvme"},
+	{Name: "nvme3n1", SizeBytes: 15000000000000, LogicalSectorBytes: 512, Transport: "nvme"},
 }
 
 // TestRS501ACreateScript_EmittedLayoutValidates feeds the create script's

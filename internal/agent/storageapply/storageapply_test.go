@@ -4,6 +4,7 @@ package storageapply
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -170,8 +171,8 @@ func TestSummarizeLayout(t *testing.T) {
 		},
 	}
 	cmds, err := storage.Plan(layout, []storage.BlockDevice{
-		{Name: "nvme4n1", SizeBytes: 1 << 40},
-		{Name: "nvme5n1", SizeBytes: 1 << 40},
+		{Name: "nvme4n1", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+		{Name: "nvme5n1", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
 	})
 	if err != nil {
 		t.Fatalf("plan: %v", err)
@@ -193,5 +194,31 @@ func TestSummarizeLayout(t *testing.T) {
 	}
 	if !strings.Contains(joined, "mdadm") {
 		t.Errorf("summary should include the mdadm create command, got:\n%s", joined)
+	}
+}
+
+// TestInventory_LogicalSectorSize: Plan sizes FAT32 partitions by the disk's
+// logical sector size, so Inventory must carry lsblk's LOG-SEC through,
+// whether util-linux emits the column as a number or a string, and leave it
+// zero (absent) when lsblk does not report it.
+func TestInventory_LogicalSectorSize(t *testing.T) {
+	r := newScriptRunner()
+	r.output["lsblk -Jb -d -o NAME,SIZE,TRAN,MODEL,LOG-SEC"] = `{"blockdevices":[
+		{"name":"vda","size":8589934592,"tran":null,"model":null,"log-sec":4096},
+		{"name":"sda","size":"1000204886016","tran":"sata","model":"Disk ","log-sec":"512"},
+		{"name":"sr0","size":1073741312,"tran":"sata","model":"DVD","log-sec":2048},
+		{"name":"nvme0n1","size":1920383410176,"tran":"nvme","model":"NVMe"}
+	]}`
+	got, err := Inventory(scriptCtx(r))
+	if err != nil {
+		t.Fatalf("Inventory: %v", err)
+	}
+	want := []storage.BlockDevice{
+		{Name: "vda", SizeBytes: 8589934592, LogicalSectorBytes: 4096},
+		{Name: "sda", SizeBytes: 1000204886016, LogicalSectorBytes: 512, Transport: "sata", Model: "Disk"},
+		{Name: "nvme0n1", SizeBytes: 1920383410176, Transport: "nvme", Model: "NVMe"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Inventory =\n%+v\nwant\n%+v", got, want)
 	}
 }

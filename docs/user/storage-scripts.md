@@ -67,6 +67,8 @@ This is the same format the old MAAS commissioning scripts produced. It has prov
 
 Partition `size` is `"512M"`, `"100G"`, or `"rest"` (fill remaining). `fs` is optional — omit it for raw partitions (e.g., RAID members). `bootable` marks the ESP partition.
 
+A `vfat` partition is formatted FAT32, which needs at least 65525 clusters, so its minimum size depends on the disk's logical sector size: `33M` on a disk with 512-byte sectors, `257M` on a 4Kn disk (4096-byte sectors). Below that, `mkfs.fat` would format the partition anyway and UEFI firmware could not read it, so the agent refuses the layout before touching any disk, naming the minimum ("make the partition at least 257M"). The inventory a script reads does not carry the sector size, so size an ESP that may land on a 4Kn disk for 4Kn; the `512M` ESPs on this page fit both.
+
 **RAID arrays** — software RAID via mdadm. Members reference partition names or whole-disk names from the layout.
 
 ```json
@@ -260,6 +262,7 @@ Implementation notes:
 
 - The layout JSON uses map keys for device names. `Plan()` must sort or toposort explicitly — Go map iteration is nondeterministic.
 - Only one partition per disk may use `"rest"`. `Plan()` rejects layouts with multiple `"rest"` partitions on the same disk.
+- `Plan()` rejects a `vfat` partition smaller than the FAT32 minimum for its disk's logical sector size (`BlockDevice.LogicalSectorBytes`, from `lsblk`'s `LOG-SEC` column), since `mkfs.fat -F 32` formats an undersized partition with only a warning.
 
 ### Execution
 
@@ -287,8 +290,8 @@ func TestPlan_RAID1Root(t *testing.T) {
         "mounts": {"/":{"device":"mdroot"},"/boot/efi":{"device":"nvme0n1p1"}}
     }`)
     inventory := []BlockDevice{
-        {Name: "nvme0n1", SizeBytes: 1920383410176},
-        {Name: "nvme1n1", SizeBytes: 1920383410176},
+        {Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
+        {Name: "nvme1n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
     }
 
     cmds, err := Plan(layout, inventory)
