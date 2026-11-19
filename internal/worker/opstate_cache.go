@@ -668,9 +668,10 @@ func (o *opState) commissionOpForMAC(mac string) *model.Operation {
 
 // recordPhoneHome sets the running overlay for a machine (if it exists in
 // the view), latches the deploy op as locally phone-homed, and returns the
-// active deploy op ID to complete, or "" if none. Combined reader/writer:
-// reads the view and writes the overlay + scans ops under one mu.Lock.
-func (o *opState) recordPhoneHome(machineID uuid.UUID) string {
+// active deploy op ID to complete, or uuid.Nil if none. Combined
+// reader/writer: reads the view and writes the overlay + scans ops under
+// one mu.Lock.
+func (o *opState) recordPhoneHome(machineID uuid.UUID) uuid.UUID {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	// Record the local machine-state advance as an overlay rather than
@@ -688,10 +689,10 @@ func (o *opState) recordPhoneHome(machineID uuid.UUID) string {
 			// that brings it back as claimed-deploying must not downgrade
 			// the running overlay and re-wipe the fresh disk.
 			o.phoneHomed[op.ID.String()] = true
-			return op.ID.String()
+			return op.ID
 		}
 	}
-	return ""
+	return uuid.Nil
 }
 
 // --- Op-set readers (ops only, under mu.RLock) ---

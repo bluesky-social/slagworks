@@ -557,9 +557,12 @@ service POSTs `/api/v1/phone-home`):
   `awaiting_phone_home` clobber guard (documented in the
   state-machine doc).
 
-Outbox handling: every observation and op update the cache accepts
-is appended to a durable outbox row on the local SQLite (via
-`LocalDB.AppendOutbox`) and queued for the WebSocket drain
+Outbox handling: every observation the cache accepts is appended to
+a durable outbox row on the local SQLite (via `LocalDB.AppendOutbox`)
+and deleted only when global acks it; op updates are queued in
+memory only and are never acknowledged, so anything that must not be
+lost (commission reports, the phone-home that completes a deploy)
+rides an observation. Both are queued for the WebSocket drain
 (`cache.go:334 appendObservation`, `685 DrainOutbox`, `805 RequeueOutbox`,
 `824 AckObservation`, `843 ReloadOutboxFromDisk`). Retry backoff is in
 `armRetryTimerLocked` (724) and `RequeueRejected` (772). This is why

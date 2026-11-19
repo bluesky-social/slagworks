@@ -184,7 +184,7 @@ is in flight.
 |---|---|---|---|---|---|
 | 1 | `CreateMachine` | `internal/store/store.go:60` | new machine row (from `mirror.OnDeviceCreated`) | `NetBoxSerial != ""` | initial `state = new` if empty (line 67) |
 | 2 | `ClaimOperation` | `internal/store/store.go:369` | worker WS RPC `claim_op` | op status is `pending` (CAS at line 430); machine not locked; state is in `claimTransition` allowed set | commission -> `commissioning`; deploy -> `deploying`; power ops leave state untouched |
-| 3 | `CompleteOperationWithState` | `internal/store/store.go:576` | hub receives `op_update{status=completed}` | op not already terminal | sets target state; deploy passes `MachineStateRunning`; empty target means no state change (power ops, per `internal/hubhandlers/hubhandlers.go:60`) |
+| 3 | `CompleteOperationWithState` | `internal/store/store.go:576` | hub receives `op_update{status=completed}`, or a `phone_home` observation naming the deploy op | op not already terminal | sets target state; deploy passes `MachineStateRunning`; empty target means no state change (power ops, per `internal/hubhandlers/hubhandlers.go:60`) |
 | 4 | `CommitCommissionResult` | `internal/store/commission_result.go` | commission observation handler | exact active commission op ID belongs to the reported machine | atomically stores inventory, completes that op, and moves its machine to `commissioned` |
 | 5 | `FailOperation` | `internal/store/store.go:772` | worker `op_update{status=failed}`, `AbortMachine`, or one of the three timeout sweeps | op not already terminal | per-rule branching, see below |
 
@@ -562,12 +562,22 @@ Path depends on the op type.
   `handler.go:941` calls `provider.RecordPhoneHome`, which is
   `Cache.RecordPhoneHome` (`internal/worker/cache.go:404`).
   That sets the machine's local state to `running`, emits a
-  `phone_home` observation, and calls
-  `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. The op
-  update flows through the outbox to the hub, and
-  `hubhandlers.OpUpdate.HandleOpUpdate` calls
+  `phone_home` observation carrying the deploy op's ID, and calls
+  `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. Both reach
   `Store.CompleteOperationWithState(opID, Running, ...)`, which
-  auto-locks the machine.
+  auto-locks the machine: the op update through
+  `hubhandlers.OpUpdate.HandleOpUpdate`, the observation through
+  the observation handler (`internal/commission/handler.go`,
+  `handlePhoneHome`). Whichever lands first completes the op; the
+  other is a no-op. The observation is the one that must arrive:
+  the installed OS phones home only until its first 2xx, op updates
+  live only in the worker's memory and are never acknowledged, and
+  the observation stays in the worker's SQLite outbox until global
+  acks it. Without it, a worker restart, a dropped connection or a
+  failed op-update handler between the 2xx and delivery would leave
+  the op at `awaiting_phone_home` until `PhoneHomeTimeout` fails a
+  healthy host. A `phone_home` with no op ID (the worker held no
+  active deploy op) changes nothing.
 - **Commission** completes via the commission report path, not the
   op-update path. The observation handler calls
   `Store.CommitCommissionResult(opID, machineID, data)`, which revalidates
