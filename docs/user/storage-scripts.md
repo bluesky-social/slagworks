@@ -81,6 +81,8 @@ A fixed size is the size the installed system keeps. The agent turns off cloud-i
 }
 ```
 
+A member belongs to its array alone: list it once, in one array, and mount the array rather than the member. A whole disk can be a member only when its disk entry declares no partitions, because `mdadm --create` on the disk would overwrite them. The agent refuses a layout that breaks any of these rules before touching any disk.
+
 Supported levels: 0, 1, 5, 6, 10. Each level needs its md personality module
 (`raid0`, `raid1`, `raid456`, `raid10`) in the boot image's deploy initrd, which
 `assets/initramfs/hooks/slagworks` bakes in. A boot image built without a
@@ -114,6 +116,8 @@ systemd-boot loads.
   "/data":     { "device": "mddata" }
 }
 ```
+
+A swap partition or array is formatted with `mkswap` but is not a filesystem, so it cannot appear in `mounts`.
 
 A mount point must be a clean absolute path: `/var/lib`, not `var/lib`,
 `/var/lib/`, `/var//lib` or `/srv/../var`, and with no whitespace, control
