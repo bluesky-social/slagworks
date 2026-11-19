@@ -377,8 +377,9 @@ func (h *Handler) SetLogger(l *slog.Logger) {
 // so pool edits take effect without a service restart; a no-change
 // call is a silent no-op (snapshots apply frequently — op phases,
 // machine state — and almost never change pools). Existing leases are
-// kept: a lease outside every new pool simply expires without renewal
-// (the allocator only checks pool membership at allocation time).
+// kept until they expire, but a REQUEST to renew one that the new pools no
+// longer cover is NAKed (classifyRequest), so the client re-DISCOVERs into
+// the new range.
 func (h *Handler) UpdatePools(p PoolConfig) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -791,9 +792,9 @@ func requestedAddr(req *dhcpv4.DHCPv4) net.IP {
 type requestVerdict int
 
 const (
-	// requestFallthrough: reqIP is this MAC's existing lease or its static
-	// reservation. allocateIP's existing renew/reservation branch serves it
-	// unchanged.
+	// requestFallthrough: reqIP is this MAC's static reservation, or its
+	// existing lease inside the resolved pool's range. allocateIP's
+	// reservation/renew branch serves it unchanged.
 	requestFallthrough requestVerdict = iota
 	// requestAdopt: no existing lease, but reqIP is safe to grant as-is.
 	// classifyRequest has ALREADY written the lease (atomically with the
@@ -822,10 +823,15 @@ const (
 //     reservation branch ignores the requested address entirely). reserved
 //     is the caller's reservationFor result, so a reservation outside p's
 //     subnet arrives as nil and the request is classified as unreserved.
-//  2. reqIP is this MAC's existing unexpired lease → fallthrough (normal
-//     renew). A DIFFERENT existing lease → NAK — never ACK at reqIP (would
-//     create a second lease for one MAC) and never silently substitute the
-//     held address (the client asked for something specific).
+//  2. reqIP is this MAC's existing unexpired lease and inside p's range →
+//     fallthrough (normal renew). The same lease outside p's range → NAK:
+//     a later snapshot removed its reservation or moved the range or slice
+//     away from it, or the request resolved to a pool other than the one
+//     that granted it. The lease is not released; like every lease it ends
+//     at expiry or when the re-DISCOVER the NAK triggers overwrites it. A
+//     DIFFERENT existing lease → NAK — never ACK at reqIP (would create a
+//     second lease for one MAC) and never silently substitute the held
+//     address (the client asked for something specific).
 //  3. reqIP is not a dynamic address in p's resolved range (p is already
 //     the correctly-scoped pool for this packet — this gateway's own slice
 //     for direct OOB requests, or the matched RelaySubnet for relayed
@@ -869,10 +875,16 @@ func (h *Handler) classifyRequest(mac net.HardwareAddr, reqIP, reserved net.IP, 
 	now := time.Now()
 
 	if l, ok := h.leases[macStr]; ok && now.Before(l.Expiry) {
-		if l.IP.Equal(reqIP) {
-			return requestFallthrough, "existing lease match"
+		if !l.IP.Equal(reqIP) {
+			return requestNAK, "existing lease mismatch"
 		}
-		return requestNAK, "existing lease mismatch"
+		// Same range test allocateIP's renew branch applies: a fallthrough
+		// for a lease outside p's range would make allocateIP allocate a
+		// different address (or none on a reservations-only pool).
+		if p.rangeStart == nil || !ipInRange(reqIP, p.rangeStart, p.rangeEnd) {
+			return requestNAK, "existing lease outside the resolved pool's range"
+		}
+		return requestFallthrough, "existing lease match"
 	}
 
 	if p.rangeStart == nil || !ipInRange(reqIP, p.rangeStart, p.rangeEnd) {
@@ -1257,7 +1269,9 @@ func (h *Handler) allocateIP(mac net.HardwareAddr, reserved net.IP, p *pool, arp
 		}
 		// Lease exists but in a different pool (e.g., MAC moved between
 		// direct and relayed networks). The overwrite below replaces
-		// the stale entry, freeing the old IP for other MACs.
+		// the stale entry, freeing the old IP for other MACs. Only a
+		// DISCOVER or a REQUEST naming no address gets here: a REQUEST
+		// naming this lease was NAKed by classifyRequest.
 	}
 
 	// Find a free IP in the range, cleaning up expired leases along the way
