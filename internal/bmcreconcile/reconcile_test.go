@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -46,6 +47,25 @@ func TestParseUserList(t *testing.T) {
 				{Slot: 2, Name: "ADMIN", Privilege: PrivAdmin, Enabled: true},
 			},
 		},
+		{
+			// The bytes ipmitool itself writes into the pipe, TAB header
+			// included. Names up to IPMI's 16-byte maximum come through
+			// whole: HPE ships "Administrator" at slot 2.
+			name: "ipmitool raw output, TAB header",
+			in: ipmitoolUserListHeader +
+				ipmitoolUserRow(1, "", "true", "false", "false", "ADMINISTRATOR") +
+				ipmitoolUserRow(2, "Administrator", "true", "true", "true", "ADMINISTRATOR") +
+				ipmitoolUserRow(3, "monitor", "true", "true", "true", "USER") +
+				ipmitoolUserRow(4, "ipmi-exporter-ro", "true", "true", "true", "OPERATOR") +
+				ipmitoolUserRow(5, "", "true", "false", "false", "NO ACCESS"),
+			want: []User{
+				{Slot: 1, Name: "", Privilege: PrivAdmin, Enabled: true},
+				{Slot: 2, Name: "Administrator", Privilege: PrivAdmin, Enabled: true},
+				{Slot: 3, Name: "monitor", Privilege: PrivUser, Enabled: true},
+				{Slot: 4, Name: "ipmi-exporter-ro", Privilege: PrivOperator, Enabled: true},
+				{Slot: 5, Name: "", Privilege: 0, Enabled: false},
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -60,6 +80,56 @@ func TestParseUserList(t *testing.T) {
 			for i := range got {
 				if got[i] != tc.want[i] {
 					t.Errorf("row %d: got %+v, want %+v", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// ipmitoolUserListHeader is the header row ipmitool writes for `user list`,
+// byte for byte. It is a C string literal (lib/ipmi_user.c,
+// dump_user_access) holding two TABs; a terminal expands them to 8-column
+// stops, which puts each heading over its data column. The space-separated
+// headers elsewhere in this file are that terminal rendering.
+const ipmitoolUserListHeader = "ID  Name\t     Callin  Link Auth\tIPMI Msg   Channel Priv Limit\n"
+
+// ipmitoolUserRow renders one `user list` data row as ipmitool does:
+// printf("%-4d%-17s%-8s%-11s%-11s%-s\n"), space-padded with no TABs.
+func ipmitoolUserRow(slot int, name, callin, linkAuth, ipmiMsg, priv string) string {
+	return fmt.Sprintf("%-4d%-17s%-8s%-11s%-11s%-s\n", slot, name, callin, linkAuth, ipmiMsg, priv)
+}
+
+// TestReconcile_RawIpmitoolOutput_InBandRedeployIsNoOp runs an in-band
+// redeploy against the bytes real ipmitool writes (ipmitoolUserListHeader).
+// The monitor account is already provisioned, so provision-once means no
+// write of any kind but the boot order, and the slot-2 gate must accept the
+// bmc-creds-admin account at slot 2 whatever its length.
+func TestReconcile_RawIpmitoolOutput_InBandRedeployIsNoOp(t *testing.T) {
+	for _, admin := range []string{"ADMIN", "Administrator"} {
+		t.Run(admin, func(t *testing.T) {
+			fake := newFakeIPMITool(t)
+			table := ipmitoolUserListHeader +
+				ipmitoolUserRow(1, "", "true", "false", "false", "ADMINISTRATOR") +
+				ipmitoolUserRow(2, admin, "true", "true", "true", "ADMINISTRATOR") +
+				ipmitoolUserRow(3, "monitor", "true", "true", "true", "USER")
+			fake.queueOutput("user list 1", table)
+			fake.queueOutput("chassis bootparam set bootflag force_pxe options=PEF,timestamp,reset_persistence", "")
+			fake.queueOutput("user list 1", table)
+
+			res, err := Reconcile(context.Background(), Options{
+				IPMITool:  fake.path,
+				Desired:   []DesiredUser{{Name: MonitorUser, Privilege: PrivUser}},
+				AdminUser: admin,
+			})
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if len(res.CreatedOrUpdated) != 0 {
+				t.Errorf("redeploy rewrote a provisioned account's password: %+v", res.CreatedOrUpdated)
+			}
+			for _, c := range fake.calls() {
+				if !strings.Contains(c.Args, "user list 1") && !strings.Contains(c.Args, "bootparam") {
+					t.Errorf("redeploy of a compliant BMC issued %q", c.Args)
 				}
 			}
 		})
@@ -82,11 +152,13 @@ func TestReconcile_FullProvisioning_FreshBMC(t *testing.T) {
 `)
 	// Setter sequence for slots 3 and 4, then boot order.
 	for _, cmd := range []string{
+		"user priv 3 15 1",
 		"user set name 3 slagworks",
 		"user set password 3 *",
 		"user priv 3 3 1",
 		"channel setaccess 1 3 callin=on ipmi=on link=on privilege=3",
 		"user enable 3",
+		"user priv 4 15 1",
 		"user set name 4 monitor",
 		"user set password 4 *",
 		"user priv 4 2 1",
@@ -233,10 +305,10 @@ func TestReconcile_WrongPriv_FixedInPlace_NoPasswordRewrite(t *testing.T) {
 }
 
 // TestReconcile_PartialCreate_DisabledUser_GetsFreshPassword guards the
-// partial-create recovery path: create does set-name -> set-password -> priv
-// -> ENABLE, so a crash after set-name (but before the password write) leaves
-// the slot NAMED-BUT-DISABLED with no usable password. A reconcile retry MUST
-// treat such a slot as needing (re)provisioning — write a fresh password and
+// partial-create recovery path: create does NO ACCESS -> set-name ->
+// set-password -> priv -> ENABLE, so a crash after set-name (but before the
+// password write) leaves the slot NAMED-BUT-DISABLED with no usable
+// password. A reconcile retry MUST treat such a slot as needing (re)provisioning — write a fresh password and
 // report the cred — NOT silently enable it at the right privilege with an
 // unknown password (which would strand the account, with slagworksd holding no
 // valid cred). slagworks exists at slot 3 but is DISABLED.
@@ -284,6 +356,71 @@ func TestReconcile_PartialCreate_DisabledUser_GetsFreshPassword(t *testing.T) {
 	u := res.CreatedOrUpdated[0]
 	if u.Name != "slagworks" || u.Slot != 3 || u.Password == "" || u.Privilege != PrivAdmin {
 		t.Errorf("re-provisioned slagworks: %+v (want name=slagworks slot=3 priv=ADMIN non-empty pw)", u)
+	}
+}
+
+// TestReconcile_PartialCreate_ReusedSlot_GetsFreshPassword: deploy 1 creates
+// the monitor in a free slot that still lists a real privilege limit, as a
+// slot the leftover pass disabled and cleared does (that pass leaves the
+// limit and the old password in place), and stops after the name write
+// because the BMC refuses the password. `user list` has no enable column, so
+// reconcile reads a slot as disabled only when it lists NO ACCESS, and only
+// a disabled remnant gets a fresh password. Were the remnant to list the old
+// limit, deploy 2 would read an enabled monitor and only fix its privilege
+// and enable it, putting the previous occupant's password live under the
+// monitor name, or at USER do nothing at all; either way it reports no cred.
+// After deploy 2 the monitor must be enabled at USER with a password one of
+// the deploys reported.
+func TestReconcile_PartialCreate_ReusedSlot_GetsFreshPassword(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		leftoverPriv PrivLevel
+	}{
+		{"never-used slot", privNoAccess},
+		{"cleared leftover at OPERATOR", PrivOperator},
+		{"cleared leftover at USER", PrivUser},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			bmc := newStatefulBMC(t, map[int]bmcSlot{
+				1: {Priv: privNoAccess},
+				2: {Name: "ADMIN", Priv: PrivAdmin, Password: "Adm1n!pw", Enabled: true},
+				3: {Priv: tc.leftoverPriv, Password: "Old!leftover1"},
+			})
+			opt := Options{IPMITool: bmc.path, Desired: []DesiredUser{{Name: MonitorUser, Privilege: PrivUser}}}
+
+			bmc.refusePasswordWrites(true)
+			res1, err := Reconcile(context.Background(), opt)
+			if err == nil {
+				t.Fatal("deploy 1: expected the refused password write to fail the reconcile")
+			}
+			if got := bmc.slot(3).Name; got != MonitorUser {
+				t.Fatalf("deploy 1 should have named slot 3 before the password write; slot 3 name = %q", got)
+			}
+
+			bmc.refusePasswordWrites(false)
+			res2, err := Reconcile(context.Background(), opt)
+			if err != nil {
+				t.Fatalf("deploy 2: %v", err)
+			}
+
+			var reported []string
+			for _, res := range []*Result{res1, res2} {
+				if res == nil {
+					continue
+				}
+				for _, u := range res.CreatedOrUpdated {
+					reported = append(reported, u.Password)
+				}
+			}
+			got := bmc.slot(3)
+			if got.Name != MonitorUser || !got.Enabled || got.Priv != PrivUser {
+				t.Fatalf("after deploy 2 slot 3 is %+v; want monitor enabled at USER", got)
+			}
+			if !slices.Contains(reported, got.Password) {
+				t.Fatalf("the monitor at slot 3 holds password %q, which no deploy reported (reported: %q)", got.Password, reported)
+			}
+		})
 	}
 }
 
@@ -594,6 +731,7 @@ func TestReconcile_RestoresMissingUser(t *testing.T) {
 4                    true    false      false      NO ACCESS
 `)
 	for _, cmd := range []string{
+		"user priv 4 15 1",
 		"user set name 4 monitor",
 		"user set password 4 *",
 		"user priv 4 2 1",
@@ -1073,8 +1211,10 @@ func TestReconcile_StoredPassword_WriteRefused(t *testing.T) {
 	fake.queueUserTest("4", "16", storedMonitorPW, userTestWrongSize)
 	fake.queueUserTest("4", "20", storedMonitorPW, userTestWrongSize)
 	for range 3 {
-		fake.queueFailure("user set password 4 "+storedMonitorPW,
-			"IPMI command failed: Unknown (0x19)\nSet User Password command failed (user 4)\n", 1)
+		fake.queueFailure("user set password 4 "+storedMonitorPW, megaRACRefusal("4"), 1)
+		// Each refusal is followed by a test: the slot still does not hold it.
+		fake.queueUserTest("4", "16", storedMonitorPW, userTestWrongSize)
+		fake.queueUserTest("4", "20", storedMonitorPW, userTestWrongSize)
 	}
 
 	res, err := Reconcile(context.Background(), storedMonitorOptions(fake, storedMonitorPW))
@@ -1152,6 +1292,7 @@ func TestReconcile_StoredPassword_CreatesAbsentMonitor(t *testing.T) {
 		[3]string{"3", "", ""},
 	))
 	for _, cmd := range []string{
+		"user priv 3 15 1",
 		"user set name 3 monitor",
 		"user set password 3 " + storedMonitorPW,
 		"user priv 3 2 1",
@@ -1230,6 +1371,164 @@ func TestReconcile_StoredPassword_DriftedMatching_FixedInPlace(t *testing.T) {
 				t.Errorf("LeftoversDisabled = %v, want [maas]", res.LeftoversDisabled)
 			}
 		})
+	}
+}
+
+// setPasswordNoResponse is ipmitool's output for a `user set password` that
+// got no response (a lost lanplus reply): no completion code, exit 1.
+func setPasswordNoResponse(slot string) string {
+	return "Set User Password command failed (user " + slot + ")\n"
+}
+
+// megaRACRefusal is AMI MegaRAC's answer to `user set password` with the
+// slot's current password, or one in its reuse history: completion code
+// 0x19, exit 1.
+func megaRACRefusal(slot string) string {
+	return "IPMI command failed: Unknown (0x19)\nSet User Password command failed (user " + slot + ")\n"
+}
+
+// writtenPasswords returns the password argument of every `user set
+// password` call, and testedPasswords that of every `user test` call.
+func writtenPasswords(calls []fakeCall) []string {
+	var out []string
+	for _, c := range calls {
+		f := strings.Fields(c.Args)
+		if i := slices.Index(f, "password"); i >= 2 && f[i-2] == "user" && f[i-1] == "set" && i+2 < len(f) {
+			out = append(out, f[i+2])
+		}
+	}
+	return out
+}
+
+func testedPasswords(calls []fakeCall) []string {
+	var out []string
+	for _, c := range calls {
+		f := strings.Fields(c.Args)
+		if i := slices.Index(f, "test"); i >= 1 && f[i-1] == "user" && i+3 < len(f) {
+			out = append(out, f[i+3])
+		}
+	}
+	return out
+}
+
+// TestReconcile_Rotate_LostWriteResponse_ReportsGeneratedPassword: a
+// --rotate-monitor run on a MegaRAC BMC whose first `user set password`
+// is applied but whose response is lost, so ipmitool exits 1. Retrying the
+// write would send the BMC its current password, which MegaRAC refuses
+// with 0x19; the run would then fail without reporting the generated
+// password the BMC now holds, and global would keep the old one (monitor
+// locked out). Instead the failed write is followed by `user test`, which
+// finds the generated password on the BMC: no retry, and the password is
+// reported for global to store.
+func TestReconcile_Rotate_LostWriteResponse_ReportsGeneratedPassword(t *testing.T) {
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+	fake.queueFailure("user set password 4 *", setPasswordNoResponse("4"), 1)
+	// What a retry would get: the generated password is now current.
+	for range 2 {
+		fake.queueFailure("user set password 4 *", megaRACRefusal("4"), 1)
+	}
+	fake.queueOutput("user test 4 16 *", userTestSuccess)
+	queueFixInPlace(fake)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+
+	opt := RemoteOptions(LANTarget{Host: "192.0.2.10", Username: "ADMIN", Password: "adminpw!"}, "") // --rotate-monitor
+	opt.IPMITool = fake.path
+	res, err := Reconcile(context.Background(), opt)
+	if err != nil {
+		var reported []ProvisionedUser
+		if res != nil {
+			reported = res.CreatedOrUpdated
+		}
+		t.Fatalf("the BMC applied the generated password but Reconcile failed, reporting %+v: %v", reported, err)
+	}
+	calls := fake.calls()
+	written := writtenPasswords(calls)
+	if len(written) != 1 {
+		t.Fatalf("got %d `user set password` calls, want 1: a write the BMC holds must not be retried", len(written))
+	}
+	if tested := testedPasswords(calls); !slices.Equal(tested, written) {
+		t.Errorf("after the failed write, `user test` checked %d password(s), want the written one", len(tested))
+	}
+	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Slot != 4 || res.CreatedOrUpdated[0].Password != written[0] {
+		t.Errorf("CreatedOrUpdated = %+v, want monitor at slot 4 carrying the generated password the BMC holds", res.CreatedOrUpdated)
+	}
+}
+
+// TestReconcile_StoredPassword_LostWriteResponse_Confirmed: the re-assert
+// path writes the stored password after `user test` finds a different one.
+// When that write is applied but its response is lost, the next test finds
+// the stored password on the BMC, so the run succeeds without a retry
+// (which MegaRAC would refuse with 0x19) instead of failing with "does not
+// hold the stored password".
+func TestReconcile_StoredPassword_LostWriteResponse_Confirmed(t *testing.T) {
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+	fake.queueUserTest("4", "16", storedMonitorPW, userTestIncorrect)
+	fake.queueFailure("user set password 4 "+storedMonitorPW, setPasswordNoResponse("4"), 1)
+	for range 2 {
+		fake.queueFailure("user set password 4 "+storedMonitorPW, megaRACRefusal("4"), 1)
+	}
+	fake.queueUserTest("4", "16", storedMonitorPW, userTestSuccess) // after the failed write
+	fake.queueUserTest("4", "16", storedMonitorPW, userTestSuccess) // re-assert's confirmation
+	queueFixInPlace(fake)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+
+	res, err := Reconcile(context.Background(), storedMonitorOptions(fake, storedMonitorPW))
+	if err != nil {
+		t.Fatalf("the BMC holds the stored password after the write, but Reconcile failed: %v", err)
+	}
+	if n := countCalls(fake.calls(), "user set password"); n != 1 {
+		t.Errorf("got %d `user set password` calls, want 1: a write the BMC holds must not be retried", n)
+	}
+	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Slot != 4 || res.CreatedOrUpdated[0].Password != "" {
+		t.Errorf("CreatedOrUpdated = %+v, want monitor written at slot 4 with no generated password", res.CreatedOrUpdated)
+	}
+}
+
+// TestReconcile_StoredPassword_CreateIntoSlotAlreadyHoldingIt: creating the
+// monitor writes the stored password to a free slot without testing first.
+// When that slot already holds it (an un-named slot that kept a previous
+// monitor's password), MegaRAC refuses the write with 0x19. The test after
+// the refusal finds the password in place, so the account is created
+// rather than the run failing on a write that had nothing to change. The
+// create drops the slot to NO ACCESS before naming it, as every create does;
+// that leaves the password alone, so the test still finds it.
+func TestReconcile_StoredPassword_CreateIntoSlotAlreadyHoldingIt(t *testing.T) {
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "", ""},
+	))
+	fake.queueOutput("user priv 3 15 1", "")
+	fake.queueOutput("user set name 3 monitor", "")
+	for range 3 {
+		fake.queueFailure("user set password 3 "+storedMonitorPW, megaRACRefusal("3"), 1)
+	}
+	fake.queueUserTest("3", "16", storedMonitorPW, userTestSuccess)
+	for _, cmd := range []string{
+		"user priv 3 2 1",
+		"channel setaccess 1 3 callin=on ipmi=on link=on privilege=2",
+		"user enable 3",
+	} {
+		fake.queueOutput(cmd, "")
+	}
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "monitor", "USER"},
+	))
+
+	res, err := Reconcile(context.Background(), storedMonitorOptions(fake, storedMonitorPW))
+	if err != nil {
+		t.Fatalf("slot 3 already holds the stored password, but Reconcile failed: %v", err)
+	}
+	if n := countCalls(fake.calls(), "user set password"); n != 1 {
+		t.Errorf("got %d `user set password` calls, want 1: a password the slot holds must not be retried", n)
+	}
+	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Slot != 3 || res.CreatedOrUpdated[0].Password != "" {
+		t.Errorf("CreatedOrUpdated = %+v, want monitor created at slot 3 with no generated password", res.CreatedOrUpdated)
 	}
 }
 
@@ -1439,6 +1738,7 @@ func TestReconcile_Remote_EndToEnd(t *testing.T) {
 		[3]string{"4", "", ""},
 	))
 	for _, cmd := range []string{
+		"user priv 4 15 1",
 		"user set name 4 monitor",
 		"user set password 4 *",
 		"user priv 4 2 1",
@@ -1493,13 +1793,15 @@ func TestReconcile_Remote_EndToEnd(t *testing.T) {
 }
 
 // TestSetPassword_ErrorRedactsPassword: when every `user set password`
-// attempt fails, the returned error (which becomes an op result and a log
-// line) must not carry the password, even though ipmitool's command line
-// and output would otherwise echo it.
+// attempt fails (and the `user test` after each shows the slot does not
+// hold the password), the returned error (which becomes an op result and a
+// log line) must not carry the password, even though ipmitool's command
+// line and output would otherwise echo it.
 func TestSetPassword_ErrorRedactsPassword(t *testing.T) {
 	fake := newFakeIPMITool(t)
 	for range 3 {
 		fake.queueFailure("user set password 4 *", "rejected "+storedMonitorPW, 1)
+		fake.queueUserTest("4", "16", storedMonitorPW, userTestIncorrect)
 	}
 	err := setPassword(context.Background(), Options{
 		IPMITool: fake.path, IPMIInterface: "open",
@@ -1507,8 +1809,12 @@ func TestSetPassword_ErrorRedactsPassword(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the set-password failure to surface")
 	}
-	if calls := fake.calls(); len(calls) != 3 {
-		t.Fatalf("expected 3 set-password attempts, got %d", len(calls))
+	calls := fake.calls()
+	if n := countCalls(calls, "user set password"); n != 3 {
+		t.Fatalf("expected 3 set-password attempts, got %d", n)
+	}
+	if n := countCalls(calls, "user test 4 16"); n != 3 {
+		t.Errorf("expected a `user test` after each failed attempt, got %d", n)
 	}
 	if strings.Contains(err.Error(), storedMonitorPW) {
 		t.Errorf("error leaks the password: %v", err)
@@ -1749,4 +2055,131 @@ func (f *fakeIPMITool) calls() []fakeCall {
 		out = append(out, fakeCall{Args: args, Env: env, TZ: tz})
 	}
 	return out
+}
+
+// statefulBMC is an ipmitool replacement that keeps a BMC's user table in a
+// JSON file across calls, for tests that run Reconcile more than once against
+// one BMC: what a later run lists follows from what earlier runs wrote, which
+// the scripted fakeIPMITool cannot express. As on a real BMC, `user list`
+// shows each slot's channel-1 privilege limit whatever its enable bit, and
+// naming, disabling or setting the password of a slot leaves the limit
+// alone. It handles only the commands the in-band path issues and fails on
+// any other.
+type statefulBMC struct {
+	t     *testing.T
+	path  string // the fake ipmitool
+	state string // its JSON state file
+}
+
+// bmcSlot is one user slot of a statefulBMC.
+type bmcSlot struct {
+	Name     string
+	Priv     PrivLevel // channel-1 privilege limit; privNoAccess for none
+	Password string
+	Enabled  bool // the enable bit, which `user list` does not show
+}
+
+type bmcState struct {
+	Slots map[int]bmcSlot
+	// RefusePasswordWrites makes every `user set password` fail.
+	RefusePasswordWrites bool
+}
+
+// statefulBMCScript is the fake ipmitool. It keeps its state in state.json
+// beside itself.
+const statefulBMCScript = `#!/usr/bin/env python3
+import json, os, sys
+
+state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+args = sys.argv[1:]
+if args[:1] == ["-I"]:
+    args = args[2:]
+cmd = " ".join(args)
+with open(state_path) as f:
+    state = json.load(f)
+slots = state["Slots"]
+
+def slot(n):
+    if n not in slots:
+        sys.exit("fake BMC: no slot %s: %s" % (n, cmd))
+    return slots[n]
+
+PRIV = {1: "CALLBACK", 2: "USER", 3: "OPERATOR", 4: "ADMINISTRATOR", 15: "NO ACCESS"}
+if args[:3] == ["user", "list", "1"]:
+    print("ID  Name             Callin  Link Auth  IPMI Msg   Channel Priv Limit")
+    for n in sorted(slots, key=int):
+        s = slots[n]
+        print("%-4s%-17s%-8s%-11s%-11s%s" % (n, s["Name"], "true", "true", "true", PRIV[s["Priv"]]))
+elif args[:3] == ["user", "set", "name"]:
+    slot(args[3])["Name"] = args[4]
+elif args[:3] == ["user", "set", "password"]:
+    if state["RefusePasswordWrites"]:
+        sys.exit("Set User Password command failed (user %s)" % args[3])
+    slot(args[3])["Password"] = args[4]
+elif args[:2] == ["user", "priv"]:
+    slot(args[2])["Priv"] = int(args[3])
+elif args[:2] == ["channel", "setaccess"]:
+    for a in args[4:]:
+        if a.startswith("privilege="):
+            slot(args[3])["Priv"] = int(a[len("privilege="):])
+elif args[:2] == ["user", "enable"]:
+    slot(args[2])["Enabled"] = True
+elif args[:2] == ["user", "disable"]:
+    slot(args[2])["Enabled"] = False
+elif args[:3] == ["chassis", "bootparam", "set"]:
+    pass
+else:
+    sys.exit("fake BMC: unhandled command: " + cmd)
+with open(state_path, "w") as f:
+    json.dump(state, f)
+`
+
+func newStatefulBMC(t *testing.T, slots map[int]bmcSlot) *statefulBMC {
+	t.Helper()
+	dir := t.TempDir()
+	b := &statefulBMC{t: t, path: filepath.Join(dir, "ipmitool"), state: filepath.Join(dir, "state.json")}
+	if err := os.WriteFile(b.path, []byte(statefulBMCScript), 0o755); err != nil {
+		t.Fatalf("write fake ipmitool: %v", err)
+	}
+	b.save(bmcState{Slots: slots})
+	return b
+}
+
+func (b *statefulBMC) load() bmcState {
+	b.t.Helper()
+	data, err := os.ReadFile(b.state)
+	if err != nil {
+		b.t.Fatalf("read fake BMC state: %v", err)
+	}
+	var s bmcState
+	if err := json.Unmarshal(data, &s); err != nil {
+		b.t.Fatalf("parse fake BMC state: %v", err)
+	}
+	return s
+}
+
+func (b *statefulBMC) save(s bmcState) {
+	b.t.Helper()
+	data, err := json.Marshal(s)
+	if err != nil {
+		b.t.Fatalf("encode fake BMC state: %v", err)
+	}
+	if err := os.WriteFile(b.state, data, 0o644); err != nil {
+		b.t.Fatalf("write fake BMC state: %v", err)
+	}
+}
+
+// refusePasswordWrites makes every later `user set password` fail (true) or
+// succeed (false).
+func (b *statefulBMC) refusePasswordWrites(refuse bool) {
+	b.t.Helper()
+	s := b.load()
+	s.RefusePasswordWrites = refuse
+	b.save(s)
+}
+
+// slot returns slot n as the BMC holds it now.
+func (b *statefulBMC) slot(n int) bmcSlot {
+	b.t.Helper()
+	return b.load().Slots[n]
 }

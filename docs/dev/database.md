@@ -112,6 +112,9 @@ detail; this is the map.
   mirrors, so two workers can serve disjoint cages of one NetBox site.
   `relay_pools` (00018) is the list of relayed DHCP scopes the worker
   serves in addition to its directly-attached ephemeral pool.
+  `last_snapshot_seq` is drawn from the `site_snapshot_seq` sequence
+  (00031), so it is never reissued and keeps rising across a delete and
+  re-create of the same slug; per-slug values are not contiguous.
 - `site_workers(id, site_slug, worker_id, fqdn, first_seen_at,
   last_seen_at, token_hash)`. `token_hash` (00012) is `sha256(bearer)`;
   the plaintext is returned once at registration and never persisted.
@@ -126,19 +129,23 @@ detail; this is the map.
 - `log_envelopes(id bigserial, ts, global_received_at, received_at,
   level, source, host, machine_id, op_id, trace_id, phase, msg,
   payload jsonb)` — one row per structured log envelope from agents,
-  SOL pumps, site workers, and global itself. Live-tail queries lag
-  by 500ms past `now()` so an in-flight transaction can't allocate a
-  sequence id inside the read window and get skipped. Emitter clocks
+  SOL pumps, site workers, and global itself. Every `/logs/stream`
+  query, backfill pages as well as live-tail polls, lags by 500ms past
+  `now()` so an in-flight transaction can't allocate a sequence id
+  inside the read window and get skipped. Emitter clocks
   can be arbitrarily skewed (agents pre-NTP); the watermark uses
   `global_received_at`, which is server-assigned.
 - `console_casts(id bigserial, machine_id UUID UNIQUE, cast_started_at,
   width, height)` and `console_cast_events(id bigserial, cast_id,
   t_us bigint, received_at, data bytea)` — one perpetual asciicast
-  per machine, appended forever. `t_us` is monotonic-per-cast
-  microseconds; the site worker computes it as `prev_max_us +
-  monotonic_since_pump_start` and the on-demand resume-offset RPC
-  keeps it monotonic across pump restarts. `data` is `bytea` because
-  SOL bytes are not guaranteed UTF-8.
+  per machine, appended forever. `t_us` is strictly increasing
+  per-cast microseconds; the site worker computes it as `prev_max_us +
+  monotonic_since_pump_start`, bumped to one past the pump's previous
+  frame when two frames land in the same microsecond, and the
+  on-demand resume-offset RPC keeps it increasing across pump
+  restarts. The console stream relies on strictness: it pages with
+  cursor `t_us + 1`, so a repeated `t_us` would be skipped. `data` is
+  `bytea` because SOL bytes are not guaranteed UTF-8.
 
 ### testpg
 

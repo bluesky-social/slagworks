@@ -67,7 +67,11 @@ func (h *ReadHandler) Open(filename string) (io.ReadCloser, error) {
 	full := filepath.Join(h.dir, clean)
 
 	// Double-check the resolved path is still within the serve directory
-	if !strings.HasPrefix(full, h.dir+string(filepath.Separator)) {
+	// and is not the directory itself. Compare with filepath.Rel, which
+	// cleans both sides: Join has already cleaned full, so a string-prefix
+	// test against h.dir as configured would reject every file when the
+	// directory is spelled "/srv/tftp/", "./ipxe" or ".".
+	if rel, err := filepath.Rel(h.dir, full); err != nil || rel == "." || !filepath.IsLocal(rel) {
 		return nil, fmt.Errorf("tftp: rejected path traversal: %q", filename)
 	}
 

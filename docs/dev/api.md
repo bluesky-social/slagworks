@@ -236,11 +236,20 @@ Connection setup:
 1. The worker connects with `?token=`.
 2. Its first message must be `hello`. Global rejects the connection when
    `hello.worker_id` differs from the token's worker, when `proto` is below
-   the current op-stream protocol (`OpStreamProto`, 1), or, when NetBox is
-   configured, when `serial` is empty or does not resolve to exactly one
-   NetBox device inside the worker's site-config scope.
+   the current op-stream protocol (`OpStreamProto`, 1), when, with NetBox
+   configured, `serial` is empty or does not resolve to exactly one NetBox
+   device inside the worker's site-config scope, or when it cannot write
+   `serial` to the worker's `site_workers` row (`serial_persist_failed`; the
+   outlet-op interlock reads serving workers from that column, so a worker
+   is never connected under a serial it lacks). The worker reconnects and
+   retries.
 3. Global replies with `snapshot` (worker is behind) or `no_change`, then
-   sends `op_resync`.
+   sends `op_resync`. The worker drops the connection when its first message
+   is anything else; a `snapshot` pushed by a content change may precede the
+   reply, but op-stream messages and the `power_status`, `boot_status` and
+   `dhcp_leases` RPC requests never do. Until the reply is sent the worker is
+   not an RPC target, so a site whose only workers are still waiting for it
+   answers those reads as if no worker were connected.
 
 Worker to global:
 
@@ -320,10 +329,6 @@ Frames: one header object, then `[t_seconds, "o", data]` lines with invalid
 UTF-8 replaced. Errors after the upgrade arrive as a single
 `{"code","message"}` frame. Parameter errors before the upgrade return an
 HTTP 400.
-
-`internal/ws/messages.go` also defines `subscribe`, `log_entries`,
-`op_snapshot` and `op_status` for an operation-watch stream. No server
-endpoint serves them.
 
 ---
 

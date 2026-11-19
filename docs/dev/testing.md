@@ -123,6 +123,17 @@ Key rules and shapes:
   everything in `ip netns pids <ns>` and then deletes the namespace.
   In CI every shard runs on a fresh machine, so nothing can leak from
   one run into the next.
+- **NIC firmware.** BIOS VMs network-boot through QEMU's default iPXE
+  option ROM (`pxe-virtio.rom` from `ipxe-qemu`). UEFI VMs load no
+  option ROM: OVMF's own virtio-net driver sits under OVMF's PXE stack
+  and under the chainloaded `snponly.efi`, as a board's firmware driver
+  does on real hardware. QEMU's default UEFI ROM (`efi-virtio.rom`, an
+  iPXE build from 2022 on Ubuntu 24.04) corrupts its heap during a large
+  download when the host cannot run the QEMU I/O thread and the vCPU at
+  the same time; a UEFI test then timed out with the serial console
+  ending at `.../initrd...`, sometimes after an `X64 Exception` dump
+  naming `virtio-net.efidrv`. `TestUEFINetbootOnOneHostCPU` holds a VM
+  to one host CPU to reproduce that starvation.
 - **BMC simulation.** `bmcsim.go` runs OpenIPMI's `ipmi_sim` outside
   the VM and wires it to QEMU's `ipmi-bmc-extern` + `isa-ipmi-kcs`
   so the guest sees a real `/dev/ipmi0`. Out-of-process (not the

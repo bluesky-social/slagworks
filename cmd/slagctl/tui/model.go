@@ -44,9 +44,12 @@ type consoleBackfillDoneMsg struct{}
 // through the injected timezone) and, if it carries a phase, advances the
 // lifecycle. Carrying the envelope — not a pre-formatted string — keeps the
 // D9 timezone seam inside the pane, the single place that owns formatting.
+// otherOp marks an envelope of a different op on the same machine
+// (translateEnvelope): it is logged, but its phase is not this op's.
 type logEnvelopeMsg struct {
-	id  int64
-	env slogkit.Envelope
+	id      int64
+	env     slogkit.Envelope
+	otherOp bool
 }
 
 // phaseMsg advances the lifecycle spine. Phase is a field on log envelopes
@@ -286,7 +289,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// age of the last activity rather than resetting to ~0 on connect (bug 1).
 		m.markEventAt(msg.env.TS)
 		m.logs.Append(msg.id, msg.env)
-		if msg.env.Phase != "" {
+		if msg.env.Phase != "" && !msg.otherOp {
 			m.lifecycle.Observe(msg.env.Phase, msg.env.TS)
 		}
 		return m, nil

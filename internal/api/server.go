@@ -573,10 +573,10 @@ func (s *Server) registerRoutes() {
 
 	// Structured-log stream for `slagctl machine logs` and the watch
 	// view. Reads log_envelopes via logstore.Store, with a 500ms
-	// watermark for live-tail (defends against pg
-	// sequence-id-allocated-pre-commit reordering). Operator auth like
-	// every other read: the bearer token rides the upgrade request's
-	// Authorization header.
+	// watermark on every query, backfill and live tail alike (defends
+	// against pg sequence-id-allocated-pre-commit reordering). Operator
+	// auth like every other read: the bearer token rides the upgrade
+	// request's Authorization header.
 	if s.logStore != nil {
 		read.GET("/logs/stream", s.handleLogsStream)
 	}
@@ -2421,6 +2421,9 @@ func (s *Server) updateSiteConfig(c *echo.Context) error {
 		return herr
 	}
 	if err := s.store.UpdateSiteConfig(cfg); err != nil {
+		if errors.Is(err, store.ErrSiteConfigNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound, "site_config not found")
+		}
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 	s.invalidateSite(cfg.Slug)

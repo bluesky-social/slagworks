@@ -145,6 +145,11 @@ type LogLine struct {
 // inventory collector at deploy time and pipes the result directly to
 // the pre-chosen storage script. Global picks the script in the
 // snapshot-build step and ships it via StorageScriptForMAC.
+//
+// Every mac argument is in canonical form, lower-case and colon-separated,
+// which is how the snapshot builder stores interface MACs. Lookups are
+// exact, so a caller holding a MAC from free-form input (an HTTP request)
+// lower-cases it first.
 type MachineProvider interface {
 	BootActionForMAC(mac string) BootAction
 	MachineIDForMAC(mac string) (uuid.UUID, bool)

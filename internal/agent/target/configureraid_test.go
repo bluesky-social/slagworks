@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/bluesky-social/slagworks/internal/agent"
+	"github.com/bluesky-social/slagworks/internal/storage"
 )
 
 // chrootMounts is a fake Runner that keeps a kernel-like mount table for the
@@ -23,11 +24,30 @@ import (
 //     PATH; `umount --recursive PATH` (or -R) unmounts that too.
 //
 // busy names paths that stay busy whatever umount is asked (an open file).
+// mdadm --detail --export answers for /dev/md0, the one array of
+// raidRootLayout.
 type chrootMounts struct {
 	root    string
 	mounted map[string]bool
 	busy    map[string]bool
 	runs    []string
+}
+
+// raidRootLayout roots the host on a RAID1 mirror, which the plan assembles
+// as /dev/md0.
+func raidRootLayout() storage.Layout {
+	return storage.Layout{
+		Devices: map[string]storage.Device{
+			"vda": {Type: "disk", PTable: "gpt", Boot: true, Partitions: []storage.Partition{
+				{Name: "vda1", Size: "512M", FS: "vfat", Bootable: true}, {Name: "vda2", Size: "rest"},
+			}},
+			"vdb": {Type: "disk", PTable: "gpt", Partitions: []storage.Partition{
+				{Name: "vdb1", Size: "512M"}, {Name: "vdb2", Size: "rest"},
+			}},
+			"mdroot": {Type: "raid", Level: 1, Members: []string{"vda2", "vdb2"}, FS: "ext4"},
+		},
+		Mounts: map[string]storage.Mount{"/": {Device: "mdroot"}, "/boot/efi": {Device: "vda1"}},
+	}
 }
 
 func newChrootMounts(root string) *chrootMounts {
@@ -37,8 +57,8 @@ func newChrootMounts(root string) *chrootMounts {
 func (r *chrootMounts) Available(string) bool { return true }
 
 func (r *chrootMounts) Output(name string, args ...string) (string, error) {
-	if name == "mdadm" && slices.Equal(args, []string{"--detail", "--scan"}) {
-		return "ARRAY /dev/md0 metadata=1.0 UUID=3aaa0122:29827cfa:5331ad66:ca767371", nil
+	if name == "mdadm" && slices.Equal(args, []string{"--detail", "--export", "/dev/md0"}) {
+		return "MD_LEVEL=raid1\nMD_METADATA=1.0\nMD_UUID=3aaa0122:29827cfa:5331ad66:ca767371\n", nil
 	}
 	return "", fmt.Errorf("chrootMounts: unexpected Output %s %v", name, args)
 }
@@ -100,7 +120,7 @@ func (r *chrootMounts) left() []string {
 func TestConfigureRAID_UnmountsWhatTheChrootMountedBeneathItsBinds(t *testing.T) {
 	root := t.TempDir()
 	r := newChrootMounts(root)
-	err := ConfigureRAID(&agent.Context{Log: slog.Default(), Exec: r}, root)
+	err := ConfigureRAID(&agent.Context{Log: slog.Default(), Exec: r}, root, raidRootLayout())
 	if left := r.left(); len(left) != 0 {
 		t.Fatalf("ConfigureRAID left %v mounted (err %v); commands run:\n%s",
 			left, err, strings.Join(r.runs, "\n"))
@@ -117,7 +137,7 @@ func TestConfigureRAID_ReturnsBindUnmountFailure(t *testing.T) {
 	root := t.TempDir()
 	r := newChrootMounts(root)
 	r.busy[root+"/sys"] = true
-	err := ConfigureRAID(&agent.Context{Log: slog.Default(), Exec: r}, root)
+	err := ConfigureRAID(&agent.Context{Log: slog.Default(), Exec: r}, root, raidRootLayout())
 	if err == nil {
 		t.Fatalf("ConfigureRAID returned nil with %v still mounted", r.left())
 	}

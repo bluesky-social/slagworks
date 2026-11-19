@@ -91,7 +91,7 @@ func TestCachedTokenLifecycle(t *testing.T) {
 	}
 
 	access := mkJWT(t, map[string]any{"sub": "abc123", "preferred_username": "operator@example.com"})
-	if err := WriteCachedToken(cfg, &oauth2.Token{
+	if err := WriteCachedToken(context.Background(), cfg, &oauth2.Token{
 		AccessToken: access,
 		Expiry:      time.Now().Add(time.Hour),
 		TokenType:   "Bearer",
@@ -120,7 +120,7 @@ func TestCachedTokenLifecycle(t *testing.T) {
 		t.Errorf("CachedBearer returned a different token than the cached one")
 	}
 
-	if err := Logout(cfg); err != nil {
+	if err := Logout(context.Background(), cfg); err != nil {
 		t.Fatalf("Logout: %v", err)
 	}
 	if _, err := os.Stat(wantPath); !os.IsNotExist(err) {

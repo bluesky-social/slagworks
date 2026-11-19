@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"strings"
 
 	"github.com/bluesky-social/slagworks/internal/awssecrets"
@@ -121,10 +122,15 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 		}
 		ifacesByDev[iface.Device.ID] = append(ifacesByDev[iface.Device.ID], iface)
 	}
-	ipByIfaceID := make(map[int]string, len(in.IPs))
+	// Every active address per interface, not just the last row NetBox
+	// listed: a machine's facts carry one address per interface, so the
+	// machine loop rejects an interface with more than one rather than
+	// letting list order pick the survivor.
+	activeIPsByIfaceID := make(map[int][]string, len(in.IPs))
 	for _, ip := range in.IPs {
 		if ip.AssignedObjectID != nil && ip.AssignedObjectType == "dcim.interface" && ip.IsActive() {
-			ipByIfaceID[*ip.AssignedObjectID] = ip.Address
+			id := *ip.AssignedObjectID
+			activeIPsByIfaceID[id] = append(activeIPsByIfaceID[id], ip.Address)
 		}
 	}
 
@@ -171,6 +177,9 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 	consoleByDev := buildConsoleEndpoints(in.ConsolePorts, in.ConsoleServers)
 
 	machines := make([]model.MachineSnapshot, 0, len(in.Machines))
+	// multiAddr collects every bound-machine interface with more than one
+	// active address; any entry fails the build after the loop.
+	var multiAddr []string
 	for _, m := range in.Machines {
 		// Resolve the NetBox device (if bound) up front: its name is the
 		// hostname both the storage and network matchers scope on.
@@ -244,12 +253,21 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 				ms.Console = consoleByDev[d.ID]
 			}
 			for _, ni := range ifacesByDev[*m.NetBoxDeviceID] {
+				addrs := activeIPsByIfaceID[ni.ID]
+				if len(addrs) > 1 {
+					slices.Sort(addrs)
+					multiAddr = append(multiAddr, fmt.Sprintf("device %q interface %s (NetBox interface %d) has %d active IP addresses: %s",
+						hostname, ni.Name, ni.ID, len(addrs), strings.Join(addrs, ", ")))
+					continue
+				}
 				iface := model.SnapshotInterface{
 					NetBoxID: ni.ID,
 					Name:     ni.Name,
 					MAC:      strings.ToLower(ni.GetMAC()),
 					Type:     classifyMachineInterface(ni, ms.BMCIP != ""),
-					IP:       ipByIfaceID[ni.ID],
+				}
+				if len(addrs) == 1 {
+					iface.IP = addrs[0]
 				}
 				// L2-bond facts (additive; absent/zero on L3 hosts whose
 				// interfaces carry none of these in NetBox). LAG is the
@@ -301,6 +319,17 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 			}
 		}
 		machines = append(machines, ms)
+	}
+	// Fail the whole build, as buildOOBReservations does for an interface
+	// with two OOB addresses: keeping one address would hand the
+	// network-config script and the worker's DHCP reservation whichever
+	// address NetBox listed last. Only bound machines' interfaces count:
+	// no other device's addresses reach a SnapshotInterface.
+	if len(multiAddr) > 0 {
+		slices.Sort(multiAddr)
+		multiAddr = slices.Compact(multiAddr) // two machines bound to one device
+		return model.SiteSnapshot{}, fmt.Errorf("site %s: %s; slagworks gives each machine interface exactly one address, for its network-config script facts and DHCP reservation, and will not guess which. In NetBox, keep one address active per interface and set the others to reserved or deprecated",
+			in.Site.Slug, strings.Join(multiAddr, "; "))
 	}
 
 	// OOB DHCP reservations: every interface (INCLUDING mgmt_only) whose
@@ -461,9 +490,9 @@ func iprangeStringCF(r netbox.IPRange, field string) string {
 // prefixes, emit {MAC, IP}. mgmt_only/BMC interfaces are INCLUDED (the
 // whole point — the OOB net is mostly BMCs/PDUs/switch-mgmt ports). The
 // MAC is taken via Interface.GetMAC (NetBox 4.x primary_mac_address); the
-// IPs come from the raw IPAddress list (NOT the last-write-wins
-// ipByIfaceID map the machine loop uses) so a multi-IP interface is
-// actually visible here.
+// IPs come from the raw IPAddress list, filtered to OOB addresses, because
+// reservations cover every site device and the machine loop's multi-address
+// check covers only bound machines.
 //
 // Fails loudly (per the plan's conflict-rejection rule) on:
 //   - more than one OOB IP on a single interface,

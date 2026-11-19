@@ -69,6 +69,8 @@ Partition `name` is the device node the kernel gives the partition at that posit
 
 A `vfat` partition is formatted FAT32, which needs at least 65525 clusters, so its minimum size depends on the disk's logical sector size: `33M` on a disk with 512-byte sectors, `257M` on a 4Kn disk (4096-byte sectors). Below that, `mkfs.fat` would format the partition anyway and UEFI firmware could not read it, so the agent refuses the layout before touching any disk, naming the minimum ("make the partition at least 257M"). The inventory a script reads does not carry the sector size, so size an ESP that may land on a 4Kn disk for 4Kn; the `512M` ESPs on this page fit both.
 
+A fixed size is the size the installed system keeps. The agent turns off cloud-init's `growpart` and `resizefs` on the deployed host, so free space after a fixed-size root partition stays free; use `"rest"` for a root that fills the disk.
+
 **RAID arrays** — software RAID via mdadm. Members reference partition names or whole-disk names from the layout.
 
 ```json
@@ -79,6 +81,8 @@ A `vfat` partition is formatted FAT32, which needs at least 65525 clusters, so i
 }
 ```
 
+A member belongs to its array alone: list it once, in one array, and mount the array rather than the member. A whole disk can be a member only when its disk entry declares no partitions, because `mdadm --create` on the disk would overwrite them. The agent refuses a layout that breaks any of these rules before touching any disk.
+
 Supported levels: 0, 1, 5, 6, 10. Each level needs its md personality module
 (`raid0`, `raid1`, `raid456`, `raid10`) in the boot image's deploy initrd, which
 `assets/initramfs/hooks/slagworks` bakes in. A boot image built without a
@@ -87,6 +91,21 @@ were repartitioned, with an error that names the module; rebuild the image and
 redeploy with `--destructive`.
 
 `array_uuid` (optional) pins the array's md UUID instead of letting mdadm pick a random one, so a later `preserve` deploy can find the array by it. At boot the array is identified by that UUID alone, so the agent refuses a deploy when a disk it leaves unwritten still carries a member superblock with the same UUID, typically the disk a redeploy moved the array off: that stale member could claim the array ahead of the real members. Redeploy with `--wipe-all-disks` to zero such disks, or zero the named device with `mdadm --zero-superblock` from a `--recovery` boot.
+
+The installed system assembles exactly the arrays the layout names, created
+(`raid`) or reassembled (`preserve`), and no others. The agent writes
+`/etc/mdadm/mdadm.conf` with `AUTO -all` and one `ARRAY` line per layout
+array, identified by its UUID, then regenerates the initramfs so the
+initramfs carries that file. An md superblock on a disk the layout leaves
+alone (a disk outside the layout, or a `retain` disk) is therefore never
+assembled at boot, and so cannot take the `/dev/mdN` name a layout array
+needs. To keep using such an array, name it in the layout as a `preserve`
+device. An array created on the installed system later is not assembled at
+boot until its `ARRAY` line is in `mdadm.conf` (`mdadm --detail --brief
+<dev>` prints it) and the initramfs the bootloader loads carries that file:
+run `update-initramfs -u`, and on UEFI also copy the regenerated
+`/boot/initrd.img-<version>` to `/boot/efi/slagworks/initrd.img`, the copy
+systemd-boot loads.
 
 **Mounts** — maps mount points to device names from the layout.
 
@@ -97,6 +116,8 @@ redeploy with `--destructive`.
   "/data":     { "device": "mddata" }
 }
 ```
+
+A swap partition or array is formatted with `mkswap` but is not a filesystem, so it cannot appear in `mounts`.
 
 A mount point must be a clean absolute path: `/var/lib`, not `var/lib`,
 `/var/lib/`, `/var//lib` or `/srv/../var`, and with no whitespace, control

@@ -311,7 +311,9 @@ Types are in `internal/model/snapshot.go`:
 
 `internal/snapshot/builder.go:66` is `Build(in Inputs) (SiteSnapshot,
 error)`. It is pure — no I/O — and fails loudly if `Prefixes` is
-empty (`builder.go:68`). Its inputs (`Inputs`, `builder.go:31`) are
+empty (`builder.go:68`) or if an interface of a bound machine carries
+more than one active IP address (a machine's interface facts hold one).
+Its inputs (`Inputs`, `builder.go:31`) are
 NetBox reads (site, config, prefixes, OOB prefixes and ranges,
 devices, device-types, interfaces, IPs), Postgres reads (machines,
 images, storage scripts, network scripts, SSH keys), and
@@ -351,7 +353,11 @@ and push it" lives. Interfaces at the top (`dispatcher.go:19`):
 gather all reads, call `Build`, compute `ContentHash`, compare with
 `cfg.LastSnapshotHash`, and either skip (metric label
 `skipped_no_change`) or bump `site_configs.last_snapshot_seq` and
-push (`success`). The per-scope filtering lives in
+push (`success`). The bump takes the next value of the
+`site_snapshot_seq` Postgres sequence, not the row's value plus one,
+so a slug's SeqNum keeps rising when its site config is deleted and
+re-created: its workers keep their persisted SeqNum and would drop
+anything lower. The per-scope filtering lives in
 `internal/snapshot/scope.go`: a device is included in a site's
 snapshot only if `Scope.ClaimsDevice(d)` returns true (whole-site
 configs claim everything under the NetBox site; location-scoped
@@ -462,7 +468,10 @@ cast pipeline, and the `SourceSOL` constant no longer exists.
   `handleCastResume` (901), `handleClaimOp` (962).
 - Provides `PowerStatus` / `BootStatus` synchronous RPCs (453, 503)
   used by the operator API; the response is routed to the calling
-  goroutine by `deliverRPCReply` (551).
+  goroutine by `deliverRPCReply` (551). These and the `DHCPLeases`
+  fan-out target only connections whose hello reply has been sent
+  (`rpcTargets`): a connection registers before that reply, and the
+  worker accepts only `snapshot` or `no_change` as its first message.
 
 The concrete handler implementations wired in `buildGlobal` live in
 `internal/hubhandlers`:
@@ -991,13 +1000,13 @@ passive carrier.
 
 `internal/configscript`:
 
-- `Script` (`configscript.go:19`) — `Path`, `Priority`, `Rules
+- `Script` (`configscript.go:20`) — `Path`, `Priority`, `Rules
   []MatchRule`, `Content`.
-- `Parse(path, content, validFields)` (line 38) — reads header
-  directives `# slagworks:match <field> <regex>` and
+- `Parse(path, content, validFields)` (line 45) — reads header
+  directives `# slagworks:match <field>=<value>` and
   `# slagworks:priority <int>` from the leading comment block.
-  Rejects unknown fields.
-- `Match(scripts, resolve)` (line 106) — resolves each field via a
+  Rejects unknown fields and any other `slagworks:` directive.
+- `Match(scripts, resolve)` (line 123) — resolves each field via a
   callback and picks the highest-priority script whose rules all
   match.
 

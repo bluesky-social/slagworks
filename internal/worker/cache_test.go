@@ -311,6 +311,50 @@ func TestUpdateOpPhase_AwaitingPhoneHomeOnlyLeftByFailure(t *testing.T) {
 	})
 }
 
+// TestBootAction_AwaitingPhoneHomeOnUnclaimedDeploy covers an install that
+// finishes before the site sees its deploy op claimed. BootActionForMAC
+// serves the installer for a pending deploy op on a commissioned or failed
+// machine (the pending-op clause), and HandleProgressReport accepts reports
+// for a pending op, so a host that PXEs on its own while the executor's
+// claim keeps failing installs, posts deploy_complete, and latches the op
+// at awaiting_phone_home with the machine still in its resting state (only
+// the claim's op_delta moves it to deploying). The post-install reboot's
+// PXE must boot the disk: BootDeploy runs the installer over the fresh
+// install, a reinstall loop with slagworks.destructive and a failed disk
+// check (host stranded in the recovery shell) without it.
+func TestBootAction_AwaitingPhoneHomeOnUnclaimedDeploy(t *testing.T) {
+	for _, state := range []model.MachineState{model.MachineStateCommissioned, model.MachineStateFailed} {
+		t.Run(string(state), func(t *testing.T) {
+			c := NewCache(nil)
+			mid, opID := uuid.New(), uuid.New()
+			mac := "52:54:00:b1:00:02"
+			c.ApplySnapshot(snapMachine(mid, mac, state))
+			seedOpsResync(c, model.Operation{
+				ID: opID, MachineID: mid, Type: model.OpDeploy, Status: model.OpPending, Version: 1,
+			})
+			if got := c.BootActionForMAC(mac); got != model.BootDeploy {
+				t.Fatalf("precondition: pending deploy op on a %s machine got %d, want BootDeploy", state, got)
+			}
+
+			if err := c.HandleProgressReport(&model.ProgressReport{
+				MachineID: mid.String(), OperationID: opID.String(), Event: "deploy_complete",
+			}); err != nil {
+				t.Fatalf("deploy_complete: %v", err)
+			}
+			if op := c.GetOperation(opID.String()); op == nil || op.Status != model.OpPending || op.Phase != "awaiting_phone_home" {
+				t.Fatalf("precondition: op = %+v, want pending at awaiting_phone_home", op)
+			}
+			if got := c.MachineState(mid); got != string(state) {
+				t.Fatalf("precondition: machine state %q, want %q (no claim delta yet)", got, state)
+			}
+
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("post-install PXE of a %s machine whose deploy op is awaiting_phone_home got %d, want BootLocal (%d)", state, got, model.BootLocal)
+			}
+		})
+	}
+}
+
 // TestUpdateOpPhase_BootPrefixAllowedWhenNotAwaiting confirms the guard is
 // narrow: a deploy op NOT in awaiting_phone_home (e.g. mid-install) accepts
 // boot-prefix phase updates normally.
