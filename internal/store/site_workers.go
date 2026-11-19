@@ -149,18 +149,21 @@ func (s *Store) ListSiteWorkers(siteSlug string) ([]model.SiteWorker, error) {
 }
 
 // ListSiteWorkersBySerial returns registered workers whose verified hardware
-// serial equals the given value (across all slugs). The P4b PDU-outlet POST
-// uses it as the creation-time analog of the claim-time INV-1 check: "is this
+// serial equals the given value ignoring case (across all slugs). The P4b
+// PDU-outlet POST uses it as the creation-time analog of the claim-time INV-1 check: "is this
 // outlet's downstream device a serving worker?" A non-empty result means the
 // downstream IS a registered worker (so `off` is refused, and a non-AllowSelf
 // cycle/on needs an eligible partner). An empty serial never matches a real
-// worker, so the caller must not call this with "".
+// worker, so the caller must not call this with "". The column holds the
+// worker's SMBIOS spelling and the caller passes NetBox's; the hello gate
+// matched those case-insensitively (model.SameHardwareSerial), so this
+// lookup does too.
 func (s *Store) ListSiteWorkersBySerial(serial string) ([]model.SiteWorker, error) {
 	if serial == "" {
 		return nil, nil
 	}
 	var out []model.SiteWorker
-	return out, s.db.Where("serial = ?", serial).Find(&out).Error
+	return out, s.db.Where("LOWER(serial) = LOWER(?)", serial).Find(&out).Error
 }
 
 // ResolveSiteWorker resolves ident to exactly one site worker row.

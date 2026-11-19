@@ -52,6 +52,23 @@ func TestWorkerInterlock_SkipsSelfSerialOutletOp(t *testing.T) {
 	}
 }
 
+// TestWorkerInterlock_SkipsSelfOutletOpAcrossSerialCase: the worker's serial
+// is its SMBIOS spelling, the op's DownstreamSerial is NetBox's. Global
+// verified the worker as that NetBox device with a case-insensitive match, so
+// a case-only difference is still this worker's own feed.
+func TestWorkerInterlock_SkipsSelfOutletOpAcrossSerialCase(t *testing.T) {
+	for _, opType := range []model.OperationType{model.OpPowerOff, model.OpPowerCycle} {
+		t.Run(string(opType), func(t *testing.T) {
+			c, pdu := interlockCache(t, "abc123")
+			seedOpsResync(c, outletPowerOp(t, pdu, opType, "ABC123", false))
+			if got := c.PendingPowerOps(); len(got) != 0 {
+				t.Errorf("outlet %s feeding this worker (NetBox %q, SMBIOS %q) must be skipped, got %d ops",
+					opType, "ABC123", "abc123", len(got))
+			}
+		})
+	}
+}
+
 // TestWorkerInterlock_HonorsAllowSelfForCycle: an AllowSelf cycle on the
 // worker's own feed IS returned (the operator chose the self-cycle).
 func TestWorkerInterlock_HonorsAllowSelfForCycle(t *testing.T) {

@@ -198,6 +198,94 @@ func TestInterlock_SelfFeedingOff_DeclinedForEveryone(t *testing.T) {
 	}
 }
 
+// TestInterlock_SerialCaseMismatchDoesNotDisarm: the hello gate verifies a
+// worker's SMBIOS serial by asking NetBox for devices with that serial, and
+// NetBox's device serial filter is case-insensitive (iexact). A worker whose
+// board reports "abc123" is therefore verified as the NetBox device whose
+// serial is "ABC123", and site_workers.serial holds the reported spelling.
+// The op's downstream_serial is NetBox's spelling. The interlock must treat
+// the two spellings as the same device, or it is silently inert for that
+// worker.
+func TestInterlock_SerialCaseMismatchDoesNotDisarm(t *testing.T) {
+	const netboxSerial = "ABC123"   // dcim.device.serial, stamped into the op as downstream_serial
+	const reportedSerial = "abc123" // what the worker's dmidecode prints
+
+	cases := []struct {
+		name       string
+		opType     model.OperationType
+		registered []model.SiteWorker
+		claimant   string
+	}{
+		{
+			// Both INV-1 and INV-2 apply: the worker would cut its own feed.
+			name:       "self off",
+			opType:     model.OpPowerOff,
+			registered: []model.SiteWorker{{SiteSlug: "pop3", WorkerID: "worker-1", Serial: reportedSerial}},
+			claimant:   reportedSerial,
+		},
+		{
+			// INV-2 only: no registered row, a non-AllowSelf cycle by the
+			// downstream device itself.
+			name:     "self cycle",
+			opType:   model.OpPowerCycle,
+			claimant: reportedSerial,
+		},
+		{
+			// INV-1 only: a partner worker (a hot spare at a multi-worker
+			// site) must not power off the outlet feeding a registered worker.
+			name:       "partner off",
+			opType:     model.OpPowerOff,
+			registered: []model.SiteWorker{{SiteSlug: "pop3", WorkerID: "w-down", Serial: reportedSerial}},
+			claimant:   "SN-PARTNER",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := newFakeAuth()
+			auth.register("tok-1", "pop3", "worker-1")
+			if tc.registered != nil {
+				auth.setSiteWorkers("pop3", tc.registered...)
+			}
+
+			op := outletOp(t, tc.opType, netboxSerial, false)
+			claimed := *op
+			claimed.Status = model.OpClaimed
+			claimed.ClaimedBy = "worker-1"
+			claimed.Version = 1
+			claimer := &fakeOpClaimer{pendingOp: op, op: &claimed}
+
+			// The production resolver accepts any serial NetBox returns exactly
+			// one in-scope device for; with an iexact filter that includes a
+			// case-only variant.
+			resolver := newFakeSerialResolver()
+			hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, OpClaimer: claimer, SerialResolver: resolver})
+			hub.Push("pop3", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"},
+				Machines: []model.MachineSnapshot{{ID: op.MachineID}}})
+			srv := httptest.NewServer(hub)
+			defer srv.Close()
+			conn := dialHub(t, srv, "tok-1")
+			if conn == nil {
+				t.Fatal("dial failed")
+			}
+			defer conn.CloseNow()
+			helloAndDrainSerial(t, conn, "worker-1", tc.claimant)
+
+			resp, errStr := claimAndRead(t, conn, op.ID)
+			if errStr != "" {
+				t.Fatalf("unexpected rpc error: %s", errStr)
+			}
+			if resp.Operation != nil || len(claimer.calls()) != 0 {
+				t.Fatalf("claimant %q was granted an outlet %s whose downstream is NetBox device %q, "+
+					"the worker whose board reports %q (store claims attempted: %d)",
+					tc.claimant, tc.opType, netboxSerial, reportedSerial, len(claimer.calls()))
+			}
+			if !resp.AlreadyClaimed {
+				t.Fatal("an interlock decline must be reported as already_claimed")
+			}
+		})
+	}
+}
+
 // TestInterlock_EmptySerialClaimant_Declined: an outlet op claimed by a worker
 // whose verified serial is "" (unverified) is declined fail-closed.
 func TestInterlock_EmptySerialClaimant_Declined(t *testing.T) {

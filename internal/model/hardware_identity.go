@@ -32,3 +32,14 @@ func NormalizeHardwareIdentifier(value string) string {
 func NormalizeHardwareSerial(value string) string {
 	return NormalizeHardwareIdentifier(value)
 }
+
+// SameHardwareSerial reports whether a and b are the same non-empty hardware
+// serial, ignoring letter case. This is NetBox's relation: its device serial
+// filter matches iexact, so the hub's hello gate accepts a worker whose board
+// reports "abc123" as the device NetBox records as "ABC123". A check that asks
+// whether a worker-reported serial and a NetBox serial name the same device
+// must use this relation too, or a worker can be verified as a device and
+// then fail to match it.
+func SameHardwareSerial(a, b string) bool {
+	return a != "" && strings.EqualFold(a, b)
+}

@@ -982,7 +982,9 @@ type workerConn struct {
 	// hello and verified against NetBox. "" means the worker
 	// reported no serial (unverified). Set once in serve() before the read
 	// loop starts and read-only thereafter, so no lock is needed. The P4b
-	// outlet-op interlock reads this to decide claim eligibility.
+	// outlet-op interlock reads this to decide claim eligibility. NetBox
+	// matched it case-insensitively, so it can differ in case from the
+	// device's NetBox serial: compare with model.SameHardwareSerial.
 	verifiedSerial string
 
 	// fqdn is the worker's advertised hello.FQDN, set once before the
@@ -1707,7 +1709,9 @@ func (c *workerConn) outletClaimEligible(opID uuid.UUID) (bool, string) {
 // registeredWorkerSerials returns the set of non-empty verified hardware
 // serials for the workers registered against this conn's slug (connected or
 // not), for the INV-1 serving-worker check. An unverified worker (serial "")
-// contributes no entry — it can't be matched as a downstream anyway.
+// contributes no entry — it can't be matched as a downstream anyway. Entries
+// keep the workers' SMBIOS spelling; outletClaimEligibility matches them
+// against the NetBox downstream serial ignoring case.
 func (c *workerConn) registeredWorkerSerials() (map[string]bool, error) {
 	workers, err := c.hub.cfg.Auth.ListSiteWorkers(c.slug)
 	if err != nil {
