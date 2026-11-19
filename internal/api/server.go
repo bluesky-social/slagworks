@@ -407,9 +407,14 @@ func NewServer(cfg Config) *Server {
 	s.echo.JSONSerializer = operatorJSONSerializer{}
 	s.echo.Use(middleware.Recover())
 	s.echo.Use(middleware.BodyLimit(12 << 20)) // 12 MiB
+	// The request log records the path, never the query string: the
+	// site-worker upgrade carries its bearer token as ?token= (see the hub
+	// route below), and global's log has more readers than may act as a
+	// site worker. Redacting known parameters instead would leak the next
+	// query-borne secret; the cost is that list filters are not logged.
 	s.echo.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
 		LogMethod:  true,
-		LogURI:     true,
+		LogURIPath: true,
 		LogStatus:  true,
 		LogLatency: true,
 		Skipper: func(c *echo.Context) bool {
@@ -421,7 +426,7 @@ func NewServer(cfg Config) *Server {
 		LogValuesFunc: func(c *echo.Context, v middleware.RequestLoggerValues) error {
 			args := []any{
 				"method", v.Method,
-				"uri", v.URI,
+				"path", v.URIPath,
 				"status", v.Status,
 				"latency", v.Latency,
 			}
