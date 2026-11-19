@@ -562,7 +562,12 @@ is appended to a durable outbox row on the local SQLite (via
 (`cache.go:334 appendObservation`, `685 DrainOutbox`, `805 RequeueOutbox`,
 `824 AckObservation`, `843 ReloadOutboxFromDisk`). Retry backoff is in
 `armRetryTimerLocked` (724) and `RequeueRejected` (772). This is why
-a site worker restart does not lose commission reports.
+a site worker restart does not lose commission reports. The one entry
+the drain never sends is one whose encoded `observation` message exceeds
+`ws.MaxMessageBytes` (16 MiB, the hub's read limit) or cannot be encoded:
+`WSConn.drainOnce` logs it at error level and deletes its row, because
+the hub would close the connection on it and the reconnect would put it
+first in line again.
 
 ### Executor — `internal/worker/executor.go`
 
