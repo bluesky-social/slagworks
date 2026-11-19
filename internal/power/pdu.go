@@ -122,38 +122,41 @@ func NewPDUController(_ context.Context, specs []PDUOutletSpec, log *slog.Logger
 	return p, nil
 }
 
-// PowerOff turns ALL feeds off. On a partial failure (one feed off, one
-// errored) it ROLLS BACK — issues olOn to every feed it cut — so a
-// failed PowerOff returns the box to its known-good fully-redundant
-// state rather than stranding it half-off. The rollback action only ever
+// PowerOff turns ALL feeds off. On a failure (one feed errored) it ROLLS
+// BACK — issues olOn to every feed it may have cut, including the one
+// whose olOff errored — so a failed PowerOff returns the box to its
+// known-good fully-redundant state rather than stranding it half-off.
+// The errored feed is included because a cli error does not mean the
+// command didn't run: the session can drop after the NMC executed olOff
+// but before its result code arrived. The rollback action only ever
 // powers toward up, so it is itself safe. See doc §D.
 func (p *PDUController) PowerOff(ctx context.Context) error {
-	var cut []outletConn
+	var attempted []outletConn
 	for _, oc := range p.outlets {
+		attempted = append(attempted, oc)
 		if _, err := oc.conn.cli(ctx, fmt.Sprintf("olOff %d", oc.outlet)); err != nil {
-			// Roll back the feeds we already cut, then report. Use a
+			// Roll back every feed we sent olOff to, then report. Use a
 			// context DETACHED from ctx's cancellation: if the PowerOff
 			// failed *because* ctx was cancelled/timed out, reusing ctx
 			// would make the rollback no-op instantly — defeating the
 			// rollback exactly when it's most needed. We still bound it
 			// with a fresh timeout so a wedged rollback can't hang.
 			rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
-			rbErr := p.rollbackOn(rbCtx, cut)
+			rbErr := p.rollbackOn(rbCtx, attempted)
 			rbCancel()
 			if rbErr != nil {
-				return fmt.Errorf("pdu power off %s outlet %d: %w; AND rollback failed: %v (box may be running on partial feeds)",
+				return fmt.Errorf("pdu power off %s outlet %d: %w; AND rollback failed: %v (box may be on partial feeds or off; check power status, then power on or retry)",
 					oc.host, oc.outlet, err, rbErr)
 			}
-			return fmt.Errorf("pdu power off %s outlet %d: %w (rolled back %d already-cut feed(s) to restore redundancy)",
-				oc.host, oc.outlet, err, len(cut))
+			return fmt.Errorf("pdu power off %s outlet %d: %w (rolled back %d feed(s) to on, including this one in case its olOff ran; retry the power off)",
+				oc.host, oc.outlet, err, len(attempted))
 		}
-		cut = append(cut, oc)
 	}
 	return nil
 }
 
 // rollbackOn issues olOn to each given outlet, restoring power. Used by
-// PowerOff on partial failure. Aggregates any errors; the box only ever
+// PowerOff on failure. Aggregates any errors; the box only ever
 // ends up more-powered, never darker, so this is the safe direction.
 func (p *PDUController) rollbackOn(ctx context.Context, outlets []outletConn) error {
 	var errs []error
