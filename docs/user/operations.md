@@ -271,7 +271,12 @@ recent active operation.
   phase spine on the right, structured envelope stream on the left,
   SOL passthrough at the bottom.
 - On a non-TTY: falls back to a flat line-based log stream (`--plain`
-  forces this on a TTY too). Exits non-zero if the operation fails.
+  forces this on a TTY too and writes the lines to stdout): the op's
+  structured log envelopes from `/api/v1/logs/stream`, in the
+  `machine logs` format, then a one-line summary. Exits 0 when the
+  operation completes, non-zero if it fails or `--timeout` passes first.
+  `machine deploy -w` and `machine commission -w` take this path when
+  stderr is not a terminal (CI, pipes).
 
 Flags: `--timeout <dur>` (default 30m), `--hold` (keep TUI open on
 completion even under CI recording), `--no-hold` (tear down
