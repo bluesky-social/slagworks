@@ -251,7 +251,10 @@ the fields it discovered:
 
 - Top-level: `serial`, `asset_tag`, `name` (hostname), `status`
   (`active` on deploy), `device_type`.
-- Tags: adds `slagworks-managed`.
+- Tags: adds `slagworks-managed` and keeps every operator tag. NetBox
+  replaces the whole tag set on PATCH, so the sync reads the device's
+  tags first and writes them back with `slagworks-managed` added; once
+  the tag is present it leaves `tags` out of the PATCH.
 - Custom fields: `slagworks_id`, `board_vendor`, `board_product`,
   `chassis_type`, `board_serial`.
 
