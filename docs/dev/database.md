@@ -195,7 +195,11 @@ Tables (all defined by GORM structs in `localdb.go`):
   and the seq cursor can't disagree after a mid-write crash.
 - `dhcp_leases(mac PK, ip, expires_at)` — active leases persisted
   through restart. Expired rows are lazily deleted by
-  `LoadDHCPLeases`.
+  `LoadDHCPLeases`. `expires_at` is declared `datetime` but holds
+  text with the writer's UTC offset, so expiry is judged in Go after
+  the driver parses it, never by an SQL comparison (which would order
+  wall-clock readings and misjudge rows across a DST or time-zone
+  change).
 - `current_deploy_ops(machine_id PK, operation_id)` — gates
   progress reports against ops the cache hasn't yet seen via
   snapshot. Kept after the `deploy_logs` and `sol_lines` tables were

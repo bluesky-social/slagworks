@@ -500,13 +500,28 @@ func (l *LocalDB) DeleteDHCPLease(mac net.HardwareAddr) {
 	l.db.Delete(&dhcpLeaseRow{}, "mac = ?", mac.String())
 }
 
-// LoadDHCPLeases returns all non-expired persisted leases.
+// LoadDHCPLeases returns all non-expired persisted leases and deletes the
+// expired ones.
+//
+// Expiry is judged in Go, never in SQL. The driver stores expires_at as
+// text carrying the writer's UTC offset ("2006-01-02 15:04:05.999999999-07:00"),
+// so an SQL comparison orders wall-clock readings, not instants: a row
+// written under a different offset than time.Now() has at load (a restart
+// around a DST change, or after the host's time zone changes) reads up to
+// the offset difference early or late. The driver parses the offset back
+// into time.Time, so comparing in Go is exact.
 func (l *LocalDB) LoadDHCPLeases() []DHCPLease {
 	var rows []dhcpLeaseRow
-	l.db.Where("expires_at > ?", time.Now()).Find(&rows)
+	l.db.Find(&rows)
 
+	now := time.Now()
 	leases := make([]DHCPLease, 0, len(rows))
+	var expired []string
 	for _, r := range rows {
+		if !r.ExpiresAt.After(now) {
+			expired = append(expired, r.MAC)
+			continue
+		}
 		mac, err := net.ParseMAC(r.MAC)
 		if err != nil {
 			l.log.Warn("corrupt DHCP lease MAC, skipping", "mac", r.MAC)
@@ -520,19 +535,28 @@ func (l *LocalDB) LoadDHCPLeases() []DHCPLease {
 		leases = append(leases, DHCPLease{MAC: mac, IP: ip, ExpiresAt: r.ExpiresAt})
 	}
 
-	// Clean up expired leases
-	l.db.Where("expires_at <= ?", time.Now()).Delete(&dhcpLeaseRow{})
+	if len(expired) > 0 {
+		l.db.Delete(&dhcpLeaseRow{}, "mac IN ?", expired)
+	}
 
 	return leases
 }
 
 // CountActiveDHCPLeases returns the number of currently-valid (non-expired)
 // DHCP leases persisted to the local DB. Used by site worker startup to
-// summarize what got loaded; cheap COUNT(*) instead of pulling the row
-// set when the site only needs the integer.
+// summarize what got loaded. It reads only the expiry column and judges it
+// in Go, for the reason given on LoadDHCPLeases.
 func (l *LocalDB) CountActiveDHCPLeases() int64 {
+	var expiries []time.Time
+	l.db.Model(&dhcpLeaseRow{}).Pluck("expires_at", &expiries)
+
+	now := time.Now()
 	var n int64
-	l.db.Model(&dhcpLeaseRow{}).Where("expires_at > ?", time.Now()).Count(&n)
+	for _, e := range expiries {
+		if e.After(now) {
+			n++
+		}
+	}
 	return n
 }
 
