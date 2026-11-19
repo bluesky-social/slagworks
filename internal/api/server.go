@@ -47,8 +47,9 @@ type Server struct {
 	verifier           tokenverify.Verifier
 	authz              tokenverify.Authorizer
 	// credAuthz is the extra check credentialAuth applies to the routes
-	// that return a stored device credential in plaintext. nil: none, so
-	// every operator who passes authz may read credentials.
+	// that return a stored device credential in plaintext, or a site-worker
+	// token that receives them. nil: none, so every operator who passes
+	// authz may read credentials.
 	credAuthz tokenverify.Authorizer
 	// oidcIssuer/oidcAudience are retained to enrich the auth-rejection log
 	// line (the "expected" values shown next to a rejected token's own
@@ -129,9 +130,10 @@ type Config struct {
 	// slice form; the cobra/global layer parses the env and requires at least one.
 	RequiredGroups []string
 	// CredentialGroups, when non-empty, additionally gates the routes that
-	// return a stored device credential in plaintext (any-of): the caller
-	// must pass RequiredGroups AND carry one of these. Empty leaves those
-	// routes under RequiredGroups alone.
+	// return a stored device credential in plaintext, or mint a site-worker
+	// token that receives them (any-of): the caller must pass
+	// RequiredGroups AND carry one of these. Empty leaves those routes under
+	// RequiredGroups alone.
 	CredentialGroups []string
 	// Verifier, if non-nil, is used as-is (test injection). If nil and
 	// OIDCIssuer is set, NewServer builds the verifier via tokenverify.New.
@@ -412,9 +414,15 @@ func NewServer(cfg Config) *Server {
 	s.echo.JSONSerializer = operatorJSONSerializer{}
 	s.echo.Use(middleware.Recover())
 	s.echo.Use(middleware.BodyLimit(12 << 20)) // 12 MiB
+	// The request log records the path, never the query string: a site
+	// worker on a build older than the bearer-header hub still sends its
+	// token as ?token= on every (refused) reconnect, and global's log has
+	// more readers than may act as a site worker. Redacting known
+	// parameters instead would leak the next query-borne secret; the cost
+	// is that list filters are not logged.
 	s.echo.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
 		LogMethod:  true,
-		LogURI:     true,
+		LogURIPath: true,
 		LogStatus:  true,
 		LogLatency: true,
 		Skipper: func(c *echo.Context) bool {
@@ -426,7 +434,7 @@ func NewServer(cfg Config) *Server {
 		LogValuesFunc: func(c *echo.Context, v middleware.RequestLoggerValues) error {
 			args := []any{
 				"method", v.Method,
-				"uri", v.URI,
+				"path", v.URIPath,
 				"status", v.Status,
 				"latency", v.Latency,
 			}
@@ -490,8 +498,10 @@ func (s *Server) registerRoutes() {
 	read.GET("/machines/:id/netbox-diff", s.netboxDiffMachine)
 	// The one route that returns a stored device credential in plaintext;
 	// credentialAuth adds the optional credential-group check after
-	// oidcAuth. Routes that only use credentials server-side (power, boot,
-	// op creation) stay under the operator check alone.
+	// oidcAuth. Its other user is POST /site-workers below, whose token
+	// receives the credentials on the op stream. Routes that only use
+	// credentials server-side (power, boot, op creation) stay under the
+	// operator check alone.
 	read.GET("/devices/:ident/creds", s.getDeviceCreds, s.credentialAuth)
 	// PDU outlet resolve: non-mutating preflight that reverse-traces the
 	// outlet's cable and returns the downstream device identity, feed
@@ -552,7 +562,11 @@ func (s *Server) registerRoutes() {
 	admin.POST("/site-configs", s.createSiteConfig)
 	admin.PATCH("/site-configs/:slug", s.updateSiteConfig)
 	admin.DELETE("/site-configs/:slug", s.deleteSiteConfig)
-	admin.POST("/site-workers", s.registerSiteWorker)
+	// A site-worker token is credential-equivalent: the hub's op stream
+	// hands a connected worker every operation for its site with the
+	// credentials unredacted. Minting or rotating one therefore takes the
+	// same credential-group check as GET /devices/:ident/creds.
+	admin.POST("/site-workers", s.registerSiteWorker, s.credentialAuth)
 	admin.DELETE("/site-workers/:ident", s.deleteSiteWorker)
 	admin.POST("/admin/netbox/bootstrap", s.netboxBootstrap)
 	admin.POST("/admin/netbox/migrate-chassis-serial", s.netboxMigrateChassisSerial)
@@ -568,9 +582,10 @@ func (s *Server) registerRoutes() {
 		api.POST("/hooks/netbox", s.webhookHandler.HandleWebhook)
 	}
 
-	// Site-worker WebSocket hub. The hub authenticates via ?token=
-	// internally against site_workers.token_hash, so we don't wrap it
-	// in the adminAuth middleware — that's a different token class.
+	// Site-worker WebSocket hub. The hub authenticates the worker's
+	// bearer token internally against site_workers.token_hash, so we
+	// don't wrap it in the adminAuth middleware — that's a different
+	// token class.
 	// GET is the only method a browser/client would use to upgrade.
 	if s.wsHub != nil {
 		api.GET("/ws/site", echo.WrapHandler(s.wsHub))
@@ -719,8 +734,9 @@ func (s *Server) scrubTerminalCredentials() {
 // machine row by netbox_device_id.
 //
 // Returns 400 for malformed input, 404 when the hostname doesn't resolve
-// or there's no slagworks row for the resolved device, 503 when NetBox
-// integration isn't configured but a hostname was supplied.
+// or there's no slagworks row for the resolved device, 409 when several
+// NetBox devices carry the hostname, 503 when NetBox integration isn't
+// configured but a hostname was supplied.
 func (s *Server) resolveMachineParam(c *echo.Context) (uuid.UUID, error) {
 	raw := c.Param("id")
 	if id, err := uuid.Parse(raw); err == nil {
@@ -734,10 +750,15 @@ func (s *Server) resolveMachineParam(c *echo.Context) (uuid.UUID, error) {
 		return uuid.Nil, echo.NewHTTPError(http.StatusServiceUnavailable,
 			"hostname resolution requires NetBox integration; pass a machine UUID instead")
 	}
-	// siteID 0 means "any site" — NetBox names like `kworker-l34-1.pop1`
-	// already encode the site in the hostname, so cross-site uniqueness
-	// is enforced by the name itself.
+	// siteID 0 means "any site". Names like `kworker-l34-1.pop1` usually
+	// encode the site, but NetBox only enforces uniqueness within a site,
+	// so a name two sites share is refused rather than guessed.
 	dev, err := s.netbox.FindDeviceByName(c.Request().Context(), raw, 0)
+	var ambig *netbox.AmbiguousNameError
+	if errors.As(err, &ambig) {
+		return uuid.Nil, echo.NewHTTPError(http.StatusConflict,
+			ambig.Error()+"; pass the machine UUID instead")
+	}
 	if err != nil {
 		return uuid.Nil, echo.NewHTTPError(http.StatusInternalServerError,
 			fmt.Sprintf("netbox lookup: %v", err))
@@ -1867,6 +1888,12 @@ func (s *Server) createImage(c *echo.Context) error {
 	if img.Name == "" || img.Version == "" || img.SHA256 == "" || img.URL == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "name, version, sha256, and url are required")
 	}
+	// The name becomes a directory on every site worker; "..", "." or a
+	// name with a slash would point SyncImages' remove-and-replace outside
+	// that worker's images dir.
+	if err := model.ValidateImageName(img.Name); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
 	if err := s.store.CreateImage(&img); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
@@ -1894,6 +1921,11 @@ func (s *Server) upsertImage(c *echo.Context) error {
 	img.Name = c.Param("name")
 	if img.Name == "" || img.Version == "" || img.SHA256 == "" || img.URL == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "name (in path), version, sha256, and url are required")
+	}
+	// Same check as createImage: the name becomes a directory on every
+	// site worker.
+	if err := model.ValidateImageName(img.Name); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 	if err := s.store.UpsertImage(&img); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -2127,6 +2159,12 @@ func (s *Server) createSSHKey(c *echo.Context) error {
 	if err := s.store.CreateSSHKey(&key); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
+	// SSH keys are global: every site's snapshot carries the list, and the
+	// agent writes the deployed host's authorized_keys from the worker's copy
+	// (/boot/ssh-keys). Nothing in a deploy rebuilds the snapshot before that
+	// fetch, so push a fresh one to all sites now or a deploy can come up
+	// without the key the operator just added.
+	s.invalidateAllSites()
 	return c.JSON(http.StatusCreated, key)
 }
 
@@ -2138,6 +2176,10 @@ func (s *Server) deleteSSHKey(c *echo.Context) error {
 	if err := s.store.DeleteSSHKey(id); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
+	// Removal is revocation: without a fresh snapshot on every site, deploys
+	// keep installing the removed key as root's authorized key until some
+	// unrelated rebuild. See createSSHKey.
+	s.invalidateAllSites()
 	return c.NoContent(http.StatusNoContent)
 }
 

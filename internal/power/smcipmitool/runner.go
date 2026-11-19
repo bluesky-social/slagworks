@@ -71,8 +71,8 @@ func (r *Runner) log() *slog.Logger {
 // would corrupt any value that happens to contain the password as a
 // substring (a password of "on" breaks the power-state parse, a digit run
 // shared with the serial breaks the identity check). Anything that can
-// reach a log or error — the error paths here and parse errors in the
-// callers (see scrubErr) — is scrubbed.
+// reach a log or error is scrubbed: the error paths here, and parse errors
+// in the callers (see PowerStatus and scrubErr).
 func (r *Runner) run(ctx context.Context, c Conn, sub ...string) (string, error) {
 	// Always bound the call. context.WithTimeout returns the earlier of the
 	// caller's deadline and r.timeout(), so a shorter caller deadline still
@@ -131,8 +131,11 @@ func (r *Runner) run(ctx context.Context, c Conn, sub ...string) (string, error)
 	return raw, nil
 }
 
-// scrubErr scrubs the password from a parse error, whose message may quote
-// the raw output run returned.
+// scrubErr scrubs the password from a parse error. It only catches a
+// password that appears verbatim in the message, so it is not enough for an
+// error that renders the output it rejected: quoting or trimming the output
+// changes an echoed password before the scrub sees it. Such an error must be
+// built from scrubbed output instead, as PowerStatus does.
 func scrubErr(err error, pass string) error {
 	if err == nil {
 		return nil
@@ -147,7 +150,14 @@ func (r *Runner) PowerStatus(ctx context.Context, c Conn) (PowerState, error) {
 		return PowerUnknown, err
 	}
 	st, err := ParsePowerStatus(out)
-	return st, scrubErr(err, c.Pass)
+	if err != nil {
+		// The parse error trims and %q-quotes the output, which can escape
+		// or drop characters of an echoed password (`"`, `\`, control
+		// characters, whitespace at the ends). Scrub the output before it is
+		// rendered; scrubbing the rendered message would miss the password.
+		return PowerUnknown, unrecognizedPowerStatus(scrubSecret(out, c.Pass))
+	}
+	return st, nil
 }
 
 // PowerOn runs `ipmi power up`.

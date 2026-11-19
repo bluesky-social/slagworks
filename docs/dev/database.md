@@ -137,15 +137,20 @@ detail; this is the map.
   `now()` so an in-flight transaction can't allocate a sequence id
   inside the read window and get skipped. Emitter clocks
   can be arbitrarily skewed (agents pre-NTP); the watermark uses
-  `global_received_at`, which is server-assigned.
+  `global_received_at`, which is server-assigned, and the live tail
+  admits a row when either `ts` or `global_received_at` is at or after
+  the subscriber's `since`.
 - `console_casts(id bigserial, machine_id UUID UNIQUE, cast_started_at,
   width, height)` and `console_cast_events(id bigserial, cast_id,
   t_us bigint, received_at, data bytea)` — one perpetual asciicast
-  per machine, appended forever. `t_us` is monotonic-per-cast
-  microseconds; the site worker computes it as `prev_max_us +
-  monotonic_since_pump_start` and the on-demand resume-offset RPC
-  keeps it monotonic across pump restarts. `data` is `bytea` because
-  SOL bytes are not guaranteed UTF-8.
+  per machine, appended forever. `t_us` is strictly increasing
+  per-cast microseconds; the site worker computes it as `prev_max_us +
+  monotonic_since_pump_start`, bumped to one past the pump's previous
+  frame when two frames land in the same microsecond, and the
+  on-demand resume-offset RPC keeps it increasing across pump
+  restarts. The console stream relies on strictness: it pages with
+  cursor `t_us + 1`, so a repeated `t_us` would be skipped. `data` is
+  `bytea` because SOL bytes are not guaranteed UTF-8.
 
 ### testpg
 
@@ -197,10 +202,12 @@ Tables (all defined by GORM structs in `localdb.go`):
   operations, seq — as a JSON blob).
 - `outbox(id autoincrement, payload text, created_at)` — every
   observation the worker sends to global is persisted here first
-  and only deleted when global's `rpc_response{ok:true}` arrives
-  (`AckOutboxRow`). Retry state (`Attempts`, `NextAttempt`) is
-  in-memory only; a worker restart resets the backoff ladder
-  intentionally.
+  and only deleted (`AckOutboxRow`) when global's
+  `rpc_response{ok:true}` or a terminal rejection arrives, or when the
+  drain finds the observation too large to send (over
+  `ws.MaxMessageBytes`) or impossible to encode. Retry state
+  (`Attempts`, `NextAttempt`) is in-memory only; a worker restart
+  resets the backoff ladder intentionally.
 - `cached_machines(machine_id PK, state, data)` — the machine
   snapshot list, one row each. Written in the same transaction as
   the `snapshot_meta` kv row (`SaveSnapshot`) so the machine list

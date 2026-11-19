@@ -137,8 +137,11 @@ type Client struct {
 }
 
 type cacheEntry struct {
-	secret    *AdminSecret
-	fetchedAt time.Time
+	secret *AdminSecret
+	// readAt is when the GetSecretValue that returned secret was issued.
+	// The TTL counts from it, so a slow read does not extend how long its
+	// value is served, and a read issued earlier never replaces the entry.
+	readAt time.Time
 }
 
 // Config bundles the optional knobs. Zero values pick sensible defaults.
@@ -202,7 +205,7 @@ func (c *Client) GetAdmin(ctx context.Context, pop string) (*AdminSecret, error)
 	}
 
 	c.mu.Lock()
-	if entry, ok := c.cache[pop]; ok && time.Since(entry.fetchedAt) < c.cacheTTL {
+	if entry, ok := c.cache[pop]; ok && time.Since(entry.readAt) < c.cacheTTL {
 		c.mu.Unlock()
 		return entry.secret, nil
 	}
@@ -211,8 +214,12 @@ func (c *Client) GetAdmin(ctx context.Context, pop string) (*AdminSecret, error)
 	// Cache miss: fetch outside the lock so concurrent misses on
 	// different pops don't serialize. A burst of misses on the SAME
 	// pop will issue redundant fetches; acceptable for slagworks's
-	// op-rate.
+	// op-rate. Their responses can arrive in any order, so the store
+	// below keeps the latest-issued read's value: a read issued before
+	// a rotation that returns after a later read was cached must not
+	// put the pre-rotation password back.
 	name := "pop/" + pop + "/bmc-creds-admin"
+	readAt := time.Now()
 	out, err := c.api.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
 		SecretId: &name,
 	})
@@ -229,7 +236,9 @@ func (c *Client) GetAdmin(ctx context.Context, pop string) (*AdminSecret, error)
 	}
 
 	c.mu.Lock()
-	c.cache[pop] = cacheEntry{secret: parsed, fetchedAt: time.Now()}
+	if cur, ok := c.cache[pop]; !ok || cur.readAt.Before(readAt) {
+		c.cache[pop] = cacheEntry{secret: parsed, readAt: readAt}
+	}
 	c.mu.Unlock()
 
 	return parsed, nil

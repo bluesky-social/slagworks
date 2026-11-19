@@ -160,14 +160,20 @@ against NetBox, then:
   `ipmi_exporter` and `sel-archiver` keep scraping. An existing account is
   tested first (`ipmitool user test`, at 16 and 20 bytes) and the password
   written only when the BMC doesn't already hold it: AMI MegaRAC refuses
-  to set a password to its current value (completion code 0x19). If the
+  to set a password to its current value (completion code 0x19). For the
+  same reason a password write that ipmitool reports as failed (its
+  response lost, for example), stored or freshly generated, is followed by
+  a test before any retry, and counts as written when the BMC holds the
+  password. If the
   BMC holds a different password and also refuses the stored one (for
   example because it is in MegaRAC's reuse history), the op fails saying
   so; set the password on the BMC by hand, or use `--rotate-monitor`.
   Only a device with no stored entry (a new BMC) gets a freshly generated
   password, which is stored there;
 - disables and clears every other named account (a leftover
-  `slagworks` or `maas` account, for example);
+  `slagworks` or `maas` account, for example). When no empty slot is
+  left for `monitor`, it takes a leftover's slot instead, disabling the
+  leftover before renaming it;
 - brings the BMC's time settings into compliance (see "Time compliance"
   below).
 
@@ -274,7 +280,12 @@ recent active operation.
   phase spine on the right, structured envelope stream on the left,
   SOL passthrough at the bottom.
 - On a non-TTY: falls back to a flat line-based log stream (`--plain`
-  forces this on a TTY too). Exits non-zero if the operation fails.
+  forces this on a TTY too and writes the lines to stdout): the op's
+  structured log envelopes from `/api/v1/logs/stream`, in the
+  `machine logs` format, then a one-line summary. Exits 0 when the
+  operation completes, non-zero if it fails or `--timeout` passes first.
+  `machine deploy -w` and `machine commission -w` take this path when
+  stderr is not a terminal (CI, pipes).
 
 Flags: `--timeout <dur>` (default 30m), `--hold` (keep TUI open on
 completion even under CI recording), `--no-hold` (tear down
