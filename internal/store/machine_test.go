@@ -363,6 +363,90 @@ func TestSetMachineDesiredOS(t *testing.T) {
 	}
 }
 
+// SetMachinePXEEligible refuses to enable PXE on a locked machine and leaves
+// the flag unchanged (docs/user/operations.md: "Locked machines cannot be
+// PXE-enabled"; the API maps ErrMachineLocked to 409). Disabling stays
+// allowed on a locked machine, an unlocked machine can be enabled
+// repeatedly, and an unknown machine is ErrMachineNotFound (the API's 404)
+// in both directions instead of a silent no-op.
+func TestSetMachinePXEEligible(t *testing.T) {
+	st := testStore(t)
+	locked := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-locked-pxe", State: model.MachineStateRunning, Locked: true}
+	if err := st.CreateMachine(locked); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.SetMachinePXEEligible(locked.ID, true); !errors.Is(err, ErrMachineLocked) {
+		t.Errorf("pxe-enable on a locked machine returned %v; want ErrMachineLocked", err)
+	}
+	got, err := st.GetMachine(locked.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PXEEligible {
+		t.Errorf("locked, in-service machine is now PXE-eligible")
+	}
+
+	// Disabling is the safe direction and is not lock-gated. A deployed
+	// machine is running, locked and still PXE-eligible.
+	deployed := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-deployed-pxe", State: model.MachineStateRunning, Locked: true, PXEEligible: true}
+	if err := st.CreateMachine(deployed); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetMachinePXEEligible(deployed.ID, false); err != nil {
+		t.Errorf("pxe-disable on a locked machine returned %v; want nil", err)
+	}
+	if got, err := st.GetMachine(deployed.ID); err != nil || got.PXEEligible {
+		t.Errorf("after pxe-disable on a locked machine: pxe_eligible=%v err=%v, want false", got != nil && got.PXEEligible, err)
+	}
+
+	unlocked := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-unlocked-pxe", State: model.MachineStateCommissioned}
+	if err := st.CreateMachine(unlocked); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // the second pass re-sets the value it already holds
+		if err := st.SetMachinePXEEligible(unlocked.ID, true); err != nil {
+			t.Fatalf("pxe-enable on an unlocked machine returned %v; want nil", err)
+		}
+	}
+	if got, err := st.GetMachine(unlocked.ID); err != nil || !got.PXEEligible {
+		t.Errorf("after pxe-enable on an unlocked machine: pxe_eligible=%v err=%v, want true", got != nil && got.PXEEligible, err)
+	}
+
+	missing := uuid.New()
+	for _, eligible := range []bool{true, false} {
+		if err := st.SetMachinePXEEligible(missing, eligible); !errors.Is(err, ErrMachineNotFound) {
+			t.Errorf("SetMachinePXEEligible(unknown, %v) returned %v; want ErrMachineNotFound", eligible, err)
+		}
+	}
+}
+
+// SetMachineLocked reports an unknown machine as ErrMachineNotFound (the
+// API's 404) instead of a silent no-op, and treats re-setting the current
+// value as success.
+func TestSetMachineLocked(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-lock", State: model.MachineStateRunning}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // the second pass re-sets the value it already holds
+		if err := st.SetMachineLocked(m.ID, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := st.GetMachine(m.ID); err != nil || !got.Locked {
+		t.Errorf("after SetMachineLocked(true): locked=%v err=%v, want true", got != nil && got.Locked, err)
+	}
+
+	missing := uuid.New()
+	for _, locked := range []bool{true, false} {
+		if err := st.SetMachineLocked(missing, locked); !errors.Is(err, ErrMachineNotFound) {
+			t.Errorf("SetMachineLocked(unknown, %v) returned %v; want ErrMachineNotFound", locked, err)
+		}
+	}
+}
+
 // TestMigrate_DropsMachineBMCCreds pins migration 00030: the machines
 // table carries no BMC credential columns. The device's
 // pop/<pop>/bmc-creds-admin entry is the only BMC credential, so a

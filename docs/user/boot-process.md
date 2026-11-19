@@ -77,6 +77,9 @@ a machine ever gets booted:
   address, and logs a warning with the declined address: find and remove the
   other host using it. A static reservation is still offered to its MAC, so a
   declined reservation keeps failing until the conflict is resolved.
+- **Client requests only.** A packet whose BOOTP op is not BOOTREQUEST is
+  dropped on every segment, whatever its option 53 says (RFC 2131), and
+  counted under the `not_bootrequest` drop reason.
 - **Known-MAC filter.** When a segment is non-promiscuous and `KnownMACs` is
   set, an unregistered MAC's DHCP is silently dropped at debug level
   (`handler.go:424-428`). A promiscuous segment (typical for OOB where you

@@ -2,7 +2,9 @@ package storage
 
 import (
 	"fmt"
+	"path"
 	"strings"
+	"unicode"
 )
 
 // validate checks a layout for internal consistency before planning.
@@ -63,6 +65,9 @@ func validate(layout Layout) error {
 	// legitimately have no FS but are never mounted directly (the md
 	// device is), so they don't hit this path.
 	for path, m := range layout.Mounts {
+		if err := validateMountPoint(path); err != nil {
+			return err
+		}
 		if !deviceExists(m.Device, layout) {
 			return fmt.Errorf("mount %q references unknown device %q", path, m.Device)
 		}
@@ -107,6 +112,31 @@ func validate(layout Layout) error {
 		return fmt.Errorf("layout has no root (/) mount")
 	}
 
+	return nil
+}
+
+// validateMountPoint rejects a mount point that is not a clean absolute
+// path. Every consumer uses the key verbatim: planMounts mounts at
+// "/target"+mp and orders mounts by the number of "/" in each key, and the
+// agent writes the key into /etc/fstab. A relative key mounts beside
+// /target, a ".." segment escapes it, a doubled or trailing slash miscounts
+// the depth (so a parent can mount over its child) or names one point twice,
+// and whitespace, control characters or a backslash corrupt the fstab line
+// (fstab splits on blanks and decodes \040-style escapes). A clean absolute
+// key has none of these problems, and two distinct clean keys always name
+// distinct mount points.
+func validateMountPoint(mp string) error {
+	if !strings.HasPrefix(mp, "/") {
+		return fmt.Errorf("mount point %q is not absolute; mount points must start with \"/\" (for example \"/data\"): fix the storage script's mounts", mp)
+	}
+	for _, r := range mp {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || r == '\\' {
+			return fmt.Errorf("mount point %q contains whitespace, a control character or a backslash, which /etc/fstab cannot hold verbatim: rename it in the storage script's mounts", mp)
+		}
+	}
+	if clean := path.Clean(mp); clean != mp {
+		return fmt.Errorf("mount point %q is not a clean path (doubled or trailing slash, or a \".\" or \"..\" segment); write it as %q in the storage script's mounts", mp, clean)
+	}
 	return nil
 }
 
@@ -184,9 +214,20 @@ func memberReferencesDisk(member, disk string) bool {
 func validateDisk(name string, dev Device) error {
 	// Disks with no partitions are valid — they may be whole-disk RAID members.
 	restCount := 0
-	for _, p := range dev.Partitions {
+	for i, p := range dev.Partitions {
 		if p.Name == "" {
 			return fmt.Errorf("disk %q: partition missing name", name)
+		}
+		// planDisk creates and formats partition i+1 at the node the kernel
+		// gives that position, while mounts, RAID members, fstab and the
+		// bootloader reach the partition through "/dev/" + its name. Any
+		// other name sends those to a different device than the one just
+		// formatted. A "/dev/"-prefixed name is the same node: resolveDevPath
+		// passes it through unchanged.
+		if want := partName(name, i+1); stripDevPrefix(p.Name) != want {
+			return fmt.Errorf("disk %q partition %d is named %q, but the kernel names it %q; "+
+				"rename it %q, since mounts and RAID members find a partition by its name",
+				name, i+1, p.Name, want, want)
 		}
 		if p.Size == "" {
 			return fmt.Errorf("disk %q partition %q: missing size", name, p.Name)

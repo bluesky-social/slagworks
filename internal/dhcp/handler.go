@@ -380,8 +380,9 @@ func (h *Handler) SetLogger(l *slog.Logger) {
 // so pool edits take effect without a service restart; a no-change
 // call is a silent no-op (snapshots apply frequently — op phases,
 // machine state — and almost never change pools). Existing leases are
-// kept: a lease outside every new pool simply expires without renewal
-// (the allocator only checks pool membership at allocation time).
+// kept until they expire, but a REQUEST to renew one that the new pools no
+// longer cover is NAKed (classifyRequest), so the client re-DISCOVERs into
+// the new range.
 func (h *Handler) UpdatePools(p PoolConfig) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -529,6 +530,18 @@ func (h *Handler) HandlePacketOn(req *dhcpv4.DHCPv4, iface string) *dhcpv4.DHCPv
 	log := h.log.With(logAttrs...)
 
 	h.cfg.Metrics.countRequest(frameType)
+
+	// RFC 2131 / RFC 951: a server acts only on op=BOOTREQUEST. The socket
+	// layer hands over any datagram that parses, and option 53 alone does
+	// not make a packet a client request: answering an op=BOOTREPLY (or
+	// junk-op) DISCOVER would allocate a lease and emit an OFFER that the
+	// reply builder stamps op=BOOTREQUEST. Checked before the MAC filter
+	// because it holds on every segment, promiscuous or not.
+	if req.OpCode != dhcpv4.OpcodeBootRequest {
+		log.Warn("dropping DHCP packet that is not a BOOTREQUEST", "op", uint8(req.OpCode))
+		h.cfg.Metrics.drop(DropNotBootRequest)
+		return nil
+	}
 
 	view := h.viewForIface(iface)
 	if !view.pools.Promiscuous && h.cfg.KnownMACs != nil && !h.cfg.KnownMACs(mac.String()) {
@@ -849,9 +862,9 @@ func requestedAddr(req *dhcpv4.DHCPv4) net.IP {
 type requestVerdict int
 
 const (
-	// requestFallthrough: reqIP is this MAC's existing lease or its static
-	// reservation. allocateIP's existing renew/reservation branch serves it
-	// unchanged.
+	// requestFallthrough: reqIP is this MAC's static reservation, or its
+	// existing lease inside the resolved pool's range. allocateIP's
+	// reservation/renew branch serves it unchanged.
 	requestFallthrough requestVerdict = iota
 	// requestAdopt: no existing lease, but reqIP is safe to grant as-is.
 	// classifyRequest has ALREADY written the lease (atomically with the
@@ -880,10 +893,15 @@ const (
 //     reservation branch ignores the requested address entirely). reserved
 //     is the caller's reservationFor result, so a reservation outside p's
 //     subnet arrives as nil and the request is classified as unreserved.
-//  2. reqIP is this MAC's existing unexpired lease → fallthrough (normal
-//     renew). A DIFFERENT existing lease → NAK — never ACK at reqIP (would
-//     create a second lease for one MAC) and never silently substitute the
-//     held address (the client asked for something specific).
+//  2. reqIP is this MAC's existing unexpired lease and inside p's range →
+//     fallthrough (normal renew). The same lease outside p's range → NAK:
+//     a later snapshot removed its reservation or moved the range or slice
+//     away from it, or the request resolved to a pool other than the one
+//     that granted it. The lease is not released; like every lease it ends
+//     at expiry or when the re-DISCOVER the NAK triggers overwrites it. A
+//     DIFFERENT existing lease → NAK — never ACK at reqIP (would create a
+//     second lease for one MAC) and never silently substitute the held
+//     address (the client asked for something specific).
 //  3. reqIP is not a dynamic address in p's resolved range (p is already
 //     the correctly-scoped pool for this packet — this gateway's own slice
 //     for direct OOB requests, or the matched RelaySubnet for relayed
@@ -927,10 +945,16 @@ func (h *Handler) classifyRequest(mac net.HardwareAddr, reqIP, reserved net.IP, 
 	now := time.Now()
 
 	if l, ok := h.leases[macStr]; ok && now.Before(l.Expiry) {
-		if l.IP.Equal(reqIP) {
-			return requestFallthrough, "existing lease match"
+		if !l.IP.Equal(reqIP) {
+			return requestNAK, "existing lease mismatch"
 		}
-		return requestNAK, "existing lease mismatch"
+		// Same range test allocateIP's renew branch applies: a fallthrough
+		// for a lease outside p's range would make allocateIP allocate a
+		// different address (or none on a reservations-only pool).
+		if p.rangeStart == nil || !ipInRange(reqIP, p.rangeStart, p.rangeEnd) {
+			return requestNAK, "existing lease outside the resolved pool's range"
+		}
+		return requestFallthrough, "existing lease match"
 	}
 
 	if p.rangeStart == nil || !ipInRange(reqIP, p.rangeStart, p.rangeEnd) {
@@ -954,6 +978,12 @@ func (h *Handler) classifyRequest(mac net.HardwareAddr, reqIP, reserved net.IP, 
 // buildNAK constructs a DHCPNAK for a request. A NAK carries the server-id
 // (this interface's serverIP) and no address; the client discards its lease
 // and restarts at DISCOVER.
+//
+// For a relayed request (giaddr set) the NAK always has the broadcast bit
+// set, per RFC 2131 4.3.2, instead of copying the client's flags as
+// NewReplyFromRequest does. The NAK has no yiaddr, so a relay that honors a
+// clear bit has nowhere to unicast it. On a direct NAK the bit steers no
+// relay (Server picks the destination itself), so it stays as copied.
 func (h *Handler) buildNAK(req *dhcpv4.DHCPv4, view ifaceView, log *slog.Logger) *dhcpv4.DHCPv4 {
 	nak, err := dhcpv4.NewReplyFromRequest(req,
 		dhcpv4.WithMessageType(dhcpv4.MessageTypeNak),
@@ -962,6 +992,9 @@ func (h *Handler) buildNAK(req *dhcpv4.DHCPv4, view ifaceView, log *slog.Logger)
 	if err != nil {
 		log.Error("failed to build DHCP NAK", "err", err)
 		return nil
+	}
+	if gi := req.GatewayIPAddr; gi != nil && !gi.IsUnspecified() {
+		nak.SetBroadcast()
 	}
 	h.cfg.Metrics.drop(DropNAK)
 	return nak
@@ -1315,7 +1348,9 @@ func (h *Handler) allocateIP(mac net.HardwareAddr, reserved net.IP, p *pool, arp
 		}
 		// Lease exists but in a different pool (e.g., MAC moved between
 		// direct and relayed networks). The overwrite below replaces
-		// the stale entry, freeing the old IP for other MACs.
+		// the stale entry, freeing the old IP for other MACs. Only a
+		// DISCOVER or a REQUEST naming no address gets here: a REQUEST
+		// naming this lease was NAKed by classifyRequest.
 	}
 
 	// Find a free IP in the range, cleaning up expired leases and expired

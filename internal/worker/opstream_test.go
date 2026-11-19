@@ -473,6 +473,82 @@ func TestStaleResyncKeepsAwaitingPhoneHome(t *testing.T) {
 	}
 }
 
+// TestAwaitingPhoneHomeSurvivesRestart: the install finishes while global is
+// unreachable, so the awaiting_phone_home phase update (and, once the host
+// phones home, the completion) sit in the in-memory op_update queue and
+// never reach global. The worker restarts before it reconnects, losing that
+// queue. On reconnect the hub's hello sends the snapshot and then an
+// op_resync built from global's row, which is still claimed at the
+// pre-install phase. The installed host's next PXE must still boot its disk:
+// the local latch has to come back from LocalDB, or BootDeploy re-images it.
+func TestAwaitingPhoneHomeSurvivesRestart(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		phoneHome bool
+	}{
+		{"restart after deploy_complete", false},
+		{"restart after phone-home", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const mac = "52:54:00:15:10:57"
+			dbPath := t.TempDir() + "/worker.db"
+			id, opID := uuid.New(), uuid.New()
+			// Global's row never moves past this: it gets neither the phase
+			// nor the completion.
+			globalRow := model.Operation{
+				ID: opID, MachineID: id, Type: model.OpDeploy,
+				Status: model.OpClaimed, Phase: "finalizing", Version: 5,
+			}
+
+			db, err := OpenLocalDB(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := NewCache(db)
+			deployingMachine(c, id, mac)
+			seedOpsResync(c, globalRow)
+			// Global becomes unreachable. Agent and phone-home traffic is
+			// site-local, so the install still finishes.
+			if err := c.HandleProgressReport(&model.ProgressReport{
+				MachineID: id.String(), OperationID: opID.String(), Event: "deploy_complete",
+			}); err != nil {
+				t.Fatalf("deploy_complete: %v", err)
+			}
+			if tc.phoneHome {
+				c.RecordPhoneHome(id)
+			}
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("precondition: installed host got %d, want BootLocal", got)
+			}
+
+			// Restart: a new process over the same worker.db.
+			db2, err := OpenLocalDB(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c = NewCache(db2)
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("precondition: rehydrated, untrusted set got %d, want BootLocal", got)
+			}
+
+			// Reconnect: hello snapshot, then op_resync from global's row.
+			deployingMachine(c, id, mac)
+			seedOpsResync(c, globalRow)
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("installed host's next PXE after restart and op_resync: got %d, want BootLocal (%d); BootDeploy re-images it", got, model.BootLocal)
+			}
+			// The phone-home pin (applyOpResync keeps a phoned-home machine
+			// running while global still shows the op claimed) must come
+			// back too, not only the phase latch.
+			if tc.phoneHome {
+				if got := c.MachineState(id); got != string(model.MachineStateRunning) {
+					t.Fatalf("phoned-home machine after restart and op_resync: state %q, want running", got)
+				}
+			}
+		})
+	}
+}
+
 // TestFailedDeltaLeavesAwaitingPhoneHome: the phone-home timeout's failure
 // still applies; keepTerminalWait only blocks phase regressions on an op
 // global still shows active.
@@ -487,6 +563,107 @@ func TestFailedDeltaLeavesAwaitingPhoneHome(t *testing.T) {
 	if op := c.GetOperation(opID.String()); op == nil || op.Status != model.OpFailed {
 		t.Fatalf("op = %+v, want status failed", op)
 	}
+}
+
+// failedByAgent seeds a machine whose lifecycle op global holds claimed at
+// version 1, then has the agent report a phase and fail in it. The worker
+// marks the op failed locally without a Version bump; global has not
+// processed the failure yet.
+func failedByAgent(t *testing.T, typ model.OperationType, state model.MachineState, phase, mac string) (*Cache, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	c := NewCache(nil)
+	id, opID := uuid.New(), uuid.New()
+	c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 1, Machines: []model.MachineSnapshot{{
+		ID: id, State: state, PXEEligible: true,
+		Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}},
+	}}})
+	seedOpsResync(c, model.Operation{ID: opID, MachineID: id, Type: typ, Status: model.OpClaimed, Version: 1})
+	for _, r := range []model.ProgressReport{
+		{Phase: phase},
+		{Failed: true, Phase: phase, Error: "agent step failed"},
+	} {
+		r.MachineID, r.OperationID = id.String(), opID.String()
+		if err := c.HandleProgressReport(&r); err != nil {
+			t.Fatalf("report %+v: %v", r, err)
+		}
+	}
+	if got := c.BootActionForMAC(mac); got != model.BootLocal {
+		t.Fatalf("precondition: after the failure report got %d, want BootLocal", got)
+	}
+	return c, id, opID
+}
+
+// TestAgentFailureSurvivesActiveEchoAndResync: a failure the agent reported
+// holds until op_removed. Global applies the worker's failure op_updates one
+// write at a time, and each phase write publishes an op_delta (higher
+// Version, still claimed) before the failure publishes op_removed; a resync
+// built before global processed the failure, or after the best-effort
+// op_update was lost, also still shows the op claimed. Neither may revive
+// it: a revived op actuates the host again, and its phase reports are then
+// dropped (the op is marked failed), so a deploy could never latch
+// awaiting_phone_home and the host was re-imaged on every boot.
+func TestAgentFailureSurvivesActiveEchoAndResync(t *testing.T) {
+	t.Run("deploy: stale phase echo", func(t *testing.T) {
+		mac := "52:54:00:71:00:01"
+		c, id, opID := failedByAgent(t, model.OpDeploy, model.MachineStateDeploying, "partitioning", mac)
+		c.ApplyOpDelta(model.Operation{
+			ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Phase: "partitioning", Version: 2,
+		}, "")
+		if got := c.BootActionForMAC(mac); got != model.BootLocal {
+			t.Fatalf("after a stale echo of the failed op: got %d, want BootLocal (%d)", got, model.BootLocal)
+		}
+		if op := c.GetOperation(opID.String()); op == nil || op.Status != model.OpFailed || op.Version != 2 {
+			t.Fatalf("op = %+v, want status failed at version 2", op)
+		}
+	})
+
+	t.Run("commission: stale phase echo", func(t *testing.T) {
+		mac := "52:54:00:71:00:02"
+		c, id, opID := failedByAgent(t, model.OpCommission, model.MachineStateCommissioning, "agent_starting", mac)
+		c.ApplyOpDelta(model.Operation{
+			ID: opID, MachineID: id, Type: model.OpCommission, Status: model.OpClaimed, Phase: "agent_starting", Version: 2,
+		}, "")
+		if got := c.BootActionForMAC(mac); got != model.BootLocal {
+			t.Fatalf("after a stale echo of the failed op: got %d, want BootLocal (%d)", got, model.BootLocal)
+		}
+	})
+
+	// The failed op_update died with the connection, so the reconnect's
+	// op_resync still shows the op claimed. The host must not be re-imaged,
+	// and a report for the failed op must be refused rather than accepted
+	// with its awaiting_phone_home silently dropped.
+	t.Run("deploy: resync after a lost failure", func(t *testing.T) {
+		mac := "52:54:00:71:00:03"
+		c, id, opID := failedByAgent(t, model.OpDeploy, model.MachineStateDeploying, "partitioning", mac)
+		seedOpsResync(c, model.Operation{
+			ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Phase: "partitioning", Version: 2,
+		})
+		if got := c.BootActionForMAC(mac); got != model.BootLocal {
+			t.Fatalf("after a resync still showing the failed op claimed: got %d, want BootLocal (%d)", got, model.BootLocal)
+		}
+		if err := c.HandleProgressReport(&model.ProgressReport{
+			MachineID: id.String(), OperationID: opID.String(), Event: "deploy_complete",
+		}); err == nil {
+			t.Fatalf("deploy_complete for the failed op was accepted; post-install PXE now gets %d, want the report refused", c.BootActionForMAC(mac))
+		}
+	})
+
+	// op_removed still ends the local failure: a later op for the machine is
+	// unaffected.
+	t.Run("op_removed clears the failure", func(t *testing.T) {
+		mac := "52:54:00:71:00:04"
+		c, id, opID := failedByAgent(t, model.OpDeploy, model.MachineStateDeploying, "partitioning", mac)
+		c.ApplyOpRemoved(opID.String(), id.String(), 3, model.MachineStateFailed)
+		if c.IsOpFailed(opID.String()) {
+			t.Fatal("op_removed must clear the local failure marker")
+		}
+		next := uuid.New()
+		c.ApplyOpDelta(model.Operation{ID: next, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Version: 1},
+			model.MachineStateDeploying)
+		if got := c.BootActionForMAC(mac); got != model.BootDeploy {
+			t.Fatalf("a new deploy op after op_removed: got %d, want BootDeploy (%d)", got, model.BootDeploy)
+		}
+	})
 }
 
 // TestRehydratedViewAcceptsEqualSeqOnce reproduces the pop1 rollout of
