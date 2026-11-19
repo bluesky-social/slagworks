@@ -310,8 +310,8 @@ func (h *LogBatch) HandleLogBatch(ctx context.Context, workerID string, msg ws.L
 		return nil
 	}
 	// A worker relays only what its site ring holds: its own
-	// envelopes (source=site) and the agent's (source=agent, stamped
-	// by /logs/ingest). Any other source rejects the whole frame,
+	// envelopes (source=site) and the agent's (source=agent, the only
+	// source /logs/ingest accepts). Any other source rejects the whole frame,
 	// before anything is persisted or re-emitted. source=global in
 	// particular is global's own: op-lifecycle envelopes are written
 	// inside the store transaction that makes the transition
@@ -331,7 +331,7 @@ func (h *LogBatch) HandleLogBatch(ctx context.Context, workerID string, msg ws.L
 			// gets a redeploy hint.
 			return fmt.Errorf("worker=%s emitted source=sol envelope; SOL rides the cast pipeline — redeploy the worker", workerID)
 		default:
-			return fmt.Errorf("worker=%s relayed a source=%q envelope (machine_id=%s op_id=%s); workers may relay only agent and site envelopes, so the batch was dropped — upgrade the worker if it predates /logs/ingest stamping source=agent, and look for a host posting forged envelopes to its /logs/ingest",
+			return fmt.Errorf("worker=%s relayed a source=%q envelope (machine_id=%s op_id=%s); workers may relay only agent and site envelopes, so the batch was dropped — upgrade the worker if it predates /logs/ingest refusing non-agent envelopes, and look for a host posting forged envelopes to its /logs/ingest",
 				workerID, env.Source, env.MachineID, env.OpID)
 		}
 	}
