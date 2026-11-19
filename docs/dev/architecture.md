@@ -87,11 +87,14 @@ Modes (dispatched from `main.go` around line 165):
   (conditionally) `console_probe` back through `POST /api/v1/report`,
   then sends the full inventory as an operation-bound
   `commission_report` through that same endpoint and reboots.
-- `deploy` (default) — the long path in `main.go:249`. Verifies
-  identity, resolves the storage layout, plans and executes wipe /
-  partition / mkfs, extracts the image, installs a bootloader,
-  configures RAID, writes fstab, seeds cloud-init, applies the
-  network configuration, writes the hostname, installs SSH keys,
+- `deploy` (default) — the long path in `deploy.go` `runDeploy`.
+  Verifies identity, resolves the storage layout, renders the network
+  configuration (runs the network script; both scripts run before any
+  disk is touched, so a model gap fails the deploy with the host as
+  found), plans and executes wipe / partition / mkfs, extracts the
+  image, installs a bootloader, configures RAID, writes fstab, seeds
+  cloud-init, writes the rendered network configuration into the
+  target, writes the hostname, installs SSH keys,
   enrolls in Tailscale, writes the phone-home unit, reconciles the
   BMC, reports `deploy_complete`, and reboots.
 
