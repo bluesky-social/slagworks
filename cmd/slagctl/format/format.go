@@ -6,7 +6,8 @@ import (
 	"io"
 	"strings"
 	"time"
-	"unicode/utf8"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 // State/status icons.
@@ -149,14 +150,15 @@ func PrintJSON(w io.Writer, v any) error {
 }
 
 // PrintTable writes a formatted table with a bold header row.
-// Column widths are computed from plain text (ANSI stripped) so that
-// invisible escape sequences don't inflate padding. The original styled
-// cell content is preserved in the output.
+// Column widths are measured in terminal display cells (ansi.StringWidth):
+// escape sequences count as zero and wide characters such as CJK as two,
+// so every column starts at the same terminal column on every line. The
+// original styled cell content is preserved in the output.
 func PrintTable(w io.Writer, headers []string, rows [][]string) {
 	numCols := len(headers)
 	colWidths := make([]int, numCols)
 	for i, h := range headers {
-		if n := utf8.RuneCountInString(h); n > colWidths[i] {
+		if n := ansi.StringWidth(h); n > colWidths[i] {
 			colWidths[i] = n
 		}
 	}
@@ -165,7 +167,7 @@ func PrintTable(w io.Writer, headers []string, rows [][]string) {
 			if i >= numCols {
 				break
 			}
-			if n := utf8.RuneCountInString(StripANSI(cell)); n > colWidths[i] {
+			if n := ansi.StringWidth(cell); n > colWidths[i] {
 				colWidths[i] = n
 			}
 		}
@@ -180,8 +182,7 @@ func PrintTable(w io.Writer, headers []string, rows [][]string) {
 			}
 			line.WriteString(cell)
 			if i < numCols-1 {
-				plainWidth := utf8.RuneCountInString(StripANSI(cell))
-				line.WriteString(strings.Repeat(" ", colWidths[i]-plainWidth+minPad))
+				line.WriteString(strings.Repeat(" ", colWidths[i]-ansi.StringWidth(cell)+minPad))
 			}
 		}
 		return line.String()
@@ -191,24 +192,4 @@ func PrintTable(w io.Writer, headers []string, rows [][]string) {
 	for _, row := range rows {
 		fmt.Fprintln(w, writeLine(row))
 	}
-}
-
-// StripANSI removes ANSI escape sequences from a string.
-func StripANSI(s string) string {
-	var out strings.Builder
-	inEscape := false
-	for _, r := range s {
-		if r == '\033' {
-			inEscape = true
-			continue
-		}
-		if inEscape {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inEscape = false
-			}
-			continue
-		}
-		out.WriteRune(r)
-	}
-	return out.String()
 }
