@@ -307,9 +307,13 @@ posture the storage matcher takes.
 The site worker exposes `/api/v1/machines/<id>/network-facts` — a JSON list
 of `model.SnapshotInterface` records (`NetBoxID`, `Name`, `MAC`, `Type`,
 `IP`, `LAG`, `VLAN`, `MTU`, `Gateway`). `Type` is `physical`, `lag`, or
-`ipmi`. `Gateway` is the longest-prefix-match of the interface CIDR against
-site prefixes' `gateway_ip` custom field. The script owns all topology
-interpretation from these facts; slagworks itself is topology-agnostic. See
+`ipmi`. `IP` is the interface's one `status=active` NetBox address. An
+interface with more than one active address fails the site's snapshot build,
+naming the device, the interface and its addresses; set every address but one
+to `reserved` or `deprecated`. `Gateway` is the longest-prefix-match of the
+interface CIDR against site prefixes' `gateway_ip` custom field. The script
+owns all topology interpretation from these facts; slagworks itself is
+topology-agnostic. See
 `assets/network/100-hot-spare-pop2` for a worked L2-bond example.
 
 ### Uploading

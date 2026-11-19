@@ -303,7 +303,9 @@ Types are in `internal/model/snapshot.go`:
 
 `internal/snapshot/builder.go:66` is `Build(in Inputs) (SiteSnapshot,
 error)`. It is pure — no I/O — and fails loudly if `Prefixes` is
-empty (`builder.go:68`). Its inputs (`Inputs`, `builder.go:31`) are
+empty (`builder.go:68`) or if an interface of a bound machine carries
+more than one active IP address (a machine's interface facts hold one).
+Its inputs (`Inputs`, `builder.go:31`) are
 NetBox reads (site, config, prefixes, OOB prefixes and ranges,
 devices, device-types, interfaces, IPs), Postgres reads (machines,
 images, storage scripts, network scripts, SSH keys), and
