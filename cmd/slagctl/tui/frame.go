@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 
+	"github.com/bluesky-social/slagworks/cmd/slagctl/format"
 	"github.com/bluesky-social/slagworks/internal/model"
 )
 
@@ -444,16 +445,20 @@ func renderHeader(in frameInput, maxW int) string {
 // workerLabel renders the claiming worker for the header/summary. claimed_by
 // may be a worker UUID or a friendly worker name. Em dash before it's known;
 // a UUID is shortened to its first 8 chars (operators map it via
-// `slagctl worker list`); a friendly name is shown verbatim (the box width
-// truncates if needed — we don't chop a real name at 8).
+// `slagctl worker list`); a friendly name is shown in full (the box width
+// truncates if needed — we don't chop a real name at 8). claimed_by arrives
+// off the log stream like any envelope field and an unknown ID passes the
+// resolver unchanged, so the name is escaped for the terminal, and the short
+// UUID is cut from the parsed value: uuid.Parse also accepts braced and
+// urn:uuid: forms and does not check the bytes it strips from the braced one.
 func workerLabel(worker string) string {
 	if worker == "" {
 		return "—"
 	}
-	if _, err := uuid.Parse(worker); err == nil {
-		return worker[:8]
+	if id, err := uuid.Parse(worker); err == nil {
+		return id.String()[:8]
 	}
-	return worker
+	return format.Untrusted(worker)
 }
 
 // renderSummary is the derived-state box under the lifecycle column: current
@@ -586,14 +591,28 @@ func errorPaneBody(in frameInput, innerW, rows int) []string {
 // error pane. The full text is in the operation's result.
 const causeOmittedMarker = "[... lines omitted; full error: slagctl operation show <op-id>]"
 
-// wrapLines splits s on newlines and hard-wraps each line to w terminal cells
-// (cell-aware, so wide characters in a script's stderr cannot overflow the
-// row budget). Empty s yields no lines; w < 1 disables wrapping.
+// lineBreaks folds every line ending control-plane text can carry to "\n":
+// CRLF, and the bare CR that progress output (curl, dd status=progress) uses
+// to redraw a line. The frame splits rows on "\n" only, and the terminal
+// returns to column 0 on a CR, so a CR left in a row draws the rest of the
+// row over the box's left border.
+var lineBreaks = strings.NewReplacer("\r\n", "\n", "\r", "\n")
+
+// wrapLines splits s on line breaks (LF, CRLF or a bare CR) and hard-wraps
+// each line to w terminal cells (cell-aware, so wide characters in a script's
+// stderr cannot overflow the row budget). Empty s yields no lines; w < 1
+// disables wrapping. s is a failure cause, usually the target agent's own
+// report, so each line is escaped for the terminal before wrapping; only the
+// line breaks between them survive.
 func wrapLines(s string, w int) []string {
 	if s == "" {
 		return nil
 	}
-	return strings.Split(ansi.Hardwrap(strings.TrimRight(s, "\n"), w, true), "\n")
+	lines := strings.Split(strings.TrimRight(lineBreaks.Replace(s), "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = format.Untrusted(l)
+	}
+	return strings.Split(ansi.Hardwrap(strings.Join(lines, "\n"), w, true), "\n")
 }
 
 // clampWidth truncates a line to w display cells (rune count; log lines are
@@ -621,7 +640,7 @@ func smallTerminalMessage(in frameInput) string {
 	var msg string
 	switch {
 	case in.done && in.failed:
-		reason := in.failReason
+		reason := format.Untrusted(in.failReason)
 		if reason == "" {
 			reason = in.lifecycle.FailedPhase()
 		}

@@ -541,7 +541,7 @@ func registerSiteGauges(reg prometheus.Registerer, sc *siteServiceConfig) {
 	}, func() float64 { return float64(sc.cache.LastSeqNum()) }))
 	reg.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
 		Name: "slagworks_site_logring_dropped_total",
-		Help: "Log envelopes dropped from the forwarding ring under pressure (drop-oldest).",
+		Help: "Log envelopes dropped from the forwarding ring under pressure (drop-oldest), past max age, or too large for one log_batch.",
 	}, func() float64 { return float64(sc.logRing.Stats().Dropped) }))
 
 	// OOB DHCP conflict interlock metrics: the conflict gauge and the

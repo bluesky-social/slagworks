@@ -586,7 +586,8 @@ func (o *opState) validateReportBinding(machineID, opID uuid.UUID, event string)
 	// completes the deploy op locally; an op_removed may then delete that op
 	// before a lost response is retried. A running machine makes the retry a
 	// side-effect-free acknowledgement. The first phone-home still arrives
-	// while deploying and must pass the exact active deploy-op checks below.
+	// while deploying and must pass the exact active deploy-op checks below,
+	// including the awaiting_phone_home phase.
 	if event == "phone_home" && o.effectiveState(machineID, m.State) == model.MachineStateRunning {
 		mcp := cloneMachineSnapshot(m)
 		mcp.State = model.MachineStateRunning
@@ -614,6 +615,16 @@ func (o *opState) validateReportBinding(machineID, opID uuid.UUID, event string)
 	}
 	if wantType != "" && op.Type != wantType {
 		return nil, nil, false, fmt.Errorf("event %q requires %s operation, got %s", event, wantType, op.Type)
+	}
+	// A phone-home is the installed OS reporting that it booted, and it
+	// completes the deploy (RecordPhoneHome). It is valid only once the
+	// agent's deploy_complete has latched awaiting_phone_home, which is
+	// also the only phase that hands the host BootLocal; accepting it
+	// earlier records a deploy as successful over a disk the agent has not
+	// finished (or started) writing. The op may still be pending: a host
+	// can install on the pending-op boot clause before any claim lands.
+	if event == "phone_home" && op.Phase != "awaiting_phone_home" {
+		return nil, nil, false, fmt.Errorf("deploy operation %s is at phase %q, not awaiting_phone_home: a phone-home is accepted only after the agent reports deploy_complete", opID, op.Phase)
 	}
 	mcp, ocp := cloneMachineSnapshot(m), *op
 	mcp.State = o.effectiveState(machineID, m.State)

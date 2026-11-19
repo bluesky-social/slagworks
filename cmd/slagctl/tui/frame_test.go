@@ -2,13 +2,16 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
 	"github.com/bluesky-social/slagworks/internal/model"
+	"github.com/bluesky-social/slagworks/internal/slogkit"
 )
 
 // TestSyncedSince_LockstepAcrossAnchors is the bug-2 guard: timers with
@@ -344,6 +347,182 @@ func TestFrame_MultiLineFailureKeepsLayout(t *testing.T) {
 	}
 	if gotH, wantH := lipgloss.Height(got), lipgloss.Height(frame("one-line cause")); gotH != wantH {
 		t.Errorf("frame height = %d with a multi-line cause, want %d (layout must not grow)", gotH, wantH)
+	}
+}
+
+// TestFrame_FailureCauseCarriageReturnKeepsLayout: a failed config script's
+// cause carries the script's stderr verbatim, and progress-style output in it
+// (curl, dd status=progress) redraws a line with a bare "\r". The error pane
+// split the cause into rows on "\n" only, so the "\r" reached the frame, where
+// the renderer returns to column 0 and draws the rest of the row over the
+// error box's left border. A bare "\r" is a row break, like "\n".
+func TestFrame_FailureCauseCarriageReturnKeepsLayout(t *testing.T) {
+	in := frameInput{
+		failReason: "network script failed: exit status 1; script stderr:\n" +
+			"  5% fetched\r100% fetched\r\nERROR: no bond",
+	}
+	got := errorPaneBody(in, 80, 6)
+	want := []string{
+		"network script failed: exit status 1; script stderr:",
+		"  5% fetched",
+		"100% fetched",
+		"ERROR: no bond",
+	}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("errorPaneBody =\n%q\nwant\n%q", got, want)
+	}
+
+	lc := newLifecyclePane(model.OpDeploy)
+	lc.Observe("power_cycle", at(0))
+	lc.Observe("finalizing", at(30*time.Second))
+	now := fixedClock(at(42 * time.Second))
+	lc.now = now
+	lc.Fail(at(42 * time.Second))
+	frame := renderFrame(frameInput{
+		opType:     model.OpDeploy,
+		machine:    "kworker-l34-1.pop1",
+		startedAt:  at(0),
+		console:    newConsolePane(),
+		lifecycle:  lc,
+		done:       true,
+		failed:     true,
+		failReason: in.failReason,
+		width:      minTermCols,
+		height:     minRows,
+		spinner:    "⠙",
+		now:        now,
+	})
+	if strings.Contains(frame, "\r") {
+		t.Errorf("frame contains a carriage return; the renderer would draw the rest of the row over the box border:\n%q", frame)
+	}
+	if n := len(strings.Split(frame, "\n")); n != minRows {
+		t.Errorf("frame is %d rows on a %d-row terminal", n, minRows)
+	}
+}
+
+// TestFrame_LogLineBreaksKeepFrameShape guards the logs box's row budget: one
+// envelope renders as one row (logPane.format), and renderLogBody fills exactly
+// the rows the terminal leaves. A message with line breaks in it (a
+// subprocess's multi-line output, or the bare "\r" of progress-style output)
+// reached the frame intact. Each "\n" added a row, so the frame outgrew the
+// terminal and the renderer clipped the bottom border and the newest log
+// lines; a bare "\r" returned the cursor to column 0 and drew the rest of the
+// line over the box border and timestamp.
+func TestFrame_LogLineBreaksKeepFrameShape(t *testing.T) {
+	for _, tc := range []struct{ name, msg, first, second string }{
+		{"LF", "mdadm: cannot open /dev/sdb1\nmdadm: device busy", "cannot open /dev/sdb1", "device busy"},
+		{"CRLF", "mdadm: cannot open /dev/sdb1\r\nmdadm: device busy", "cannot open /dev/sdb1", "device busy"},
+		{"bare CR", "network script stderr:   5% fetched\r100% fetched", "5% fetched", "100% fetched"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Fill the logs box so the line-break entry and the newest line
+			// both sit in the visible tail.
+			lp := newLogPane(time.UTC)
+			for i := 1; i <= 20; i++ {
+				lp.Append(int64(i), mkEnv("site", at(time.Duration(i)*time.Second), "", fmt.Sprintf("line %d", i), nil))
+			}
+			lp.Append(21, mkEnv("agent", at(21*time.Second), "", tc.msg, nil))
+			lp.Append(22, mkEnv("site", at(22*time.Second), "", "newest line", nil))
+			in := midDeployFrame(minTermCols, minRows)
+			in.logLines = lp.Lines()
+			frame := renderFrame(in)
+
+			if strings.Contains(frame, "\r") {
+				t.Errorf("frame contains a carriage return; the renderer would draw the rest of the row over the box border")
+			}
+			rows := strings.Split(plain(frame), "\n")
+			if len(rows) != minRows {
+				t.Errorf("frame is %d rows on a %d-row terminal", len(rows), minRows)
+			}
+			// The terminal shows only the first minRows rows.
+			visible := rows[:min(len(rows), minRows)]
+			if !strings.Contains(visible[len(visible)-2], "newest line") {
+				t.Errorf("newest log line is not on the last row of the logs box:\n%s", strings.Join(visible, "\n"))
+			}
+			if !strings.HasPrefix(visible[len(visible)-1], "╰") {
+				t.Errorf("bottom border of the logs box is not on the terminal's last row:\n%s", strings.Join(visible, "\n"))
+			}
+			oneRow := false
+			for _, row := range rows {
+				if strings.Contains(row, tc.first) && strings.Contains(row, tc.second) {
+					oneRow = true
+				}
+			}
+			if !oneRow {
+				t.Errorf("want %q and %q on one row:\n%s", tc.first, tc.second, strings.Join(rows, "\n"))
+			}
+		})
+	}
+}
+
+// sgr matches the Select Graphic Rendition sequences the TUI's own styles and
+// box borders emit.
+var sgr = regexp.MustCompile(`\x1b\[[0-9;:]*m`)
+
+// assertNoTerminalControls fails if s, with the TUI's own styling removed,
+// still carries a control character other than a line feed: such a byte came
+// from streamed data and would reach the operator's terminal.
+func assertNoTerminalControls(t *testing.T, s string) {
+	t.Helper()
+	for _, line := range strings.Split(sgr.ReplaceAllString(s, ""), "\n") {
+		for _, r := range line {
+			if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+				t.Errorf("frame carries terminal control %U: %q", r, line)
+				break
+			}
+		}
+	}
+}
+
+// TestFrame_EscapesTerminalControlsFromStream: the claiming worker, log lines
+// and failure cause all arrive off the log stream and the op row, and the cause
+// is the target agent's own report. Escape sequences in them must reach the
+// frame as visible text, at full size and on the small-terminal path. The cell
+// renderer Bubble Tea puts between the frame and the terminal drops some
+// sequences (OSC 52, CSI) but passes OSC 8 hyperlinks and APC strings through,
+// so the frame itself must be clean.
+func TestFrame_EscapesTerminalControlsFromStream(t *testing.T) {
+	m := newTestModel(fixedClock(at(42 * time.Second)))
+	m.startedAt = at(0)
+	m.holdOnTerminal = true
+	m = send(m, phaseMsg{phase: "power_cycle", at: at(0)})
+	m = send(m, claimedMsg{worker: "\x1b]52;c;ZWNobyBwd25lZAo=\x07worker"})
+	m = send(m, logEnvelopeMsg{id: 1, env: slogkit.Envelope{TS: at(time.Second), Source: slogkit.SourceAgent,
+		Msg: "ok\x1b]8;;http://evil.example/\x07click\x1b]8;;\x07"}})
+	m = send(m, opTerminalMsg{failed: true, at: at(42 * time.Second),
+		reason: "net: script failed\nERROR: \x1b_apc\x1b\\missing bond\r\x1b[2K\x1b]8;;http://evil.example/\x07fix"})
+
+	frame := m.View().Content
+	assertNoTerminalControls(t, frame)
+	for _, want := range []string{`\x1b]52;c;`, `ok\x1b]8;;http://evil.example/\x07click`, "net: script failed", `ERROR: \x1b_apc\x1b\missing bond`, `\x1b[2K\x1b]8;;http://evil.example/\x07fix`} {
+		if !strings.Contains(plain(frame), want) {
+			t.Errorf("frame missing %q:\n%s", want, plain(frame))
+		}
+	}
+
+	m = send(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	small := m.View().Content
+	assertNoTerminalControls(t, small)
+	if !strings.Contains(small, `net: script failed\nERROR: \x1b_apc`) {
+		t.Errorf("small-terminal message missing the escaped cause: %q", small)
+	}
+}
+
+// TestWorkerLabel_ShortUUIDIsCanonical: uuid.Parse also accepts the 38-byte
+// braced form without checking the bytes it strips and the urn:uuid: form, so
+// the short label is cut from the parsed UUID, never from the raw claimed_by:
+// "\x1bc0000000-...x" parses, and its first 8 raw bytes are ESC c (reset).
+func TestWorkerLabel_ShortUUIDIsCanonical(t *testing.T) {
+	for in, want := range map[string]string{
+		"c0ffee00-0000-4000-8000-000000000001":          "c0ffee00",
+		"{c0ffee00-0000-4000-8000-000000000001}":        "c0ffee00",
+		"\x1bc0000000-0000-4000-8000-000000000001x":     "c0000000",
+		"urn:uuid:c0ffee00-0000-4000-8000-000000000001": "c0ffee00",
+		"site-a-sw-2\x1b]52;c;cHduZWQ=\x07":             `site-a-sw-2\x1b]52;c;cHduZWQ=\x07`,
+	} {
+		if got := workerLabel(in); got != want {
+			t.Errorf("workerLabel(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

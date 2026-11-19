@@ -17,6 +17,10 @@ import (
 // assert exactly what ReconcileInterfaces did. The interface list is
 // served in a fixed order (the order rows were passed in, then rows
 // created by POST), so a test controls the order NetBox lists them in.
+// Like NetBox it applies a PATCHed name to the row and answers 400 to a
+// POST or PATCH whose name another row already holds (device+name
+// uniqueness), so a reconcile that writes names in the wrong order
+// fails here as it would against a real NetBox.
 type reconcileFixture struct {
 	rows    map[int]map[string]any // interface id -> row
 	order   []int                  // row ids in list order; deleted ids are skipped
@@ -26,6 +30,27 @@ type reconcileFixture struct {
 	macs    []map[string]any // POST /api/dcim/mac-addresses/ bodies
 	nextID  int
 }
+
+// nameHeld reports whether a row other than id is named name.
+func (f *reconcileFixture) nameHeld(id int, name any) bool {
+	for rid, row := range f.rows {
+		if rid != id && row["name"] == name {
+			return true
+		}
+	}
+	return false
+}
+
+// names returns each row's current name, by id.
+func (f *reconcileFixture) names() map[int]any {
+	out := make(map[int]any, len(f.rows))
+	for id, row := range f.rows {
+		out[id] = row["name"]
+	}
+	return out
+}
+
+const dupNameBody = `{"__all__":["Interface with this Device and Name already exists."]}`
 
 func newReconcileFixture(rows []map[string]any) *reconcileFixture {
 	f := &reconcileFixture{
@@ -59,6 +84,10 @@ func (f *reconcileFixture) server(t *testing.T) *httptest.Server {
 			body, _ := io.ReadAll(r.Body)
 			var parsed map[string]any
 			_ = json.Unmarshal(body, &parsed)
+			if f.nameHeld(0, parsed["name"]) {
+				http.Error(w, dupNameBody, http.StatusBadRequest)
+				return
+			}
 			f.nextID++
 			parsed["id"] = f.nextID
 			f.posts = append(f.posts, parsed)
@@ -70,6 +99,15 @@ func (f *reconcileFixture) server(t *testing.T) *httptest.Server {
 			body, _ := io.ReadAll(r.Body)
 			var parsed map[string]any
 			_ = json.Unmarshal(body, &parsed)
+			if name, renames := parsed["name"]; renames {
+				if f.nameHeld(id, name) {
+					http.Error(w, dupNameBody, http.StatusBadRequest)
+					return
+				}
+				if row, ok := f.rows[id]; ok {
+					row["name"] = name
+				}
+			}
 			f.patches[id] = append(f.patches[id], parsed)
 			_, _ = w.Write([]byte(`{}`))
 		case r.Method == http.MethodDelete:
@@ -185,6 +223,132 @@ func TestReconcileInterfaces_PlaceholderEvictedOnRename(t *testing.T) {
 	}
 }
 
+// TestReconcileInterfaces_RenameOntoStaleRowName pins that a rename is
+// not blocked by the row of a NIC that is gone. Row 11's card was
+// removed and the kernel now gives its name to the NIC row 12 carries:
+// row 12 is renamed to eth0 and stale row 11, whose MAC no NIC reports,
+// is deleted first to free the name. Refusing the MAC-bearing squatter
+// failed every commission of the host until NetBox was edited by hand.
+func TestReconcileInterfaces_RenameOntoStaleRowName(t *testing.T) {
+	f := newReconcileFixture([]map[string]any{
+		ifaceRow(11, "eth0", "25gbase-x-sfp28", "AA:00:00:00:00:01", nil), // NIC no longer present
+		ifaceRow(12, "ens1f0", "25gbase-x-sfp28", "AA:00:00:00:00:02", nil),
+	})
+	srv := f.server(t)
+	defer srv.Close()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+	err := c.ReconcileInterfaces(context.Background(), 1, []NICData{
+		{Name: "eth0", MAC: "aa:00:00:00:00:02", IntfType: "25gbase-x-sfp28"},
+	}, false)
+	if err != nil {
+		t.Fatalf("ReconcileInterfaces: %v (want row 12 renamed to eth0 and stale row 11 deleted)", err)
+	}
+	if got := f.names(); len(got) != 1 || got[12] != "eth0" {
+		t.Errorf("rows after reconcile = %v, want only 12=eth0", got)
+	}
+	if len(f.deletes) != 1 || f.deletes[0] != 11 {
+		t.Errorf("deletes = %v, want [11] (once)", f.deletes)
+	}
+	if len(f.posts) != 0 {
+		t.Errorf("expected no creations, got %v", f.posts)
+	}
+}
+
+// TestReconcileInterfaces_RenamesThroughOccupiedNames pins that rows
+// keep their identity when names move between NICs that are all still
+// present: each target name is held by another row that is itself
+// being renamed. NetBox's device+name uniqueness rejects any order of
+// direct renames for a swap, so reconcile must move such rows aside
+// first instead of refusing the MAC-bearing holder.
+func TestReconcileInterfaces_RenamesThroughOccupiedNames(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows []map[string]any
+		nics []NICData
+		want map[int]any
+	}{
+		{
+			// Two cards exchanged slots, or ethN probe order changed.
+			name: "swap",
+			rows: []map[string]any{
+				ifaceRow(11, "eth0", "25gbase-x-sfp28", "AA:00:00:00:00:01", nil),
+				ifaceRow(12, "eth1", "25gbase-x-sfp28", "AA:00:00:00:00:02", nil),
+			},
+			nics: []NICData{
+				{Name: "eth0", MAC: "aa:00:00:00:00:02", IntfType: "25gbase-x-sfp28"},
+				{Name: "eth1", MAC: "aa:00:00:00:00:01", IntfType: "25gbase-x-sfp28"},
+			},
+			want: map[int]any{11: "eth1", 12: "eth0"},
+		},
+		{
+			// Path-based names moved up one bus after a PCIe change: the
+			// first rename's target is held by a row renamed later.
+			name: "shift up",
+			rows: []map[string]any{
+				ifaceRow(11, "enp3s0", "25gbase-x-sfp28", "AA:00:00:00:00:01", nil),
+				ifaceRow(12, "enp4s0", "25gbase-x-sfp28", "AA:00:00:00:00:02", nil),
+			},
+			nics: []NICData{
+				{Name: "enp4s0", MAC: "aa:00:00:00:00:01", IntfType: "25gbase-x-sfp28"},
+				{Name: "enp5s0", MAC: "aa:00:00:00:00:02", IntfType: "25gbase-x-sfp28"},
+			},
+			want: map[int]any{11: "enp4s0", 12: "enp5s0"},
+		},
+		{
+			// Names moved down one bus: the second rename's target was
+			// held by a row an earlier NIC already renamed.
+			name: "shift down",
+			rows: []map[string]any{
+				ifaceRow(11, "enp4s0", "25gbase-x-sfp28", "AA:00:00:00:00:01", nil),
+				ifaceRow(12, "enp5s0", "25gbase-x-sfp28", "AA:00:00:00:00:02", nil),
+			},
+			nics: []NICData{
+				{Name: "enp3s0", MAC: "aa:00:00:00:00:01", IntfType: "25gbase-x-sfp28"},
+				{Name: "enp4s0", MAC: "aa:00:00:00:00:02", IntfType: "25gbase-x-sfp28"},
+			},
+			want: map[int]any{11: "enp3s0", 12: "enp4s0"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReconcileFixture(tc.rows)
+			srv := f.server(t)
+			defer srv.Close()
+			c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+			if err := c.ReconcileInterfaces(context.Background(), 1, tc.nics, false); err != nil {
+				t.Fatalf("ReconcileInterfaces: %v (want both rows kept and renamed)", err)
+			}
+			if len(f.posts) != 0 || len(f.deletes) != 0 {
+				t.Errorf("rows must keep their identity: posts=%v deletes=%v", f.posts, f.deletes)
+			}
+			if got := f.names(); fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("names after reconcile = %v, want %v", got, tc.want)
+			}
+			if len(f.macs) != 0 {
+				t.Errorf("each row keeps its MAC; expected no MAC writes, got %v", f.macs)
+			}
+
+			// SyncCommissionData promises idempotence: an identical rerun
+			// changes nothing.
+			f.patches = map[int][]map[string]any{}
+			if err := c.ReconcileInterfaces(context.Background(), 1, tc.nics, false); err != nil {
+				t.Fatalf("second ReconcileInterfaces: %v", err)
+			}
+			for id, ps := range f.patches {
+				for _, p := range ps {
+					if _, renames := p["name"]; renames && p["name"] != tc.want[id] {
+						t.Errorf("rerun renamed row %d: %v", id, p)
+					}
+				}
+			}
+			if got := f.names(); fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("names after rerun = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestReconcileInterfaces_NameFallbackForMACless pins that NICs
 // without a MAC still match by name (no spurious create+delete).
 func TestReconcileInterfaces_NameFallbackForMACless(t *testing.T) {
@@ -245,11 +409,11 @@ func TestReconcileInterfaces_DuplicateMACFallsBackToName(t *testing.T) {
 // the duplicate-MAC case above. Once two same-MAC NICs have been
 // reconciled, NetBox holds two rows with that MAC (eth0 and eth1, the
 // state the test above and a first reconcile of an empty device both
-// leave). byMAC keeps one row per MAC, so if the MAC lookup ran before an
-// exact name+MAC match, NIC eth0 would claim the eth1 row, try to rename
-// it onto its own eth0 row, and fail on the MAC-bearing "squatter"; every
-// later commission of the host would fail. SyncCommissionData promises
-// idempotency, so the rerun must be a pure update in either list order.
+// leave). If a MAC-only match could run before the exact name+MAC match,
+// NIC eth0 could claim the eth1 row, try to rename it onto its own eth0
+// row, and fail on the MAC-bearing "squatter"; every later commission of
+// the host would fail. SyncCommissionData promises idempotency, so the
+// rerun must be a pure update in either list order.
 func TestReconcileInterfaces_DuplicateMACRerunIsIdempotent(t *testing.T) {
 	eth0 := ifaceRow(40, "eth0", "25gbase-x-sfp28", "AA:BB:CC:DD:EE:01", nil)
 	eth1 := ifaceRow(41, "eth1", "25gbase-x-sfp28", "AA:BB:CC:DD:EE:01", nil)
@@ -287,6 +451,135 @@ func TestReconcileInterfaces_DuplicateMACRerunIsIdempotent(t *testing.T) {
 				t.Errorf("MACs already match: expected no MAC-object creations, got %v", f.macs)
 			}
 		})
+	}
+}
+
+// TestReconcileInterfaces_NewNICDoesNotTakeRenamedNICsRow pins that a row
+// follows its MAC even when a NIC reported earlier now carries the row's
+// name. The initrd names NICs in driver-probe order, so adding a card that
+// probes first shifts the bond member from eth0 to eth1 and gives eth0 to
+// the new card. The new card has no MAC match; if it fell back to name
+// before the member's MAC was matched, it would claim the member's row
+// (and with it the lag, IPs and cable) and re-MAC it, and the real member
+// would get a bare new row: deploy then builds the bond from the wrong
+// port. The new card must get a new row, created after the member's row
+// has given up the name.
+func TestReconcileInterfaces_NewNICDoesNotTakeRenamedNICsRow(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		newMAC string // the new card's MAC; empty when the agent reports none
+	}{
+		{"new NIC with unknown MAC", "aa:00:00:00:00:02"},
+		{"new NIC without MAC", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bondRef := map[string]any{"id": 10, "name": "bond0"}
+			f := newReconcileFixture([]map[string]any{
+				ifaceRow(10, "bond0", "lag", "", nil),
+				ifaceRow(11, "eth0", "25gbase-x-sfp28", "AA:00:00:00:00:01", bondRef),
+			})
+			srv := f.server(t)
+			defer srv.Close()
+			c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+			err := c.ReconcileInterfaces(context.Background(), 1, []NICData{
+				{Name: "eth0", MAC: tc.newMAC, IntfType: "25gbase-x-sfp28"},           // new card, probed first
+				{Name: "eth1", MAC: "aa:00:00:00:00:01", IntfType: "25gbase-x-sfp28"}, // the bond member
+			}, false)
+			if err != nil {
+				t.Fatalf("ReconcileInterfaces: %v", err)
+			}
+
+			// Row 11 may first be renamed aside to free eth0 for the new
+			// row (planNameMoves); it must end up named eth1.
+			ps := f.patches[11]
+			if got := f.rows[11]["name"]; got != "eth1" {
+				t.Errorf("row 11 (bond member): final name %v, want eth1 (PATCHes %v)", got, ps)
+			}
+			for _, p := range ps {
+				if _, hasLag := p["lag"]; hasLag {
+					t.Errorf("row 11: PATCH %v sets lag (must leave membership untouched)", p)
+				}
+			}
+			if len(f.posts) != 1 || f.posts[0]["name"] != "eth0" {
+				t.Fatalf("expected exactly one POST, for the new eth0, got %v", f.posts)
+			}
+			newID := fmt.Sprint(f.posts[0]["id"])
+			var wantMACs []string
+			if tc.newMAC != "" {
+				wantMACs = []string{newID + "=" + tc.newMAC}
+			}
+			var gotMACs []string
+			for _, m := range f.macs {
+				gotMACs = append(gotMACs, fmt.Sprint(m["assigned_object_id"])+"="+fmt.Sprint(m["mac_address"]))
+			}
+			if fmt.Sprint(gotMACs) != fmt.Sprint(wantMACs) {
+				t.Errorf("MAC objects (interface=mac) = %v, want %v: row 11 keeps its MAC, only the new row gets one", gotMACs, wantMACs)
+			}
+			if len(f.deletes) != 0 {
+				t.Errorf("expected no deletions, got %v", f.deletes)
+			}
+		})
+	}
+}
+
+// assignedMACRow returns an interface row in the state a half-finished
+// MAC write leaves in NetBox 4.2+: one MAC object assigned to the
+// interface, none marked primary, so the interface's own mac_address
+// (derived from the primary) is null.
+func assignedMACRow(id int, name, typ string, macID int, mac string) map[string]any {
+	r := ifaceRow(id, name, typ, "", nil)
+	r["mac_addresses"] = []map[string]any{{"id": macID, "mac_address": mac}}
+	r["primary_mac_address"] = nil
+	return r
+}
+
+// primaryMACPatches returns the primary_mac_address values PATCHed onto
+// interface id, in order.
+func primaryMACPatches(f *reconcileFixture, id int) []any {
+	var out []any
+	for _, p := range f.patches[id] {
+		if v, ok := p["primary_mac_address"]; ok {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// TestReconcileInterfaces_AssignedMACWithoutPrimaryIsMarkedPrimary pins
+// the repair of a half-finished MAC write. Setting an interface's MAC
+// takes two NetBox writes: create a MAC object assigned to the interface,
+// then mark it primary. When the second fails after the first committed
+// (a 5xx, a timeout, a lost create response), the row is left with
+// mac_addresses=[M] and no primary, and SyncCommissionData relies on the
+// next run to finish the job. Interface.GetMAC falls back to
+// mac_addresses[0], so reconcile read that row as already carrying M and
+// skipped it on every later run, leaving the primary null for good. The
+// rerun must mark the existing object primary without creating a
+// duplicate.
+func TestReconcileInterfaces_AssignedMACWithoutPrimaryIsMarkedPrimary(t *testing.T) {
+	f := newReconcileFixture([]map[string]any{
+		assignedMACRow(50, "eth0", "25gbase-x-sfp28", 900, "AA:00:00:00:00:01"),
+	})
+	srv := f.server(t)
+	defer srv.Close()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+	err := c.ReconcileInterfaces(context.Background(), 1, []NICData{
+		{Name: "eth0", MAC: "aa:00:00:00:00:01", IntfType: "25gbase-x-sfp28"},
+	}, false)
+	if err != nil {
+		t.Fatalf("ReconcileInterfaces: %v", err)
+	}
+	if len(f.macs) != 0 {
+		t.Errorf("expected no MAC-object creations (object 900 already holds the MAC), got %v", f.macs)
+	}
+	got := primaryMACPatches(f, 50)
+	if len(got) != 1 || got[0] != float64(900) {
+		t.Errorf("row 50: primary_mac_address PATCHes = %v, want [900] (the already-assigned object)", got)
+	}
+	if len(f.posts) != 0 || len(f.deletes) != 0 {
+		t.Errorf("expected pure update; posts=%v deletes=%v", f.posts, f.deletes)
 	}
 }
 
@@ -443,6 +736,40 @@ func TestReconcileInterfaces_MgmtOnlyRowIsIdempotent(t *testing.T) {
 	}
 	if len(f.deletes) != 0 {
 		t.Errorf("expected no deletions, got %v", f.deletes)
+	}
+}
+
+// TestReconcileInterfaces_MgmtOnlyRerunMarksAssignedMACPrimary is the
+// half-finished MAC write of
+// TestReconcileInterfaces_AssignedMACWithoutPrimaryIsMarkedPrimary on the
+// synthetic "ipmi" row. Reconcile created that row on an earlier run, so
+// it is protected and the rerun takes the mgmt-only idempotency skip,
+// which recognises the row by GetMAC and therefore also matched on the
+// mac_addresses[0] fallback. The skip must still mark the assigned MAC
+// object primary, and must write nothing else to the protected row.
+func TestReconcileInterfaces_MgmtOnlyRerunMarksAssignedMACPrimary(t *testing.T) {
+	bmc := assignedMACRow(91, "ipmi", "1000base-t", 901, "AA:BB:CC:DD:EE:91")
+	bmc["mgmt_only"] = true
+	f := newReconcileFixture([]map[string]any{bmc})
+	srv := f.server(t)
+	defer srv.Close()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+	err := c.ReconcileInterfaces(context.Background(), 1, []NICData{
+		{Name: "ipmi", MAC: "aa:bb:cc:dd:ee:91", IntfType: "1000base-t", MgmtOnly: true},
+	}, false)
+	if err != nil {
+		t.Fatalf("ReconcileInterfaces: %v", err)
+	}
+	if len(f.macs) != 0 {
+		t.Errorf("expected no MAC-object creations (object 901 already holds the MAC), got %v", f.macs)
+	}
+	ps := f.patches[91]
+	if len(ps) != 1 || len(ps[0]) != 1 || ps[0]["primary_mac_address"] != float64(901) {
+		t.Errorf("row 91 (protected mgmt_only): PATCHes = %v, want exactly [{primary_mac_address: 901}]", ps)
+	}
+	if len(f.posts) != 0 || len(f.deletes) != 0 {
+		t.Errorf("expected no creations or deletions; posts=%v deletes=%v", f.posts, f.deletes)
 	}
 }
 

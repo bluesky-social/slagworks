@@ -291,7 +291,9 @@ There are two things called "claim" in the code base.
 NetBox device. This is location-subtree membership, not an
 operation claim. It is used by the NetBox webhook and by the
 reconciler to decide which site's snapshot needs invalidation on a
-device event.
+device event. It answers for the device as it is now, so when a webhook
+shows the device's site or location changed, the config it left is
+covered by invalidating every site config (`mirror.OnDeviceMoved`).
 
 ### Operation claim (the state-machine claim)
 
@@ -301,6 +303,11 @@ advances the machine to the corresponding running state. It is
 invoked by the site worker's WebSocket RPC (`ws/messages.go:197`
 `ClaimOpMsg`; hub side `ws/hub.go:962` `handleClaimOp`; client side
 `internal/worker/wsconn.go:200` `ClaimOp`).
+
+Before the store call, the hub reads the op and declines the claim
+(answering `already_claimed`, writing nothing) when the op's machine is not
+in the claiming worker's site, or when the PDU-outlet self-power interlock
+refuses this worker. See [Op transport](#op-transport-the-op-event-stream-tier-2-phase-2).
 
 The store implementation:
 
@@ -466,10 +473,18 @@ Confidentiality scoping: `Operation.Params` carries per-site credentials
 (BMC/PDU passwords, tailnet auth keys), so `op_delta` and `op_resync` are
 slug-scoped — the hub sends them only to workers whose cached per-slug
 snapshot contains the op's machine (`Hub.machineInSlug`), preserving the
-pre-cutover baseline where ops rode the per-slug snapshot. `op_removed`
-fans fleet-wide, unfiltered: it carries no params (no secrets) and must
-survive membership loss (a machine deleted from NetBox is in no snapshot,
-but its drift-failed op must still be dropped on the worker driving it).
+pre-cutover baseline where ops rode the per-slug snapshot. The claim reply
+carries the op too, so `handleClaimOp` applies the same check before the
+claim CAS: a `claim_op` for an op whose machine is not in the worker's
+snapshot is answered `already_claimed` and the op stays pending. That
+cache is only as current as the slug's last push, so a device that moves
+out of a config's scope must get that config rebuilt too: the NetBox
+webhook invalidates every site config when a device's site or location
+changes (`mirror.OnDeviceMoved`), and the reconcile tick is the backstop.
+`op_removed` fans fleet-wide, unfiltered: it carries no params (no
+secrets) and must survive membership loss (a machine deleted from NetBox
+is in no snapshot, but its drift-failed op must still be dropped on the
+worker driving it).
 
 ### Credentials in operations
 
@@ -485,7 +500,10 @@ mechanisms below derive from (`model.SecretParamPaths`), and
 field (password/secret/key/token) anywhere under `OpParams` that lacks it.
 
 - **Workers get the real values.** The op stream (`op_delta`, `op_resync`,
-  the claim reply) carries params unredacted, scoped by slug as above.
+  the claim reply) carries params unredacted, scoped by slug as above. A
+  site-worker token is therefore credential-equivalent, so minting one
+  (`POST /site-workers`) takes the same optional credential-group check
+  as `GET /devices/:ident/creds` (`SLAGWORKS_OIDC_CREDENTIAL_GROUPS`).
 - **Operators never do.** The API server's echo JSON serializer
   (`internal/api/op_redaction.go`) is the one choke point for operator
   responses: every `Operation` it encodes (op-create responses from
@@ -504,6 +522,13 @@ field (password/secret/key/token) anywhere under `OpParams` that lacks it.
   for at most one minute while global is up, or until global's next start
   if it is down. Nothing reads credentials from a terminal op: a retry is
   a new op that resolves credentials afresh.
+
+Both mechanisms find a credential by its exact key, while `encoding/json`
+matches a key to a field ignoring letter case. So `model.DecodeParams`
+refuses params that spell a key on a credential path, or a transport key
+(`pdu_runtime`, `amt_runtime`), in any other case: the worker fails such an
+op rather than use a credential that operators would see and the table
+would keep.
 
 Residual exposure: an active op holds its credentials in the
 `operations` table (and in each worker's op layer and `worker.db`) for as
@@ -564,10 +589,21 @@ Path depends on the op type.
 
 - **Deploy** completes via the phone-home service on the deployed
   host, not via the agent. The agent writes a systemd unit
-  (`generatePhoneHomeUnit`, `main.go:1484`) that POSTs
-  `/api/v1/phone-home?mac=...`; the httpboot handler at
-  `handler.go:941` calls `provider.RecordPhoneHome`, which is
-  `Cache.RecordPhoneHome` (`internal/worker/cache.go:404`).
+  (`target.GeneratePhoneHomeUnit`, `internal/agent/target/target.go`)
+  that POSTs `/api/v1/report` with the deploy's `machine_id`, `op_id`
+  and `event: "phone_home"`, retrying until it gets a 2xx.
+  `Cache.HandleProgressReport` accepts it only when
+  `opState.validateReportBinding` finds that op active, of type
+  deploy, owned by that machine, and at phase `awaiting_phone_home`
+  (the agent's `deploy_complete` has latched it); anything else is a
+  409, and the unit keeps retrying. A phone-home earlier than that
+  would record a deploy as successful over a disk the agent has not
+  finished writing. Once the machine is `running` a retried
+  phone-home is acknowledged without side effects. There is no
+  MAC-only phone-home route: a request that names no op cannot
+  complete one (`TestPhoneHome_CompletesOnlyTheBoundDeployAwaitingIt`,
+  `internal/httpboot/phone_home_test.go`). An accepted report
+  calls `Cache.RecordPhoneHome` (`internal/worker/cache.go`).
   That sets the machine's local state to `running`, emits a
   `phone_home` observation carrying the deploy op's ID, and calls
   `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. Both reach
@@ -773,8 +809,9 @@ keeps failing installs with the machine still `commissioned` or
 `failed`: only the claim's op_delta moves it to `deploying`, and
 `HandleProgressReport` accepts reports for a pending op
 (`TestBootAction_AwaitingPhoneHomeOnUnclaimedDeploy`, `cache_test.go`).
-The target boots off disk, its phone-home
-service POSTs `/api/v1/phone-home`, `RecordPhoneHome` fires the
+The target boots off disk and its phone-home service POSTs its
+`phone_home` report to `/api/v1/report`; the worker accepts that
+report only at this phase. `RecordPhoneHome` then fires the
 completion path described earlier, and the op transitions to
 `completed` with `machine.state = running`.
 
@@ -844,8 +881,11 @@ command line arguments (`internal/httpboot/handler.go:381`):
 - `slagworks.destructive`
 - `slagworks.wipe_all_disks`
 - `slagworks.recovery`
-- `slagworks.tailscale_authkey=<key>` (when a Tailscale runtime blob
-  is attached)
+- `slagworks.tailscale_authkey=<key>` and
+  `slagworks.tailscale_hostname=<name>` (when a Tailscale runtime blob
+  is attached; neither when its hostname is not a valid hostname, so
+  the agent skips enrollment rather than the device name reaching the
+  script)
 
 The agent parses the boolean flags (`cmd/slagworks-agent/main.go:136`)
 and consumes them:

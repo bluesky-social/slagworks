@@ -7,13 +7,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// LogEntry is a single log line from a deploy agent.
-type LogEntry struct {
-	Source string `json:"source"`
-	TS     string `json:"ts"`
-	Line   string `json:"line"`
-}
-
 type Observation struct {
 	MachineID   uuid.UUID       `json:"machine_id"`
 	OperationID uuid.UUID       `json:"op_id,omitempty"`
