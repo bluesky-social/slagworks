@@ -183,23 +183,26 @@ func memberReferencesDisk(member, disk string) bool {
 
 func validateDisk(name string, dev Device) error {
 	// Disks with no partitions are valid — they may be whole-disk RAID members.
-	restCount := 0
-	for _, p := range dev.Partitions {
+	for i, p := range dev.Partitions {
 		if p.Name == "" {
 			return fmt.Errorf("disk %q: partition missing name", name)
 		}
 		if p.Size == "" {
 			return fmt.Errorf("disk %q partition %q: missing size", name, p.Name)
 		}
+		// planDisk creates partitions in order, and sgdisk gives a "rest"
+		// partition all the space left, so nothing after one fits.
 		if p.Size == "rest" {
-			restCount++
+			if i != len(dev.Partitions)-1 {
+				return fmt.Errorf("disk %q partition %q: only the last partition on a disk may be sized \"rest\"; "+
+					"move it last or give it a fixed size", name, p.Name)
+			}
+		} else if _, err := sizeBytes(p.Size); err != nil {
+			return fmt.Errorf("disk %q partition %q: %w", name, p.Name, err)
 		}
 		if p.BIOSGrub && (p.FS != "" || p.Bootable) {
 			return fmt.Errorf("disk %q partition %q: bios_grub is mutually exclusive with fs/bootable", name, p.Name)
 		}
-	}
-	if restCount > 1 {
-		return fmt.Errorf("disk %q: multiple partitions with size \"rest\" (max 1)", name)
 	}
 
 	return nil
