@@ -68,7 +68,13 @@ a machine ever gets booted:
   allocation (`internal/dhcp/handler.go:944`). A pool with a nil
   `RangeStart` (reservations-only segment) still serves the full reservation
   set; a non-reserved MAC on such a segment gets no offer, which is what
-  lets a slice-owning peer answer in an active/active split-pool cage.
+  lets a slice-owning peer answer in an active/active split-pool cage. A
+  reservation also wins over another MAC's live lease on the same address
+  (the address moved to a new MAC in NetBox, or the reservation sits inside
+  the dynamic pool and a dynamic client drew it first): the handler revokes
+  that lease with a warning, and the other MAC is NAKed at its next renew
+  and re-DISCOVERs onto a different address. Until that renew, both devices
+  answer for the address on the wire.
 - **Address conflicts (DHCPDECLINE).** A client that checks its new address
   for duplicates before using it (dhcpcd in the initrd, for instance) sends a
   DECLINE when another host already answers for it, then starts over at
