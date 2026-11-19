@@ -68,17 +68,6 @@ func (h *Handler) SetLogger(l *slog.Logger) {
 	h.log = l
 }
 
-// MarkVerified records that the installed OS phoned home (post-boot).
-func (h *Handler) MarkVerified(mac string) {
-	id, ok := h.provider.MachineIDForMAC(mac)
-	if !ok {
-		h.log.Warn("ignoring phone-home for unknown MAC", "mac", mac)
-		return
-	}
-	h.provider.RecordPhoneHome(id)
-	h.log.Info("marked machine as verified", "mac", mac, "machine_id", id)
-}
-
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mac := r.URL.Query().Get("mac")
 	if mac != "" && !validMAC.MatchString(mac) {
@@ -1021,18 +1010,6 @@ func (s *Server) buildMux() *http.ServeMux {
 			return
 		}
 		s.handleInventory(w, r)
-	})
-
-	mux.HandleFunc("/api/v1/phone-home", func(w http.ResponseWriter, r *http.Request) {
-		if !requirePOST(w, r) {
-			return
-		}
-		mac, ok := requireMAC(w, r)
-		if !ok {
-			return
-		}
-		handler.MarkVerified(mac)
-		w.WriteHeader(http.StatusOK)
 	})
 
 	// GET /boot/storage-script?mac={mac} — returns the pre-chosen

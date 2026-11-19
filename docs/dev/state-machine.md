@@ -557,11 +557,13 @@ Path depends on the op type.
 
 - **Deploy** completes via the phone-home service on the deployed
   host, not via the agent. The agent writes a systemd unit
-  (`generatePhoneHomeUnit`, `main.go:1484`) that POSTs
-  `/api/v1/phone-home?mac=...`; the httpboot handler at
-  `handler.go:941` calls `provider.RecordPhoneHome`, which is
-  `Cache.RecordPhoneHome` (`internal/worker/cache.go:404`).
-  That sets the machine's local state to `running`, emits a
+  (`target.GeneratePhoneHomeUnit`, `internal/agent/target/target.go`)
+  that POSTs `{"machine_id":"...","op_id":"...","event":"phone_home"}`
+  to `/api/v1/report`. `Cache.HandleProgressReport` rejects it unless
+  `validateReportBinding` finds that exact op active, of type deploy,
+  and bound to that machine, then calls `Cache.RecordPhoneHome`.
+  There is no MAC-keyed phone-home: one that names no operation
+  would bypass those checks. `RecordPhoneHome` sets the machine's local state to `running`, emits a
   `phone_home` observation, and calls
   `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. The op
   update flows through the outbox to the hub, and
@@ -732,7 +734,8 @@ Test: `TestUpdateOpPhase_AwaitingPhoneHomeNotClobbered`
 `Cache.BootActionForMAC` reads the phase and returns `BootLocal`
 whenever `state = deploying` and `phase = awaiting_phone_home`
 (`cache.go:280`). The target boots off disk, its phone-home
-service POSTs `/api/v1/phone-home`, `RecordPhoneHome` fires the
+service POSTs the bound `phone_home` report to `/api/v1/report`,
+`RecordPhoneHome` fires the
 completion path described earlier, and the op transitions to
 `completed` with `machine.state = running`.
 

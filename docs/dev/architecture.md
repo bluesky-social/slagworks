@@ -102,7 +102,9 @@ Modes (dispatched from `main.go` around line 165):
 All agent-to-site traffic is plain HTTP against the site worker's
 HTTP-boot server (see [Boot handlers](#boot-handlers)). The final
 phone-home is done by a systemd unit written by the agent
-(`generatePhoneHomeUnit`, `main.go:1484`), not by the agent itself.
+(`target.GeneratePhoneHomeUnit`, `internal/agent/target/target.go`), not
+by the agent itself; it POSTs a `phone_home` report carrying the machine
+and operation IDs to `/api/v1/report`.
 
 ### `slagctl`
 
@@ -545,9 +547,9 @@ handler, and the executor):
 - `ReservedIPForMAC`, `IsOOBManagedNonMachine`, `MachineIDForMAC`.
 - `GetDHCPConfig`, `GetOOBConfig`, `GetSSHKeys`, `GetSiteInfo`.
 
-Observation intake (called from the HTTP-boot handler when the agent
-POSTs `/api/v1/report` or `/api/v1/inventory` or the phone-home
-service POSTs `/api/v1/phone-home`):
+Observation intake (reached from the HTTP-boot handler when the agent
+POSTs `/api/v1/report` or `/api/v1/inventory`, or the installed OS's
+phone-home service POSTs its `phone_home` report to `/api/v1/report`):
 
 - `RecordDeployComplete` (382), `RecordPhoneHome` (404),
   `RecordCommissionReport` (434), `RecordInventoryReport` (446).
@@ -651,10 +653,9 @@ matter to contributors:
   `internal/httpboot/handler.go`):
 
   ```text
-  POST /api/v1/report                            (progress, phase, failure, deploy_complete, commission_report)
+  POST /api/v1/report                            (progress, phase, failure, deploy_complete, commission_report; phone_home from the installed OS)
   POST /api/v1/inventory
   POST /logs/ingest                              (log envelopes)
-  POST /api/v1/phone-home?mac=...                (from the installed OS)
   GET  /boot/ipxe?mac=...
   GET  /boot/ssh-keys
   GET  /files/bin/slagworks-agent
