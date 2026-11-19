@@ -214,6 +214,11 @@ algorithm:
 
 Notes:
 
+- The row name is the directory name. `SyncImages` skips, with an
+  error, any name that fails `model.ValidateImageName` (lowercase
+  letters, digits, `.`, `_`, `-`, starting with a letter or digit)
+  before downloading or removing anything, and still syncs the other
+  rows. The API refuses such names when the row is written.
 - No cpio repack, no InjectOverlayInit. The initrd downloaded IS the
   initrd served. That's the entire point of baking the BOOT hook at
   image-build time.

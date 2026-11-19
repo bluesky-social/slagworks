@@ -614,6 +614,64 @@ func TestFailedDeltaLeavesAwaitingPhoneHome(t *testing.T) {
 	}
 }
 
+// TestAwaitingPhoneHomeHoldsBeforeClaimDelta: the executor has claimed a
+// deploy op and driven the host into the installer, but the claim's op_delta,
+// the only thing that moves the machine to deploying on this worker, has not
+// been applied when the agent reports deploy_complete. The op is claimed and
+// running locally while the machine still reads commissioned.
+// TestBootAction_AwaitingPhoneHomeOnUnclaimedDeploy (cache_test.go) covers the
+// same latch for an op that is still pending; this is the claimed half. The
+// post-install PXE must boot the disk, before the late claim delta and after
+// it: BootDeploy re-wipes the disk just installed.
+func TestAwaitingPhoneHomeHoldsBeforeClaimDelta(t *testing.T) {
+	c := NewCache(nil)
+	id, opID := uuid.New(), uuid.New()
+	mac := "52:54:00:a1:00:01"
+	c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 1, Machines: []model.MachineSnapshot{{
+		ID: id, State: model.MachineStateCommissioned, PXEEligible: true,
+		Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}},
+	}}})
+	c.ApplyOpResync(nil, nil)
+	c.ApplyOpDelta(model.Operation{ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpPending}, "")
+	// The cache side of Executor.executeOp + runLifecycleOp.
+	c.MarkOpClaimed(opID.String())
+	c.UpdateOpPhase(opID.String(), "power_cycle")
+	c.UpdateOpPhase(opID.String(), "pxe_booting")
+	c.MarkOpStatus(opID.String(), model.OpRunning)
+	if got := c.BootActionForMAC(mac); got != model.BootDeploy {
+		t.Fatalf("precondition: the install boot got %d, want BootDeploy (%d)", got, model.BootDeploy)
+	}
+
+	// The agent finishes the install.
+	if err := c.HandleProgressReport(&model.ProgressReport{
+		MachineID: id.String(), OperationID: opID.String(), Event: "deploy_complete",
+	}); err != nil {
+		t.Fatalf("deploy_complete: %v", err)
+	}
+	if op := c.GetOperation(opID.String()); op == nil || op.Status != model.OpRunning || op.Phase != "awaiting_phone_home" {
+		t.Fatalf("precondition: op = %+v, want running at awaiting_phone_home", op)
+	}
+	if got := c.MachineState(id); got != string(model.MachineStateCommissioned) {
+		t.Fatalf("precondition: machine state %q, want commissioned (no claim delta yet)", got)
+	}
+
+	// The post-install reboot PXEs first (PXE is boot order #1).
+	if got := c.BootActionForMAC(mac); got != model.BootLocal {
+		t.Fatalf("post-install PXE before the claim delta: got %d, want BootLocal (%d)", got, model.BootLocal)
+	}
+
+	// The late claim delta lands: global's claimed row, machine deploying.
+	c.ApplyOpDelta(model.Operation{
+		ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Version: 1,
+	}, model.MachineStateDeploying)
+	if got := c.MachineState(id); got != string(model.MachineStateDeploying) {
+		t.Fatalf("after the claim delta: machine state %q, want deploying", got)
+	}
+	if got := c.BootActionForMAC(mac); got != model.BootLocal {
+		t.Fatalf("post-install PXE after the late claim delta: got %d, want BootLocal (%d)", got, model.BootLocal)
+	}
+}
+
 // failedByAgent seeds a machine whose lifecycle op global holds claimed at
 // version 1, then has the agent report a phase and fail in it. The worker
 // marks the op failed locally without a Version bump; global has not

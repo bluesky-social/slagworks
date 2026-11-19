@@ -67,15 +67,19 @@ variable shown, so a flag on the command line overrides the variable.
   comma-separated groups; a token is accepted when it carries any of them.
   Required: global refuses to start without at least one group. Blank
   entries are dropped. Every operator endpoint uses this check; there is
-  no separate read-only role. The device-credential endpoint can also
-  require `SLAGWORKS_OIDC_CREDENTIAL_GROUPS`.
+  no separate read-only role. The device-credential endpoint and
+  site-worker registration can also require
+  `SLAGWORKS_OIDC_CREDENTIAL_GROUPS`.
 - **`SLAGWORKS_OIDC_CREDENTIAL_GROUPS`** / `--oidc-credential-groups` —
   comma-separated groups allowed to read stored device credentials in
   plaintext: `GET /api/v1/devices/:ident/creds`, which
-  `slagctl machine creds` calls. When set, a caller must pass the
-  `SLAGWORKS_OIDC_REQUIRED_GROUPS` check and also carry any one of these
-  groups; other operators get 403 with a message naming this setting.
-  Unset or blank (the default), every operator may read credentials.
+  `slagctl machine creds` calls, and `POST /api/v1/site-workers`, which
+  `slagctl worker register` calls (a site-worker token receives the
+  site's device credentials with every operation it is sent). When set, a
+  caller must pass the `SLAGWORKS_OIDC_REQUIRED_GROUPS` check and also
+  carry any one of these groups; other operators get 403 with a message
+  naming this setting.
+  Unset or blank (the default), every operator may call both.
   Blank entries are dropped. Global logs at startup whether credential
   reads are restricted and by how many groups. Endpoints that only use a
   credential server-side (operations, power and boot status) are not
@@ -101,7 +105,11 @@ variable shown, so a flag on the command line overrides the variable.
   set, each deploy operation carries a single-use auth key (valid 2 hours)
   tagged `tag:<pop>`, where `<pop>` is the device's NetBox site slug, so
   the OAuth client must own those tags. Either empty disables enrollment;
-  a mint failure is logged and the deploy proceeds without it.
+  a mint failure is logged and the deploy proceeds without it. The same
+  happens, with no key minted, when the device's tailnet hostname
+  (`<name>-<pop>`, with a trailing `.<pop>` dropped from the name) is not a
+  valid hostname: dot-separated labels of letters, digits and hyphens, none
+  starting or ending with a hyphen.
 - **`SLAGWORKS_HOSTNAME_TEMPLATE`** / `--hostname-template` — how a
   deployed machine's hostname is derived from its NetBox device name.
   The agent writes the result to `/etc/hostname` and `/etc/hosts`.
@@ -119,10 +127,18 @@ variable shown, so a flag on the command line overrides the variable.
   (here `.example.net`) is used unchanged. When the template uses
   `{node}` or `{zone}` and a device name has no dot (or nothing on one
   side of its last dot), the machine gets no hostname from slagworks
-  and keeps the deployed image's default. Any other `{...}`, or a
-  template with no placeholder, is a configuration error: global
-  refuses to start. Changing the template changes the hostname every
-  machine gets on its next deploy.
+  and keeps the deployed image's default. The same happens when the
+  result is not a valid hostname: dot-separated labels of ASCII
+  letters, digits and hyphens, none empty or starting or ending with
+  a hyphen, at most 63 characters each and 253 in all (RFC 1123). A
+  device name containing a space, `/`, `_` or a newline, for example,
+  gives no hostname with or without a template. Any other `{...}`, a
+  template with no placeholder, or a template whose literal text no
+  device name could make a valid hostname (a character other than a
+  letter, digit, hyphen or dot, an empty label, or a label starting
+  or ending with a hyphen, as in `{node}.internal.{zone}.example_net`)
+  is a configuration error: global refuses to start. Changing the
+  template changes the hostname every machine gets on its next deploy.
 
 ### AWS
 
@@ -133,9 +149,10 @@ Secrets Manager region is fixed at `us-east-2`
 
 If the SDK configuration cannot be loaded, global logs a warning and runs
 without a secret store: operations that need a BMC credential are refused
-at creation and `slagctl machine creds` returns 503. If the configuration
-loads but no credentials are available, the same operations fail when
-global first tries to read a secret.
+at creation, PDU and AMT operations (including `slagctl power outlet`) are
+created without a credential, and `slagctl machine creds` returns 503. If
+the configuration loads but no credentials are available, the same
+operations fail when global first tries to read a secret.
 
 ## `slagworksd site`
 

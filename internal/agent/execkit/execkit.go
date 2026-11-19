@@ -15,6 +15,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -34,6 +36,99 @@ const outputCapBytes = 16 << 10
 // exception) is the last thing it writes.
 const configScriptStderrCap = 8 << 10
 
+// ErrStopped is what starting a command returns once its Group has been
+// stopped: the command was not started.
+var ErrStopped = errors.New("the agent is stopping and runs no further commands")
+
+// Group tracks the processes the agent has started so that one call can end
+// all of them. The agent stops when the site worker reports that its
+// operation is over, and exiting is not enough: a child the agent leaves
+// behind keeps running, so a long rsync or mkfs would go on writing to the
+// disks, and a chrooted daemon would stay up in the recovery environment.
+//
+// Every process that can outlive a moment goes through a Group: the commands
+// Exec runs, the config scripts (RunConfigScript), and the daemons and
+// clients the agent starts itself. The zero value is ready to use. A nil
+// *Group tracks nothing: Start and Wait fall through to the command and Stop
+// does nothing, which is what tests that build a Context by hand get.
+//
+// A process is tracked from Start until its Wait returns, and Stop kills
+// what is tracked. A background process that a command left behind after it
+// returned is not: none of the agent's commands leave one that writes to the
+// host, and killing a finished command's process group on every Wait would
+// end helpers a command means to leave running (a mount helper, an LVM
+// monitor) on the path where nothing is being stopped.
+type Group struct {
+	// mu guards stopped and running. It is held across a command's start,
+	// so Stop either sees the command in running or keeps it from starting.
+	mu      sync.Mutex
+	stopped bool
+	running map[*exec.Cmd]struct{}
+}
+
+// Start starts cmd in its own process group and tracks it until Wait.
+// After Stop it returns ErrStopped without starting anything.
+func (g *Group) Start(cmd *exec.Cmd) error {
+	if g == nil {
+		return cmd.Start()
+	}
+	// Its own process group, so Stop can reach the children it forks:
+	// killing only rsync's or chroot's top process would leave the workers
+	// that do the writing running.
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped {
+		return ErrStopped
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	if g.running == nil {
+		g.running = make(map[*exec.Cmd]struct{})
+	}
+	g.running[cmd] = struct{}{}
+	return nil
+}
+
+// Wait waits for a command Start started and stops tracking it.
+func (g *Group) Wait(cmd *exec.Cmd) error {
+	err := cmd.Wait()
+	if g != nil {
+		g.mu.Lock()
+		delete(g.running, cmd)
+		g.mu.Unlock()
+	}
+	return err
+}
+
+// Run is Start followed by Wait.
+func (g *Group) Run(cmd *exec.Cmd) error {
+	if err := g.Start(cmd); err != nil {
+		return err
+	}
+	return g.Wait(cmd)
+}
+
+// Stop ends the group for good: every tracked process is killed together
+// with its process group, and every later Start returns ErrStopped. The
+// kills are sent before Stop returns; it does not wait for the processes to
+// die.
+func (g *Group) Stop() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stopped = true
+	for cmd := range g.running {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+}
+
 // Exec is the production Runner: it spawns real processes, tees their
 // output live to Tee (falling back to the agent's stdout/stderr when
 // nil), and logs a structured envelope per completed exec.
@@ -43,7 +138,24 @@ type Exec struct {
 	// commands stay visible mid-run. nil falls back to os.Stdout /
 	// os.Stderr.
 	Tee io.Writer
+	// Procs is the group this Exec's commands run in. The agent shares one
+	// group between its Exec and its Context so a single Stop ends
+	// everything; nil gives the Exec a group of its own.
+	Procs *Group
+
+	own Group
 }
+
+func (e *Exec) group() *Group {
+	if e.Procs != nil {
+		return e.Procs
+	}
+	return &e.own
+}
+
+// Stop stops the Exec's group: the commands Run and Output have in flight
+// are killed, and every later Run or Output returns ErrStopped.
+func (e *Exec) Stop() { e.group().Stop() }
 
 // Run executes a command and returns its error. The full exec outcome
 // (argv, exit code, duration, bounded stdout/stderr) ships as one
@@ -60,7 +172,7 @@ func (e *Exec) Run(name string, args ...string) error {
 		cmd.Stderr = io.MultiWriter(os.Stderr, stderr)
 	}
 	started := time.Now()
-	err := cmd.Run()
+	err := e.group().Run(cmd)
 	dur := time.Since(started)
 
 	exitCode := 0
@@ -114,8 +226,18 @@ func (e *Exec) Run(name string, args ...string) error {
 // Output executes a command and returns its trimmed stdout.
 func (e *Exec) Output(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
-	out, err := cmd.Output()
-	return strings.TrimSpace(string(out)), err
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	// Keep what exec.Cmd.Output does for a failed command: its stderr rides
+	// the ExitError, which is where callers look for the tool's own account
+	// of the failure (storageapply's probeError).
+	stderr := &boundedBuffer{cap: outputCapBytes}
+	cmd.Stderr = stderr
+	err := e.group().Run(cmd)
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+		exitErr.Stderr = stderr.buf
+	}
+	return strings.TrimSpace(out.String()), err
 }
 
 // Available reports whether the named command exists in $PATH.
@@ -233,7 +355,10 @@ func (b *tailBuffer) String() string {
 // and appended to the returned error on failure. Without that the failure
 // reached the operation result as a bare "exit status 1" and the script's
 // explanation of what to fix was visible only on the serial console.
-func RunConfigScript(log *slog.Logger, kind string, scriptContent []byte, envName string, data []byte, sidecars map[string][]byte) ([]byte, error) {
+//
+// The script runs in procs, so a stopping agent kills it with everything
+// else it started; nil runs it untracked.
+func RunConfigScript(procs *Group, log *slog.Logger, kind string, scriptContent []byte, envName string, data []byte, sidecars map[string][]byte) ([]byte, error) {
 	dir, err := os.MkdirTemp("", "slagworks-"+kind+"-*")
 	if err != nil {
 		return nil, fmt.Errorf("create %s temp dir: %w", kind, err)
@@ -263,7 +388,10 @@ func RunConfigScript(log *slog.Logger, kind string, scriptContent []byte, envNam
 	cmd.Env = append(os.Environ(), envName+"="+dataPath)
 	stderr := &tailBuffer{cap: configScriptStderrCap}
 	cmd.Stderr = io.MultiWriter(os.Stderr, stderr)
-	out, err := cmd.Output()
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	err = procs.Run(cmd)
+	out := stdout.Bytes()
 
 	diag := strings.TrimSpace(stderr.String())
 	for line := range strings.SplitSeq(diag, "\n") {

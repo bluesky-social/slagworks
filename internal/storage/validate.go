@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"unicode"
 )
@@ -55,6 +56,9 @@ func validate(layout Layout) error {
 	if err := validateRetainMemberCollisions(layout); err != nil {
 		return err
 	}
+	if err := validateRAIDMemberUse(layout); err != nil {
+		return err
+	}
 
 	// Verify all mount devices exist in the layout and are mountable.
 	// A disk partition referenced by a mount must declare a filesystem:
@@ -62,8 +66,8 @@ func validate(layout Layout) error {
 	// unconditionally, so mounting an FS-less partition (a bios_grub EF02
 	// embedding partition, or any partition simply omitted from fs
 	// config) would mount raw, unformatted bytes. RAID-member partitions
-	// legitimately have no FS but are never mounted directly (the md
-	// device is), so they don't hit this path.
+	// legitimately have no FS, but validateRAIDMemberUse has already
+	// refused a mount of one (the md device is mounted instead).
 	for path, m := range layout.Mounts {
 		if err := validateMountPoint(path); err != nil {
 			return err
@@ -104,6 +108,12 @@ func validate(layout Layout) error {
 			if p.FS == "" {
 				return fmt.Errorf("mount %q references partition %q which has no filesystem", path, m.Device)
 			}
+		}
+		// The planner formats swap with mkswap, but swap is not a
+		// filesystem: the mount would fail ("unknown filesystem type
+		// 'swap'") after the disks were already repartitioned.
+		if DeclaredFS(layout, m.Device) == "swap" {
+			return fmt.Errorf("mount %q references swap device %q (swap cannot be mounted; remove it from mounts)", path, m.Device)
 		}
 	}
 
@@ -213,7 +223,6 @@ func memberReferencesDisk(member, disk string) bool {
 
 func validateDisk(name string, dev Device) error {
 	// Disks with no partitions are valid — they may be whole-disk RAID members.
-	restCount := 0
 	for i, p := range dev.Partitions {
 		if p.Name == "" {
 			return fmt.Errorf("disk %q: partition missing name", name)
@@ -232,15 +241,19 @@ func validateDisk(name string, dev Device) error {
 		if p.Size == "" {
 			return fmt.Errorf("disk %q partition %q: missing size", name, p.Name)
 		}
+		// planDisk creates partitions in order, and sgdisk gives a "rest"
+		// partition all the space left, so nothing after one fits.
 		if p.Size == "rest" {
-			restCount++
+			if i != len(dev.Partitions)-1 {
+				return fmt.Errorf("disk %q partition %q: only the last partition on a disk may be sized \"rest\"; "+
+					"move it last or give it a fixed size", name, p.Name)
+			}
+		} else if _, err := sizeBytes(p.Size); err != nil {
+			return fmt.Errorf("disk %q partition %q: %w", name, p.Name, err)
 		}
 		if p.BIOSGrub && (p.FS != "" || p.Bootable) {
 			return fmt.Errorf("disk %q partition %q: bios_grub is mutually exclusive with fs/bootable", name, p.Name)
 		}
-	}
-	if restCount > 1 {
-		return fmt.Errorf("disk %q: multiple partitions with size \"rest\" (max 1)", name)
 	}
 
 	return nil
@@ -288,6 +301,49 @@ func validateRAID(name string, dev Device, layout Layout) error {
 		}
 	}
 
+	return nil
+}
+
+// validateRAIDMemberUse rejects a layout that gives a RAID member a second
+// use. mdadm --create takes each member for its array alone, so a member
+// listed twice, shared by two arrays or also mounted fails at mdadm or
+// mount, after Phase 1 has already zapped and repartitioned the disks. A
+// whole disk used as a member while its disk entry also declares partitions
+// does not fail at all: Phase 1 creates and formats those partitions, then
+// mdadm --create on the disk writes its superblock over the GPT and its
+// data area over the partitions, and an unmounted one (a second ESP) is
+// lost without an error. Arrays and mounts are walked in sorted
+// order so the error names the same device on every run.
+func validateRAIDMemberUse(layout Layout) error {
+	_, _, raidNames, _ := classifyDevices(layout)
+	owner := make(map[string]string) // member name -> the raid that uses it
+	for _, name := range raidNames {
+		for _, member := range layout.Devices[name].Members {
+			if disk, ok := layout.Devices[member]; ok && disk.Type == "disk" && len(disk.Partitions) > 0 {
+				return fmt.Errorf("raid %q: member %q is a whole disk that also declares partitions, which mdadm --create on the disk would overwrite (use one of its partitions as the member, or remove the partitions)", name, member)
+			}
+			key := stripDevPrefix(member)
+			switch prev, used := owner[key]; {
+			case used && prev == name:
+				return fmt.Errorf("raid %q: member %q is listed twice (list each member once)", name, member)
+			case used:
+				return fmt.Errorf("raid %q: member %q is already a member of raid %q (a device can belong to one array only)", name, member, prev)
+			}
+			owner[key] = name
+		}
+	}
+
+	paths := make([]string, 0, len(layout.Mounts))
+	for path := range layout.Mounts {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		dev := layout.Mounts[path].Device
+		if raid, ok := owner[stripDevPrefix(dev)]; ok {
+			return fmt.Errorf("mount %q references %q, a member of raid %q (mount the array instead)", path, dev, raid)
+		}
+	}
 	return nil
 }
 

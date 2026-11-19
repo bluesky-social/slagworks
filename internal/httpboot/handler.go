@@ -81,17 +81,6 @@ func (h *Handler) SetLogger(l *slog.Logger) {
 	h.log = l
 }
 
-// MarkVerified records that the installed OS phoned home (post-boot).
-func (h *Handler) MarkVerified(mac string) {
-	id, ok := h.provider.MachineIDForMAC(mac)
-	if !ok {
-		h.log.Warn("ignoring phone-home for unknown MAC", "mac", mac)
-		return
-	}
-	h.provider.RecordPhoneHome(id)
-	h.log.Info("marked machine as verified", "mac", mac, "machine_id", id)
-}
-
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mac, ok := canonicalMAC(r.URL.Query().Get("mac"))
 	if mac != "" && !ok {
@@ -245,26 +234,129 @@ exit
 // serial config (the old tty0+ttyS1 default) produced hosts whose
 // console silently didn't match their BMC's SOL port; preflight also
 // enforces the field at deploy-op creation.
-func (h *Handler) consoleParams(mac string) (string, bool) {
+//
+// The value is trimmed the way the agent trims the same field
+// (bootloader.FetchKernelParams), so a value written through the NetBox
+// API with a trailing newline means the same thing on both sides. A
+// configured value that can't ride the iPXE kernel line verbatim
+// (checkKernelParams) returns an error; the caller refuses the boot.
+func (h *Handler) consoleParams(mac string) (string, bool, error) {
 	if h.provider == nil {
-		return "", false
+		return "", false, nil
 	}
 	if m := h.provider.MachineByMAC(mac); m != nil {
 		return consoleParamsForMachine(m)
 	}
-	return "", false
+	return "", false, nil
 }
 
-func consoleParamsForMachine(m *model.MachineSnapshot) (string, bool) {
-	kp := m.KernelParams
+func consoleParamsForMachine(m *model.MachineSnapshot) (string, bool, error) {
+	kp := strings.TrimSpace(m.KernelParams)
 	switch kp {
 	case "none":
-		return "", true
+		return "", true, nil
 	case "":
-		return "", false
-	default:
-		return "console=tty0 " + kp, true
+		return "", false, nil
 	}
+	if err := checkKernelParams(kp); err != nil {
+		return "", true, fmt.Errorf("slagworks_kernel_params %q: %w", kp, err)
+	}
+	return "console=tty0 " + kp, true, nil
+}
+
+// checkKernelParams reports why a slagworks_kernel_params value can't go
+// onto the iPXE kernel line verbatim. The field is verbatim kernel cmdline,
+// so extra kernel arguments are its job, but iPXE reads the line first
+// (src/image/script.c, src/core/exec.c): a newline ends the kernel command
+// and starts another, a standalone ||, && or ; chains another command, a
+// word starting with # comments out the rest of the line (BOOTIF,
+// boot=slagworks and the op identity), and ${...} expands an iPXE setting.
+// Control and non-ASCII bytes are refused outright: iPXE and the kernel
+// disagree on which of them separate words (the kernel counts 0xa0 as a
+// space, iPXE does not).
+func checkKernelParams(kp string) error {
+	for i := 0; i < len(kp); i++ {
+		if c := kp[i]; c < ' ' || c > '~' {
+			return fmt.Errorf("byte %#02x at offset %d is not printable ASCII", c, i)
+		}
+	}
+	if strings.Contains(kp, "${") {
+		return errors.New(`"${" would make iPXE expand a setting`)
+	}
+	for _, w := range strings.Fields(kp) {
+		if w == "||" || w == "&&" || w == ";" {
+			return fmt.Errorf("the word %q would make iPXE run another command", w)
+		}
+		if strings.HasPrefix(w, "#") {
+			return fmt.Errorf("the word %q would make iPXE drop the rest of the boot line", w)
+		}
+	}
+	return nil
+}
+
+// checkKernelArgValue reports why v can't be the value of one key=value
+// argument on the iPXE kernel line. The BOOT hook and the agent read these
+// back by splitting /proc/cmdline on whitespace, so v must stay one word to
+// iPXE, the kernel and them: printable ASCII with no space, no '"' (kernel
+// quoting joins arguments), no '\' (a trailing one joins the next script
+// line onto the kernel line) and no "${" (iPXE settings expansion).
+// bmcAdminUserKernelArg meets the same standard by encoding instead.
+func checkKernelArgValue(v string) error {
+	if v == "" {
+		return errors.New("empty value")
+	}
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; c <= ' ' || c > '~' || c == '"' || c == '\\' {
+			return fmt.Errorf("byte %#02x at offset %d would split or join boot arguments", c, i)
+		}
+	}
+	if strings.Contains(v, "${") {
+		return errors.New(`"${" would make iPXE expand a setting`)
+	}
+	return nil
+}
+
+// badKernelParamsScript is served instead of any kernel boot when the
+// device-type's slagworks_kernel_params fails checkKernelParams. The value
+// is logged (err quotes it), never echoed: it is exactly what can't be
+// trusted on an iPXE line.
+func (h *Handler) badKernelParamsScript(mac string, err error) string {
+	h.log.Error("refusing boot: slagworks_kernel_params cannot ride the iPXE kernel line",
+		"mac", mac, "err", err)
+	return fmt.Sprintf(`#!ipxe
+echo slagworks: ERROR: slagworks_kernel_params for mac %s cannot ride the boot cmdline
+echo slagworks: iPXE would read part of it as a command, a comment or a setting (the site worker log says which)
+echo slagworks: fix the NetBox device-type custom field slagworks_kernel_params, then retry
+shell
+`, mac)
+}
+
+// badKernelArgScript is served instead of a deploy boot when a value the
+// deploy puts on the kernel line fails checkKernelArgValue. Only the
+// argument's key is echoed and logged, never the value: it may be the
+// tailnet auth key.
+func (h *Handler) badKernelArgScript(mac, key string, err error) string {
+	h.log.Error("refusing deploy boot: value cannot ride the iPXE kernel line as one argument",
+		"mac", mac, "arg", key, "err", err)
+	return fmt.Sprintf(`#!ipxe
+echo slagworks: ERROR: %s for mac %s cannot ride the boot cmdline as one argument
+echo slagworks: it would add boot arguments or iPXE commands (the site worker log says why)
+echo slagworks: correct the value at its source and create the deploy op again
+shell
+`, key, mac)
+}
+
+// badOpParamsScript is served instead of a deploy boot when the deploy op's
+// params do not decode. The decode error is logged, not echoed: it can quote
+// a params key and the op's params carry credentials.
+func (h *Handler) badOpParamsScript(mac, opID string, err error) string {
+	h.log.Error("refusing deploy boot: the deploy operation's params do not decode",
+		"mac", mac, "op_id", opID, "err", err)
+	return fmt.Sprintf(`#!ipxe
+echo slagworks: ERROR: deploy operation %s for mac %s has params the site worker cannot decode
+echo slagworks: the site worker log says why; abort the operation and create it again
+shell
+`, opID, mac)
 }
 
 // broadcastConsoleParams is the determination-mode console cmdline for
@@ -306,7 +398,10 @@ shell
 }
 
 func (h *Handler) kernelBootScript(mac string) string {
-	console, ok := h.consoleParams(mac)
+	console, ok, err := h.consoleParams(mac)
+	if err != nil {
+		return h.badKernelParamsScript(mac, err)
+	}
 	if !ok {
 		return h.missingConsoleScript(mac)
 	}
@@ -375,7 +470,10 @@ func (h *Handler) commissionBootScript(mac string) string {
 	if err != nil {
 		return h.identityErrorScript(err)
 	}
-	console, ok := consoleParamsForMachine(machine)
+	console, ok, err := consoleParamsForMachine(machine)
+	if err != nil {
+		return h.badKernelParamsScript(mac, err)
+	}
 	if !ok {
 		// Unset kernel_params: determination commission. Broadcast to
 		// every candidate console so the boot is visible over SOL and
@@ -411,7 +509,10 @@ func (h *Handler) deployBootScript(mac string) string {
 	if err != nil {
 		return h.identityErrorScript(err)
 	}
-	console, ok := consoleParamsForMachine(machine)
+	console, ok, err := consoleParamsForMachine(machine)
+	if err != nil {
+		return h.badKernelParamsScript(mac, err)
+	}
 	if !ok {
 		return h.missingConsoleScript(mac)
 	}
@@ -419,6 +520,19 @@ func (h *Handler) deployBootScript(mac string) string {
 	imageName := h.resolveImageName()
 	base := fmt.Sprintf("http://%s/files/images/%s", server, imageName)
 	extra := ""
+	// Free-text values ride as one key=value argument each. The first one
+	// that can't (checkKernelArgValue) refuses the boot below instead of
+	// adding kernel arguments or iPXE commands.
+	badKey, badErr := "", error(nil)
+	addArg := func(key, value string) {
+		if err := checkKernelArgValue(value); err != nil {
+			if badErr == nil {
+				badKey, badErr = key, err
+			}
+			return
+		}
+		extra += " " + key + "=" + value
+	}
 
 	machineID, opID, traceID := machine.ID.String(), op.ID.String(), ""
 	if h.provider != nil {
@@ -426,67 +540,86 @@ func (h *Handler) deployBootScript(mac string) string {
 			if op.TraceID != uuid.Nil {
 				traceID = op.TraceID.String()
 			}
-			if p, err := model.DecodeParams(op.Params); err == nil {
-				if p.Destructive {
-					extra = " slagworks.destructive"
-				}
-				if p.WipeAllDisks {
-					extra += " slagworks.wipe_all_disks"
-				}
-				if p.Recovery {
-					extra += " slagworks.recovery"
-				}
-				// fatal_at is a TEST-ONLY parameter wired through to the
-				// agent's SLAGWORKS_FATAL_AT env var. Used by the recovery
-				// sshd integration test to force a clean late-stage
-				// fatal. Not exposed via slagctl.
-				if p.FatalAt != "" {
-					extra += " slagworks.fatal_at=" + p.FatalAt
-				}
-				// efivarfs is a TEST-ONLY parameter wired through to
-				// the BOOT hook's slagworks.efivarfs= kernel
-				// cmdline knob. The qemutest matrix uses
-				// efivarfs=skip to repro the pop1 ship-blocker
-				// (efivarfs not mounted -> efibootmgr -c fails ->
-				// agent FATALs in the new behavior, silent-Warned
-				// in the old). Production deploys leave this unset.
-				//
-				// This (and fatal_at above) is not yet gated on
-				// SLAGWORKS_TEST=1, so a stray test-fixture op.Params
-				// in production could re-introduce the pop1 bug.
-				// Deferred until before pop1 takes real traffic.
-				if p.Efivarfs != "" {
-					extra += fmt.Sprintf(" slagworks.efivarfs=%s", p.Efivarfs)
-				}
-				// data_marker is a TEST-ONLY parameter wired to the
-				// agent's slagworks.data_marker= cmdline token. The
-				// preserve-data qemu test uses it to drop a first-boot
-				// unit that writes+echoes /data/PRESERVE_MARKER, proving
-				// a preserved array survives a redeploy. Production
-				// deploys leave this unset (same gating concern
-				// as fatal_at/efivarfs).
-				if p.DataMarker != "" {
-					extra += " slagworks.data_marker=" + p.DataMarker
-				}
-				// Tailscale deploy-time enrollment (plan
-				// 2026-06-21-tailscale-enrollment-at-deploy). The auth
-				// key + hostname ride the kernel cmdline; the agent reads
-				// them from /proc/cmdline (visible in its chroot) and
-				// enrolls before reboot. Absent block => no tokens => the
-				// agent skips enrollment. The key is single-use and
-				// auto-expiring; cmdline exposure on the box we're imaging
-				// is out of the threat model (see the plan). Both tokens
-				// are emitted only when the auth key is present so a
-				// half-populated block can't produce a hostname-only
-				// cmdline the agent would misread.
-				if ts := p.TailscaleRuntime; ts != nil && ts.AuthKey != "" {
-					extra += " slagworks.tailscale_authkey=" + ts.AuthKey
+			// Params the decoder refuses (a null transport block, a credential
+			// key in another letter case, a type error) refuse the boot: serving
+			// the installer without them would drop recovery, the tailnet
+			// enrollment and every other params-derived argument, and the
+			// executor fails such an op anyway once it is claimed.
+			p, err := model.DecodeParams(op.Params)
+			if err != nil {
+				return h.badOpParamsScript(mac, opID, err)
+			}
+			if p.Destructive {
+				extra = " slagworks.destructive"
+			}
+			if p.WipeAllDisks {
+				extra += " slagworks.wipe_all_disks"
+			}
+			if p.Recovery {
+				extra += " slagworks.recovery"
+			}
+			// fatal_at is a TEST-ONLY parameter wired through to the
+			// agent's SLAGWORKS_FATAL_AT env var. Used by the recovery
+			// sshd integration test to force a clean late-stage
+			// fatal. Not exposed via slagctl.
+			if p.FatalAt != "" {
+				addArg("slagworks.fatal_at", p.FatalAt)
+			}
+			// efivarfs is a TEST-ONLY parameter wired through to
+			// the BOOT hook's slagworks.efivarfs= kernel
+			// cmdline knob. The qemutest matrix uses
+			// efivarfs=skip to repro a past ship-blocker
+			// (efivarfs not mounted -> efibootmgr -c fails ->
+			// agent FATALs in the new behavior, silent-Warned
+			// in the old). Production deploys leave this unset.
+			//
+			// This (and fatal_at above) is not yet gated on
+			// SLAGWORKS_TEST=1, so a stray test-fixture op.Params
+			// in production could re-introduce that bug.
+			if p.Efivarfs != "" {
+				addArg("slagworks.efivarfs", p.Efivarfs)
+			}
+			// data_marker is a TEST-ONLY parameter wired to the
+			// agent's slagworks.data_marker= cmdline token. The
+			// preserve-data qemu test uses it to drop a first-boot
+			// unit that writes+echoes /data/PRESERVE_MARKER, proving
+			// a preserved array survives a redeploy. Production
+			// deploys leave this unset (same gating concern
+			// as fatal_at/efivarfs).
+			if p.DataMarker != "" {
+				addArg("slagworks.data_marker", p.DataMarker)
+			}
+			// Tailscale deploy-time enrollment (plan
+			// 2026-06-21-tailscale-enrollment-at-deploy). The auth
+			// key + hostname ride the kernel cmdline; the agent reads
+			// them from /proc/cmdline (visible in its chroot) and
+			// enrolls before reboot. Absent block => no tokens => the
+			// agent skips enrollment. The key is single-use and
+			// auto-expiring; cmdline exposure on the box we're imaging
+			// is out of the threat model (see the plan). Both tokens
+			// are emitted only when the auth key is present so a
+			// half-populated block can't produce a hostname-only
+			// cmdline the agent would misread.
+			//
+			// The hostname derives from the NetBox device name, which
+			// is free text. A hostname that isn't valid drops both
+			// tokens (the agent skips enrollment) rather than refusing
+			// the deploy: global declines to mint for such a name, so
+			// this only covers an op written some other way. A valid
+			// hostname and the key still go through addArg like the
+			// rest, so no value can split the line.
+			if ts := p.TailscaleRuntime; ts != nil && ts.AuthKey != "" {
+				if ts.Hostname != "" && !model.ValidHostname(ts.Hostname) {
+					h.log.Warn("tailscale enrollment skipped: the op's tailnet hostname is not a valid hostname",
+						"machine_id", machineID, "op_id", opID, "hostname", ts.Hostname)
+				} else {
+					addArg("slagworks.tailscale_authkey", ts.AuthKey)
 					if ts.Hostname != "" {
-						extra += " slagworks.tailscale_hostname=" + ts.Hostname
+						addArg("slagworks.tailscale_hostname", ts.Hostname)
 					}
 				}
-				extra += bmcAdminUserKernelArg(machine, p)
 			}
+			extra += bmcAdminUserKernelArg(machine, p)
 		}
 
 		// Append system UUID for the identity check — agent refuses to
@@ -494,8 +627,12 @@ func (h *Handler) deployBootScript(mac string) string {
 		// commissioned; the check below refuses to serve a boot
 		// script in that case.
 		if machine.SystemUUID != "" {
-			extra += fmt.Sprintf(" slagworks.expect-uuid=%s", machine.SystemUUID)
+			addArg("slagworks.expect-uuid", machine.SystemUUID)
 		}
+	}
+
+	if badErr != nil {
+		return h.badKernelArgScript(mac, badKey, badErr)
 	}
 
 	// If we have a deploy operation but no expected UUID, refuse to serve a boot script
@@ -766,8 +903,17 @@ func (s *Server) SetLogger(l *slog.Logger) {
 // pushes each envelope into the configured Sink (typically the site
 // worker's logring). Fire-and-forget on the agent side: 2xx on
 // successful ingest, 503 if the sink isn't wired, 400 on malformed
-// body. Validation is intentionally minimal — the OOB-net trust
-// boundary makes auth out of scope for v0 (see plan).
+// body or on any envelope whose source is not agent.
+//
+// The endpoint is unauthenticated (auth is out of scope for v0), so any
+// host on a served segment can POST here. Its only legitimate producer
+// is slagworks-agent, which stamps source=agent on every envelope.
+// Source is the field downstream consumers trust: global and site
+// envelopes carry op lifecycle and phase events, and the deploy watch
+// treats a source=global status envelope as the operation's terminal
+// signal. A batch with any other source is refused whole, before
+// anything is pushed, so a forged line cannot ride along with real
+// ones. machine_id and op_id stay producer-claimed and unverified.
 func (s *Server) handleLogsIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -786,6 +932,13 @@ func (s *Server) handleLogsIngest(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(body, &msg); err != nil {
 		http.Error(w, "decode body: "+err.Error(), http.StatusBadRequest)
 		return
+	}
+	for i, env := range msg.Envelopes {
+		if env.Source != slogkit.SourceAgent {
+			http.Error(w, fmt.Sprintf("envelope %d has source %q: /logs/ingest accepts only source=%q envelopes from slagworks-agent; nothing in this batch was ingested",
+				i, env.Source, slogkit.SourceAgent), http.StatusBadRequest)
+			return
+		}
 	}
 	now := time.Now().UTC()
 	for _, env := range msg.Envelopes {
@@ -897,9 +1050,8 @@ func (s *Server) handleStorageScript(w http.ResponseWriter, machineID string) {
 }
 
 func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
-	if err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+	body, ok := readObservationBody(w, r, "inventory")
+	if !ok {
 		return
 	}
 	if len(body) == 0 || !json.Valid(body) {
@@ -934,6 +1086,55 @@ func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("inventory report queued in outbox", "machine_id", machineID)
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, `{"status":"accepted"}`)
+}
+
+// reportRejectionStatus picks the status for a report the provider refused.
+// 410 Gone is the final answer: the report's operation is over (aborted,
+// failed, timed out or completed), and the agent stops on it instead of
+// carrying on with an install nobody is waiting for. Every other rejection
+// is 409 Conflict, which the agent treats as it always has: a best-effort
+// report is dropped and a final report is retried. The two must not be
+// merged, because 409 also covers a worker that restarted and has not
+// resynchronized its operations yet, where the operation may be healthy.
+func reportRejectionStatus(err error) int {
+	if errors.Is(err, model.ErrOperationNotActive) {
+		return http.StatusGone
+	}
+	return http.StatusConflict
+}
+
+// readObservationBody reads the whole body of a request whose JSON the
+// worker queues for global inside an observation: all of it for
+// /api/v1/inventory, its commission_data for /api/v1/report (measuring the
+// whole body bounds the part inside it). It answers 413 and returns false
+// when the body, as the worker will encode it, is over
+// ws.MaxObservationDataBytes. The size is measured after encoding because
+// json.Marshal escapes '<', '>' and '&' as six-byte sequences, so a body
+// under the cap can grow past it, and past the message limit global reads
+// (ws.MaxMessageBytes). Accepting such a body would answer 200 for a
+// report that the drain then drops. The cap also bounds what one
+// unauthenticated request can make the worker hold in memory and write to
+// its outbox: /api/v1/report had no limit of its own.
+func readObservationBody(w http.ResponseWriter, r *http.Request, what string) ([]byte, bool) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, ws.MaxObservationDataBytes))
+	var mbe *http.MaxBytesError
+	tooLarge := errors.As(err, &mbe)
+	if err != nil && !tooLarge {
+		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return nil, false
+	}
+	if !tooLarge {
+		// Invalid JSON fails to encode; the caller rejects it with 400.
+		encoded, err := json.Marshal(json.RawMessage(body))
+		tooLarge = err == nil && len(encoded) > ws.MaxObservationDataBytes
+	}
+	if tooLarge {
+		http.Error(w, fmt.Sprintf("%s body is over the %d-byte limit the site worker can forward to global "+
+			"(measured after JSON escaping); send a smaller report", what, ws.MaxObservationDataBytes),
+			http.StatusRequestEntityTooLarge)
+		return nil, false
+	}
+	return body, true
 }
 
 func (s *Server) buildMux() *http.ServeMux {
@@ -979,8 +1180,12 @@ func (s *Server) buildMux() *http.ServeMux {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		body, ok := readObservationBody(w, r, "report")
+		if !ok {
+			return
+		}
 		var report model.ProgressReport
-		if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+		if err := json.Unmarshal(body, &report); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
@@ -996,7 +1201,7 @@ func (s *Server) buildMux() *http.ServeMux {
 			handler.log.Warn("rejecting unbound agent report",
 				"machine_id", report.MachineID, "op_id", report.OperationID,
 				"event", report.Event, "err", err)
-			http.Error(w, err.Error(), http.StatusConflict)
+			http.Error(w, err.Error(), reportRejectionStatus(err))
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -1037,18 +1242,6 @@ func (s *Server) buildMux() *http.ServeMux {
 			return
 		}
 		s.handleInventory(w, r)
-	})
-
-	mux.HandleFunc("/api/v1/phone-home", func(w http.ResponseWriter, r *http.Request) {
-		if !requirePOST(w, r) {
-			return
-		}
-		mac, ok := requireMAC(w, r)
-		if !ok {
-			return
-		}
-		handler.MarkVerified(mac)
-		w.WriteHeader(http.StatusOK)
 	})
 
 	// GET /boot/storage-script?mac={mac} — returns the pre-chosen

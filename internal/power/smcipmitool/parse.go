@@ -27,8 +27,17 @@ func ParsePowerStatus(out string) (PowerState, error) {
 	case strings.Contains(s, "power is currently off"):
 		return PowerOff, nil
 	default:
-		return PowerUnknown, fmt.Errorf("smcipmitool: unrecognized power status output: %q", strings.TrimSpace(out))
+		return PowerUnknown, unrecognizedPowerStatus(out)
 	}
+}
+
+// unrecognizedPowerStatus is ParsePowerStatus's error for output it does not
+// recognize. It trims the output and quotes it with %q so the operator sees
+// what the tool printed. Both steps can change a password echoed in the
+// output, so Runner.PowerStatus builds this error from scrubbed output
+// rather than scrubbing the finished message.
+func unrecognizedPowerStatus(out string) error {
+	return fmt.Errorf("smcipmitool: unrecognized power status output: %q", strings.TrimSpace(out))
 }
 
 // productSerialLabel is the exact field label the tool emits for the

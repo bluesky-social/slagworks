@@ -70,7 +70,9 @@ type Config struct {
 
 	// ReserveIP, when non-nil, returns a static IP reservation for the given MAC.
 	// Called before dynamic pool allocation. If it returns a non-nil IP, that IP
-	// is used regardless of whether it falls within the dynamic pool range.
+	// is used regardless of whether it falls within the dynamic pool range. A
+	// live lease another MAC holds on that IP is revoked when the reservation
+	// is granted; that MAC is NAKed at its next renew.
 	ReserveIP func(mac string) net.IP
 
 	// LeaseStore, when non-nil, provides lease persistence across restarts.
@@ -119,9 +121,9 @@ type Config struct {
 
 	// OnLeaseEvent, when non-nil, is called SYNCHRONOUSLY — in lease-
 	// mutation order, under h.mu — from every lease-table mutation site
-	// (allocate, renew, delete on expiry sweep or DECLINE). This is
-	// deliberately NOT the OnACK pattern (`go callback()`) and NOT a
-	// drop-on-full channel: the ledger this feeds (see
+	// (allocate, renew, delete: expiry sweep, DECLINE, or reservation
+	// revoke). This is deliberately NOT the OnACK pattern (`go callback()`)
+	// and NOT a drop-on-full channel: the ledger this feeds (see
 	// docs/plans/2026-07-13-dhcp-lease-visibility.md Phase 3) folds
 	// events in order, and a dropped allocate/delete is a hole in the
 	// product's core deliverable (lease history), not a cosmetic gap.
@@ -142,8 +144,11 @@ type Config struct {
 // lease is written for the first time, or moves to a different IP —
 // including adopt-in-place), "renew" (a MAC's existing lease on the
 // SAME IP is extended), or "delete" (an expired entry is purged by
-// the sweep in allocateIP, or a client DECLINEs its leased address —
-// see handleDecline). Pool is the same subnet-CIDR label
+// the sweep in allocateIP, a client DECLINEs its leased address — see
+// handleDecline — or another MAC's live lease is revoked because its
+// address is being granted as a reservation; the revoke's "delete"
+// precedes the reservation holder's "allocate"). Pool is the
+// same subnet-CIDR label
 // poolLabelForIP produces for the dhcp_leases RPC (Leases) — computed
 // here, under h.mu, rather than by the worker-side callback: the
 // callback runs INSIDE the same critical section (see OnLeaseEvent),
@@ -1315,8 +1320,11 @@ func (h *Handler) allocateIP(mac net.HardwareAddr, reserved net.IP, p *pool, arp
 	now := time.Now()
 
 	// Static reservation (already filtered to p's subnet by reservationFor)
-	// takes precedence over the dynamic pool.
+	// takes precedence over the dynamic pool, and over another MAC's live
+	// lease on the same address: that lease is revoked first, so the table
+	// never holds two leases on one address.
 	if reserved != nil {
+		h.revokeOtherLeases(macStr, reserved, now)
 		h.setLease(macStr, mac, reserved, now.Add(leaseDur))
 		return reserved
 	}
@@ -1434,6 +1442,31 @@ func (h *Handler) setLease(macStr string, mac net.HardwareAddr, ip net.IP, expir
 	h.leases[macStr] = &lease{MAC: mac, IP: ip, Expiry: expiry}
 	h.persistLease(mac, ip, expiry)
 	h.emitLeaseEvent(event, mac, ip, expiry)
+}
+
+// revokeOtherLeases drops every unexpired lease on ip held by a MAC other
+// than macStr. allocateIP's reservation branch calls it before granting a
+// reservation, which keeps the table at one holder per address when the
+// reservation was handed to a new MAC while the old holder's lease was live,
+// or when it lies inside the dynamic range and a dynamic client drew it
+// first. The revoked MAC holds no lease any more, so classifyRequest NAKs its
+// next REQUEST for the address (the MAC's own reservation differs, or the
+// address is outside the dynamic range or leased to the reservation holder)
+// and it re-DISCOVERs. Until then it keeps using the
+// address on the wire; this keeps the lease table honest, it does not clear
+// the wire. If two MACs are both reserved the same address (a data error),
+// each grant revokes the other and the warning repeats on every renew.
+// Caller must hold h.mu.
+func (h *Handler) revokeOtherLeases(macStr string, ip net.IP, now time.Time) {
+	for other, l := range h.leases {
+		if other == macStr || !l.IP.Equal(ip) || !now.Before(l.Expiry) {
+			continue
+		}
+		h.log.Warn("revoking another MAC's live lease on a reserved address; that MAC is NAKed at its next renew. "+
+			"If the address is inside the dynamic pool, move the reservation or the pool so they no longer overlap",
+			"ip", ip.String(), "reserved_for", macStr, "revoked_from", other)
+		h.deleteLease(other, l)
+	}
 }
 
 // deleteLease removes macStr's lease l from the in-memory map and the

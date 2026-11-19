@@ -126,6 +126,35 @@ func TestLogPane_Format(t *testing.T) {
 	goldenScreen(t, "logpane_format", strings.Join(lines, "\n"))
 }
 
+// TestLogPane_EscapesTerminalControls: every string on an envelope is text the
+// sending host chose (agent envelopes arrive through the site's
+// unauthenticated /logs/ingest). The formatted line must carry escape
+// sequences as visible text and fold line breaks to the visible marker, one
+// envelope per row, so they cannot repaint the frame, plant a hyperlink or
+// forge a log row.
+func TestLogPane_EscapesTerminalControls(t *testing.T) {
+	p := newLogPane(time.UTC)
+	e := env(slogkit.Source("agent\x1b[2J"), 0, "ok\x1b]8;;http://evil.example/\x07click\x1b]8;;\x07\nforged row")
+	e.Phase = "partitioning\x1b[1A"
+	p.Append(1, e)
+	ex := env(slogkit.SourceAgent, time.Second, "exec")
+	ex.Extra = map[string]any{"argv": "sgdisk \x1b_apc\x1b\\", "err": "boom\r\u009d52;c;cHduZWQ=\u009c"}
+	p.Append(2, ex)
+
+	for _, line := range p.Lines() {
+		assertNoTerminalControls(t, line)
+		if strings.Contains(line, "\n") {
+			t.Errorf("one envelope rendered as several rows: %q", line)
+		}
+	}
+	lines := strings.Join(p.Lines(), "\n")
+	for _, want := range []string{`ok\x1b]8;;http://evil.example/\x07click`, `click\x1b]8;;\x07 ⏎ forged row`, `phase=partitioning\x1b[1A`, `sgdisk \x1b_apc\x1b\`, `boom ⏎ \u009d52`} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("log pane missing the escaped text %q:\n%s", want, lines)
+		}
+	}
+}
+
 // TestLogPane_PhaseSurvivesExec is the regression for the exec-overwrites-phase
 // bug: an agent exec envelope that ALSO carries a phase field must keep the
 // phase prefix, not have it clobbered by the argv expansion. The mockup shows
@@ -147,6 +176,34 @@ func TestLogPane_PhaseSurvivesExec(t *testing.T) {
 	// Order: phase prefix precedes the exec body.
 	if strings.Index(line, "phase=") > strings.Index(line, "exec:") {
 		t.Errorf("phase should precede exec body: %q", line)
+	}
+}
+
+// TestLogPane_FormatFoldsLineBreaks pins the single-row contract of format: a
+// line break inside the message (LF, CRLF, or a bare CR) becomes a visible
+// " ⏎ " so the whole entry stays on one row, and a trailing one is dropped.
+// The frame-level effect is guarded by TestFrame_LogLineBreaksKeepFrameShape.
+func TestLogPane_FormatFoldsLineBreaks(t *testing.T) {
+	p := newLogPane(time.UTC)
+	for _, tc := range []struct{ msg, want string }{
+		{"a\nb", "10:14:00 [agent ] a ⏎ b"},
+		{"a\r\nb", "10:14:00 [agent ] a ⏎ b"},
+		{"  5%\r100%", "10:14:00 [agent ]   5% ⏎ 100%"},
+		{"a\n\nb", "10:14:00 [agent ] a ⏎  ⏎ b"},
+		{"done\n", "10:14:00 [agent ] done"},
+		{"done\r\n", "10:14:00 [agent ] done"},
+	} {
+		if got := p.format(env(slogkit.SourceAgent, 0, tc.msg)); got != tc.want {
+			t.Errorf("format(%q) = %q, want %q", tc.msg, got, tc.want)
+		}
+	}
+
+	// The exec expansion builds the body from Extra; its fields fold too.
+	ex := env(slogkit.SourceAgent, 0, "exec")
+	ex.Extra = map[string]any{"argv": "mdadm --stop /dev/md0", "exit_code": float64(1), "err": "exit status 1\nmdadm: busy"}
+	want := "10:14:00 [agent ] exec: mdadm --stop /dev/md0 → exit 1 err=exit status 1 ⏎ mdadm: busy"
+	if got := p.format(ex); got != want {
+		t.Errorf("format(exec) = %q, want %q", got, want)
 	}
 }
 

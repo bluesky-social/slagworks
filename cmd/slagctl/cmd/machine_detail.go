@@ -58,7 +58,9 @@ func printMachineDetail(w io.Writer, m *model.Machine) error {
 // commission_data JSON. Silently no-ops when the JSON is unparseable or
 // missing the `steps` field — older commissions persisted before
 // the steps array existed don't have it, and a malformed blob is the agent's bug to
-// surface elsewhere, not the operator's view to crash on.
+// surface elsewhere, not the operator's view to crash on. commission_data is
+// the commissioning target's own report, so every string from it goes through
+// format.Untrusted.
 func printCommissionSteps(w io.Writer, raw json.RawMessage) {
 	var wrapper struct {
 		Steps []commissionStepView `json:"steps"`
@@ -78,10 +80,10 @@ func printCommissionSteps(w io.Writer, raw json.RawMessage) {
 			detail = s.Warning
 		}
 		rows[i] = []string{
-			s.Name,
+			format.Untrusted(s.Name),
 			renderStepStatus(s.Status),
 			strconv.FormatInt(s.DurationMs, 10) + "ms",
-			detail,
+			format.Untrusted(detail),
 		}
 	}
 	format.PrintTable(w, []string{"STEP", "STATUS", "DURATION", "DETAIL"}, rows)
@@ -96,6 +98,6 @@ func renderStepStatus(status string) string {
 	case "failed":
 		return format.StateFailed.Render(format.IconFailed + " failed")
 	default:
-		return status
+		return format.Untrusted(status)
 	}
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/bluesky-social/slagworks/cmd/slagctl/tui"
 	"github.com/bluesky-social/slagworks/internal/model"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 )
 
@@ -166,7 +167,7 @@ func TestFormatTerminalOpReport(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := formatTerminalOpReport(tc.op, tc.machine)
 			// Strip ANSI for plain-string checks.
-			plain := stripANSISimple(got)
+			plain := ansi.Strip(got)
 			for _, w := range tc.want {
 				if !strings.Contains(plain, w) {
 					t.Errorf("report missing %q:\n%s", w, plain)
@@ -179,28 +180,4 @@ func TestFormatTerminalOpReport(t *testing.T) {
 			}
 		})
 	}
-}
-
-// stripANSISimple removes ANSI escape sequences for plain-text comparisons
-// in tests. It mirrors format.StripANSI without importing that package from
-// an internal test file (which is already in the same binary — fine, but
-// this avoids a cross-package reference in tests that don't otherwise need
-// the format package).
-func stripANSISimple(s string) string {
-	var out strings.Builder
-	inEsc := false
-	for _, r := range s {
-		if r == '\033' {
-			inEsc = true
-			continue
-		}
-		if inEsc {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inEsc = false
-			}
-			continue
-		}
-		out.WriteRune(r)
-	}
-	return out.String()
 }

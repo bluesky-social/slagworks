@@ -68,7 +68,13 @@ a machine ever gets booted:
   allocation (`internal/dhcp/handler.go:944`). A pool with a nil
   `RangeStart` (reservations-only segment) still serves the full reservation
   set; a non-reserved MAC on such a segment gets no offer, which is what
-  lets a slice-owning peer answer in an active/active split-pool cage.
+  lets a slice-owning peer answer in an active/active split-pool cage. A
+  reservation also wins over another MAC's live lease on the same address
+  (the address moved to a new MAC in NetBox, or the reservation sits inside
+  the dynamic pool and a dynamic client drew it first): the handler revokes
+  that lease with a warning, and the other MAC is NAKed at its next renew
+  and re-DISCOVERs onto a different address. Until that renew, both devices
+  answer for the address on the wire.
 - **Address conflicts (DHCPDECLINE).** A client that checks its new address
   for duplicates before using it (dhcpcd in the initrd, for instance) sends a
   DECLINE when another host already answers for it, then starts over at
@@ -188,7 +194,21 @@ policy lives. `Handler.ServeHTTP`
   (`destructive`, `wipe_all_disks`, `recovery`, `tailscale_authkey`, etc.).
   If the machine has never been commissioned (no `SystemUUID`), the
   handler refuses to serve a deploy script and returns an iPXE `shell`
-  drop instead (`handler.go:441-444`).
+  drop instead (`handler.go:441-444`). It also refuses a deploy whose
+  operation params it cannot decode, rather than booting the installer
+  without them (which would drop `recovery` and every other
+  params-derived argument). It refuses the same way when a
+  value it would put on the kernel line as one `key=value` argument (the
+  tailnet auth key, the system UUID, the test-only knobs) contains a
+  space, a control or non-ASCII byte, `"`, `\` or `${`, any of which
+  would add kernel arguments or iPXE commands; the error names the
+  argument, and the site worker log says why. A tailnet hostname that is
+  not a valid hostname is not refused: the handler leaves out both
+  tailnet arguments and the deploy goes ahead without tailnet enrollment
+  (global does not mint a key for such a name in the first place).
+  Every kernel boot (deploy, commission, kernel-only) likewise refuses a
+  `slagworks_kernel_params` value iPXE would read as more than kernel
+  arguments (see `hardware/adding-new-hardware.md`).
 Each generated script sets `BOOTIF=01-${net0/mac:hexhyp}` and `ip=dhcp` so
 stock Ubuntu `/init` (via `configure_networking`) knows which NIC iPXE
 chainloaded on and will DHCP on the correct port. `boot=slagworks` is the
@@ -282,7 +302,11 @@ what stock `/init` calls; the slagworks version does exactly this:
    under normal deploy — the agent reboots on success.
 9. On agent success (`rc==0`) the hook runs `reboot -f`. On failure it
    POSTs a `phase=agent_crashed` envelope to `/api/v1/report` and drops
-   into recovery.
+   into recovery. Exit status 3 means the agent stopped because the
+   site worker told it the operation is over (an operator abort, a
+   timeout, a failure reported elsewhere); the envelope is refused for
+   the same reason and the host waits in recovery like any other
+   failure.
 
 The recovery path (`slagworks_recovery_drop`) is worth knowing: on any
 FATAL — no lease, squashfs download failure, agent nonzero exit,
@@ -347,7 +371,8 @@ What the agent actually does, in order:
     ESP, write a systemd-boot entry pointing at
     `/slagworks/vmlinuz` and `/slagworks/initrd.img`, then
     `efibootmgr -c` to register the boot entry. A missing ESP mount is a
-    hard fail.
+    hard fail. The entry is only registered here; BootNext is set at
+    the very end (below).
   - **Legacy BIOS**: `installGRUBBIOS` — install GRUB i386-pc onto each
     disk with a `bios_grub` (EF02) partition. No BIOS-grub partition on
     any disk is a hard fail — we refuse to leave the host unbootable.
@@ -364,7 +389,8 @@ What the agent actually does, in order:
     `/slagworks/initrd.img` with it. The installed system then assembles
     those arrays and no others (see `docs/user/storage-scripts.md`). Any
     failure here is a hard fail.
-- `finalizing`: write `/etc/fstab`, seed cloud-init, apply the network
+- `finalizing`: write `/etc/fstab`, seed cloud-init (it leaves the
+  network, hostname, locale and partition sizes alone), apply the network
   config script (with NetBox facts injected), write the hostname, disable
   first-boot apt timers, write operator SSH keys, enroll on tailscale (if
   an auth key rode the cmdline), and write the
@@ -380,6 +406,13 @@ What the agent actually does, in order:
   hardware that refuses password rotation via ipmitool.
 - Report `deploy_complete` (carries `awaiting_phone_home` on the event
   and the rotated BMC credentials in the payload — one round trip).
+- UEFI only: set BootNext to the registered boot entry
+  (`efibootmgr -n`), so the reboot that follows goes to the installed
+  disk. This happens only after the site worker has accepted
+  `deploy_complete`. Firmware honors BootNext ahead of the BMC's PXE
+  override, so a deploy that is aborted or fails earlier must not leave
+  it set: the next deploy's power cycle would boot the abandoned
+  install instead of PXE.
 - Reboot.
 
 `slagworks.no_reboot` on the cmdline holds the host in the initrd instead
@@ -387,11 +420,12 @@ of rebooting, for ad-hoc debugging without losing `/target`.
 
 ## Stage 7: post-deploy boot, phone home
 
-After the reboot, the machine PXE-broadcasts again. The MAC's op is now
-`deploying, phase=awaiting_phone_home` — the site worker maps this to
-`BootLocal`, and the HTTP handler emits the platform-appropriate local-boot
-script (BIOS `exit`, UEFI `sanboot` over drives `0x80`-`0x9f`). The
-firmware boots the freshly installed OS off disk.
+After the reboot, a UEFI host whose firmware honors BootNext boots the
+installed disk directly. Any other host PXE-broadcasts again. The MAC's
+op is now `deploying, phase=awaiting_phone_home` — the site worker maps
+this to `BootLocal`, and the HTTP handler emits the platform-appropriate
+local-boot script (BIOS `exit`, UEFI `sanboot` over drives
+`0x80`-`0x9f`). The firmware boots the freshly installed OS off disk.
 
 The generated `slagworks-phone-home.service`
 (`internal/agent/target/target.go` `GeneratePhoneHomeUnit`) fires after

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
+	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/ws"
 )
@@ -115,12 +117,19 @@ func TestWatchTUIStreams_SendBearerHeader(t *testing.T) {
 
 func TestOperationWatchPlain_SendsBearerHeader(t *testing.T) {
 	seen := stubStreamServer(t, readOne)
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close() //nolint:errcheck
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	es, err := NewEventStream(ctx, apiURL, apiToken, uuid.NewString(), uuid.NewString(), 0)
-	if err != nil {
-		t.Fatalf("NewEventStream: %v", err)
-	}
-	_ = es.Close()
-	assertBearerNotInURL(t, seen, "/api/v1/ws/events")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = watchPlain(ctx, model.Operation{ID: uuid.New(), MachineID: uuid.New()}, devNull, time.Hour)
+	}()
+	assertBearerNotInURL(t, seen, "/api/v1/logs/stream")
+	cancel()
+	<-done // watchPlain reads apiURL; let it stop before cleanup restores it
 }

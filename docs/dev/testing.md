@@ -123,6 +123,28 @@ Key rules and shapes:
   everything in `ip netns pids <ns>` and then deletes the namespace.
   In CI every shard runs on a fresh machine, so nothing can leak from
   one run into the next.
+- **NIC firmware.** BIOS VMs network-boot through QEMU's default iPXE
+  option ROM (`pxe-virtio.rom` from `ipxe-qemu`). UEFI VMs load no
+  option ROM: OVMF's own virtio-net driver sits under OVMF's PXE stack
+  and under the chainloaded `snponly.efi`, as a board's firmware driver
+  does on real hardware. QEMU's default UEFI ROM (`efi-virtio.rom`, an
+  iPXE build from 2022 on Ubuntu 24.04) corrupts its heap during a large
+  download when the host cannot run the QEMU I/O thread and the vCPU at
+  the same time; a UEFI test then timed out with the serial console
+  ending at `.../initrd...`, sometimes after an `X64 Exception` dump
+  naming `virtio-net.efidrv`. `TestUEFINetbootOnOneHostCPU` holds a VM
+  to one host CPU to reproduce that starvation.
+- **Firmware boot order.** `VMConfig.NetworkBootFirst` pins the boot
+  order with QEMU `bootindex` properties (primary NIC first, primary
+  disk second) instead of `-boot order=`. OVMF then network-boots on
+  every reset, including after an install has registered its own boot
+  entry, and still honors a one-shot BootNext ahead of that. It models a
+  host whose next boot is PXE unless BootNext says otherwise, which a
+  redeploy in place needs. `TestAbortThenRedeployReachesPXE` uses it
+  with the executor driving a `FakeBMC` and with
+  `FakeHub.FailOperation`, which publishes the `op_removed` an operator
+  abort does: deploy A is aborted after its bootloader step, deploy B
+  must reach PXE.
 - **BMC simulation.** `bmcsim.go` runs OpenIPMI's `ipmi_sim` outside
   the VM and wires it to QEMU's `ipmi-bmc-extern` + `isa-ipmi-kcs`
   so the guest sees a real `/dev/ipmi0`. Out-of-process (not the

@@ -291,7 +291,9 @@ There are two things called "claim" in the code base.
 NetBox device. This is location-subtree membership, not an
 operation claim. It is used by the NetBox webhook and by the
 reconciler to decide which site's snapshot needs invalidation on a
-device event.
+device event. It answers for the device as it is now, so when a webhook
+shows the device's site or location changed, the config it left is
+covered by invalidating every site config (`mirror.OnDeviceMoved`).
 
 ### Operation claim (the state-machine claim)
 
@@ -301,6 +303,11 @@ advances the machine to the corresponding running state. It is
 invoked by the site worker's WebSocket RPC (`ws/messages.go:197`
 `ClaimOpMsg`; hub side `ws/hub.go:962` `handleClaimOp`; client side
 `internal/worker/wsconn.go:200` `ClaimOp`).
+
+Before the store call, the hub reads the op and declines the claim
+(answering `already_claimed`, writing nothing) when the op's machine is not
+in the claiming worker's site, or when the PDU-outlet self-power interlock
+refuses this worker. See [Op transport](#op-transport-the-op-event-stream-tier-2-phase-2).
 
 The store implementation:
 
@@ -466,10 +473,18 @@ Confidentiality scoping: `Operation.Params` carries per-site credentials
 (BMC/PDU passwords, tailnet auth keys), so `op_delta` and `op_resync` are
 slug-scoped — the hub sends them only to workers whose cached per-slug
 snapshot contains the op's machine (`Hub.machineInSlug`), preserving the
-pre-cutover baseline where ops rode the per-slug snapshot. `op_removed`
-fans fleet-wide, unfiltered: it carries no params (no secrets) and must
-survive membership loss (a machine deleted from NetBox is in no snapshot,
-but its drift-failed op must still be dropped on the worker driving it).
+pre-cutover baseline where ops rode the per-slug snapshot. The claim reply
+carries the op too, so `handleClaimOp` applies the same check before the
+claim CAS: a `claim_op` for an op whose machine is not in the worker's
+snapshot is answered `already_claimed` and the op stays pending. That
+cache is only as current as the slug's last push, so a device that moves
+out of a config's scope must get that config rebuilt too: the NetBox
+webhook invalidates every site config when a device's site or location
+changes (`mirror.OnDeviceMoved`), and the reconcile tick is the backstop.
+`op_removed` fans fleet-wide, unfiltered: it carries no params (no
+secrets) and must survive membership loss (a machine deleted from NetBox
+is in no snapshot, but its drift-failed op must still be dropped on the
+worker driving it).
 
 ### Credentials in operations
 
@@ -485,7 +500,10 @@ mechanisms below derive from (`model.SecretParamPaths`), and
 field (password/secret/key/token) anywhere under `OpParams` that lacks it.
 
 - **Workers get the real values.** The op stream (`op_delta`, `op_resync`,
-  the claim reply) carries params unredacted, scoped by slug as above.
+  the claim reply) carries params unredacted, scoped by slug as above. A
+  site-worker token is therefore credential-equivalent, so minting one
+  (`POST /site-workers`) takes the same optional credential-group check
+  as `GET /devices/:ident/creds` (`SLAGWORKS_OIDC_CREDENTIAL_GROUPS`).
 - **Operators never do.** The API server's echo JSON serializer
   (`internal/api/op_redaction.go`) is the one choke point for operator
   responses: every `Operation` it encodes (op-create responses from
@@ -504,6 +522,13 @@ field (password/secret/key/token) anywhere under `OpParams` that lacks it.
   for at most one minute while global is up, or until global's next start
   if it is down. Nothing reads credentials from a terminal op: a retry is
   a new op that resolves credentials afresh.
+
+Both mechanisms find a credential by its exact key, while `encoding/json`
+matches a key to a field ignoring letter case. So `model.DecodeParams`
+refuses params that spell a key on a credential path, or a transport key
+(`pdu_runtime`, `amt_runtime`), in any other case: the worker fails such an
+op rather than use a credential that operators would see and the table
+would keep.
 
 Residual exposure: an active op holds its credentials in the
 `operations` table (and in each worker's op layer and `worker.db`) for as
@@ -543,8 +568,15 @@ worker, the executor's pending-op wake fires (or its 5s backstop tick),
 
 - `verifyChassisSerial` gate (guards against acting on the wrong
   physical host).
-- `BootManager.SetBootOverride(pxe)` on Supermicro, `SetBootDevice`
-  via IPMI on other vendors, so the next boot lands on PXE.
+- `Controller.SetBootDevice(pxe)`, so the next boot lands on PXE: a
+  one-time UEFI PXE override on the BMC (SMCIPMITool
+  `bootoption 14 0` on Supermicro, bmclib elsewhere, Intel AMT's
+  one-time PXE on AMT hosts) and nothing at all through a PDU, whose
+  devices must keep the network first in their firmware boot order.
+  The override is not read back, and it does not outrank an armed
+  BootNext, which is why the agent arms BootNext only for a deploy the
+  site worker has accepted as complete (see
+  [the latch](#the-awaiting_phone_home-latch)).
 - Emit phase `power_cycle`.
 - Call the power controller's `PowerCycle` (or `PowerOn` when off).
 - Emit phase `pxe_booting`.
@@ -564,10 +596,21 @@ Path depends on the op type.
 
 - **Deploy** completes via the phone-home service on the deployed
   host, not via the agent. The agent writes a systemd unit
-  (`generatePhoneHomeUnit`, `main.go:1484`) that POSTs
-  `/api/v1/phone-home?mac=...`; the httpboot handler at
-  `handler.go:941` calls `provider.RecordPhoneHome`, which is
-  `Cache.RecordPhoneHome` (`internal/worker/cache.go:404`).
+  (`target.GeneratePhoneHomeUnit`, `internal/agent/target/target.go`)
+  that POSTs `/api/v1/report` with the deploy's `machine_id`, `op_id`
+  and `event: "phone_home"`, retrying until it gets a 2xx.
+  `Cache.HandleProgressReport` accepts it only when
+  `opState.validateReportBinding` finds that op active, of type
+  deploy, owned by that machine, and at phase `awaiting_phone_home`
+  (the agent's `deploy_complete` has latched it); anything else is a
+  409, and the unit keeps retrying. A phone-home earlier than that
+  would record a deploy as successful over a disk the agent has not
+  finished writing. Once the machine is `running` a retried
+  phone-home is acknowledged without side effects. There is no
+  MAC-only phone-home route: a request that names no op cannot
+  complete one (`TestPhoneHome_CompletesOnlyTheBoundDeployAwaitingIt`,
+  `internal/httpboot/phone_home_test.go`). An accepted report
+  calls `Cache.RecordPhoneHome` (`internal/worker/cache.go`).
   That sets the machine's local state to `running`, emits a
   `phone_home` observation carrying the deploy op's ID, and calls
   `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. Both reach
@@ -607,7 +650,7 @@ Path depends on the op type.
 `Store.FailOperation` (`store.go:772`) is the funnel. Four callers:
 
 - Worker `op_update{status=failed}` — the agent's `fatal` path
-  (`cmd/slagworks-agent/main.go:228`) POSTs
+  (`runControl.fatal`, `cmd/slagworks-agent/control.go`) POSTs
   `ProgressReport{Failed: true, Phase: X, Error: msg}`; the site
   worker sets phase to `failed` (`cache.go:1504`) and queues an
   op-update with status failed. Failure surfaces immediately with
@@ -660,9 +703,12 @@ whole claimed/running window from `claimed_at` to `awaiting_phone_home`;
 `PhoneHomeTimeout` covers the window after.
 
 Phase failure is not timeout-driven. When the agent's `fatal` runs
-(`cmd/slagworks-agent/main.go:228`), it POSTs a failure report; the
-site worker marks the op failed immediately. The timeout sweeps
-exist only for the "agent died silently" case.
+(`runControl.fatal`, `cmd/slagworks-agent/control.go`), it POSTs a
+failure report; the site worker marks the op failed immediately. The
+timeout sweeps exist only for the "agent died silently" case. An agent
+that is still alive when a sweep fails its op stops at its next report,
+the same way it does after an abort (see
+[What an abort does on the host](#what-an-abort-does-on-the-host)).
 
 The worker's local failure holds until global's `op_removed` for the op.
 Global applies the failure as separate writes, and each phase write
@@ -728,16 +774,112 @@ uniformly:
 There is no state precondition on `AbortMachine`. It is a no-op
 that returns the current row if no ops are active.
 
+### What an abort does on the host
+
+Abort writes rows in global and sends nothing to the host: it does not
+power the host off (the operator follows with `machine power off` for
+that) and the worker takes no BMC action when an op is removed. An
+agent that is still running finds out from its own reports.
+
+Once the worker has applied the `op_removed`, `opState.validateReportBinding`
+(`internal/worker/opstate_cache.go`) refuses every report for that op with
+an error matching `model.ErrOperationNotActive`, and `POST /api/v1/report`
+answers it with 410 Gone (`reportRejectionStatus`,
+`internal/httpboot/handler.go`). The same answer covers every other way
+an op ends: a timeout sweep, a failure the agent or the boot hook
+reported, completion. The worker gives it only when it knows the op is
+over: it holds the op with a terminal status, it holds the op's
+tombstone, or the op is absent from a set that has been resynced since
+the worker started. Every other rejection stays 409 Conflict, including
+"operation state is not synchronized" from a worker that restarted
+mid-deploy, where the op may be healthy.
+
+The agent acts on 410 on every report path (`agentReporter.send`,
+`cmd/slagworks-agent/reporter.go`): phase reports, log flushes, failure
+reports and the final `deploy_complete` / `commission_report`. Its flush
+loop also sends an empty report every 5 seconds as a liveness check, so
+an agent in the middle of a long phase learns of an abort within that
+interval rather than at its next phase. On the first 410 the agent
+halts (`runControl.halt`, `cmd/slagworks-agent/control.go`): it kills
+the processes it has started together with their children
+(`execkit.Group.Stop`: the commands in flight, a config script, the
+tailscale daemon and client of an enrollment in progress), starts
+nothing further, and exits with status 3.
+It does not register a boot entry it had not yet registered, does not
+reconcile the BMC, does not report `deploy_complete` and does not
+reboot. The boot hook treats the nonzero exit like any agent failure
+and holds the host in the recovery environment (recovery sshd, or a
+console shell when the image carries no keys) until an operator or the
+next operation's power cycle takes it from there. Disks are left as the
+interrupted step left them, so after an abort that landed once
+partitioning had begun the next deploy of that machine needs
+`--destructive`.
+
+A 410 that arrives after the worker accepted the agent's final report
+is the expected result of that report and is ignored: global completes
+a commission as soon as it has the inventory, while the agent still has
+the console probe and its reboot ahead of it.
+
+Tests: `TestHandleProgressReport_OperationOverIsFinal` and
+`TestHandleProgressReport_UnsynchronizedIsNotFinal`
+(`internal/worker/report_final_test.go`),
+`TestReportEndpoint_OperationOverIsGone` (`internal/httpboot/handler_test.go`),
+`TestRunDeploy_StopsWhenOperationIsNoLongerActive`
+(`cmd/slagworks-agent/control_test.go`) and the `TestReporter_*` tests
+(`cmd/slagworks-agent/reporter_test.go`).
+
+Two limits follow from the agent finding out by asking. An agent that
+cannot reach the site worker never hears the 410; it runs on until its
+final report fails, and then drops to recovery through the fatal path.
+And what is not a tracked process can still finish in the moment
+between the 410 and the exit: a file being written into the target, or
+one of the short probes the agent runs directly (`modprobe`, a single
+in-band `ipmitool` call of the BMC reconcile).
+
 ## The `awaiting_phone_home` latch
 
 The deploy pipeline has a delicate moment: the agent has finished
 writing the OS, has emitted `deploy_complete`, and is about to
 reboot the target. On the first boot after that reboot the target's
-firmware will do another PXE (because the boot order still has PXE
-first — that is a MAAS-era invariant we have preserved). Without a
-latch, that PXE would land back in `Cache.BootActionForMAC` while
-the machine was still `deploying`, get `BootDeploy` again, and the
-agent would wipe the disk it just wrote.
+firmware may do another PXE: slagworks is built for hosts that
+network-boot first (the MAAS-era arrangement, kept by the BMC's
+persistent PXE flag where the in-band reconcile wrote one, or by
+firmware that puts the network ahead of what the OS wrote to
+BootOrder). Without a latch, that PXE would land back in
+`Cache.BootActionForMAC` while the machine was still `deploying`,
+get `BootDeploy` again, and the agent would wipe the disk it just
+wrote.
+
+Whether that PXE happens depends on the firmware. On a UEFI host the
+agent registers a `Slagworks` boot entry while it installs the
+bootloader (`bootloader.RegisterEFIBootEntry`; `efibootmgr -c` also
+puts the entry first in BootOrder, which some firmware keeps and some
+re-sorts), and, once the site worker has accepted `deploy_complete`,
+sets BootNext to that entry (`bootloader.SetBootNextToInstalledOS`,
+called from `completeDeploy` in `cmd/slagworks-agent/deploy.go`).
+Firmware that honors BootNext boots the installed disk directly and the
+latch is never consulted; firmware that network-boots anyway reaches the
+latch. Both end at the installed OS.
+
+BootNext is set last, after `deploy_complete` is accepted and
+immediately before the reboot, because firmware honors it ahead of
+everything else, the one-shot PXE override `runLifecycleOp` arms on the
+BMC included. While it is armed the host's next boot is the installed
+disk whatever the next operation asks of the BMC. A deploy that is
+aborted, fails or times out before its completion is accepted therefore
+leaves BootNext unset, and the next deploy's power cycle reaches PXE.
+(Set during the bootloader step, as it used to be, it stayed armed
+through the rest of the deploy: a deploy aborted in `finalizing`
+followed by a new deploy booted the aborted install off the disk, and
+the new operation waited out `OpTimeout` at `pxe_booting`.) Tests:
+`TestRegisterEFIBootEntry_DoesNotArmBootNext`
+(`internal/agent/bootloader/bootnext_test.go`),
+`TestCompleteDeploy_BootNextOnlyAfterDeployCompleteAccepted`
+(`cmd/slagworks-agent/deploy_complete_test.go`) and the QEMU test
+`TestAbortThenRedeployReachesPXE`. One window remains: between a
+completed deploy's BootNext write and the firmware consuming it on the
+reboot that follows, a new operation's power cycle still boots the
+installed disk once.
 
 The fix is a clobber guard on the op's phase.
 
@@ -772,8 +914,9 @@ keeps failing installs with the machine still `commissioned` or
 `failed`: only the claim's op_delta moves it to `deploying`, and
 `HandleProgressReport` accepts reports for a pending op
 (`TestBootAction_AwaitingPhoneHomeOnUnclaimedDeploy`, `cache_test.go`).
-The target boots off disk, its phone-home
-service POSTs `/api/v1/phone-home`, `RecordPhoneHome` fires the
+The target boots off disk and its phone-home service POSTs its
+`phone_home` report to `/api/v1/report`; the worker accepts that
+report only at this phase. `RecordPhoneHome` then fires the
 completion path described earlier, and the op transitions to
 `completed` with `machine.state = running`.
 
@@ -843,8 +986,11 @@ command line arguments (`internal/httpboot/handler.go:381`):
 - `slagworks.destructive`
 - `slagworks.wipe_all_disks`
 - `slagworks.recovery`
-- `slagworks.tailscale_authkey=<key>` (when a Tailscale runtime blob
-  is attached)
+- `slagworks.tailscale_authkey=<key>` and
+  `slagworks.tailscale_hostname=<name>` (when a Tailscale runtime blob
+  is attached; neither when its hostname is not a valid hostname, so
+  the agent skips enrollment rather than the device name reaching the
+  script)
 
 The agent parses the boolean flags (`cmd/slagworks-agent/main.go:136`)
 and consumes them:
