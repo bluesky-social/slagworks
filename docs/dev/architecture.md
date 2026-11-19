@@ -420,8 +420,9 @@ Global to site:
 - `op_delta` / `op_resync` / `op_removed` (`OpDeltaMsg`, line 434 /
   `OpResyncMsg`, 450 / `OpRemovedMsg`, 462) — the op-event stream.
   Operations left `SiteSnapshot` (Tier 2 Phase 2); they flow as per-op
-  `op_delta`s, a full `op_resync` on every (re)connect, and
-  `op_removed` for terminal ops.
+  `op_delta`s (re-sent for the whole site after every pushed snapshot),
+  a full `op_resync` on every (re)connect, and `op_removed` for terminal
+  ops.
 - `power_status_request` / `boot_status_request` (`131`, `150`) —
   synchronous RPCs invoked by the API for operator reads.
 

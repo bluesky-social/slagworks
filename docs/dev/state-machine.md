@@ -440,6 +440,15 @@ op-event stream (`op_delta` / `op_resync` / `op_removed`, defined in
 - **(re)connect** sends an unconditional `op_resync` (the active set
   scoped to the conn's site + the transient overlay each claimed/running
   op implies).
+- **snapshot push** (`ws/hub.go` `Push`) follows each fan-out snapshot
+  with every active op of the site, re-sent as an `op_delta` scoped to the
+  new membership and carrying the transient state a claimed op implies.
+  The mirror commits a machine row and only schedules the identity
+  rebuild, so an op created on a new machine before that rebuild is
+  pushed has its `op_delta` dropped by the membership filter below; the
+  re-send is what delivers it. The worker drops the versions it already
+  holds, so op progress it recorded locally is untouched (an `op_resync`
+  here would full-replace it).
 
 Confidentiality scoping: `Operation.Params` carries per-site credentials
 (BMC/PDU passwords, tailnet auth keys), so `op_delta` and `op_resync` are

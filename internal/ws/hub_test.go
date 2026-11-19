@@ -2187,6 +2187,288 @@ func TestHub_ColdHelloCachesSnapshotForOpDeltaGate(t *testing.T) {
 	}
 }
 
+// membershipLagOps is a mutable ActiveOpsReader standing in for the
+// operations table. failAfter > 0 makes every call after the first
+// failAfter calls return an error.
+type membershipLagOps struct {
+	mu        sync.Mutex
+	ops       []model.Operation
+	calls     int
+	failAfter int
+}
+
+func (r *membershipLagOps) ListActiveOperations() ([]model.Operation, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if r.failAfter > 0 && r.calls > r.failAfter {
+		return nil, errors.New("database unavailable")
+	}
+	return append([]model.Operation(nil), r.ops...), nil
+}
+
+func (r *membershipLagOps) add(op model.Operation) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ops = append(r.ops, op)
+}
+
+// TestHub_OpCreatedBeforeSnapshotPushReachesWorker: the mirror commits a
+// machine row and only schedules the identity rebuild, so an op can be
+// created on the machine before the hub's cached snapshot for the slug
+// contains it. PublishOpDelta's membership filter then drops the op_delta.
+// Once the rebuilt snapshot is pushed, the connected worker must still end
+// up holding the op. The foreign site's op must never reach it. The op
+// must arrive as an op_delta: an op_resync full-replaces the worker's op
+// set, which would revert progress it recorded locally (a failure whose
+// op_update global has not processed yet) on every push.
+func TestHub_OpCreatedBeforeSnapshotPushReachesWorker(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop1", "worker-1")
+	foreignMachine := uuid.New()
+	foreignOp := model.Operation{ID: uuid.New(), MachineID: foreignMachine, Type: model.OpPowerOn, Status: model.OpPending, Version: 1}
+	ops := &membershipLagOps{ops: []model.Operation{foreignOp}}
+	hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, ActiveOps: ops})
+
+	existing := uuid.New()
+	added := uuid.New()
+	hub.Push("pop3", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"},
+		Machines: []model.MachineSnapshot{{ID: foreignMachine}}})
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"},
+		Machines: []model.MachineSnapshot{{ID: existing}}})
+
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1") // hello reply + op_resync
+
+	// The machine row exists; an op is created on it before the identity
+	// rebuild lands. Mutate, then publish, as api.createOperation does.
+	op := model.Operation{ID: uuid.New(), MachineID: added, Type: model.OpPowerCycle, Status: model.OpPending, Version: 1}
+	ops.add(op)
+	hub.PublishOpDelta(op, "")
+
+	// The rebuild lands: the slug's snapshot now holds the machine.
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 2, Site: model.SiteInfo{Slug: "pop1"},
+		Machines: []model.MachineSnapshot{{ID: existing}, {ID: added}}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	sawSnapshot := false
+	for {
+		env, err := conn.ReadMessage(ctx)
+		if err != nil {
+			t.Fatalf("worker never received pending op %s for a machine in its own snapshot (snapshot seq 2 received: %v): "+
+				"the op_delta was dropped by the membership filter before the push and nothing re-sent it; last read: %v",
+				op.ID, sawSnapshot, err)
+		}
+		switch env.Type {
+		case TypeSnapshot:
+			sawSnapshot = true
+		case TypeOpDelta:
+			var d OpDeltaMsg
+			if err := json.Unmarshal(env.Data, &d); err != nil {
+				t.Fatal(err)
+			}
+			if d.Operation.ID == foreignOp.ID {
+				t.Fatal("foreign site's op_delta reached this worker")
+			}
+			if d.Operation.ID == op.ID {
+				return
+			}
+		case TypeOpResync:
+			t.Fatal("got an op_resync after the push: it would full-replace the worker's op set; re-send ops as op_delta")
+		}
+	}
+}
+
+// TestHub_OpVersionPublishedWhileMachineOutOfSnapshotReachesWorker: the
+// same membership filter drops a later version of an op the worker already
+// holds when it is published while the machine is briefly missing from the
+// cached snapshot. Once a snapshot holding the machine again is pushed,
+// the worker must receive the current version, and, since the dropped
+// delta was the claim, the transient machine state the claim set.
+func TestHub_OpVersionPublishedWhileMachineOutOfSnapshotReachesWorker(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop1", "worker-1")
+	m := uuid.New()
+	op := model.Operation{ID: uuid.New(), MachineID: m, Type: model.OpDeploy, Status: model.OpPending, Version: 1}
+	ops := &membershipLagOps{ops: []model.Operation{op}}
+	hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, ActiveOps: ops})
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"},
+		Machines: []model.MachineSnapshot{{ID: m}}})
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1") // the op_resync carries v1
+
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 2, Site: model.SiteInfo{Slug: "pop1"}})
+	claimed := op
+	claimed.Status = model.OpClaimed
+	claimed.Version = 2
+	ops.mu.Lock()
+	ops.ops = []model.Operation{claimed}
+	ops.mu.Unlock()
+	hub.PublishOpDelta(claimed, model.MachineStateDeploying)
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 3, Site: model.SiteInfo{Slug: "pop1"},
+		Machines: []model.MachineSnapshot{{ID: m}}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for {
+		env, err := conn.ReadMessage(ctx)
+		if err != nil {
+			t.Fatalf("worker never received op %s v2 after its machine re-entered the snapshot; it still holds v1: %v", op.ID, err)
+		}
+		if env.Type != TypeOpDelta {
+			continue
+		}
+		var d OpDeltaMsg
+		if err := json.Unmarshal(env.Data, &d); err != nil {
+			t.Fatal(err)
+		}
+		if d.Operation.ID == op.ID && d.Operation.Version == 2 {
+			if d.MachineState != model.MachineStateDeploying {
+				t.Fatalf("re-sent claimed deploy op carries machine_state %q, want %q: the claim delta that set it was dropped",
+					d.MachineState, model.MachineStateDeploying)
+			}
+			return
+		}
+	}
+}
+
+// signallingRebuilder reports that a hello found no cached snapshot and is
+// waiting on the rebuild, then blocks until gate is closed.
+type signallingRebuilder struct {
+	snap    model.SiteSnapshot
+	entered chan struct{}
+	gate    chan struct{}
+}
+
+func (s *signallingRebuilder) RebuildAndWait(ctx context.Context, _ string) (model.SiteSnapshot, error) {
+	s.entered <- struct{}{}
+	select {
+	case <-s.gate:
+		return s.snap, nil
+	case <-ctx.Done():
+		return model.SiteSnapshot{}, ctx.Err()
+	}
+}
+
+// TestHub_HelloResyncScopesBySnapshotCachedAtResync: the hello op_resync
+// must scope ops by the slug's snapshot as cached when the resync runs, not
+// by the snapshot the hello started from. A Push that lands in between fans
+// its snapshot out to this conn while the conn is not yet op-ready, so the
+// push skips its op re-send and the hello resync is the only message that
+// can deliver an op on a machine the Push added. The test writes the
+// newer snapshot into the cache directly: that is the state such a Push
+// leaves behind, without a fan-out goroutine whose timing would make the
+// outcome depend on scheduling.
+func TestHub_HelloResyncScopesBySnapshotCachedAtResync(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop1", "worker-1")
+	existing := uuid.New()
+	added := uuid.New()
+	op := model.Operation{ID: uuid.New(), MachineID: added, Type: model.OpPowerCycle, Status: model.OpPending, Version: 1}
+	reb := &signallingRebuilder{
+		snap: model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"},
+			Machines: []model.MachineSnapshot{{ID: existing}}},
+		entered: make(chan struct{}, 1),
+		gate:    make(chan struct{}),
+	}
+	hub := NewHub(HubConfig{Auth: auth, Rebuilder: reb, ActiveOps: &membershipLagOps{ops: []model.Operation{op}}})
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeHello, "", HelloMsg{WorkerID: "worker-1", Proto: OpStreamProto}); err != nil {
+		t.Fatal(err)
+	}
+	<-reb.entered
+	hub.mu.Lock()
+	hub.snapshots["pop1"] = model.SiteSnapshot{SeqNum: 2, Site: model.SiteInfo{Slug: "pop1"},
+		Machines: []model.MachineSnapshot{{ID: existing}, {ID: added}}}
+	hub.mu.Unlock()
+	close(reb.gate)
+
+	if env, err := conn.ReadMessage(ctx); err != nil || env.Type != TypeSnapshot {
+		t.Fatalf("hello reply: got %q, err %v; want snapshot", env.Type, err)
+	}
+	env, err := conn.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Type != TypeOpResync {
+		t.Fatalf("got %q, want op_resync", env.Type)
+	}
+	var r OpResyncMsg
+	if err := json.Unmarshal(env.Data, &r); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Ops) != 1 || r.Ops[0].ID != op.ID {
+		t.Fatalf("hello op_resync ops = %+v, want op %s on the machine the newer cached snapshot added", r.Ops, op.ID)
+	}
+}
+
+// TestHub_PushOpResendFailureForcesReconnect: when the op re-send that
+// follows a pushed snapshot cannot read the active ops, the hub
+// force-closes the connection so the worker's reconnect resyncs, rather
+// than leaving the worker without ops the new snapshot's membership admits.
+func TestHub_PushOpResendFailureForcesReconnect(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop1", "worker-1")
+	ops := &membershipLagOps{failAfter: 1} // the hello resync succeeds
+	hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, ActiveOps: ops})
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"}})
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 2, Site: model.SiteInfo{Slug: "pop1"},
+		Machines: []model.MachineSnapshot{{ID: uuid.New()}}})
+
+	// The hub closes without a close frame, so the worker's read fails
+	// once it has consumed the pushed snapshot.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for {
+		env, err := conn.ReadMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				t.Fatal("connection still open after the post-push op re-send failed")
+			}
+			break
+		}
+		if env.Type == TypeOpDelta || env.Type == TypeOpResync {
+			t.Fatalf("got %s although listing active ops failed", env.Type)
+		}
+	}
+	waitUntil(t, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		return len(hub.connections["pop1"]) == 0
+	}, 3*time.Second)
+}
+
 // TestHub_WorkerSMCIPMITool: the SMCIPMITool status a worker reports in its
 // hello is readable per connected worker, and the Supermicro count comes
 // from the hub's cached snapshot — together they drive the
