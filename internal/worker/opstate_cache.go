@@ -41,7 +41,9 @@ import (
 //     (durable). Cleared on identity apply ONLY when the baseline caught
 //     up (conditional clear — the re-wipe-window fix).
 //   - failedOps: opID -> failed marker; blocks UpdateOpPhase after terminal
-//     failure. Local, preserved across stream applies.
+//     failure. Local, preserved across stream applies, and keeps the op's
+//     Status failed against a delta or resync that still shows it active
+//     (keepLocalFailure) until op_removed clears it.
 //   - phaseStart: opID -> phase timing, for phase-duration logging. Local.
 //   - phoneHomed: deploy op IDs that phone-homed LOCALLY (RecordPhoneHome).
 //     A resync that brings the op back as claimed-deploying must not
@@ -143,6 +145,29 @@ func keepTerminalWait(existing, incoming *model.Operation) {
 	incoming.Phase = "awaiting_phone_home"
 }
 
+// keepLocalFailure holds a failure the agent reported (markFailed) on an op
+// global's incoming row still shows active. markFailed writes Status=failed
+// without a Version bump, and global applies the worker's failure op_updates
+// one write at a time: each phase write publishes an op_delta whose row is
+// still claimed, before the failure itself publishes op_removed. Those
+// echoes, and a resync built before global processed the failure (or after
+// the best-effort op_update was lost), carry a higher Version yet an active
+// status. Accepting one revives the op: the boot decision actuates the host
+// again while updatePhase, which failedOps still blocks, drops every phase
+// the new agent run reports, so a deploy can never latch awaiting_phone_home
+// and re-images the host on every boot. Only op_removed, which clears
+// failedOps, ends a local failure; a completed or failed row from global
+// still applies. Caller holds mu.
+func (o *opState) keepLocalFailure(incoming *model.Operation) {
+	if !o.failedOps[incoming.ID.String()] {
+		return
+	}
+	if incoming.Status == model.OpCompleted || incoming.Status == model.OpFailed {
+		return
+	}
+	incoming.Status = model.OpFailed
+}
+
 // newOpState builds an empty op-layer whose combined reads load and whose
 // identity applies swap through the given view pointer (Cache.view). wake
 // is the executor wake channel (may be nil in tests). untrusted marks a
@@ -196,12 +221,13 @@ func (o *opState) applyOpDelta(op model.Operation, machineState model.MachineSta
 	}
 
 	cp := op
+	o.keepLocalFailure(&cp)
 	keepTerminalWait(o.ops[id], &cp)
 	o.ops[id] = &cp
 	if machineState != "" {
 		o.machineState[op.MachineID] = machineState
 	}
-	return op.Status == model.OpPending
+	return cp.Status == model.OpPending
 }
 
 // applyOpResync full-replaces the op set from a resync and rebuilds the
@@ -231,6 +257,7 @@ func (o *opState) applyOpResync(ops []model.Operation, states map[string]model.M
 		if tv, ok := o.tombstones[op.ID.String()]; ok && op.Version <= tv {
 			continue
 		}
+		o.keepLocalFailure(&op)
 		keepTerminalWait(o.ops[op.ID.String()], &op)
 		next[op.ID.String()] = &op
 		if op.Status == model.OpPending {
@@ -892,7 +919,8 @@ func (o *opState) setStatus(opID string, status model.OperationStatus) {
 
 // markFailed marks an op failed, clears its phase timing, and (if present)
 // sets its in-memory Status/Phase. Once marked failed, updatePhase for this
-// op is rejected — this prevents phase progression after terminal failure.
+// op is rejected — this prevents phase progression after terminal failure —
+// and stream applies keep it failed until op_removed (keepLocalFailure).
 func (o *opState) markFailed(opID, phase string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()

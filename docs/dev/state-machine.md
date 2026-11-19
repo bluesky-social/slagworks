@@ -647,6 +647,17 @@ Phase failure is not timeout-driven. When the agent's `fatal` runs
 site worker marks the op failed immediately. The timeout sweeps
 exist only for the "agent died silently" case.
 
+The worker's local failure holds until global's `op_removed` for the op.
+Global applies the failure as separate writes, and each phase write
+publishes an `op_delta` whose row is still `claimed` before the failure
+publishes `op_removed`; a reconnect's `op_resync` can also still show the
+op claimed when the best-effort `op_update` never reached global. The
+worker keeps such an op failed (`keepLocalFailure` in
+`internal/worker/opstate_cache.go`): the host is not booted into the agent
+again and reports for the op are refused as terminal. When the failure
+never reached global, the op stays active there until a timeout sweep
+fails it.
+
 Each sweep fails its ops one transaction at a time and keeps going past
 a per-op error, returning both the ops it failed and the joined error.
 The tick (`Server.expireOperations`) publishes `op_removed` for every op

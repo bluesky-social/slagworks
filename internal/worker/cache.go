@@ -1048,7 +1048,9 @@ func (c *Cache) UpdateOpPhase(opID, phase string) {
 
 // MarkOpFailed marks an operation as failed in-memory and queues a status
 // update. Once marked failed, UpdateOpPhase for this op is rejected —
-// this prevents phase progression after terminal failure.
+// this prevents phase progression after terminal failure — and an op_delta
+// or op_resync that still shows the op active does not revive it; only
+// op_removed ends the local failure.
 func (c *Cache) MarkOpFailed(opID, phase, errMsg string) {
 	c.opState.markFailed(opID, phase)
 
