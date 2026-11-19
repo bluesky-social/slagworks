@@ -157,7 +157,7 @@ the real values over the WebSocket op stream. See
 | GET | `/images` | read | List image rows. |
 | POST | `/images` | admin | Create a row. Body `{"name","version","sha256","url","arch"}`; all but `arch` (default `amd64`) are required. 409 on conflict. Pushes a fresh snapshot to every site. |
 | PUT | `/images/:name` | admin | Create or replace the row named in the path (the path name wins over the body). Used by `slagctl image follow-latest`. Pushes a fresh snapshot to every site. |
-| DELETE | `/images/:name` | admin | Delete by name or UUID. 204. Does not push a snapshot. |
+| DELETE | `/images/:name` | admin | Delete by name or row id. A row id match wins; an identifier that is no row's id is tried as a name, even when it parses as a UUID. 204. Does not push a snapshot. |
 
 ## Storage and network scripts
 
@@ -211,7 +211,7 @@ in [`configuration.md`](../user/configuration.md#site-config-model).
 |---|---|---|---|
 | GET | `/workers` | read | List registered workers: `id`, `site_slug`, `worker_id`, `fqdn`, `serial`, `first_seen_at`, `last_seen_at`, plus for connected workers `smcipmitool` (`installed`, `missing`, `missing-required`, `disabled`) and `supermicro_machines`. |
 | POST | `/site-workers` | admin | Register a worker, or rotate its token. Body `{"site_slug","worker_id","fqdn"}`; `site_slug` and `worker_id` are required. Returns `{"id","site_slug","worker_id","fqdn","first_seen_at","token"}`; the plaintext token appears only in this response. |
-| DELETE | `/site-workers/:ident` | admin | Delete a registration. `:ident` is the row id, `worker_id` or FQDN. 409 when ambiguous, when the worker is connected, or when it has claimed operations in flight. 204. |
+| DELETE | `/site-workers/:ident` | admin | Delete a registration. `:ident` is the row id, `worker_id` or FQDN. A row id match wins; an identifier that is no row's id is tried as a `worker_id` or FQDN, even when it parses as a UUID (the default `worker_id` is one). 409 when ambiguous, when the worker is connected, or when it has claimed operations in flight. 204. |
 
 ## NetBox
 
