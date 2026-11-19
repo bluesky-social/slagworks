@@ -193,6 +193,57 @@ func PrintTable(w io.Writer, headers []string, rows [][]string) {
 	}
 }
 
+// Untrusted makes text that a provisioned host controls safe to print to the
+// operator's terminal. Agent log envelopes reach global through the site's
+// unauthenticated /logs/ingest, and commission data and progress reports
+// (phase, error) are the target's own report, so their strings can carry
+// escape sequences that erase the screen, forge or overwrite lines, plant
+// hyperlinks (OSC 8) or write the clipboard (OSC 52).
+//
+// Untrusted replaces each C0 control, DEL and C1 control with a visible
+// escape (\n, \r, \x1b, \u009b) and each byte that is not valid UTF-8 with
+// \xNN, so the operator sees that something was there and the terminal acts
+// on none of it. A tab becomes one space: it is common in tool output and
+// harmless to the terminal, but it breaks table and box alignment. The result
+// is for display only and is not reversible (a literal backslash is left as
+// is); --json output carries the original value.
+//
+// Apply it to the raw value before any styling: slagctl's own escapes are
+// added afterwards and are not affected.
+func Untrusted(s string) string {
+	if utf8.ValidString(s) && !strings.ContainsFunc(s, isTerminalControl) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			fmt.Fprintf(&b, `\x%02x`, s[i])
+		case r == '\t':
+			b.WriteByte(' ')
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		case r >= 0x80 && r < 0xa0:
+			fmt.Fprintf(&b, `\u%04x`, r)
+		default:
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
+}
+
+// isTerminalControl reports a rune a terminal interprets rather than prints:
+// a C0 control, DEL or a C1 control.
+func isTerminalControl(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0)
+}
+
 // StripANSI removes ANSI escape sequences from a string.
 func StripANSI(s string) string {
 	var out strings.Builder

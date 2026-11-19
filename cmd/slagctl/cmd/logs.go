@@ -12,6 +12,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/spf13/cobra"
 
+	"github.com/bluesky-social/slagworks/cmd/slagctl/format"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/ws"
 )
@@ -205,8 +206,11 @@ func humanRenderer(w *os.File) envelopeRenderer {
 		if host == "" {
 			host = env.Host
 		}
-		_, err := fmt.Fprintf(w, "%s [%s] %s op=%s %s\n",
-			ts, env.Source, host, abbreviate(env.OpID.String()), line)
+		// Every string field is text the sending host chose (agent envelopes
+		// arrive through the site's unauthenticated /logs/ingest), so the line
+		// is escaped as a whole before it reaches the operator's terminal.
+		_, err := fmt.Fprintln(w, format.Untrusted(fmt.Sprintf("%s [%s] %s op=%s %s",
+			ts, env.Source, host, abbreviate(env.OpID.String()), line)))
 		return err
 	}
 }
