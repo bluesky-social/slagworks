@@ -329,7 +329,8 @@ What the agent actually does, in order:
   - **Legacy BIOS**: `installGRUBBIOS` — install GRUB i386-pc onto each
     disk with a `bios_grub` (EF02) partition. No BIOS-grub partition on
     any disk is a hard fail — we refuse to leave the host unbootable.
-- `finalizing`: write `/etc/fstab`, seed cloud-init, apply the network
+- `finalizing`: write `/etc/fstab`, seed cloud-init (it leaves the
+  network, hostname, locale and partition sizes alone), apply the network
   config script (with NetBox facts injected), write the hostname, disable
   first-boot apt timers, write operator SSH keys, enroll on tailscale (if
   an auth key rode the cmdline), and write the

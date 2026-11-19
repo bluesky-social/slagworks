@@ -339,34 +339,42 @@ func enablePhoneHome(ctx *agent.Context) {
 	ctx.Log.Info("phone-home service installed")
 }
 
-// SeedCloudInit writes the cloud-init seed that disables its network
-// rendering and hostname management on the deployed host.
-func SeedCloudInit(ctx *agent.Context) error {
-	ctx.Log.Info("seeding cloud-init")
-
-	dir := "/target/etc/cloud/cloud.cfg.d"
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("mkdir cloud-init dir: %w", err)
-	}
-
-	// network: {config: disabled} stops cloud-init's fallback
-	// network rendering. Without this, cloud-init detects a
-	// carrier-up interface, synthesizes a DHCP netplan, and
-	// races our /etc/netplan/99-slagworks.yaml. The two configs
-	// disagreeing under load is part of what stalled phone-home
-	// at >2 parallel test VMs.
-	//
-	// preserve_hostname: true stops cloud-init's cc_update_hostname
-	// module from rewriting the hostname from the datasource's
-	// local-hostname on every boot. netapply.WriteHostname writes the
-	// real per-machine FQDN to /target/etc/hostname AFTER this seed;
-	// without preserve_hostname, cloud-init clobbered it back to the
-	// seed value on first boot, so a deployed host came up as
-	// "slagworks-node" instead of e.g.
-	// kworker-l34-2.internal.pop1.example.net (observed 2026-06-02).
-	// local-hostname stays only as the pre-WriteHostname fallback for
-	// the rare host with no modeled FQDN.
-	cfg := `# slagworks agent cloud-init seed
+// cloudInitSeed is the cloud-init config SeedCloudInit drops into the
+// deployed host's /etc/cloud/cloud.cfg.d.
+//
+// network: {config: disabled} stops cloud-init's fallback
+// network rendering. Without this, cloud-init detects a
+// carrier-up interface, synthesizes a DHCP netplan, and
+// races our /etc/netplan/99-slagworks.yaml. The two configs
+// disagreeing under load is part of what stalled phone-home
+// at >2 parallel test VMs.
+//
+// preserve_hostname: true stops cloud-init's cc_update_hostname
+// module from rewriting the hostname from the datasource's
+// local-hostname on every boot. netapply.WriteHostname writes the
+// real per-machine FQDN to /target/etc/hostname AFTER this seed;
+// without preserve_hostname, cloud-init clobbered it back to the
+// seed value on first boot, so a deployed host came up as
+// "slagworks-node" instead of e.g.
+// kworker-l34-2.internal.pop1.example.net (observed 2026-06-02).
+// local-hostname stays only as the pre-WriteHostname fallback for
+// the rare host with no modeled FQDN.
+//
+// growpart: {mode: "off"} and resize_rootfs: false stop cloud-init's
+// cc_growpart and cc_resizefs, which Ubuntu's cloud.cfg runs on every
+// boot. The storage script owns the layout: a fixed-size root partition
+// followed by free space was grown to the end of the disk on first boot
+// (a 5G xfs root on an 8G disk came up at 7.5G after growpart and
+// xfs_growfs). "off" is quoted because YAML 1.1 reads a bare off as
+// false, which cloud-init accepts only as a deprecated spelling.
+//
+// locale: false stops cc_locale. The image ships no /etc/default/locale
+// and no locales package, so on first boot cc_locale ran apt-get update
+// and apt-get install locales to get update-locale. That is the
+// autonomous first-boot apt that DisableFirstBootApt exists to prevent,
+// and with no archive reachable the module failed and took
+// cloud-config.service down with it on every install.
+const cloudInitSeed = `# slagworks agent cloud-init seed
 datasource_list: [None]
 datasource:
   None:
@@ -376,8 +384,24 @@ datasource:
 preserve_hostname: true
 network:
   config: disabled
+growpart:
+  mode: "off"
+resize_rootfs: false
+locale: false
 `
-	if err := os.WriteFile(dir+"/99-slagworks.cfg", []byte(cfg), 0644); err != nil {
+
+// SeedCloudInit writes the cloud-init seed that disables its network
+// rendering, hostname, locale and storage management on the deployed
+// host.
+func SeedCloudInit(ctx *agent.Context) error {
+	ctx.Log.Info("seeding cloud-init")
+
+	dir := "/target/etc/cloud/cloud.cfg.d"
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("mkdir cloud-init dir: %w", err)
+	}
+
+	if err := os.WriteFile(dir+"/99-slagworks.cfg", []byte(cloudInitSeed), 0644); err != nil {
 		return fmt.Errorf("write cloud-init: %w", err)
 	}
 

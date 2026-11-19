@@ -67,6 +67,8 @@ This is the same format the old MAAS commissioning scripts produced. It has prov
 
 Partition `size` is `"512M"`, `"100G"`, or `"rest"` (fill remaining). `fs` is optional — omit it for raw partitions (e.g., RAID members). `bootable` marks the ESP partition.
 
+A fixed size is the size the installed system keeps. The agent turns off cloud-init's `growpart` and `resizefs` on the deployed host, so free space after a fixed-size root partition stays free; use `"rest"` for a root that fills the disk.
+
 **RAID arrays** — software RAID via mdadm. Members reference partition names or whole-disk names from the layout.
 
 ```json
