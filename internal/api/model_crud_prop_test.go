@@ -651,11 +651,12 @@ func (r *pmRun) siteWorker() {
 			return
 		}
 		// Re-registration rotates the token of the SAME registration: the
-		// row keeps its id, which the list and delete checks below hold. The
-		// id in the rotation response itself is not compared, because the
-		// handler answers with a freshly generated id that names no row.
+		// response names the existing row, not a fresh id.
 		r.stats.add("site-worker register: rotation")
 		w.fqdn = fqdn
+		if got.ID != w.id {
+			r.failf("site-worker register (rotation): response id %s, but the registration's id is %s", got.ID, w.id)
+		}
 	case "register-bad":
 		body := rapid.SampledFrom([]string{`{"site_slug":"pop-a"}`, `{"worker_id":"w1"}`, `{}`, `{"site_slug":1,"worker_id":"w"}`, `[`}).Draw(r.t, "badWorker")
 		resp := r.call("site-worker register bad", propReq{method: http.MethodPost, path: "/api/v1/site-workers", token: propCredToken, body: body})

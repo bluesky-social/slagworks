@@ -763,11 +763,7 @@ func (r *pmRun) abort() {
 		r.expect("abort", resp, ref.resolveCode())
 		return
 	case ref.kind == pmRefMissing:
-		// The contract is 404. Abort answers 500 for a machine that does not
-		// exist (the store's not-found error is not mapped to a status), so
-		// the exact code is not held here; nothing may be published either
-		// way.
-		r.expect("abort (unknown machine)", resp, http.StatusNotFound, http.StatusInternalServerError)
+		r.expect("abort (unknown machine)", resp, http.StatusNotFound)
 		if got := r.env.pub.removedCount(); got != beforeRemoved {
 			r.failf("abort (unknown machine): published %d op_removed", got-beforeRemoved)
 		}
