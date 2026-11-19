@@ -3,9 +3,12 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -289,6 +292,139 @@ func TestHandleConsoleStream_SnapshotMode(t *testing.T) {
 	}
 	if !strings.Contains(got, "loading...") {
 		t.Errorf("snapshot should retain the un-overwritten line:\n%q", got)
+	}
+}
+
+// generatedCastStore serves a long cast one page at a time and allocates
+// each row's bytes fresh on every call, as the database driver does, so the
+// store itself retains nothing between pages. Each call first forces a GC
+// and records how far the live heap has grown above baseline: whatever is
+// still live at that point is what the handler kept from earlier pages.
+type generatedCastStore struct {
+	rows    int64
+	rowSize int
+
+	mu       sync.Mutex
+	baseline uint64
+	peak     uint64
+}
+
+func liveHeapBytes() uint64 {
+	runtime.GC()
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	return ms.HeapAlloc
+}
+
+// generatedCastRow is row t of the cast, rowSize bytes: NUL filler, which the
+// emulator consumes without drawing (keeping a long replay fast), then a
+// newline and one full 80-column line naming the row. Every row scrolls the
+// screen by one full line, which is what fills an emulator's scrollback, and
+// the final screen's bottom line names the last row replayed.
+func generatedCastRow(t int64, rowSize int) []byte {
+	line := fmt.Sprintf("\r\nrow %08d %s", t, strings.Repeat("k", 67))
+	data := make([]byte, rowSize)
+	copy(data[rowSize-len(line):], line)
+	return data
+}
+
+func (s *generatedCastStore) MachineExists(uuid.UUID) (bool, error) { return true, nil }
+
+func (s *generatedCastStore) EnsureConsoleCast(uuid.UUID) (*model.ConsoleCast, error) {
+	return &model.ConsoleCast{ID: 1, Width: 80, Height: 24, CastStartedAt: time.Now()}, nil
+}
+
+func (s *generatedCastStore) CastEventsSince(_ context.Context, _ int64, floorTUs int64, limit int) ([]model.ConsoleCastEvent, error) {
+	grown := liveHeapBytes()
+	s.mu.Lock()
+	if grown > s.baseline {
+		s.peak = max(s.peak, grown-s.baseline)
+	}
+	s.mu.Unlock()
+	var out []model.ConsoleCastEvent
+	for t := max(floorTUs, 0); t < s.rows && (limit <= 0 || len(out) < limit); t++ {
+		out = append(out, model.ConsoleCastEvent{ID: t + 1, TUs: t, Data: generatedCastRow(t, s.rowSize)})
+	}
+	return out, nil
+}
+
+func (s *generatedCastStore) SinceFloorByDuration(context.Context, int64, time.Duration) (int64, error) {
+	return 0, nil
+}
+
+func (s *generatedCastStore) LiveEdgeCastFloor(context.Context, int64) (int64, error) {
+	return s.rows, nil
+}
+
+func (s *generatedCastStore) ScanCastEventsForNonce(context.Context, uuid.UUID, string, time.Duration) (bool, error) {
+	return false, nil
+}
+
+// TestHandleConsoleStream_SnapshotMemoryBoundedByPage: snapshot=true is the
+// watch TUI's attach path, and cast events are kept forever, so the cast a
+// snapshot replays grows for the life of the machine. The snapshot needs
+// only the final screen, so global's memory while building it must stay
+// bounded by one page of rows plus the emulator's screen. Two things broke
+// that: collecting every row's bytes before replaying any of them, and the
+// emulator's 10,000-line scrollback, which the snapshot never reads. A
+// 64 MiB cast here must not grow the live heap past 16 MiB at any page
+// boundary, and the snapshot must still end on the cast's last row.
+func TestHandleConsoleStream_SnapshotMemoryBoundedByPage(t *testing.T) {
+	const rows, rowSize = 16384, 4096 // 64 MiB of SOL bytes
+	cs := &generatedCastStore{rows: rows, rowSize: rowSize}
+	srv := newServerWithConsole(cs)
+	httpSrv := httptest.NewServer(srv.echo)
+	defer httpSrv.Close()
+
+	wsURL := strings.Replace(httpSrv.URL, "http", "ws", 1) +
+		"/api/v1/console/stream?machine=" + uuid.NewString() + "&snapshot=true"
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cs.mu.Lock()
+	cs.baseline = liveHeapBytes()
+	cs.mu.Unlock()
+	conn, dialResp, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if dialResp != nil && dialResp.Body != nil {
+		_ = dialResp.Body.Close()
+	}
+	defer conn.CloseNow() //nolint:errcheck
+
+	if _, _, err := conn.Read(ctx); err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	var lines [][]byte
+	for {
+		_, line, err := conn.Read(ctx)
+		if err != nil {
+			break // server closes after the snapshot (follow=false)
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) != 1 {
+		t.Fatalf("snapshot mode should emit exactly 1 frame, got %d", len(lines))
+	}
+	var ev [3]any
+	if err := json.Unmarshal(lines[0], &ev); err != nil {
+		t.Fatalf("snapshot frame not a JSON event: %v / %q", err, lines[0])
+	}
+	data, _ := ev[2].(string)
+	screen := feedANSI([]byte(data))
+	if want := fmt.Sprintf("row %08d", rows-1); !strings.Contains(screen, want) {
+		t.Errorf("snapshot should end on the cast's last row %q:\n%q", want, screen)
+	}
+
+	cs.mu.Lock()
+	peak := cs.peak
+	cs.mu.Unlock()
+	t.Logf("peak live-heap growth %d KiB", peak>>10)
+	const limit = 16 << 20
+	if peak > limit {
+		t.Fatalf("live heap grew by %d MiB while building one snapshot of a %d MiB cast; want <= %d MiB (one page of rows plus one screen)",
+			peak>>20, rows*rowSize>>20, limit>>20)
 	}
 }
 
