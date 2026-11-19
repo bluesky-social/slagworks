@@ -36,39 +36,51 @@ type netBundleFile struct {
 	Group   string `json:"group,omitempty"`
 }
 
-// ApplyNetworkConfig configures the deployed host's network. It mirrors the
-// storage-script seam: the site worker serves a pre-chosen network-config
-// script (matched on NetBox identity) plus the machine's raw NetBox
-// interface facts; the agent runs the script in the deploy initrd with
-// SLAGWORKS_NETWORK_FACTS pointing at the facts JSON, and applies the
-// emitted file+unit bundle to /target.
+// NetworkConfig is the deployed host's network configuration, rendered by
+// RenderNetworkConfig before any disk is touched and written into /target by
+// ApplyNetworkConfig at the end of the deploy. A nil bundle means the
+// built-in all-en* DHCP netplan.
+type NetworkConfig struct {
+	bundle *netBundle
+}
+
+// RenderNetworkConfig resolves the deployed host's network configuration. It
+// mirrors the storage-script seam: the site worker serves a pre-chosen
+// network-config script (matched on NetBox identity) plus the machine's raw
+// NetBox interface facts; the agent runs the script in the deploy initrd with
+// SLAGWORKS_NETWORK_FACTS pointing at the facts JSON and validates the emitted
+// file+unit bundle. It touches nothing on disk.
+//
+// The script is a pure function of those facts and hard-fails by design on an
+// incomplete NetBox model, so the deploy runs this BEFORE the boot-disk safety
+// check and partitioning: a model gap fails the deploy with the host as found,
+// not after the disks were wiped and the OS installed.
 //
 // Failure semantics mirror storageapply.ResolveLayout's hard-fail:
-//   - 204 (no script matched) or empty machineID (dev/stdout path): write
-//     the built-in all-en*-DHCP netplan and return. The un-modeled host
-//     still comes up.
-//   - script matched but execution fails / emits invalid JSON / a path
-//     escapes /target: FAIL the deploy. A host that should get L3 netplan +
-//     FRR silently coming up DHCP-only is a latent fabric break — the same
-//     loud-fail-over-silent-wrong-state reasoning as the storage wrong-disk
-//     class.
-func ApplyNetworkConfig(ctx *agent.Context, machineID string) error {
-	ctx.Log.Info("applying network config")
+//   - 204 (no script matched) or empty machineID (dev/stdout path): the
+//     built-in all-en*-DHCP netplan. The un-modeled host still comes up.
+//   - script matched but execution fails, emits invalid JSON, or emits a
+//     file with a relative path or a non-octal mode: FAIL the deploy. A host
+//     that should get L3 netplan + FRR silently coming up DHCP-only is a
+//     latent fabric break — the same loud-fail-over-silent-wrong-state
+//     reasoning as the storage wrong-disk class.
+func RenderNetworkConfig(ctx *agent.Context, machineID string) (*NetworkConfig, error) {
+	ctx.Log.Info("rendering network config")
 
 	if machineID == "" {
-		ctx.Log.Info("no machine ID; using default all-en* DHCP netplan")
-		return WriteDefaultNetplan(ctx)
+		ctx.Log.Info("no machine ID; will use default all-en* DHCP netplan")
+		return &NetworkConfig{}, nil
 	}
 
 	scriptURL := fmt.Sprintf("http://%s/api/v1/machines/%s/network-script", ctx.Server, machineID)
 	scriptContent, err := agent.HTTPGet(scriptURL)
 	if err != nil {
-		return fmt.Errorf("fetch network script for machine %s: %w "+
+		return nil, fmt.Errorf("fetch network script for machine %s: %w "+
 			"(check the site worker is reachable at %s)", machineID, err, ctx.Server)
 	}
 	if len(scriptContent) == 0 {
-		ctx.Log.Info("no network script matched; using default all-en* DHCP netplan")
-		return WriteDefaultNetplan(ctx)
+		ctx.Log.Info("no network script matched; will use default all-en* DHCP netplan")
+		return &NetworkConfig{}, nil
 	}
 
 	// Fetch the machine's NetBox interface facts. The script does all
@@ -76,7 +88,7 @@ func ApplyNetworkConfig(ctx *agent.Context, machineID string) error {
 	factsURL := fmt.Sprintf("http://%s/api/v1/machines/%s/network-facts", ctx.Server, machineID)
 	facts, err := agent.HTTPGet(factsURL)
 	if err != nil {
-		return fmt.Errorf("fetch network facts for machine %s: %w", machineID, err)
+		return nil, fmt.Errorf("fetch network facts for machine %s: %w", machineID, err)
 	}
 	if len(facts) == 0 {
 		facts = []byte("[]")
@@ -89,17 +101,50 @@ func ApplyNetworkConfig(ctx *agent.Context, machineID string) error {
 	sidecars := map[string][]byte{netlib.ModuleName + ".py": netlib.Source}
 	bundleJSON, err := execkit.RunConfigScript(ctx.Log, "network", scriptContent, "SLAGWORKS_NETWORK_FACTS", facts, sidecars)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var bundle netBundle
 	if err := json.Unmarshal(bundleJSON, &bundle); err != nil {
-		return fmt.Errorf("parse bundle JSON from network script: %w", err)
+		return nil, fmt.Errorf("parse bundle JSON from network script: %w", err)
 	}
-	if err := applyNetBundle(ctx.Log, bundle, "/target", ctx.Exec.Run); err != nil {
+	if err := validateNetBundle(bundle); err != nil {
+		return nil, fmt.Errorf("invalid bundle from network script: %w", err)
+	}
+	ctx.Log.Info("network config rendered", "files", len(bundle.Files), "enable_units", len(bundle.EnableUnits))
+	return &NetworkConfig{bundle: &bundle}, nil
+}
+
+// ApplyNetworkConfig writes a config RenderNetworkConfig produced into
+// /target: the script's bundle (files, ownership, enabled units), or the
+// built-in DHCP netplan when no script matched. The parts that need the
+// target's tree (symlink-contained path resolution, chown against its
+// passwd db, systemctl enable) can only fail here.
+func ApplyNetworkConfig(ctx *agent.Context, cfg *NetworkConfig) error {
+	ctx.Log.Info("applying network config")
+	if cfg.bundle == nil {
+		return WriteDefaultNetplan(ctx)
+	}
+	if err := applyNetBundle(ctx.Log, *cfg.bundle, "/target", ctx.Exec.Run); err != nil {
 		return fmt.Errorf("apply network bundle: %w", err)
 	}
 	ctx.Log.Info("network config applied")
+	return nil
+}
+
+// validateNetBundle checks every part of a bundle that does not depend on the
+// target tree: each file path is absolute and each mode is valid octal. It
+// runs at render time, before any disk is touched, and again at apply time so
+// a bad entry is refused before any file is written.
+func validateNetBundle(bundle netBundle) error {
+	for _, f := range bundle.Files {
+		if !filepath.IsAbs(f.Path) {
+			return fmt.Errorf("bundle file path %q is not absolute", f.Path)
+		}
+		if _, err := parseBundleMode(f.Mode); err != nil {
+			return fmt.Errorf("bundle file %q: %w", f.Path, err)
+		}
+	}
 	return nil
 }
 
@@ -136,6 +181,9 @@ func parseBundleMode(s string) (os.FileMode, error) {
 // unit enable, bind-mount gating) is unit-testable without root or a real
 // chroot — runner sees exactly the chroot/mount/umount commands that would run.
 func applyNetBundle(log logger, bundle netBundle, target string, runner func(string, ...string) error) error {
+	if err := validateNetBundle(bundle); err != nil {
+		return err
+	}
 	// Write all files (and chown them) FIRST, before any bind mounts exist.
 	// This is deliberate ordering, not just convenience: systemctl enable
 	// below bind-mounts the host's /dev /proc /sys into the target, and once
@@ -145,9 +193,6 @@ func applyNetBundle(log logger, bundle netBundle, target string, runner func(str
 	// Doing every os.WriteFile before the mounts go up removes that window
 	// entirely. (chown runs through chroot but needs no pseudo-fs.)
 	for _, f := range bundle.Files {
-		if !filepath.IsAbs(f.Path) {
-			return fmt.Errorf("bundle file path %q is not absolute", f.Path)
-		}
 		// Resolve under the target root WITH symlink evaluation, then confirm
 		// containment. Lexical Join+Clean is insufficient: the stock image
 		// ships /etc symlinks a buggy script's path could ride out of /target.

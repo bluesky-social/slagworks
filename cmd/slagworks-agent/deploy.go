@@ -28,17 +28,24 @@ type deployParams struct {
 	setPhase     func(string)
 	fatal        func(string, error)
 	done         chan struct{}
+	// checkIdentity verifies this machine's SMBIOS system-uuid against
+	// expectUUID (verifyIdentity in production). A field so tests can
+	// drive runDeploy without dmidecode.
+	checkIdentity func(expectUUID string) error
 }
 
 // runDeploy drives the deploy sequence: identity check, storage
-// resolve/plan/apply, root extraction, bootloader install, target
-// finalization (fstab/cloud-init/network/hostname/keys), tailscale
-// enrollment, BMC reconcile, deploy_complete report, and reboot.
+// resolve/plan, network-config render, storage apply, root extraction,
+// bootloader install, target finalization (fstab/cloud-init/network/
+// hostname/keys), tailscale enrollment, BMC reconcile, deploy_complete
+// report, and reboot. Everything that can hard-fail on inputs known at
+// start (the storage and network scripts) runs before the first disk is
+// touched.
 func runDeploy(ctx *agent.Context, p deployParams) {
 	setPhase, fatal := p.setPhase, p.fatal
 
 	// Verify machine identity before touching any disks
-	if err := verifyIdentity(p.expectUUID); err != nil {
+	if err := p.checkIdentity(p.expectUUID); err != nil {
 		fatal("identity check", err)
 	}
 	ctx.Log.Info("identity verified (system-uuid matches)")
@@ -73,6 +80,17 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 	}
 
 	ctx.Log.Info(fmt.Sprintf("storage layout planned (%d commands)", len(cmds)))
+
+	// Render the network config BEFORE any disk is touched. The network
+	// script is a pure function of the NetBox interface facts, and it
+	// hard-fails by design on an incomplete model (a missing bond, an
+	// unmodeled /31 leg); run after the install, that failure left the host
+	// wiped and half-deployed for a problem knowable up front. The rendered
+	// bundle is written into /target in the finalizing phase.
+	netCfg, err := netapply.RenderNetworkConfig(ctx, p.machineID)
+	if err != nil {
+		fatal("rendering network config", err)
+	}
 
 	if p.destructive {
 		ctx.Log.Info("--destructive set, skipping disk safety check")
@@ -231,7 +249,7 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 		fatal("seeding cloud-init", err)
 	}
 
-	if err := netapply.ApplyNetworkConfig(ctx, p.machineID); err != nil {
+	if err := netapply.ApplyNetworkConfig(ctx, netCfg); err != nil {
 		fatal("applying network config", err)
 	}
 

@@ -225,8 +225,8 @@ script plus the machine's raw interface facts to the agent, and the agent
 runs the script in the deploy initrd with `SLAGWORKS_NETWORK_FACTS` pointing
 at the facts JSON. The script emits a bundle of files and units to be
 applied under `/target`. See `internal/snapshot/netscript.go` for the
-matcher and `cmd/slagworks-agent/main.go` `applyNetworkConfig` /
-`applyNetBundle` for the agent-side apply.
+matcher and `internal/agent/netapply` (`RenderNetworkConfig`, then
+`ApplyNetworkConfig` / `applyNetBundle`) for the agent side.
 
 ### When you need a netscript
 
@@ -289,11 +289,17 @@ Scripts print one JSON document on stdout:
 
 ### Failure semantics
 
-`applyNetworkConfig` fails the deploy on: script matched but execution
-returned non-zero, output that does not parse as `netBundle`, or a path that
-escapes `/target`. Silently coming up with the default DHCP netplan when a
-script was supposed to run is treated as a fabric break — the same
-"loud-fail over silent-wrong-state" posture the storage matcher takes.
+The agent runs the script and validates its bundle early in the deploy,
+before the boot-disk safety check or any disk is touched, and fails the
+deploy there on: script matched but execution returned non-zero, output that
+does not parse as `netBundle`, or a file with a relative path or a non-octal
+mode. A NetBox model the script rejects therefore fails the deploy with the
+host exactly as found. The bundle is written into `/target` at the end of
+the deploy, where the checks that need the installed tree run (path
+containment, `chown` against the target's users, unit enable). Silently
+coming up with the default DHCP netplan when a script was supposed to run is
+treated as a fabric break — the same "loud-fail over silent-wrong-state"
+posture the storage matcher takes.
 
 ### Facts consumed by the script
 

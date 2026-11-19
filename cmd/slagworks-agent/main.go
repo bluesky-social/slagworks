@@ -248,16 +248,17 @@ func main() {
 	}
 
 	runDeploy(ctx, deployParams{
-		image:        *image,
-		machineID:    *machineID,
-		operationID:  *opID,
-		expectUUID:   *expectUUID,
-		destructive:  *destructive,
-		wipeAllDisks: *wipeAllDisks,
-		reporter:     reporter,
-		setPhase:     setPhase,
-		fatal:        fatal,
-		done:         done,
+		image:         *image,
+		machineID:     *machineID,
+		operationID:   *opID,
+		expectUUID:    *expectUUID,
+		destructive:   *destructive,
+		wipeAllDisks:  *wipeAllDisks,
+		reporter:      reporter,
+		setPhase:      setPhase,
+		fatal:         fatal,
+		done:          done,
+		checkIdentity: verifyIdentity,
 	})
 }
 
