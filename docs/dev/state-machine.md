@@ -344,9 +344,9 @@ it. The authoritative implementation is `Cache.BootActionForMAC`
 |---|---|---|---|
 | Unknown MAC (not in the snapshot) | — | — | `BootLocal` (`cache.go:254`) |
 | Any state with `!PXEEligible` | — | — | `BootLocal` (`cache.go:257`) |
+| Any state | deploy op | `awaiting_phone_home` | `BootLocal` (checked before the state rows below) |
 | `commissioning` | commission op already claimed | — | `BootCommission` (`cache.go:278`) |
 | `deploying` | deploy op | anything except `awaiting_phone_home` | `BootDeploy` (`cache.go:285`) |
-| `deploying` | deploy op | `awaiting_phone_home` | `BootLocal` (`cache.go:280`) |
 | `new` | commission op | — | `BootCommission` |
 | `new` | — | — | `BootLocal` |
 | `failed` | pending commission op | — | `BootCommission` (`cache.go:300`) |
@@ -366,9 +366,11 @@ Notes:
 - Commission and deploy both require an exact active operation. The boot
   script derives `machine_id`, `op_id`, and `trace_id` from that single
   binding; inventory can validate identity but cannot select another machine.
-- The `awaiting_phone_home` branch (`cache.go:280`) is the reason
-  the post-deploy reboot does not loop-wipe the disk; see [The
-  `awaiting_phone_home` latch](#the-awaiting_phone_home-latch).
+- The `awaiting_phone_home` row is the reason the post-deploy reboot
+  does not loop-wipe the disk; see [The `awaiting_phone_home`
+  latch](#the-awaiting_phone_home-latch). It is tested before the
+  machine state, so the `failed` and `commissioned` deploy rows apply
+  only to a deploy op that has not finished its install.
 
 ### How the boot action reaches the target
 
@@ -730,11 +732,15 @@ Test: `TestUpdateOpPhase_AwaitingPhoneHomeNotClobbered`
 (`cache_test.go:190`).
 
 `Cache.BootActionForMAC` reads the phase and returns `BootLocal`
-whenever `state = deploying` and `phase = awaiting_phone_home`
-(`cache.go:280`). The target boots off disk, its phone-home
-service POSTs `/api/v1/phone-home`, `RecordPhoneHome` fires the
-completion path described earlier, and the op transitions to
-`completed` with `machine.state = running`.
+whenever the active deploy op is at `phase = awaiting_phone_home`,
+whatever the machine's state. It does not require `state =
+deploying`: the worker learns that state only from the claim's
+op_delta (or an op_resync), so a late claim delta, or a pending op
+whose host PXE-booted on its own, lets the install finish while the
+machine still reads `commissioned` or `failed`. The target boots off
+disk, its phone-home service POSTs `/api/v1/phone-home`,
+`RecordPhoneHome` fires the completion path described earlier, and
+the op transitions to `completed` with `machine.state = running`.
 
 Timeout: `PhoneHomeTimeout` (30 minutes by default) anchored on
 `phase_entered_at`.

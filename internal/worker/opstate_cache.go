@@ -426,6 +426,16 @@ func (o *opState) bootActionLocked(mac string) bootAction {
 	activeOp := o.activeLifecycleOpLocked(m.ID)
 	state := o.effectiveState(m.ID, m.State)
 
+	// The awaiting_phone_home latch holds in every machine state, not only
+	// deploying: the deploying overlay arrives on the claim's op_delta, so
+	// the install can finish while the machine still reads commissioned or
+	// failed here (a late claim delta, or a pending op the host PXE-booted
+	// on its own). The commissioned and failed rows below would otherwise
+	// serve BootDeploy and re-wipe the disk just installed.
+	if activeOp != nil && activeOp.Type == model.OpDeploy && activeOp.Phase == "awaiting_phone_home" {
+		return bootAction{action: model.BootLocal}
+	}
+
 	switch state {
 	case model.MachineStateCommissioning:
 		// Fail-closed: a transient commissioning state must be backed by
@@ -442,9 +452,6 @@ func (o *opState) bootActionLocked(mac string) bootAction {
 		return bootAction{action: model.BootLocal, warn: true, mac: mac, state: state}
 	case model.MachineStateDeploying:
 		if activeOp != nil && activeOp.Type == model.OpDeploy {
-			if activeOp.Phase == "awaiting_phone_home" {
-				return bootAction{action: model.BootLocal}
-			}
 			if o.untrusted {
 				return bootAction{action: model.BootLocal}
 			}

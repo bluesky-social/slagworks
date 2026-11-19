@@ -489,6 +489,64 @@ func TestFailedDeltaLeavesAwaitingPhoneHome(t *testing.T) {
 	}
 }
 
+// TestAwaitingPhoneHomeHoldsOutsideDeployingState: the deploying overlay
+// reaches the worker only on the claim's op_delta (or an op_resync), so the
+// agent can finish an install while the worker still reads the machine as
+// commissioned or failed: the claim delta is late, or the op is still pending
+// (the executor has not reached it, or its claims keep failing) and the host
+// PXE-booted on its own. Once deploy_complete moves the op to
+// awaiting_phone_home, the post-install PXE must boot the disk whatever state
+// the machine reads; BootDeploy re-wipes the disk just installed.
+func TestAwaitingPhoneHomeHoldsOutsideDeployingState(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		state   model.MachineState
+		claimed bool // the executor won the claim, but the claim's op_delta has not been applied
+	}{
+		{"claimed, claim op_delta not applied yet", model.MachineStateCommissioned, true},
+		{"op still pending, machine commissioned", model.MachineStateCommissioned, false},
+		{"op still pending, machine failed", model.MachineStateFailed, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewCache(nil)
+			id, opID := uuid.New(), uuid.New()
+			mac := "52:54:00:a1:00:01"
+			c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 1, Machines: []model.MachineSnapshot{{
+				ID: id, State: tc.state, PXEEligible: true,
+				Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}},
+			}}})
+			c.ApplyOpResync(nil, nil)
+			c.ApplyOpDelta(model.Operation{ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpPending}, "")
+			if tc.claimed {
+				// The cache side of Executor.executeOp + runLifecycleOp.
+				c.MarkOpClaimed(opID.String())
+				c.UpdateOpPhase(opID.String(), "power_cycle")
+				c.UpdateOpPhase(opID.String(), "pxe_booting")
+				c.MarkOpStatus(opID.String(), model.OpRunning)
+			}
+			if got := c.BootActionForMAC(mac); got != model.BootDeploy {
+				t.Fatalf("precondition: the install boot got %d, want BootDeploy (%d)", got, model.BootDeploy)
+			}
+
+			// The agent finishes the install.
+			if err := c.HandleProgressReport(&model.ProgressReport{
+				MachineID: id.String(), OperationID: opID.String(), Event: "deploy_complete",
+			}); err != nil {
+				t.Fatalf("deploy_complete: %v", err)
+			}
+			if op := c.GetOperation(opID.String()); op == nil || op.Phase != "awaiting_phone_home" {
+				t.Fatalf("precondition: op = %+v, want phase awaiting_phone_home", op)
+			}
+
+			// The post-install reboot PXEs first (PXE is boot order #1).
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("post-install PXE of a deploy op at awaiting_phone_home (machine state %s): got %d, want BootLocal (%d)",
+					c.MachineState(id), got, model.BootLocal)
+			}
+		})
+	}
+}
+
 // TestRehydratedViewAcceptsEqualSeqOnce reproduces the pop1 rollout of
 // 2026-10-24: an older worker decoded snapshot N without a field it didn't
 // know and persisted it; after upgrading, the restarted worker rehydrated

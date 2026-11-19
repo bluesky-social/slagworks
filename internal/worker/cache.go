@@ -282,26 +282,31 @@ func (c *Cache) HelloSeqNum() int64 {
 //
 // Decision table (forward-path scope; redeploy-from-running is punted):
 //
+//   - any state + deploy op at awaiting_phone_home  → BootLocal
+//     (post-deploy reboot; the install is done, the OS should boot)
 //   - state new + pending commission op             → BootCommission
 //   - state failed + pending commission op          → BootCommission
 //   - state commissioned + pending deploy op        → BootDeploy
 //   - state failed + pending deploy op              → BootDeploy
 //   - state commissioning (op already claimed)      → BootCommission
-//   - state deploying, phase != awaiting_phone_home → BootDeploy
-//   - state deploying, phase == awaiting_phone_home → BootLocal
-//     (post-deploy reboot; the install is done, the OS should boot)
+//   - state deploying + deploy op                   → BootDeploy
 //   - anything else (running with no ops, etc.)     → BootLocal
+//
+// The first row wins over every row below it.
 //
 // Two clauses are critical and not obvious:
 //
-//   - "deploying + awaiting_phone_home → BootLocal" prevents the
-//     post-deploy PXE loop. The machine stays in `deploying` until
-//     phone-home; without phase-aware dispatch, the post-deploy
-//     reboot would re-serve the deploy initrd and infinite-loop.
+//   - "deploy op at awaiting_phone_home → BootLocal" prevents the
+//     post-deploy PXE loop. The op holds that phase until phone-home;
+//     without phase-aware dispatch, the post-deploy reboot would
+//     re-serve the deploy initrd and infinite-loop. It must not depend
+//     on the machine reading `deploying`: that overlay arrives only on
+//     the claim's op_delta (or an op_resync), so the install can finish
+//     while the machine still reads commissioned or failed here.
 //   - The pending-op clauses are what make the state-on-claim model
 //     work: the host PXEs while the machine is in a resting state,
 //     boot-action sees the pending op and serves the right initrd,
-//     the agent boots and claims the op (which advances the state).
+//     and the executor's claim advances the state.
 //
 // Combined read: machine identity comes from the view, machine State and
 // the active op come from the op-layer overlay. opState holds opState.mu
@@ -345,7 +350,7 @@ func (c *Cache) NotifyLogWrite() {
 // the BMC reconcile phase. nil is allowed; the observation goes out
 // without a Data field.
 //
-// The boot-action decision table reads `deploying + phase=
+// The boot-action decision table reads `deploy op at phase=
 // awaiting_phone_home → BootLocal`, which lets the post-install
 // reboot chain to disk instead of looping back into the deploy
 // initrd. The op transitions to `completed` only when phone-home
@@ -1154,7 +1159,7 @@ func (c *Cache) HandleProgressReport(report *model.ProgressReport) error {
 		// RecordPhoneHome). Without this phase, the boot-action
 		// would re-serve the deploy initrd on the post-install
 		// reboot and loop forever — see BootActionForMAC's
-		// "deploying + awaiting_phone_home → BootLocal" clause.
+		// "deploy op at awaiting_phone_home → BootLocal" clause.
 		c.UpdateOpPhase(opID, "awaiting_phone_home")
 		var data []byte
 		if report.BMCCreds != nil {
