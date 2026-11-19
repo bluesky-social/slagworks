@@ -302,7 +302,11 @@ what stock `/init` calls; the slagworks version does exactly this:
    under normal deploy — the agent reboots on success.
 9. On agent success (`rc==0`) the hook runs `reboot -f`. On failure it
    POSTs a `phase=agent_crashed` envelope to `/api/v1/report` and drops
-   into recovery.
+   into recovery. Exit status 3 means the agent stopped because the
+   site worker told it the operation is over (an operator abort, a
+   timeout, a failure reported elsewhere); the envelope is refused for
+   the same reason and the host waits in recovery like any other
+   failure.
 
 The recovery path (`slagworks_recovery_drop`) is worth knowing: on any
 FATAL — no lease, squashfs download failure, agent nonzero exit,
@@ -367,7 +371,8 @@ What the agent actually does, in order:
     ESP, write a systemd-boot entry pointing at
     `/slagworks/vmlinuz` and `/slagworks/initrd.img`, then
     `efibootmgr -c` to register the boot entry. A missing ESP mount is a
-    hard fail.
+    hard fail. The entry is only registered here; BootNext is set at
+    the very end (below).
   - **Legacy BIOS**: `installGRUBBIOS` — install GRUB i386-pc onto each
     disk with a `bios_grub` (EF02) partition. No BIOS-grub partition on
     any disk is a hard fail — we refuse to leave the host unbootable.
@@ -401,6 +406,13 @@ What the agent actually does, in order:
   hardware that refuses password rotation via ipmitool.
 - Report `deploy_complete` (carries `awaiting_phone_home` on the event
   and the rotated BMC credentials in the payload — one round trip).
+- UEFI only: set BootNext to the registered boot entry
+  (`efibootmgr -n`), so the reboot that follows goes to the installed
+  disk. This happens only after the site worker has accepted
+  `deploy_complete`. Firmware honors BootNext ahead of the BMC's PXE
+  override, so a deploy that is aborted or fails earlier must not leave
+  it set: the next deploy's power cycle would boot the abandoned
+  install instead of PXE.
 - Reboot.
 
 `slagworks.no_reboot` on the cmdline holds the host in the initrd instead
@@ -408,11 +420,12 @@ of rebooting, for ad-hoc debugging without losing `/target`.
 
 ## Stage 7: post-deploy boot, phone home
 
-After the reboot, the machine PXE-broadcasts again. The MAC's op is now
-`deploying, phase=awaiting_phone_home` — the site worker maps this to
-`BootLocal`, and the HTTP handler emits the platform-appropriate local-boot
-script (BIOS `exit`, UEFI `sanboot` over drives `0x80`-`0x9f`). The
-firmware boots the freshly installed OS off disk.
+After the reboot, a UEFI host whose firmware honors BootNext boots the
+installed disk directly. Any other host PXE-broadcasts again. The MAC's
+op is now `deploying, phase=awaiting_phone_home` — the site worker maps
+this to `BootLocal`, and the HTTP handler emits the platform-appropriate
+local-boot script (BIOS `exit`, UEFI `sanboot` over drives
+`0x80`-`0x9f`). The firmware boots the freshly installed OS off disk.
 
 The generated `slagworks-phone-home.service`
 (`internal/agent/target/target.go` `GeneratePhoneHomeUnit`) fires after

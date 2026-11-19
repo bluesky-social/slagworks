@@ -311,6 +311,15 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case opTerminalMsg:
+		// First terminal wins. A held screen gets a second one for the same op:
+		// the stream's source=global envelope and the op-row poll backstop each
+		// deliver one, in either order. Applying the second would move endTime
+		// (the frozen total), replace the reason, and re-run Fail on whatever
+		// phase arrived in between, so the final screen stays as the first left
+		// it. The run already quit or is holding; nothing to return.
+		if m.done {
+			return m, nil
+		}
 		m.done = true
 		m.failed = msg.failed
 		m.failReason = msg.reason

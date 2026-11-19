@@ -58,6 +58,14 @@ import (
 //     outage). While untrusted the op set may force BootLocal (conservative)
 //     but never actuate (BootDeploy/BootCommission) and the executor is
 //     paused. The first op_resync clears it.
+//   - resynced: true once an op_resync has been applied in this process, so
+//     the op set is global's active set and not merely "nothing received
+//     yet". An agent report for an op the set does not hold is refused as
+//     final (model.ErrOperationNotActive, which stops the agent) only when
+//     the worker knows the op is over: it holds the op's tombstone, or the
+//     set is resynced. A worker started without a persisted op layer is
+//     neither untrusted nor resynced until its first op_resync, and must
+//     not tell a healthy deploy's agent to stop in that window.
 type opState struct {
 	mu sync.RWMutex
 
@@ -73,6 +81,7 @@ type opState struct {
 	tombstoneOrder []string
 
 	untrusted bool
+	resynced  bool
 
 	// wake is fired (buffered, non-blocking) when a delta/resync adds a
 	// PENDING op, so the executor picks it up in ms instead of waiting on
@@ -275,6 +284,7 @@ func (o *opState) applyOpResync(ops []model.Operation, states map[string]model.M
 	o.machineState = overlay
 
 	o.untrusted = false
+	o.resynced = true
 	// fireWake is a lock-free channel send, so calling it while mu is held
 	// (before the deferred Unlock) is safe.
 	if anyPending {
@@ -566,11 +576,27 @@ func (o *opState) machineByMAC(mac string) *model.MachineSnapshot {
 	return nil
 }
 
+// opNotActiveError is a report rejection that is final: the operation is
+// over. It matches model.ErrOperationNotActive under errors.Is, which is
+// what the report endpoint maps to 410 Gone.
+type opNotActiveError string
+
+func (e opNotActiveError) Error() string { return string(e) }
+
+func (e opNotActiveError) Is(target error) bool { return target == model.ErrOperationNotActive }
+
 // validateReportBinding resolves the exact machine/op pair carried by an
 // agent report. Hardware discovered by the agent is never allowed to select a
 // different machine: the op stream and identity snapshot must agree first.
 // The bool reports an already-acknowledged phone-home retry, which callers
 // return as success without repeating its outbox or state side effects.
+//
+// A rejection wraps model.ErrOperationNotActive only when the op is known to
+// be over: it is held with a terminal status, its tombstone is held, or it is
+// absent from a resynced set. That answer stops the agent, so every rejection
+// the worker cannot stand behind as final (an unsynchronized op layer, a
+// machine missing from the snapshot, a machine/op or event/type mismatch)
+// stays a plain error.
 func (o *opState) validateReportBinding(machineID, opID uuid.UUID, event string) (*model.MachineSnapshot, *model.Operation, bool, error) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
@@ -595,10 +621,13 @@ func (o *opState) validateReportBinding(machineID, opID uuid.UUID, event string)
 	}
 	op, ok := o.ops[opID.String()]
 	if !ok {
-		return nil, nil, false, fmt.Errorf("operation %s is not active on this site", opID)
+		if _, removed := o.tombstones[opID.String()]; !removed && !o.resynced {
+			return nil, nil, false, fmt.Errorf("operation %s is not known on this site yet: no operation resync since the worker started", opID)
+		}
+		return nil, nil, false, opNotActiveError(fmt.Sprintf("operation %s is not active on this site", opID))
 	}
 	if op.Status == model.OpCompleted || op.Status == model.OpFailed {
-		return nil, nil, false, fmt.Errorf("operation %s is terminal (%s)", opID, op.Status)
+		return nil, nil, false, opNotActiveError(fmt.Sprintf("operation %s is terminal (%s)", opID, op.Status))
 	}
 	if op.MachineID != machineID {
 		return nil, nil, false, fmt.Errorf("operation %s belongs to machine %s, not %s", opID, op.MachineID, machineID)

@@ -149,9 +149,10 @@ Secrets Manager region is fixed at `us-east-2`
 
 If the SDK configuration cannot be loaded, global logs a warning and runs
 without a secret store: operations that need a BMC credential are refused
-at creation and `slagctl machine creds` returns 503. If the configuration
-loads but no credentials are available, the same operations fail when
-global first tries to read a secret.
+at creation, PDU and AMT operations (including `slagctl power outlet`) are
+created without a credential, and `slagctl machine creds` returns 503. If
+the configuration loads but no credentials are available, the same
+operations fail when global first tries to read a secret.
 
 ## `slagworksd site`
 
