@@ -390,6 +390,80 @@ func TestDispatcherFetchesDescendantLocationPrefixes(t *testing.T) {
 	}
 }
 
+// TestDispatcherLocationScopedPrimaryPrefixIsStable: when a location-scoped
+// config's subtree has slagworks-production prefixes at more than one
+// location, every rebuild over unchanged NetBox data must pick the same
+// primary prefix (Build serves Inputs.Prefixes[0] as the fabric DHCP subnet
+// and gateway), and must push only once. The primary is the prefix scoped to
+// the config's own location, the one site-config create requires; when that
+// location has none, it is the lowest-id descendant's.
+func TestDispatcherLocationScopedPrimaryPrefixIsStable(t *testing.T) {
+	// cage-a deliberately has a HIGHER id than its children, so sorting the
+	// subtree ids alone would not put the config's own location first.
+	locations := []netbox.Location{
+		{ID: 30, Slug: "cage-a"},
+		{ID: 11, Slug: "row-a1", Parent: &netbox.NestedRef{ID: 30}},
+		{ID: 12, Slug: "row-a2", Parent: &netbox.NestedRef{ID: 30}},
+	}
+	prefix := func(id, locID int, cidr, gw string) netbox.Prefix {
+		return netbox.Prefix{ID: id, Prefix: cidr, ScopeType: "dcim.location", ScopeID: locID, CustomFields: gatewayJSON(gw)}
+	}
+	cases := []struct {
+		name     string
+		prefixes map[int][]netbox.Prefix
+		want     string
+	}{
+		{
+			name: "own location has a prefix",
+			prefixes: map[int][]netbox.Prefix{
+				30: {prefix(1, 30, "10.1.0.0/24", "10.1.0.1")},
+				11: {prefix(2, 11, "10.2.0.0/24", "10.2.0.1")},
+				12: {prefix(3, 12, "10.3.0.0/24", "10.3.0.1")},
+			},
+			want: "10.1.0.0/24 gw 10.1.0.1",
+		},
+		{
+			name: "only descendants have prefixes",
+			prefixes: map[int][]netbox.Prefix{
+				11: {prefix(2, 11, "10.2.0.0/24", "10.2.0.1")},
+				12: {prefix(3, 12, "10.3.0.0/24", "10.3.0.1")},
+			},
+			want: "10.2.0.0/24 gw 10.2.0.1",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := model.SiteConfig{
+				Slug: "pop2-cage-a", NetBoxSite: "pop2", NetBoxLocation: "cage-a",
+				EphemeralPoolStart: "10.1.0.100", EphemeralPoolEnd: "10.1.0.200",
+			}
+			nb := &fakeNetBox{
+				sites:            map[string]netbox.Site{"pop2": {ID: 1, Slug: "pop2", Name: "pop2"}},
+				locations:        locations,
+				locationPrefixes: c.prefixes,
+			}
+			sink := &countingSink{}
+			d := NewDispatcher(nb, newFakeStore(t, cfg), sink)
+			seen := map[string]int{}
+			const builds = 200
+			for i := range builds {
+				snap, err := d.rebuild(context.Background(), "pop2-cage-a", int64(i+1))
+				if err != nil {
+					t.Fatal(err)
+				}
+				seen[snap.DHCP.Subnet+" gw "+snap.DHCP.Gateway]++
+			}
+			if len(seen) != 1 || seen[c.want] != builds {
+				t.Fatalf("%d rebuilds over unchanged NetBox data served %d different primary DHCP prefixes, want only %s: %v",
+					builds, len(seen), c.want, seen)
+			}
+			if got := sink.Count(); got != 1 {
+				t.Fatalf("%d rebuilds over unchanged NetBox data pushed %d snapshots, want 1", builds, got)
+			}
+		})
+	}
+}
+
 // TestInvariantDispatcherDriftErrors: a location-scoped config whose
 // location vanished from the site must fail the rebuild loudly.
 func TestInvariantDispatcherDriftErrors(t *testing.T) {

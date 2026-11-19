@@ -352,44 +352,10 @@ type RPCResponseMsg struct {
 	Terminal bool `json:"terminal,omitempty"`
 }
 
-// --- Global -> slagctl: operation watch (op-state pubsub) ---
-//
-// The operation-watch surface is separate from `slagctl logs`
-// (the structured-log stream below). It exists to drive the deploy-
-// watch TUI's phase progress bar and the non-TTY watchPlain renderer
-// off live op-state events. Backend isn't wired yet. The
-// log-content vehicle here (LogEntriesMsg) is a faux-log shape used
-// for phase-change pseudo-entries; it predates structured-logs and
-// will collapse into OpStatusMsg once the backend lands. Kept for now
-// so operation-watch CLI code continues to compile; not used by the
-// structured-logs pipeline.
-
-type SubscribeMsg struct {
-	MachineID   string `json:"machine_id"`
-	OperationID string `json:"op_id,omitempty"`
-	Cursor      int64  `json:"cursor"`
-}
-
-type LogEntriesMsg struct {
-	MachineID   string           `json:"machine_id"`
-	OperationID string           `json:"op_id,omitempty"`
-	Cursor      int64            `json:"cursor"`
-	Entries     []model.LogEntry `json:"entries"`
-}
-
-type OpSnapshotMsg struct {
-	Operation model.Operation `json:"operation"`
-}
-
-type OpStatusMsg struct {
-	OperationID string `json:"op_id"`
-	Status      string `json:"status"`
-	Phase       string `json:"phase"`
-}
-
-type SubscribedMsg struct{}
-
 // --- slagctl logs <-> global ---
+
+// SubscribedMsg acknowledges a LogStreamSubscribeMsg before backfill.
+type SubscribedMsg struct{}
 
 // LogStreamSubscribeMsg is the first message slagctl sends to
 // /api/v1/logs/stream. Filters narrow the live tail; cursor selects
@@ -533,14 +499,8 @@ const (
 	TypeDHCPLeases     = "dhcp_leases"
 	TypeDHCPLeasesResp = "dhcp_leases_response"
 
-	// slagctl operation watch (op snapshots / status / phase pseudo-logs)
-	TypeSubscribe  = "subscribe"
-	TypeLogEntries = "log_entries"
-	TypeOpSnapshot = "op_snapshot"
-	TypeOpStatus   = "op_status"
-	TypeSubscribed = "subscribed"
-
-	// slagctl logs (structured log stream)
+	// slagctl logs and operation watch (structured log stream)
+	TypeSubscribed         = "subscribed"
 	TypeLogStreamSubscribe = "log_stream_subscribe"
 	TypeLogStreamEnvelope  = "log_stream_envelope"
 	TypeLogStreamMeta      = "log_stream_meta"

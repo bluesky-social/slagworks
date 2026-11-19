@@ -265,7 +265,7 @@ func (s *Store) CompleteOperation(opID uuid.UUID, result []byte) error {
 		Updates(map[string]any{
 			"status":       model.OpCompleted,
 			"completed_at": now,
-			"result":       result,
+			"result":       jsonbSafe(result),
 			"version":      gorm.Expr("version + 1"),
 		}).Error
 }
@@ -316,7 +316,7 @@ func (s *Store) CompleteOperationWithState(
 			Updates(map[string]any{
 				"status":       model.OpCompleted,
 				"completed_at": now,
-				"result":       result,
+				"result":       jsonbSafe(result),
 				"version":      gorm.Expr("version + 1"),
 			})
 		if res.Error != nil {
@@ -406,7 +406,7 @@ func (s *Store) CompleteActiveOperation(
 			Updates(map[string]any{
 				"status":       model.OpCompleted,
 				"completed_at": now,
-				"result":       result,
+				"result":       jsonbSafe(result),
 				"version":      gorm.Expr("version + 1"),
 			})
 		if res.Error != nil {
@@ -565,6 +565,9 @@ func (s *Store) FailOperationOutcome(opID uuid.UUID, result []byte) (*OpOutcome,
 // re-claim recorded a phase), the SELECT misses and the fail is a
 // clean no-op instead of killing a live op.
 func (s *Store) failOperationGuarded(opID uuid.UUID, result []byte, guard func(*gorm.DB) *gorm.DB) (*OpOutcome, error) {
+	// Before anything reads result: the terminal envelope below quotes its
+	// error text into log_envelopes.payload, also jsonb.
+	result = jsonbSafe(result)
 	now := time.Now()
 	var outcome *OpOutcome
 	err := s.db.Transaction(func(tx *gorm.DB) error {

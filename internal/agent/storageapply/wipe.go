@@ -215,18 +215,46 @@ func bystanderDisks(ctx *agent.Context, layout storage.Layout) ([]string, error)
 	if err != nil {
 		return nil, fmt.Errorf("wipe-all-disks: lsblk: %w", err)
 	}
-	return parseBystanderDisks(out, layout), nil
+	claimed, err := wipeAllDisksExclusions(ctx, layout)
+	if err != nil {
+		return nil, fmt.Errorf("wipe-all-disks: %w; refusing to wipe any disk", err)
+	}
+	return parseBystanderDisks(out, claimed), nil
+}
+
+// wipeAllDisksExclusions returns the whole disks --wipe-all-disks leaves
+// alone: layoutClaimedDisks plus every disk that holds a preserve member.
+// The disks holding preserve members come from the kernel (memberDisks),
+// not from the member names, because a member may be spelled as a
+// /dev/disk/by-* path or with a driver's own partition naming. A member
+// the kernel cannot place is an error: guessing wrong destroys the data
+// the layout preserves. bystanderDisks and CheckStaleArrayMembers both use
+// this set, so the stale-member check examines exactly the disks the
+// bystander wipe will not zero.
+func wipeAllDisksExclusions(ctx *agent.Context, layout storage.Layout) (map[string]bool, error) {
+	claimed := layoutClaimedDisks(layout)
+	for _, name := range preserveDeviceNames(layout) {
+		for _, member := range layout.Devices[name].Members {
+			disks, err := memberDisks(ctx, member)
+			if err != nil {
+				return nil, fmt.Errorf("cannot tell which disk holds preserve %q member %q: %w", name, member, err)
+			}
+			for _, disk := range disks {
+				claimed[disk] = true
+			}
+		}
+	}
+	return claimed, nil
 }
 
 // parseBystanderDisks is the testable selector behind bystanderDisks:
-// given `lsblk -dnlo NAME,TYPE` output, return every whole disk the
-// layout does not claim.
-func parseBystanderDisks(lsblkOut string, layout storage.Layout) []string {
-	claimed := layoutClaimedDisks(layout)
+// given `lsblk -dnlo NAME,TYPE` output, return every whole disk not in
+// claimed.
+func parseBystanderDisks(lsblkOut string, claimed map[string]bool) []string {
 	var disks []string
 	for _, name := range parseWholeDisks(lsblkOut) {
 		if claimed[name] {
-			continue // layout target or raid/preserve member's parent disk
+			continue // layout target, raid member's parent disk, or holds a preserve member
 		}
 		disks = append(disks, name)
 	}
@@ -248,10 +276,12 @@ func parseWholeDisks(lsblkOut string) []string {
 }
 
 // layoutClaimedDisks returns the set of every whole-disk kernel name (bare,
-// no "/dev/" prefix) claimed by ANY device in the layout: a disk or retained
-// disk's own name, or the parent whole disk of every raid/preserve member.
-// This is the exclusion set for --wipe-all-disks. Retained disks and preserve
-// members are protected data; raid members are about to be (re)assembled.
+// no "/dev/" prefix) the layout claims by name: a disk or retained disk's own
+// name, or the parent whole disk of every raid member. With the disks that
+// hold preserve members, this is the exclusion set for
+// --wipe-all-disks (wipeAllDisksExclusions). Retained disks are protected
+// data; raid members are about to be (re)assembled. Raid members are layout names (validate requires
+// it) and may not exist yet, so they are parsed rather than looked up.
 func layoutClaimedDisks(layout storage.Layout) map[string]bool {
 	claimed := make(map[string]bool, len(layout.Devices))
 	for name, dev := range layout.Devices {
@@ -260,7 +290,7 @@ func layoutClaimedDisks(layout storage.Layout) map[string]bool {
 		}
 	}
 	for _, dev := range layout.Devices {
-		if dev.Type != "raid" && dev.Type != "preserve" {
+		if dev.Type != "raid" {
 			continue
 		}
 		for _, member := range dev.Members {
@@ -300,7 +330,9 @@ var partitionSuffix = regexp.MustCompile(`^(` + wholeDiskFamilies + `)p\d+$`)
 var bareDigitSuffix = regexp.MustCompile(`^([A-Za-z]+)\d+$`)
 
 // parentDisk returns the whole-disk kernel name that owns member, which may
-// already be a whole disk (returned unchanged) or a partition of one. It
+// already be a whole disk (returned unchanged) or a partition of one. It is
+// for raid members, which are layout names; preserve members name existing
+// devices and are resolved by the kernel instead (memberDisks). It
 // inverts internal/storage/plan.go's partName across three checks, in
 // order: (1) a name matching one of the nvme/mmcblk/loop/dm/md whole-disk
 // shapes is returned unchanged (nvme0n1, mmcblk0, loop0, dm-0, md0 are
@@ -475,7 +507,11 @@ func CheckStaleArrayMembers(ctx *agent.Context, layout storage.Layout, wipeAllDi
 			"stale members of a pinned array_uuid; rerun the deploy once lsblk works", err)
 	}
 	targets := diskTypeNames(layout)
-	claimed := layoutClaimedDisks(layout)
+	claimed, err := wipeAllDisksExclusions(ctx, layout)
+	if err != nil {
+		return fmt.Errorf("%w; cannot tell which disks --wipe-all-disks leaves alone to check them for "+
+			"stale members of a pinned array_uuid; check the storage script's preserve member names against lsblk on the target", err)
+	}
 	var wipeable, protected []string
 	for _, disk := range parseWholeDisks(out) {
 		if targets[disk] || (wipeAllDisks && !claimed[disk]) {

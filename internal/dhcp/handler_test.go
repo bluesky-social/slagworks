@@ -2,6 +2,7 @@ package dhcp
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -634,6 +635,33 @@ func TestRelay_GiaddrInDirectSubnet_UsesDirectPool(t *testing.T) {
 	}
 }
 
+// TestRelay_NAKSetsBroadcastBit: RFC 2131 4.3.2 says "If 'giaddr' is set in
+// the DHCPREQUEST message, the client is on a different subnet. The server
+// MUST set the broadcast bit in the DHCPNAK, so that the relay agent will
+// broadcast the DHCPNAK to the client". A NAK carries no yiaddr, so a relay
+// that honors a clear bit has no address to unicast it to and the client
+// never hears it. The request here leaves the bit clear, as an INIT-REBOOT
+// client normally does, so the NAK must set it rather than copy it.
+func TestRelay_NAKSetsBroadcastBit(t *testing.T) {
+	h := NewHandler(relayConfig())
+	mac, _ := net.ParseMAC("52:54:00:aa:bb:41")
+
+	// INIT-REBOOT through the relay for an address from some other network.
+	req := initReboot(t, mac, "192.168.7.7")
+	req.GatewayIPAddr = net.ParseIP("10.99.2.1")
+	if req.IsBroadcast() {
+		t.Fatal("setup: request must leave the broadcast bit clear")
+	}
+
+	reply := h.HandlePacket(req)
+	if !isNAK(reply) {
+		t.Fatalf("setup: want DHCPNAK for a wrong-network INIT-REBOOT, got %v", reply)
+	}
+	if !reply.IsBroadcast() {
+		t.Fatalf("relayed DHCPNAK flags = %#04x, want broadcast bit 0x8000 set (RFC 2131 4.3.2)", reply.Flags)
+	}
+}
+
 func TestRelay_DirectAndRelayedClientsGetSeparatePools(t *testing.T) {
 	h := NewHandler(relayConfig())
 	mac1, _ := net.ParseMAC("52:54:00:aa:bb:01")
@@ -869,6 +897,56 @@ func TestHandlePacket_IgnoresNonDHCP(t *testing.T) {
 	reply := h.HandlePacket(release)
 	if reply != nil {
 		t.Fatal("expected nil for Release, got a response")
+	}
+}
+
+// TestHandlePacket_IgnoresNonBootRequestOpcode pins RFC 2131 / RFC 951: a
+// server acts only on BOOTP op=BOOTREQUEST (1). A datagram on UDP/67 with
+// any other op byte is not a client request, even when its option 53 says
+// DISCOVER or REQUEST (a corrupt relay, or another server's malformed
+// reply). It must get no reply and must not allocate a lease. Answering it
+// also puts a malformed packet on the wire: the library's reply builder
+// flips any non-BOOTREQUEST op to BOOTREQUEST, so the OFFER/ACK would leave
+// with op=1.
+func TestHandlePacket_IgnoresNonBootRequestOpcode(t *testing.T) {
+	ops := []dhcpv4.OpcodeType{dhcpv4.OpcodeBootReply, 0, 3, 0xff}
+	types := []dhcpv4.MessageType{dhcpv4.MessageTypeDiscover, dhcpv4.MessageTypeRequest}
+
+	for _, mt := range types {
+		// Control: the identical packet with op=BOOTREQUEST is served, so
+		// the cases below are refused for the opcode alone.
+		t.Run(mt.String()+"/op=BootRequest", func(t *testing.T) {
+			h := NewHandler(testConfig())
+			pkt, err := dhcpv4.New(
+				dhcpv4.WithHwAddr(net.HardwareAddr{0x52, 0x54, 0x00, 0xaa, 0xbb, 0x41}),
+				dhcpv4.WithMessageType(mt))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reply := h.HandlePacket(pkt); reply == nil {
+				t.Fatalf("control: op=BOOTREQUEST %s got no reply", mt)
+			}
+		})
+		for _, op := range ops {
+			t.Run(fmt.Sprintf("%s/op=%d", mt, uint8(op)), func(t *testing.T) {
+				h := NewHandler(testConfig())
+				pkt, err := dhcpv4.New(
+					dhcpv4.WithHwAddr(net.HardwareAddr{0x52, 0x54, 0x00, 0xaa, 0xbb, 0x41}),
+					dhcpv4.WithMessageType(mt))
+				if err != nil {
+					t.Fatal(err)
+				}
+				pkt.OpCode = op
+
+				if reply := h.HandlePacket(pkt); reply != nil {
+					t.Errorf("op=%d %s was answered with %s (op=%s), want no reply",
+						uint8(op), mt, reply.MessageType(), reply.OpCode)
+				}
+				if n := len(h.Leases()); n != 0 {
+					t.Errorf("op=%d %s allocated %d lease(s), want 0", uint8(op), mt, n)
+				}
+			})
+		}
 	}
 }
 

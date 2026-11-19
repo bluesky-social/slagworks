@@ -56,8 +56,8 @@ func TestMetrics_DORAFlow(t *testing.T) {
 }
 
 // TestMetrics_DropReasons pins the drop counter's reason labels for
-// the three drop paths reachable without a relay: unknown MAC,
-// other-server REQUEST, pool exhaustion.
+// the four drop paths reachable without a relay: unknown MAC,
+// other-server REQUEST, pool exhaustion, non-BOOTREQUEST opcode.
 func TestMetrics_DropReasons(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	cfg := testConfig()
@@ -93,6 +93,26 @@ func TestMetrics_DropReasons(t *testing.T) {
 	}
 	if got := counterValue(t, cfg.Metrics.DropsTotal, DropOtherServer); got != 1 {
 		t.Errorf("drops{other_server_id} = %v, want 1", got)
+	}
+
+	// not_bootrequest: a DISCOVER whose BOOTP op is not BOOTREQUEST is
+	// counted as received and dropped under its own reason, even from an
+	// unregistered MAC (the opcode is checked before the MAC filter).
+	for _, mac := range []net.HardwareAddr{{0xaa, 0, 0, 0, 0, 0x03}, {0xde, 0xad, 0, 0, 0, 0x02}} {
+		bogus := mustDiscover(t, mac)
+		bogus.OpCode = dhcpv4.OpcodeBootReply
+		if resp := h.HandlePacket(bogus); resp != nil {
+			t.Fatalf("expected silence for op=BOOTREPLY DISCOVER from %s", mac)
+		}
+	}
+	if got := counterValue(t, cfg.Metrics.DropsTotal, DropNotBootRequest); got != 2 {
+		t.Errorf("drops{not_bootrequest} = %v, want 2", got)
+	}
+	if got := counterValue(t, cfg.Metrics.DropsTotal, DropUnknownMAC); got != 1 {
+		t.Errorf("drops{unknown_mac} = %v after op=BOOTREPLY packets, want 1 (unchanged)", got)
+	}
+	if got := counterValue(t, cfg.Metrics.RequestsTotal, "DISCOVER"); got != 5 {
+		t.Errorf("requests{DISCOVER} = %v, want 5", got)
 	}
 }
 

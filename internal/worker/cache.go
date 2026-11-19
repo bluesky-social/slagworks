@@ -61,7 +61,9 @@ import (
 // release) -> imageSyncMu (image sync, release). No code acquires applyMu
 // while holding opState.mu/subsMu/outboxMu/imageSyncMu; no reader/mutator
 // holds more than one of opState.mu/subsMu/outboxMu/imageSyncMu; subscriber
-// callbacks run with none of these held. Pure readers take no lock.
+// callbacks run with none of these held. persistMu (persistOpState) is
+// never taken while holding opState.mu; it wraps only opState.mu.RLock and
+// the LocalDB write. Pure readers take no lock.
 type Cache struct {
 	// applyMu serializes ApplySnapshot end-to-end. Never taken by a reader.
 	applyMu sync.Mutex
@@ -103,6 +105,14 @@ type Cache struct {
 	// running without persistence (tests). The outbox holds its own
 	// reference for observation persistence.
 	localDB *LocalDB
+
+	// persistMu serializes persistOpState's read-then-write. The WS read
+	// loop (stream applies) and the agent / phone-home HTTP handlers (the
+	// latch mutations) both persist the op layer; without it a write of an
+	// older read could land after a newer one and drop the latch from
+	// disk. Taken before opState.mu (RLock, inside snapshotForPersist) and
+	// never while holding it.
+	persistMu sync.Mutex
 
 	// ImagesDir is the on-disk directory for boot images. When set,
 	// ApplySnapshot calls SyncImages after the view swap.
@@ -200,7 +210,7 @@ func NewCacheWithSerial(localDB *LocalDB, selfSerial string) *Cache {
 		// first op_resync (see opState.untrusted). Absent (fresh install,
 		// or a DB written by a pre-Tier-2 binary) leaves the empty set.
 		if os := localDB.LoadOpState(); os != nil {
-			c.opState.rehydrate(os.Ops, os.Overlay)
+			c.opState.rehydrate(*os)
 		}
 	}
 	c.view.Store(v)
@@ -240,15 +250,19 @@ func (c *Cache) ApplyOpRemoved(opID, machineID string, version int, machineState
 	c.persistOpState()
 }
 
-// persistOpState writes the current op set + overlay to LocalDB. Called
-// after every stream apply so a crash rehydrates the last-known op layer
-// (untrusted). Best-effort; a nil localDB (tests) is a no-op.
+// persistOpState writes the current op layer to LocalDB. Called after every
+// stream apply and after the local mutations that keep an installed host
+// from being re-imaged (UpdateOpPhase to awaiting_phone_home,
+// RecordPhoneHome), so a crash rehydrates the last-known op layer
+// (untrusted) with those latches intact. Best-effort; a nil localDB (tests)
+// is a no-op.
 func (c *Cache) persistOpState() {
 	if c.localDB == nil {
 		return
 	}
-	ops, overlay := c.opState.snapshotForPersist()
-	c.localDB.SaveOpState(ops, overlay)
+	c.persistMu.Lock()
+	defer c.persistMu.Unlock()
+	c.localDB.SaveOpState(c.opState.snapshotForPersist())
 }
 
 // LastSeqNum returns the SeqNum of the most recently applied snapshot,
@@ -282,22 +296,24 @@ func (c *Cache) HelloSeqNum() int64 {
 //
 // Decision table (forward-path scope; redeploy-from-running is punted):
 //
+//   - any state, deploy op phase == awaiting_phone_home → BootLocal
+//     (post-deploy reboot; the install is done, the OS should boot)
 //   - state new + pending commission op             → BootCommission
 //   - state failed + pending commission op          → BootCommission
 //   - state commissioned + pending deploy op        → BootDeploy
 //   - state failed + pending deploy op              → BootDeploy
 //   - state commissioning (op already claimed)      → BootCommission
-//   - state deploying, phase != awaiting_phone_home → BootDeploy
-//   - state deploying, phase == awaiting_phone_home → BootLocal
-//     (post-deploy reboot; the install is done, the OS should boot)
+//   - state deploying + deploy op                   → BootDeploy
 //   - anything else (running with no ops, etc.)     → BootLocal
 //
 // Two clauses are critical and not obvious:
 //
-//   - "deploying + awaiting_phone_home → BootLocal" prevents the
-//     post-deploy PXE loop. The machine stays in `deploying` until
-//     phone-home; without phase-aware dispatch, the post-deploy
-//     reboot would re-serve the deploy initrd and infinite-loop.
+//   - "awaiting_phone_home → BootLocal" prevents the post-deploy PXE
+//     loop. The machine stays in `deploying` until phone-home; without
+//     phase-aware dispatch, the post-deploy reboot would re-serve the
+//     deploy initrd and infinite-loop. It holds in every machine state
+//     because the pending-op clauses let an install finish before the
+//     claim's op_delta moves the machine off commissioned/failed.
 //   - The pending-op clauses are what make the state-on-claim model
 //     work: the host PXEs while the machine is in a resting state,
 //     boot-action sees the pending op and serves the right initrd,
@@ -336,20 +352,19 @@ func (c *Cache) NotifyLogWrite() {
 }
 
 // recordDeployComplete records the agent's "install done, rebooting"
-// signal. The deploy op is NOT completed here — it stays `claimed`
+// signal. The deploy op is NOT completed here — it stays active
 // with phase=`awaiting_phone_home` while we wait for the installed
-// OS to phone home. Local machine state stays in `deploying`.
+// OS to phone home. Local machine state does not change.
 //
 // data is the JSON-serialized payload that travels with the
 // deploy_complete observation — currently the agent's BMCCreds from
 // the BMC reconcile phase. nil is allowed; the observation goes out
 // without a Data field.
 //
-// The boot-action decision table reads `deploying + phase=
-// awaiting_phone_home → BootLocal`, which lets the post-install
-// reboot chain to disk instead of looping back into the deploy
-// initrd. The op transitions to `completed` only when phone-home
-// arrives (RecordPhoneHome).
+// The boot-action decision table reads `phase=awaiting_phone_home →
+// BootLocal`, which lets the post-install reboot chain to disk
+// instead of looping back into the deploy initrd. The op transitions
+// to `completed` only when phone-home arrives (RecordPhoneHome).
 func (c *Cache) recordDeployComplete(machineID, operationID uuid.UUID, data []byte) {
 	obs := model.Observation{
 		MachineID:   machineID,
@@ -385,15 +400,23 @@ func (c *Cache) recordBMCReconcileReport(machineID, operationID uuid.UUID, rep m
 }
 
 // RecordPhoneHome is the canonical signal that the installed OS
-// booted successfully. It completes the active deploy op (queues an
-// op_update with status=completed, which flows through the hub and
-// transitions Machine.state from `deploying` → `running`) and updates
+// booted successfully. It completes the active deploy op and updates
 // the local cache state.
 //
+// The completion travels on two channels. The phone_home observation
+// carries the deploy op's ID and is the durable one: it sits in the
+// SQLite outbox until global acks it, and global's observation handler
+// completes the op (deploying → running) from it. That matters because
+// the installed OS phones home exactly once after a 2xx, so nothing
+// re-sends the completion if it is lost after we answer. The op_update
+// with status=completed is memory-only (lost on a worker restart, on a
+// connection that dies before the hub reads it, or on a failed hub
+// handler call); it stays as the existing path, and whichever of the
+// two reaches global first completes the op while the other is a no-op.
+//
 // If no active deploy op is found (late phone-home, op already
-// completed by timeout, etc.), the observation still goes out —
-// global ignores it for state transitions but the deploy_logs and
-// audit trail still benefit.
+// completed by timeout, etc.), the observation still goes out with no
+// operation ID: global acks it without a state transition.
 func (c *Cache) RecordPhoneHome(machineID uuid.UUID) {
 	// opState records the local machine-state advance as an overlay rather
 	// than mutating the (immutable) view: the machine stays `running`
@@ -403,14 +426,23 @@ func (c *Cache) RecordPhoneHome(machineID uuid.UUID) {
 	deployOpID := c.opState.recordPhoneHome(machineID)
 
 	c.appendObservation(model.Observation{
-		MachineID: machineID,
-		Event:     "phone_home",
-		Timestamp: time.Now(),
+		MachineID:   machineID,
+		OperationID: deployOpID,
+		Event:       "phone_home",
+		Timestamp:   time.Now(),
 	})
 
-	if deployOpID != "" {
-		c.RecordOpUpdate(deployOpID, string(model.OpCompleted), nil)
+	if deployOpID != uuid.Nil {
+		c.RecordOpUpdate(deployOpID.String(), string(model.OpCompleted), nil)
 	}
+
+	// The completion op_update is not durable, and global may be
+	// unreachable: persist the running overlay and the phoneHomed latch so a
+	// restart before global completes the op does not lose them. The first
+	// op_resync after the restart can still carry the op as
+	// claimed-deploying, and applyOpResync pins the machine running only if
+	// phoneHomed survived.
+	c.persistOpState()
 }
 
 // recordCommissionReport queues a commission_report observation. Unlike
@@ -1039,9 +1071,20 @@ func (c *Cache) PrepareDeployLogs(machineID, operationID string) {
 // source:"phase" log entry, and queues the update for push to central.
 // If the operation has been marked failed, the update is rejected. The
 // awaiting_phone_home clobber guard and same-phase dedup live in
-// opState.updatePhase; see bootPrefixPhases (opstate_cache.go) for why.
+// opState.updatePhase (opstate_cache.go), which documents why.
 func (c *Cache) UpdateOpPhase(opID, phase string) {
 	upd := c.opState.updatePhase(opID, phase)
+	if phase == "awaiting_phone_home" {
+		// The latch is the op row's phase, and the phase op_update below is
+		// not durable: if global is unreachable and the worker restarts
+		// before global echoes the phase back, LocalDB still holds the
+		// pre-latch row, keepTerminalWait has nothing to keep when the
+		// first op_resync carries global's row, and the installed host's
+		// next PXE gets BootDeploy. Persist it now. Not gated on proceed:
+		// updatePhase writes the row's phase before its same-phase dedup
+		// returns proceed=false, and that write must reach disk too.
+		c.persistOpState()
+	}
 	if !upd.proceed {
 		return
 	}
@@ -1079,7 +1122,9 @@ func (c *Cache) UpdateOpPhase(opID, phase string) {
 
 // MarkOpFailed marks an operation as failed in-memory and queues a status
 // update. Once marked failed, UpdateOpPhase for this op is rejected —
-// this prevents phase progression after terminal failure.
+// this prevents phase progression after terminal failure — and an op_delta
+// or op_resync that still shows the op active does not revive it; only
+// op_removed ends the local failure.
 func (c *Cache) MarkOpFailed(opID, phase, errMsg string) {
 	c.opState.markFailed(opID, phase)
 
@@ -1180,12 +1225,12 @@ func (c *Cache) HandleProgressReport(report *model.ProgressReport) error {
 
 	switch report.Event {
 	case "deploy_complete":
-		// Phase moves to awaiting_phone_home. Op stays claimed; it
+		// Phase moves to awaiting_phone_home. Op stays active; it
 		// completes when the installed OS phones home (handled in
 		// RecordPhoneHome). Without this phase, the boot-action
 		// would re-serve the deploy initrd on the post-install
 		// reboot and loop forever — see BootActionForMAC's
-		// "deploying + awaiting_phone_home → BootLocal" clause.
+		// "awaiting_phone_home → BootLocal" clause.
 		c.UpdateOpPhase(opID, "awaiting_phone_home")
 		var data []byte
 		if report.BMCCreds != nil {

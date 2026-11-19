@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Script holds the parsed metadata and content of a config script.
@@ -35,6 +36,12 @@ type MatchRule struct {
 // first non-comment, non-shebang line. validFields gates the allowed match
 // fields — a slagworks:match against any other field is an error, so a typo'd
 // field name fails loudly at upload time instead of silently never matching.
+//
+// A header line whose first word starts with "slagworks:" (in any case) is a
+// directive, and only slagworks:match and slagworks:priority are recognized;
+// any other is an error. Treating a typo such as "slagworks:mtach" or
+// "slagworks:match:" as prose would drop the rule or priority without a word,
+// widening the script's match or letting a lower-priority script win.
 func Parse(path string, content []byte, validFields map[string]struct{}) (*Script, error) {
 	s := &Script{
 		Path:    path,
@@ -56,10 +63,18 @@ func Parse(path string, content []byte, validFields map[string]struct{}) (*Scrip
 
 		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "#"))
 
-		if after, ok := strings.CutPrefix(rest, "slagworks:match "); ok {
-			parts := strings.SplitN(strings.TrimSpace(after), "=", 2)
+		// The directive is the line's first word; any run of whitespace
+		// separates it from its argument, as around "#" and "=".
+		directive, arg := rest, ""
+		if i := strings.IndexFunc(rest, unicode.IsSpace); i >= 0 {
+			directive, arg = rest[:i], strings.TrimSpace(rest[i:])
+		}
+
+		switch {
+		case directive == "slagworks:match":
+			parts := strings.SplitN(arg, "=", 2)
 			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-				return nil, fmt.Errorf("%s: invalid match rule: %q", path, after)
+				return nil, fmt.Errorf("%s: invalid match rule: %q", path, arg)
 			}
 			rule := MatchRule{
 				Field: strings.TrimSpace(parts[0]),
@@ -77,12 +92,14 @@ func Parse(path string, content []byte, validFields map[string]struct{}) (*Scrip
 				rule.pattern = compiled
 			}
 			s.Rules = append(s.Rules, rule)
-		} else if after, ok := strings.CutPrefix(rest, "slagworks:priority "); ok {
-			p, err := parsePriority(after)
+		case directive == "slagworks:priority":
+			p, err := parsePriority(arg)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", path, err)
 			}
 			s.Priority = p
+		case hasPrefixFold(directive, "slagworks:"):
+			return nil, fmt.Errorf("%s: unrecognized header directive in %q: the only directives are \"slagworks:match <field>=<value>\" and \"slagworks:priority <int>\", lowercase; fix the spelling, or reword the comment so it does not start with \"slagworks:\"", path, rest)
 		}
 	}
 
@@ -179,6 +196,11 @@ func parsePriority(s string) (int, error) {
 		return 0, fmt.Errorf("invalid priority %q: %w", t, err)
 	}
 	return p, nil
+}
+
+// hasPrefixFold reports whether s begins with prefix, ignoring case.
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
 func sortedFields(fields map[string]struct{}) string {

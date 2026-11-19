@@ -2,7 +2,10 @@ package storage
 
 import (
 	"fmt"
+	"path"
+	"sort"
 	"strings"
+	"unicode"
 )
 
 // validate checks a layout for internal consistency before planning.
@@ -53,6 +56,9 @@ func validate(layout Layout) error {
 	if err := validateRetainMemberCollisions(layout); err != nil {
 		return err
 	}
+	if err := validateRAIDMemberUse(layout); err != nil {
+		return err
+	}
 
 	// Verify all mount devices exist in the layout and are mountable.
 	// A disk partition referenced by a mount must declare a filesystem:
@@ -60,9 +66,12 @@ func validate(layout Layout) error {
 	// unconditionally, so mounting an FS-less partition (a bios_grub EF02
 	// embedding partition, or any partition simply omitted from fs
 	// config) would mount raw, unformatted bytes. RAID-member partitions
-	// legitimately have no FS but are never mounted directly (the md
-	// device is), so they don't hit this path.
+	// legitimately have no FS, but validateRAIDMemberUse has already
+	// refused a mount of one (the md device is mounted instead).
 	for path, m := range layout.Mounts {
+		if err := validateMountPoint(path); err != nil {
+			return err
+		}
 		if !deviceExists(m.Device, layout) {
 			return fmt.Errorf("mount %q references unknown device %q", path, m.Device)
 		}
@@ -100,6 +109,12 @@ func validate(layout Layout) error {
 				return fmt.Errorf("mount %q references partition %q which has no filesystem", path, m.Device)
 			}
 		}
+		// The planner formats swap with mkswap, but swap is not a
+		// filesystem: the mount would fail ("unknown filesystem type
+		// 'swap'") after the disks were already repartitioned.
+		if DeclaredFS(layout, m.Device) == "swap" {
+			return fmt.Errorf("mount %q references swap device %q (swap cannot be mounted; remove it from mounts)", path, m.Device)
+		}
 	}
 
 	// Verify "/" mount exists.
@@ -107,6 +122,31 @@ func validate(layout Layout) error {
 		return fmt.Errorf("layout has no root (/) mount")
 	}
 
+	return nil
+}
+
+// validateMountPoint rejects a mount point that is not a clean absolute
+// path. Every consumer uses the key verbatim: planMounts mounts at
+// "/target"+mp and orders mounts by the number of "/" in each key, and the
+// agent writes the key into /etc/fstab. A relative key mounts beside
+// /target, a ".." segment escapes it, a doubled or trailing slash miscounts
+// the depth (so a parent can mount over its child) or names one point twice,
+// and whitespace, control characters or a backslash corrupt the fstab line
+// (fstab splits on blanks and decodes \040-style escapes). A clean absolute
+// key has none of these problems, and two distinct clean keys always name
+// distinct mount points.
+func validateMountPoint(mp string) error {
+	if !strings.HasPrefix(mp, "/") {
+		return fmt.Errorf("mount point %q is not absolute; mount points must start with \"/\" (for example \"/data\"): fix the storage script's mounts", mp)
+	}
+	for _, r := range mp {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || r == '\\' {
+			return fmt.Errorf("mount point %q contains whitespace, a control character or a backslash, which /etc/fstab cannot hold verbatim: rename it in the storage script's mounts", mp)
+		}
+	}
+	if clean := path.Clean(mp); clean != mp {
+		return fmt.Errorf("mount point %q is not a clean path (doubled or trailing slash, or a \".\" or \"..\" segment); write it as %q in the storage script's mounts", mp, clean)
+	}
 	return nil
 }
 
@@ -184,9 +224,20 @@ func memberReferencesDisk(member, disk string) bool {
 func validateDisk(name string, dev Device) error {
 	// Disks with no partitions are valid — they may be whole-disk RAID members.
 	restCount := 0
-	for _, p := range dev.Partitions {
+	for i, p := range dev.Partitions {
 		if p.Name == "" {
 			return fmt.Errorf("disk %q: partition missing name", name)
+		}
+		// planDisk creates and formats partition i+1 at the node the kernel
+		// gives that position, while mounts, RAID members, fstab and the
+		// bootloader reach the partition through "/dev/" + its name. Any
+		// other name sends those to a different device than the one just
+		// formatted. A "/dev/"-prefixed name is the same node: resolveDevPath
+		// passes it through unchanged.
+		if want := partName(name, i+1); stripDevPrefix(p.Name) != want {
+			return fmt.Errorf("disk %q partition %d is named %q, but the kernel names it %q; "+
+				"rename it %q, since mounts and RAID members find a partition by its name",
+				name, i+1, p.Name, want, want)
 		}
 		if p.Size == "" {
 			return fmt.Errorf("disk %q partition %q: missing size", name, p.Name)
@@ -247,6 +298,49 @@ func validateRAID(name string, dev Device, layout Layout) error {
 		}
 	}
 
+	return nil
+}
+
+// validateRAIDMemberUse rejects a layout that gives a RAID member a second
+// use. mdadm --create takes each member for its array alone, so a member
+// listed twice, shared by two arrays or also mounted fails at mdadm or
+// mount, after Phase 1 has already zapped and repartitioned the disks. A
+// whole disk used as a member while its disk entry also declares partitions
+// does not fail at all: Phase 1 creates and formats those partitions, then
+// mdadm --create on the disk writes its superblock over the GPT and its
+// data area over the partitions, and an unmounted one (a second ESP) is
+// lost without an error. Arrays and mounts are walked in sorted
+// order so the error names the same device on every run.
+func validateRAIDMemberUse(layout Layout) error {
+	_, _, raidNames, _ := classifyDevices(layout)
+	owner := make(map[string]string) // member name -> the raid that uses it
+	for _, name := range raidNames {
+		for _, member := range layout.Devices[name].Members {
+			if disk, ok := layout.Devices[member]; ok && disk.Type == "disk" && len(disk.Partitions) > 0 {
+				return fmt.Errorf("raid %q: member %q is a whole disk that also declares partitions, which mdadm --create on the disk would overwrite (use one of its partitions as the member, or remove the partitions)", name, member)
+			}
+			key := stripDevPrefix(member)
+			switch prev, used := owner[key]; {
+			case used && prev == name:
+				return fmt.Errorf("raid %q: member %q is listed twice (list each member once)", name, member)
+			case used:
+				return fmt.Errorf("raid %q: member %q is already a member of raid %q (a device can belong to one array only)", name, member, prev)
+			}
+			owner[key] = name
+		}
+	}
+
+	paths := make([]string, 0, len(layout.Mounts))
+	for path := range layout.Mounts {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		dev := layout.Mounts[path].Device
+		if raid, ok := owner[stripDevPrefix(dev)]; ok {
+			return fmt.Errorf("mount %q references %q, a member of raid %q (mount the array instead)", path, dev, raid)
+		}
+	}
 	return nil
 }
 

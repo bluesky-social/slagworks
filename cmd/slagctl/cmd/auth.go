@@ -51,7 +51,7 @@ no local browser is available.`,
 			if err != nil {
 				return err
 			}
-			if err := clientauth.WriteCachedToken(cfg, tok); err != nil {
+			if err := clientauth.WriteCachedToken(cmd.Context(), cfg, tok); err != nil {
 				return fmt.Errorf("caching token: %w", err)
 			}
 			if err := writeSavedConfig(savedConfig{API: apiURL, OIDCIssuer: issuer, OIDCClientID: clientID}); err != nil {
@@ -75,7 +75,7 @@ func authLogoutCmd() *cobra.Command {
 		Use:   "logout",
 		Short: "delete the cached SSO token",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := clientauth.Logout(tokenCacheConfig()); err != nil {
+			if err := clientauth.Logout(cmd.Context(), tokenCacheConfig()); err != nil {
 				return err
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "Logged out (cached token removed).")
