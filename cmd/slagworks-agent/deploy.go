@@ -235,8 +235,11 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 		}
 	}
 
-	if err := target.ConfigureRAID(ctx); err != nil {
-		ctx.Log.Warn("RAID configuration", "err", err)
+	// The installed system's mdadm.conf decides which arrays its initramfs
+	// assembles; a host whose initramfs lacks it can boot into an array the
+	// layout does not name, or lose its root array to one. Hard fail.
+	if err := target.ConfigureRAID(ctx, layout); err != nil {
+		fatal("configuring RAID", err)
 	}
 
 	setPhase("finalizing")
