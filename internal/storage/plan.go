@@ -65,6 +65,9 @@ func Plan(layout Layout, inventory []BlockDevice) ([]Command, error) {
 	// Phase 1: Partition disks.
 	for _, name := range diskNames {
 		dev := layout.Devices[name]
+		if err := checkFits(name, dev, inventoryByName[name]); err != nil {
+			return nil, err
+		}
 		if err := checkVFATSizes(name, dev, inventoryByName[name]); err != nil {
 			return nil, err
 		}

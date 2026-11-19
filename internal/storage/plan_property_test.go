@@ -44,18 +44,18 @@ func partNameLocal(disk string, num int) string {
 	return fmt.Sprintf("%s%s%d", disk, sep, num)
 }
 
-// drawSize picks a partition size, allowing at most one "rest" per disk so
-// the generated layout always satisfies validateDisk.
-func drawSize(t *rapid.T, restUsed *bool) string {
-	s := rapid.SampledFrom([]string{"100G", "200G", "512M", "rest"}).Draw(t, "partSize")
-	if s == "rest" {
-		if *restUsed {
-			s = "100G"
-		} else {
-			*restUsed = true
-		}
+// genDiskBytes is every generated disk's size: room for four of the largest
+// partitions drawSize picks, and their alignment, with some left for "rest".
+const genDiskBytes = 1 << 40
+
+// drawSize picks a partition size, "rest" only for the last partition so the
+// generated layout always satisfies validateDisk.
+func drawSize(t *rapid.T, last bool) string {
+	sizes := []string{"100G", "200G", "512M"}
+	if last {
+		sizes = append(sizes, "rest")
 	}
-	return s
+	return rapid.SampledFrom(sizes).Draw(t, "partSize")
 }
 
 func genParts(t *rapid.T, disk string, forceMountable bool) []Partition {
@@ -65,8 +65,8 @@ func genParts(t *rapid.T, disk string, forceMountable bool) []Partition {
 	}
 	n := rapid.IntRange(minP, 4).Draw(t, "numParts")
 	parts := make([]Partition, 0, n)
-	restUsed := false
 	for i := 0; i < n; i++ {
+		last := i == n-1
 		var kind string
 		if i == 0 && forceMountable {
 			kind = rapid.OneOf(rapid.Just("esp"), rapid.Just("fs")).Draw(t, "mountableKind")
@@ -79,10 +79,10 @@ func genParts(t *rapid.T, disk string, forceMountable bool) []Partition {
 			p.Size, p.FS, p.Bootable = "512M", "vfat", true
 		case "fs":
 			p.FS = rapid.SampledFrom([]string{"ext4", "xfs"}).Draw(t, "fs")
-			p.Size = drawSize(t, &restUsed)
+			p.Size = drawSize(t, last)
 		case "swap":
 			p.FS = "swap"
-			p.Size = drawSize(t, &restUsed)
+			p.Size = drawSize(t, last)
 		case "biosgrub":
 			p.Size, p.BIOSGrub = "1M", true
 		case "raid":
@@ -130,7 +130,7 @@ func genScenario() *rapid.Generator[scenario] {
 		for _, d := range disks {
 			devices[d.name] = Device{Type: "disk", PTable: "gpt", Partitions: d.parts}
 			inventory = append(inventory, BlockDevice{
-				Name: d.name, SizeBytes: 107374182400, Transport: d.transport,
+				Name: d.name, SizeBytes: genDiskBytes, Transport: d.transport,
 				LogicalSectorBytes: rapid.SampledFrom([]int64{512, 4096}).Draw(t, "logicalSector"),
 			})
 			if len(d.parts) == 0 {
