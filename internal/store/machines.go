@@ -185,8 +185,17 @@ func (s *Store) DeleteMachineIfIdle(id uuid.UUID) (bool, error) {
 	return deleted, nil
 }
 
+// SetMachineLocked writes ONLY the locked column. Returns
+// ErrMachineNotFound when no row matches.
 func (s *Store) SetMachineLocked(id uuid.UUID, locked bool) error {
-	return s.db.Model(&model.Machine{}).Where("id = ?", id).Update("locked", locked).Error
+	res := s.db.Model(&model.Machine{}).Where("id = ?", id).Update("locked", locked)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrMachineNotFound
+	}
+	return nil
 }
 
 // SetMachineNetBoxDeviceID writes ONLY the netbox_device_id column. Used by the
@@ -234,8 +243,38 @@ func (s *Store) WithPopAdvisoryLock(ctx context.Context, popSlug string, fn func
 	})
 }
 
+// SetMachinePXEEligible writes ONLY the pxe_eligible column. Enabling a
+// locked machine is refused with ErrMachineLocked: the lock marks a machine
+// in service, and pxe_eligible is the gate that keeps it from PXE-booting
+// into a reimage. The lock test rides the UPDATE itself, so a concurrent
+// lock cannot land between a check and the write. Disabling is not
+// lock-gated: it only moves the machine toward booting from disk. Returns
+// ErrMachineNotFound when no row matches.
 func (s *Store) SetMachinePXEEligible(id uuid.UUID, eligible bool) error {
-	return s.db.Model(&model.Machine{}).Where("id = ?", id).Update("pxe_eligible", eligible).Error
+	q := s.db.Model(&model.Machine{}).Where("id = ?", id)
+	if eligible {
+		q = q.Where("locked = ?", false)
+	}
+	res := q.Update("pxe_eligible", eligible)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	if !eligible {
+		return ErrMachineNotFound
+	}
+	// The enable matched nothing: either there is no such machine or it was
+	// locked when the UPDATE ran.
+	var n int64
+	if err := s.db.Model(&model.Machine{}).Where("id = ?", id).Count(&n).Error; err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrMachineNotFound
+	}
+	return fmt.Errorf("%w (typically because it is in service); run `slagctl machine unlock %s` first", ErrMachineLocked, id)
 }
 
 func (s *Store) StoreCommissionData(id uuid.UUID, data json.RawMessage) error {
