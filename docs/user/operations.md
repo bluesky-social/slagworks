@@ -157,7 +157,11 @@ against NetBox, then:
   `ipmi_exporter` and `sel-archiver` keep scraping. An existing account is
   tested first (`ipmitool user test`, at 16 and 20 bytes) and the password
   written only when the BMC doesn't already hold it: AMI MegaRAC refuses
-  to set a password to its current value (completion code 0x19). If the
+  to set a password to its current value (completion code 0x19). For the
+  same reason a password write that ipmitool reports as failed (its
+  response lost, for example), stored or freshly generated, is followed by
+  a test before any retry, and counts as written when the BMC holds the
+  password. If the
   BMC holds a different password and also refuses the stored one (for
   example because it is in MegaRAC's reuse history), the op fails saying
   so; set the password on the BMC by hand, or use `--rotate-monitor`.

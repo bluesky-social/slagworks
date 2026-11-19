@@ -865,6 +865,15 @@ type plan struct {
 // yet: try the v1.5 16-byte form (ipmitool default) first, then the v2.0
 // 20-byte form, then a short sleep + retry the v1.5. Generated passwords
 // are 12 ASCII chars, well under either byte limit.
+//
+// A failed attempt does not show that the slot lacks the password: the BMC
+// may have applied a write whose response was lost, or the slot may have
+// held the password already. AMI MegaRAC then refuses every further write
+// of it (0x19: it is the current password), so the ladder would fail with
+// the password live on the BMC, and a generated one would never reach the
+// caller. After each failure the slot is therefore tested (`user test`),
+// and a slot that holds the password is a success. A test that cannot run
+// proves nothing, so the ladder goes on.
 func setPassword(ctx context.Context, opt Options, slot int, password string) error {
 	var passErr error
 	for _, attempt := range []struct {
@@ -880,6 +889,9 @@ func setPassword(ctx context.Context, opt Options, slot int, password string) er
 		}
 		passErr = runIPMIToolVoid(ctx, opt, attempt.args...)
 		if passErr == nil {
+			return nil
+		}
+		if held, err := testPassword(ctx, opt, slot, password); err == nil && held {
 			return nil
 		}
 	}
