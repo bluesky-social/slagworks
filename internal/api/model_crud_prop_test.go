@@ -128,12 +128,6 @@ func (r *pmRun) image() {
 	if existing := pmSortedKeys(r.m.images); imgOp != "create" && len(existing) > 0 && rapid.IntRange(0, 9).Draw(r.t, "existingImage") < 6 {
 		name = rapid.SampledFrom(existing).Draw(r.t, "existingImageName")
 	}
-	if imgOp == "delete" && name == pmUUIDName {
-		// Not generated: DELETE /images/:name looks an identifier that
-		// parses as a UUID up as a row id only, so an image whose name has
-		// that shape cannot be deleted by name (404). It is deleted by id.
-		imgOp = "delete-id"
-	}
 	fields := func() map[string]any {
 		f := map[string]any{}
 		if rapid.IntRange(0, 9).Draw(r.t, "hasVersion") > 0 {

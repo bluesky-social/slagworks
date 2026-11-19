@@ -180,7 +180,7 @@ func TestProp_ConcurrentRequestsLinearize(t *testing.T) {
 		"lock", "unlock", "activate", "deactivate", "patch", "patch",
 	}
 
-	propCheck(t, 25, func(rt *rapid.T) {
+	propCheck(t, 50, func(rt *rapid.T) {
 		env := newPropEnv(t, nil)
 		init := cmState{
 			state: rapid.SampledFrom([]model.MachineState{
@@ -319,7 +319,7 @@ func patchAround(t interface{ Fatalf(string, ...any) }, env *propEnv, path, body
 func TestProp_PatchInterleavings(t *testing.T) {
 	stats := newPropStats()
 	defer stats.report(t)
-	propCheck(t, 20, func(rt *rapid.T) {
+	propCheck(t, 40, func(rt *rapid.T) {
 		env := newPropEnv(t, nil)
 		violation := rt.Fatalf
 

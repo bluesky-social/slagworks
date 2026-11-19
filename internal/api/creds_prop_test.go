@@ -78,7 +78,7 @@ func TestProp_OperationCredentials(t *testing.T) {
 	stats := newPropStats()
 	defer stats.report(t)
 
-	propCheck(t, 25, func(rt *rapid.T) {
+	propCheck(t, 40, func(rt *rapid.T) {
 		nb := newPropNetBox()
 		secrets := &awssecrets.FakeReader{
 			Secrets: map[string]*awssecrets.AdminSecret{"pop-a": {BySerial: map[string]awssecrets.AdminHost{}}},

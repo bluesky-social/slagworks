@@ -34,7 +34,7 @@ func TestProp_NameResolution(t *testing.T) {
 	stats := newPropStats()
 	defer stats.report(t)
 
-	propCheck(t, 30, func(rt *rapid.T) {
+	propCheck(t, 50, func(rt *rapid.T) {
 		nb := newPropNetBox()
 		secrets := &awssecrets.FakeReader{Secrets: map[string]*awssecrets.AdminSecret{
 			"pop-a": {BySerial: map[string]awssecrets.AdminHost{}},

@@ -128,7 +128,7 @@ func TestProp_PDUOutletPreflightToken(t *testing.T) {
 	defer stats.report(t)
 	subject := map[string]string{propOperatorToken: "op", propOtherOpToken: "op2"}
 
-	propCheck(t, 25, func(rt *rapid.T) {
+	propCheck(t, 50, func(rt *rapid.T) {
 		w := &pduWorld{nb: newPropNetBox()}
 		site := &netbox.NestedRef{ID: 1, Name: "pop-a", Slug: "pop-a"}
 		for p := range pduIDs {

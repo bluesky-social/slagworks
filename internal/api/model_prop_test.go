@@ -462,18 +462,19 @@ func (r *pmRun) lifecycleCreate(typ model.OperationType) {
 		wrong["recovery"] = "true"
 	}
 	b := r.drawBody("body", fields, wrong)
-	if !b.parseable {
-		// Not generated for deploy and commission: both discard the body's
-		// bind error, so a body the server cannot parse (a syntax error, a
-		// field of the wrong JSON type, a non-JSON content type) creates an
-		// operation without the flags the caller sent instead of being
-		// refused with 400. The same fields are sent as a well-formed body.
-		b = pmBody{shape: "valid", raw: pmJSON(b.f), parseable: true, f: b.f}
-	}
 	what := string(typ)
 	before := r.env.pub.deltaCount()
 	resp := r.call(what, propReq{method: http.MethodPost, path: "/api/v1/machines/" + ref.seg + "/" + what, body: b.raw, ctype: b.ctype})
 
+	if !b.parseable {
+		// docs/dev/api.md: request bodies are JSON. A body the server cannot
+		// bind (a syntax error, a field of the wrong JSON type, a non-JSON
+		// content type) is refused before anything else is looked at; it
+		// must not become an operation without the flags the caller sent.
+		r.expect(what+" (unparseable body)", resp, http.StatusBadRequest)
+		r.noNewOp(what, before)
+		return
+	}
 	eff := b.f
 	want := func() int {
 		switch b.str(eff, "via") {
@@ -1380,7 +1381,7 @@ func pmActions() []pmAction {
 // TestProp_OperatorAPIModel walks the machine and operation lifecycle: most
 // steps are guided toward actions that can make progress.
 func TestProp_OperatorAPIModel(t *testing.T) {
-	runOperatorAPIModel(t, pmActions(), 6, 15)
+	runOperatorAPIModel(t, pmActions(), 6, 30)
 }
 
 // TestProp_OperatorAPICRUD is the same machine with the record families
@@ -1400,7 +1401,7 @@ func TestProp_OperatorAPICRUD(t *testing.T) {
 			actions = append(actions, a)
 		}
 	}
-	runOperatorAPIModel(t, actions, 0, 15)
+	runOperatorAPIModel(t, actions, 0, 30)
 }
 
 // runOperatorAPIModel runs the model-based property over the given action

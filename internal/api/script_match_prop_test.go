@@ -68,7 +68,7 @@ func TestProp_StorageScriptSelection(t *testing.T) {
 	defer stats.report(t)
 	fields := []string{"system_manufacturer", "system_product", "hostname"}
 
-	propCheck(t, 25, func(rt *rapid.T) {
+	propCheck(t, 50, func(rt *rapid.T) {
 		env := newPropEnv(t, nil)
 		draw := func(name, label string) smScript {
 			s := smScript{name: name, priority: rapid.SampledFrom([]int{0, 10, 10, 20, -1}).Draw(rt, label+"priority")}
