@@ -79,7 +79,12 @@ A `vfat` partition is formatted FAT32, which needs at least 65525 clusters, so i
 }
 ```
 
-Supported levels: 0, 1, 5, 6, 10.
+Supported levels: 0, 1, 5, 6, 10. Each level needs its md personality module
+(`raid0`, `raid1`, `raid456`, `raid10`) in the boot image's deploy initrd, which
+`assets/initramfs/hooks/slagworks` bakes in. A boot image built without a
+level's module fails the deploy at `mdadm --create`, after the member disks
+were repartitioned, with an error that names the module; rebuild the image and
+redeploy with `--destructive`.
 
 **Mounts** — maps mount points to device names from the layout.
 

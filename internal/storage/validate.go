@@ -205,14 +205,39 @@ func validateDisk(name string, dev Device) error {
 	return nil
 }
 
+// raidLevels is every md level a layout may request, with the minimum
+// member count validateRAID enforces and the kernel module that provides
+// the level's md personality. The kernel loads that module by running
+// modprobe in the deploy initramfs, not in the agent's chroot, so each one
+// must be baked into the deploy initrd by assets/initramfs/hooks/slagworks
+// (raid_modules_test.go holds the two lists together). Without it
+// `mdadm --create` fails "RUN_ARRAY failed: Invalid argument" after the
+// disks have already been repartitioned.
+var raidLevels = map[int]struct {
+	minMembers int
+	module     string
+}{
+	0:  {minMembers: 2, module: "raid0"},
+	1:  {minMembers: 2, module: "raid1"},
+	5:  {minMembers: 3, module: "raid456"},
+	6:  {minMembers: 4, module: "raid456"},
+	10: {minMembers: 4, module: "raid10"},
+}
+
+// RAIDModule returns the kernel module that provides the md personality
+// for a RAID level the planner accepts, and false for any other level.
+func RAIDModule(level int) (string, bool) {
+	l, ok := raidLevels[level]
+	return l.module, ok
+}
+
 func validateRAID(name string, dev Device, layout Layout) error {
-	minMembers := map[int]int{0: 2, 1: 2, 5: 3, 6: 4, 10: 4}
-	need, known := minMembers[dev.Level]
+	l, known := raidLevels[dev.Level]
 	if !known {
 		return fmt.Errorf("raid %q: unsupported RAID level %d", name, dev.Level)
 	}
-	if len(dev.Members) < need {
-		return fmt.Errorf("raid %q: RAID %d requires at least %d members, got %d", name, dev.Level, need, len(dev.Members))
+	if len(dev.Members) < l.minMembers {
+		return fmt.Errorf("raid %q: RAID %d requires at least %d members, got %d", name, dev.Level, l.minMembers, len(dev.Members))
 	}
 
 	// Verify all members reference partitions or disks in the layout.
