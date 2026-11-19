@@ -126,10 +126,32 @@ func (c *Client) GetDevice(ctx context.Context, deviceID int) (*Device, error) {
 	return &d, nil
 }
 
-// FindDeviceByName searches for a device by name. When siteID > 0 the
-// search is scoped to that site; when siteID == 0 the search runs
-// across all sites (used by hostname-based resolvers that already
-// embed the site in the name, e.g. `kworker-l34-1.pop1`).
+// AmbiguousNameError reports that a device name matched more than one
+// device. NetBox enforces name uniqueness only within a site (and
+// tenant), so a name such as `pdu-0102-left` can exist in several sites.
+type AmbiguousNameError struct {
+	Name    string
+	Devices []Device
+}
+
+func (e *AmbiguousNameError) Error() string {
+	cands := make([]string, len(e.Devices))
+	for i, d := range e.Devices {
+		site := "no site"
+		if d.Site != nil {
+			site = "site " + d.Site.Slug
+		}
+		cands[i] = fmt.Sprintf("id %d (%s)", d.ID, site)
+	}
+	return fmt.Sprintf("NetBox device name %q matches %d devices: %s",
+		e.Name, len(e.Devices), strings.Join(cands, ", "))
+}
+
+// FindDeviceByName searches for a device by exact name. When siteID > 0
+// the search is scoped to that site; when siteID == 0 it runs across all
+// sites. Returns nil, nil when nothing matches and an
+// *AmbiguousNameError when several devices carry the name, so a caller
+// never acts on one of them by accident.
 func (c *Client) FindDeviceByName(ctx context.Context, name string, siteID int) (*Device, error) {
 	var results []Device
 	q := url.Values{"name": {name}}
@@ -139,10 +161,14 @@ func (c *Client) FindDeviceByName(ctx context.Context, name string, siteID int) 
 	if err := c.List(ctx, "/api/dcim/devices/", q, &results); err != nil {
 		return nil, err
 	}
-	if len(results) == 0 {
+	switch len(results) {
+	case 0:
 		return nil, nil
+	case 1:
+		return &results[0], nil
+	default:
+		return nil, &AmbiguousNameError{Name: name, Devices: results}
 	}
-	return &results[0], nil
 }
 
 // FindDevicesByNameSubstring searches for devices whose name contains

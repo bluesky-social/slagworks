@@ -513,6 +513,144 @@ func TestReconcile_LeftoverNameClearRefused_StillDisablesAll(t *testing.T) {
 	}
 }
 
+// TestReconcile_NoEmptySlot_TakesOverLeftover: every non-reserved slot
+// holds a stray named account (maas, olduser), so there is no empty slot
+// for monitor. Reconcile must still converge: monitor takes over the first
+// leftover's slot and the other leftover is disabled as usual. The taken
+// slot is disabled and set to NO ACCESS before it is renamed, so a run
+// that dies before the password write leaves a slot `user list` shows as
+// disabled (re-provisioned next run), never one that reads as an enabled
+// `monitor` still carrying the stray's password. Reconcile used to refuse
+// with "need 1 free slots, found 0" before any write, on every run,
+// leaving both strays enabled.
+func TestReconcile_NoEmptySlot_TakesOverLeftover(t *testing.T) {
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "maas", "ADMINISTRATOR"},
+		[3]string{"4", "olduser", "OPERATOR"},
+	))
+	want := []string{
+		"user list 1",
+		"user disable 3",
+		"user priv 3 15 1",
+		"user set name 3 monitor",
+		"user set password 3 *",
+		"user priv 3 2 1",
+		"channel setaccess 1 3 callin=on ipmi=on link=on privilege=2",
+		"user enable 3",
+		"user disable 4",
+		"user set name 4 ",
+		"user list 1",
+	}
+	for _, cmd := range want[1 : len(want)-1] {
+		fake.queueOutput(cmd, "")
+	}
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "monitor", "USER"},
+		[3]string{"4", "", ""},
+	))
+
+	opt := RemoteOptions(LANTarget{Host: "192.0.2.10", Username: "ADMIN", Password: "adminpw!"}, "")
+	opt.IPMITool = fake.path
+	res, err := Reconcile(context.Background(), opt)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Name != MonitorUser || res.CreatedOrUpdated[0].Slot != 3 ||
+		len(res.CreatedOrUpdated[0].Password) != passwordLength {
+		t.Fatalf("expected monitor provisioned at slot 3 with a generated password, got %+v", res.CreatedOrUpdated)
+	}
+	if !slices.Equal(res.LeftoversDisabled, []string{"maas", "olduser"}) {
+		t.Errorf("LeftoversDisabled = %v, want [maas olduser]", res.LeftoversDisabled)
+	}
+	var got []string
+	for _, c := range fake.calls() {
+		cmd := strings.TrimPrefix(c.Args, "-I lanplus -H 192.0.2.10 -U ADMIN -C 17 -E ")
+		if strings.HasPrefix(cmd, "user set password 3 ") {
+			cmd = "user set password 3 *"
+		}
+		got = append(got, cmd)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("ipmitool calls:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestReconcile_TakeoverSparesDesiredAccounts: only leftovers are taken
+// over. A desired account that needs no write (slagworks, already
+// compliant at slot 3) is never a candidate, even though it comes first;
+// monitor takes the maas slot. With no leftover to take, reconcile refuses
+// before any write and names the account it has no slot for.
+func TestReconcile_TakeoverSparesDesiredAccounts(t *testing.T) {
+	desired := []DesiredUser{
+		{Name: "slagworks", Privilege: PrivOperator},
+		{Name: "monitor", Privilege: PrivUser},
+	}
+
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "slagworks", "OPERATOR"},
+		[3]string{"4", "maas", "ADMINISTRATOR"},
+	))
+	for _, cmd := range []string{
+		"user disable 4",
+		"user priv 4 15 1",
+		"user set name 4 monitor",
+		"user set password 4 *",
+		"user priv 4 2 1",
+		"channel setaccess 1 4 callin=on ipmi=on link=on privilege=2",
+		"user enable 4",
+	} {
+		fake.queueOutput(cmd, "")
+	}
+	fake.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "slagworks", "OPERATOR"},
+		[3]string{"4", "monitor", "USER"},
+	))
+	res, err := Reconcile(context.Background(), Options{IPMITool: fake.path, Desired: desired, SkipBootOrder: true})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Slot != 4 {
+		t.Errorf("expected monitor provisioned at slot 4 (the maas slot), got %+v", res.CreatedOrUpdated)
+	}
+	if !slices.Equal(res.LeftoversDisabled, []string{"maas"}) {
+		t.Errorf("LeftoversDisabled = %v, want [maas]", res.LeftoversDisabled)
+	}
+	for _, c := range fake.calls() {
+		for _, slot3 := range []string{"user disable 3", "user set name 3", "user set password 3", "user priv 3", "setaccess 1 3", "user enable 3"} {
+			if strings.Contains(c.Args, slot3) {
+				t.Errorf("the compliant slagworks account at slot 3 must not be touched: %q", c.Args)
+			}
+		}
+	}
+
+	full := newFakeIPMITool(t)
+	full.queueOutput("user list 1", userTable(
+		[3]string{"1", "", "ADMINISTRATOR"},
+		[3]string{"2", "ADMIN", "ADMINISTRATOR"},
+		[3]string{"3", "slagworks", "OPERATOR"},
+	))
+	res, err = Reconcile(context.Background(), Options{IPMITool: full.path, Desired: desired, SkipBootOrder: true})
+	if err == nil || res != nil {
+		t.Fatalf("expected a refusal with a nil Result, got res=%+v err=%v", res, err)
+	}
+	if !strings.Contains(err.Error(), `"monitor"`) {
+		t.Errorf("error should name the account it has no slot for: %v", err)
+	}
+	if calls := full.calls(); len(calls) != 1 {
+		t.Errorf("expected only the user list before refusing, got %d calls: %+v", len(calls), calls)
+	}
+}
+
 // TestReconcile_PreservesVendorAdmin verifies that the vendor ADMIN
 // at slot 2 is never disabled, even though it's not in Desired. ADMIN
 // is the AWS-managed recovery cred; touching it would desync from the
