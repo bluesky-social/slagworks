@@ -59,7 +59,10 @@ func BuildInterfaceDescription(nic NICData) string {
 // recreated bare (the failure that stripped kworker bond members' LAG
 // links and dropped deployed hosts onto single-NIC DHCP fallback,
 // kworker-l56-1.pop1 2026-06-11). MAC-less NICs (and MAC-less existing
-// rows) fall back to name matching.
+// rows) fall back to name matching. Every NIC's MAC is matched before
+// any NIC falls back to name (see matchInterfaces), so a NIC that kernel
+// enumeration moved onto another NIC's old name can never take that
+// NIC's row.
 //
 // Rows matching neither MAC nor name of any observed NIC are deleted,
 // except mgmt/BMC interfaces, bonds, and virtual interfaces (including
@@ -102,8 +105,8 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 	}
 
 	byName := make(map[string]Interface, len(existing))
-	byMAC := make(map[string]Interface, len(existing))
-	mgmtMACs := make(map[string]string) // lowercased MAC -> mgmt row name
+	byMAC := make(map[string][]Interface, len(existing)) // lowercased MAC -> every row carrying it
+	mgmtMACs := make(map[string]string)                  // lowercased MAC -> mgmt row name
 	for _, iface := range existing {
 		if isMgmtInterface(iface) {
 			if mac := strings.ToLower(iface.GetMAC()); mac != "" {
@@ -115,31 +118,14 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 		}
 		byName[iface.Name] = iface
 		if mac := strings.ToLower(iface.GetMAC()); mac != "" {
-			byMAC[mac] = iface
+			byMAC[mac] = append(byMAC[mac], iface)
 		}
 	}
 
-	consumed := make(map[int]bool) // existing-row IDs claimed by an observed NIC
-
+	// Drop the NICs reconcile leaves alone before matching, so a skipped
+	// NIC never claims a row.
+	observed := make([]NICData, 0, len(nics))
 	for _, nic := range nics {
-		desc := BuildInterfaceDescription(nic)
-		ifType := nic.IntfType
-		if ifType == "" {
-			ifType = InterfaceType(nic.Speed)
-		}
-
-		body := map[string]any{
-			"device":      deviceID,
-			"name":        nic.Name,
-			"type":        ifType,
-			"enabled":     true,
-			"mgmt_only":   nic.MgmtOnly,
-			"description": desc,
-		}
-		if nic.Speed > 0 {
-			body["speed"] = nic.Speed
-		}
-
 		// A mgmt_only NIC matching an existing protected management row
 		// by name AND MAC is a rerun of a prior reconcile's own
 		// creation (e.g. the synthetic "ipmi" NICData SyncCommissionData
@@ -174,40 +160,52 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 			}
 		}
 
-		// Resolve the existing row: MAC first (physical identity),
-		// name second (MAC-less rows, virtual interfaces, or a MAC
-		// row another NIC already claimed — duplicate MACs happen on
-		// bonded/virtual NICs). A row already claimed by an earlier
-		// NIC counts as no-match at BOTH stages, so the fallback can
-		// still adopt a name row instead of POSTing into NetBox's
-		// device+name uniqueness constraint.
-		//
-		// A mgmt_only NIC never participates in this ordinary matching
-		// at all: its only legitimate match is the idempotency check
-		// above (its own prior protected row). Letting it fall through
-		// to byMAC/byName here would claim an UNPROTECTED host row on
-		// the first-ever reconcile of shared-LOM hardware (no protected
-		// BMC row exists yet to make the idempotency check fire) and
-		// rename that host interface to the BMC's name with
-		// mgmt_only=true — the same modeling corruption row protection exists
-		// to prevent, from the opposite direction. If the idempotency
-		// check didn't match, treat the mgmt NIC as always-new: skip to
-		// create, where the protected-name-collision check (below)
-		// still guards against colliding with an existing protected row
-		// under a changed BMC MAC.
-		var match Interface
-		var ok bool
-		if !nic.MgmtOnly {
-			match, ok = byMAC[strings.ToLower(nic.MAC)]
-			if ok && consumed[match.ID] {
-				ok = false
-			}
-			if !ok || nic.MAC == "" {
-				match, ok = byName[nic.Name]
-				if ok && consumed[match.ID] {
-					ok = false
-				}
-			}
+		observed = append(observed, nic)
+	}
+
+	matches := matchInterfaces(observed, byMAC, byName)
+	consumed := make(map[int]bool, len(existing)) // existing-row IDs claimed by an observed NIC
+	for _, match := range matches {
+		consumed[match.ID] = true
+	}
+
+	// Write every matched row before creating any. A new NIC can carry
+	// the name a matched row is about to be renamed away from (a card
+	// that probes first takes eth0 from the NIC it shifts to eth1), and
+	// NetBox's device+name uniqueness rejects that create until the
+	// rename has run.
+	order := make([]int, 0, len(observed))
+	for i := range observed {
+		if _, ok := matches[i]; ok {
+			order = append(order, i)
+		}
+	}
+	for i := range observed {
+		if _, ok := matches[i]; !ok {
+			order = append(order, i)
+		}
+	}
+
+	for _, i := range order {
+		nic := observed[i]
+		match, ok := matches[i]
+
+		desc := BuildInterfaceDescription(nic)
+		ifType := nic.IntfType
+		if ifType == "" {
+			ifType = InterfaceType(nic.Speed)
+		}
+
+		body := map[string]any{
+			"device":      deviceID,
+			"name":        nic.Name,
+			"type":        ifType,
+			"enabled":     true,
+			"mgmt_only":   nic.MgmtOnly,
+			"description": desc,
+		}
+		if nic.Speed > 0 {
+			body["speed"] = nic.Speed
 		}
 
 		if !ok && operatorNames {
@@ -221,7 +219,6 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 		var ifaceID int
 		var currentMAC string
 		if ok {
-			consumed[match.ID] = true
 			ifaceID = match.ID
 			currentMAC = match.GetMAC()
 			if match.Name != nic.Name && operatorNames {
@@ -246,9 +243,9 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 				// must first evict any other row squatting on the
 				// target name (e.g. a MAC-less "eth0" placeholder next
 				// to the MAC-matched ens2f0np0 we're renaming). Only
-				// MAC-less, unprotected, unclaimed rows are evicted —
-				// a MAC-bearing squatter may be a later NIC's match,
-				// and anything protected/claimed holding the name is a
+				// MAC-less, unprotected, unclaimed rows are evicted — a
+				// claimed squatter is another NIC's row, and anything
+				// protected or MAC-bearing holding the name is a
 				// modeling conflict worth failing loudly on. (The
 				// isProtectedInterface(squatter) check just below is now
 				// unreachable — protected rows never appear in byName —
@@ -294,7 +291,6 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 			if err := c.Post(ctx, "/api/dcim/interfaces/", body, &created); err != nil {
 				return fmt.Errorf("creating interface %q: %w", nic.Name, err)
 			}
-			consumed[created.ID] = true
 			ifaceID = created.ID
 			c.log.Info("created interface", "name", nic.Name, "device_id", deviceID)
 		}
@@ -332,6 +328,74 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 	}
 
 	return nil
+}
+
+// matchInterfaces pairs observed NICs, by index into nics, with the
+// unprotected existing rows they reconcile into. It matches all NICs at
+// once, strongest evidence first, so no NIC can take a row that a NIC
+// later in the report owns by stronger evidence:
+//
+//  1. MAC and name: the steady state. This also picks the right row when
+//     several rows carry one MAC (NICs reporting a shared MAC, e.g.
+//     bonded or virtual NICs, keep their own rows).
+//  2. MAC alone: a NIC the kernel now names differently. Its row is
+//     renamed in place, keeping its lag, IPs and cables.
+//  3. Name alone, among rows still unclaimed: MAC-less NICs and rows, or
+//     a replaced NIC whose old MAC no NIC reports any more.
+//
+// Resolving each NIC in report order instead (its MAC, then its name) let
+// a NIC that missed on MAC claim, by name, the row a later NIC's MAC
+// owned. The initrd names NICs in driver-probe order, so a card that
+// probes first takes eth0 from a bond member that shifts to eth1: the
+// member's row was re-MACed to the new card and the member got a bare new
+// row.
+//
+// A mgmt_only NIC never participates in this ordinary matching at all:
+// its only legitimate match is the idempotency check in
+// ReconcileInterfaces (its own prior protected row). Letting it match
+// here would claim an UNPROTECTED host row on the first-ever reconcile of
+// shared-LOM hardware (no protected BMC row exists yet to make the
+// idempotency check fire) and rename that host interface to the BMC's
+// name with mgmt_only=true — the same modeling corruption row protection
+// exists to prevent, from the opposite direction. An unmatched mgmt NIC
+// is always-new: it goes to create, where the protected-name-collision
+// check still guards against colliding with an existing protected row
+// under a changed BMC MAC.
+func matchInterfaces(nics []NICData, byMAC map[string][]Interface, byName map[string]Interface) map[int]Interface {
+	matches := make(map[int]Interface, len(nics))
+	claimed := make(map[int]bool, len(nics)) // row IDs
+	claim := func(i int, row Interface) {
+		matches[i] = row
+		claimed[row.ID] = true
+	}
+	for i, nic := range nics {
+		if nic.MgmtOnly || nic.MAC == "" {
+			continue
+		}
+		if row, ok := byName[nic.Name]; ok && !claimed[row.ID] && strings.EqualFold(row.GetMAC(), nic.MAC) {
+			claim(i, row)
+		}
+	}
+	for i, nic := range nics {
+		if _, done := matches[i]; done || nic.MgmtOnly || nic.MAC == "" {
+			continue
+		}
+		for _, row := range byMAC[strings.ToLower(nic.MAC)] {
+			if !claimed[row.ID] {
+				claim(i, row)
+				break
+			}
+		}
+	}
+	for i, nic := range nics {
+		if _, done := matches[i]; done || nic.MgmtOnly {
+			continue
+		}
+		if row, ok := byName[nic.Name]; ok && !claimed[row.ID] {
+			claim(i, row)
+		}
+	}
+	return matches
 }
 
 // findProtectedInterfaceByName scans existing (not byName — protected

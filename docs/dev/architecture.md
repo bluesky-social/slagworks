@@ -263,7 +263,10 @@ Interfaces and cables are more permissive: `ReconcileInterfaces` will
 create, patch (including rename), and delete NetBox interfaces to match
 the NICs the agent reports, but with a protected-set
 (`isProtectedInterface`) that leaves management, LAG, and virtual
-interfaces alone. On switches (device role `leaf`, `spine`,
+interfaces alone. A row's identity is its MAC: every reported MAC is
+matched to its row before any NIC falls back to matching by name, so
+when the initrd's kernel names shift (a card added or replaced) a row is
+renamed to follow its MAC and keeps its lag, IPs and cable. On switches (device role `leaf`, `spine`,
 `oob-switch`) interface names and the row set are operator-owned: the
 commission initrd's kernel names (`enp3s0npN`, `eno1`) are not the
 operational `swpN`/`eth0`, so reconcile only patches non-name fields of
