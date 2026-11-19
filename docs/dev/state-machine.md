@@ -244,7 +244,12 @@ lock (`TestFailOperation_AutoUnlocksOnFailed`,
 by `hubhandlers.OpUpdate.HandleOpUpdate`
 (`hubhandlers.go:132`). `SetOperationPhase` returns a
 `PhaseTransition` (`store.go:690`) that the hub uses to emit exactly
-one canonical log envelope per real change.
+one canonical log envelope per real change. It does not write a
+terminal (completed/failed) op: the worker can still report a phase
+after the op ended (a report in flight when the operator aborts, or
+executor progress after `op_removed`), and that report changes
+nothing and publishes nothing. The op keeps the phase it ended in, and
+its version stays at the tombstone workers hold for it.
 
 The site worker maintains its own view of the phase in
 `Cache.UpdateOpPhase` (`internal/worker/cache.go:1321`). The write

@@ -438,7 +438,7 @@ func (s *Store) CompleteActiveOperation(
 // PhaseTransition describes the result of a SetOperationPhase call.
 // Caller emits a single "phase transition" log envelope when Changed
 // is true; ignores when false (the worker emitted a duplicate phase
-// event and the row didn't change).
+// event, or the op is already terminal, and the row didn't change).
 type PhaseTransition struct {
 	Changed   bool
 	PrevPhase string
@@ -465,6 +465,13 @@ type PhaseTransition struct {
 // make the deadline forever-renewable on noisy workers; instead we
 // only bump when phase actually changes.
 //
+// A terminal (completed/failed) op is left as it is: the worker can
+// still report a phase after the op ended (a report in flight when the
+// operator aborted, or executor progress after op_removed), and the
+// phase the op ended in, phase_entered_at and version belong to the
+// terminal record. Moving the version would also publish an op_delta
+// above the tombstone workers keep for the removed op.
+//
 // Returns the transition shape (prev_phase, duration in prev) so the
 // caller can emit a "phase transition" log envelope.
 func (s *Store) SetOperationPhase(opID uuid.UUID, phase string) (PhaseTransition, error) {
@@ -475,19 +482,30 @@ func (s *Store) SetOperationPhase(opID uuid.UUID, phase string) (PhaseTransition
 			Where("id = ?", opID).First(&op).Error; err != nil {
 			return err
 		}
+		unchanged := PhaseTransition{Changed: false, NewPhase: phase, MachineID: op.MachineID, TraceID: op.TraceID}
 		if op.Phase == phase {
-			t = PhaseTransition{Changed: false, NewPhase: phase, MachineID: op.MachineID, TraceID: op.TraceID}
+			t = unchanged
 			return nil
 		}
 		now := time.Now()
-		if err := tx.Model(&model.Operation{}).
-			Where("id = ?", opID).
+		// NOT IN (completed, failed): leave a terminal op as it is. The
+		// guard sits on the UPDATE, not the read above, because the read
+		// takes no lock and an abort or timeout fail can commit between
+		// the two (the same reason CompleteOperationWithState guards its
+		// UPDATE).
+		res := tx.Model(&model.Operation{}).
+			Where("id = ? AND status NOT IN ?", opID, opstate.TerminalStatuses).
 			Updates(map[string]any{
 				"phase":            phase,
 				"phase_entered_at": now,
 				"version":          gorm.Expr("version + 1"),
-			}).Error; err != nil {
-			return err
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			t = unchanged
+			return nil
 		}
 		post, err := refetchOp(tx, opID)
 		if err != nil {
