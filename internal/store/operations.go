@@ -471,7 +471,16 @@ func (s *Store) SetOperationPhase(opID uuid.UUID, phase string) (PhaseTransition
 	var t PhaseTransition
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var op model.Operation
-		if err := tx.Select("id", "phase", "phase_entered_at", "machine_id", "trace_id").
+		// FOR UPDATE: the "did the phase change" decision and the
+		// PrevPhase/Duration below come from this read, so it must see the
+		// row the UPDATE writes. Under READ COMMITTED a plain SELECT lets
+		// two overlapping deliveries of one report (outbox redelivery on a
+		// new connection, an HA site-worker pair) both read the old phase
+		// and both write: two Changed=true results, two op_deltas, two
+		// envelopes, version +2. With the lock the second waits, then
+		// reads the first's phase and returns Changed=false.
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "phase", "phase_entered_at", "machine_id", "trace_id").
 			Where("id = ?", opID).First(&op).Error; err != nil {
 			return err
 		}

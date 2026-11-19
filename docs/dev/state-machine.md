@@ -244,7 +244,9 @@ lock (`TestFailOperation_AutoUnlocksOnFailed`,
 by `hubhandlers.OpUpdate.HandleOpUpdate`
 (`hubhandlers.go:132`). `SetOperationPhase` returns a
 `PhaseTransition` (`store.go:690`) that the hub uses to emit exactly
-one canonical log envelope per real change.
+one canonical log envelope per real change. It reads the op row `FOR
+UPDATE`, so two overlapping deliveries of the same report serialize:
+the second sees the phase the first wrote and returns `Changed=false`.
 
 The site worker maintains its own view of the phase in
 `Cache.UpdateOpPhase` (`internal/worker/cache.go:1321`). The write

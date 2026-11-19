@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 )
@@ -1031,6 +1032,163 @@ func TestSetOperationPhase_TransitionShape(t *testing.T) {
 	}
 	if t3.Changed {
 		t.Errorf("same-phase write reported Changed=true: %+v", t3)
+	}
+}
+
+// claimedDeployInPhase creates a claimed deploy op whose phase is already
+// set, for the overlapping-write tests below.
+func claimedDeployInPhase(t *testing.T, st *Store, serial, phase string) uuid.UUID {
+	t.Helper()
+	m := &model.Machine{
+		ID: uuid.New(), NetBoxSerial: serial,
+		State: model.MachineStateDeploying, PXEEligible: true,
+	}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op := &model.Operation{MachineID: m.ID, Type: model.OpDeploy, Status: model.OpClaimed}
+	if err := st.CreateOperation(op); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetOperationPhase(op.ID, phase); err != nil {
+		t.Fatal(err)
+	}
+	return op.ID
+}
+
+// overlapSetOperationPhase runs two SetOperationPhase calls on one op that
+// overlap the way two deliveries of a phase report can (the worker's outbox
+// resending an op_update on a new connection while the hub is still
+// handling the first copy, or one agent report reaching both site workers
+// of an HA pair): the second call starts after the first has read the op
+// row and before the first writes. It returns both transitions.
+//
+// The pause is a gorm query callback on the first call's phase read, the
+// only query that names phase_entered_at. The callback starts the second
+// call in a goroutine and returns once that call has either finished or is
+// waiting on a row lock, so the interleave is deterministic whether or not
+// SetOperationPhase locks the row it reads.
+func overlapSetOperationPhase(t *testing.T, st *Store, opID uuid.UUID, firstPhase, secondPhase string) (first, second PhaseTransition) {
+	t.Helper()
+	type result struct {
+		tr  PhaseTransition
+		err error
+	}
+	secondDone := make(chan result, 1)
+	sqlDB, err := st.db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "overlap-set-phase:" + uuid.NewString()
+	fired := false
+	if err := st.db.Callback().Query().After("gorm:query").Register(name, func(tx *gorm.DB) {
+		if fired || !strings.Contains(tx.Statement.SQL.String(), `"phase_entered_at"`) {
+			return
+		}
+		fired = true
+		go func() {
+			tr, err := st.SetOperationPhase(opID, secondPhase)
+			secondDone <- result{tr, err}
+		}()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case r := <-secondDone:
+				secondDone <- r
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+			var waiters int
+			if err := sqlDB.QueryRow(`SELECT count(*) FROM pg_stat_activity
+				WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiters); err == nil && waiters > 0 {
+				return
+			}
+		}
+		t.Error("second SetOperationPhase neither finished nor waited on a row lock within 10s")
+	}); err != nil {
+		t.Fatalf("register interleave callback: %v", err)
+	}
+	defer func() { _ = st.db.Callback().Query().Remove(name) }()
+
+	first, err = st.SetOperationPhase(opID, firstPhase)
+	if err != nil {
+		t.Fatalf("first SetOperationPhase: %v", err)
+	}
+	if !fired {
+		t.Fatal("interleave callback never fired: SetOperationPhase's read no longer names phase_entered_at")
+	}
+	select {
+	case r := <-secondDone:
+		if r.err != nil {
+			t.Fatalf("second SetOperationPhase: %v", r.err)
+		}
+		return first, r.tr
+	case <-time.After(10 * time.Second):
+		t.Fatal("second SetOperationPhase did not return within 10s")
+	}
+	return first, second
+}
+
+// TestSetOperationPhase_OverlappingDuplicateChangesPhaseOnce: two
+// overlapping deliveries of the same phase report record one phase change.
+// The other is the idempotent repeat (Changed=false). Recording both would
+// publish two op_deltas and two "phase transition" envelopes, observe
+// PhaseDuration twice, write phase_entered_at (the phone-home deadline
+// anchor) twice, and bump the version by two.
+func TestSetOperationPhase_OverlappingDuplicateChangesPhaseOnce(t *testing.T) {
+	st := testStore(t)
+	opID := claimedDeployInPhase(t, st, "SN-dup-phase", "finalizing")
+	before, err := st.GetOperation(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, second := overlapSetOperationPhase(t, st, opID, "awaiting_phone_home", "awaiting_phone_home")
+
+	if first.Changed == second.Changed {
+		t.Errorf("Changed: first=%v second=%v, want exactly one delivery to record the phase change",
+			first.Changed, second.Changed)
+	}
+	after, err := st.GetOperation(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Version != before.Version+1 {
+		t.Errorf("version moved %d -> %d for one phase change, want +1", before.Version, after.Version)
+	}
+}
+
+// TestSetOperationPhase_OverlappingWritersChainPrevPhase: two overlapping
+// writes of different phases both change the phase, and the transitions
+// chain. The later write's PrevPhase is the phase the earlier write set
+// and its Duration runs from the earlier write, not from the phase both
+// started in. These feed the "phase transition" envelope and the
+// PhaseDuration metric.
+func TestSetOperationPhase_OverlappingWritersChainPrevPhase(t *testing.T) {
+	st := testStore(t)
+	opID := claimedDeployInPhase(t, st, "SN-overlap-phase", "finalizing")
+	// Age the starting phase so a Duration measured from it stands out.
+	if err := st.db.Model(&model.Operation{}).Where("id = ?", opID).
+		Update("phase_entered_at", time.Now().Add(-time.Hour)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	first, second := overlapSetOperationPhase(t, st, opID, "bmc_reconcile", "awaiting_phone_home")
+
+	if !first.Changed || !second.Changed {
+		t.Fatalf("Changed: first=%v second=%v, want both (the phases differ)", first.Changed, second.Changed)
+	}
+	earlier, later := first, second
+	if later.PrevPhase == "finalizing" {
+		earlier, later = second, first
+	}
+	if earlier.PrevPhase != "finalizing" || later.PrevPhase != earlier.NewPhase {
+		t.Errorf("transitions do not chain: %q -> %q and %q -> %q, want finalizing -> one -> the other",
+			first.PrevPhase, first.NewPhase, second.PrevPhase, second.NewPhase)
+	}
+	if later.Duration > time.Minute {
+		t.Errorf("later transition's Duration = %v, want it measured from the earlier write (milliseconds), not from finalizing (1h)",
+			later.Duration)
 	}
 }
 
