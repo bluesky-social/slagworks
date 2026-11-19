@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 
 	"github.com/labstack/echo/v5"
 
@@ -23,6 +24,7 @@ import (
 type MirrorOps interface {
 	OnDeviceCreated(ctx context.Context, d mirror.Device) error
 	OnDeviceUpdated(ctx context.Context, d mirror.Device) error
+	OnDeviceMoved(ctx context.Context, deviceID int) error
 	OnDeviceDeleted(ctx context.Context, deviceID int, configSlug string) error
 	OnDeviceExternalDrift(ctx context.Context, deviceID int, fields []string, configSlug string) error
 	OnSiteUpdated(ctx context.Context, oldSlug, newSlug string) error
@@ -37,6 +39,14 @@ type MirrorOps interface {
 // (serial, name, status, asset_tag, custom_fields, tags, primary_ip4)
 // are deliberately absent so self-writes never trip this.
 var externalDriftFields = []string{"site", "location", "rack", "device_type", "role"}
+
+// movesClaim reports whether drift touches a field the site_config claim
+// is evaluated on (site and location; see snapshot.Scope.ClaimsDevice),
+// i.e. whether the device may have left the scope of a config that claimed
+// it before the change.
+func movesClaim(drift []string) bool {
+	return slices.Contains(drift, "site") || slices.Contains(drift, "location")
+}
 
 // diffExternalDrift compares the webhook's prechange/postchange
 // snapshots on the external-drift field set, returning the fields
@@ -200,6 +210,27 @@ func (h *WebhookHandler) handleDevice(ctx context.Context, c *echo.Context, env 
 		return echo.NewHTTPError(http.StatusBadRequest, "parse device")
 	}
 
+	// The external topology fields this update changed (none for other
+	// events).
+	var drift []string
+	if env.Event == "updated" {
+		drift = diffExternalDrift(env.Snapshots.PreChange, env.Snapshots.PostChange)
+	}
+
+	// A site/location change can take the device out of the config that
+	// claimed it before. The claim resolved below names only the config
+	// that claims it now (or none), so OnDeviceMoved invalidates the config
+	// it left (every config: see its doc). That needs no claim, so it runs
+	// first, even when resolving the claim fails: otherwise the old
+	// config's snapshot, and the hub's op_delta routing that trusts it,
+	// keep the machine until reconcile.
+	if movesClaim(drift) {
+		if err := h.mir.OnDeviceMoved(ctx, dev.ID); err != nil {
+			h.log.Error("invalidating site configs after a device move failed; the config the device left keeps it until reconcile",
+				"device_id", dev.ID, "fields", drift, "err", err)
+		}
+	}
+
 	// Resolve which config(s) claim this device. Empty = the device's site
 	// is unmanaged, or its location is outside every config's claim (e.g. a
 	// pop2 host in a cage no config owns). Reject quietly with 200 so NetBox
@@ -238,16 +269,14 @@ func (h *WebhookHandler) handleDevice(ctx context.Context, c *echo.Context, env 
 		// device OUT of every claimed scope, and that unclaiming is
 		// itself the drift. The mirror no-ops when the machine is idle
 		// or unknown.
-		if env.Event == "updated" {
-			if drift := diffExternalDrift(env.Snapshots.PreChange, env.Snapshots.PostChange); len(drift) > 0 {
-				slug := ""
-				if len(claimed) > 0 {
-					slug = claimed[0]
-				}
-				if err := h.mir.OnDeviceExternalDrift(ctx, dev.ID, drift, slug); err != nil {
-					h.log.Error("drift-gate check failed; event still mirrored, reconcile backstops",
-						"device_id", dev.ID, "fields", drift, "err", err)
-				}
+		if len(drift) > 0 {
+			slug := ""
+			if len(claimed) > 0 {
+				slug = claimed[0]
+			}
+			if err := h.mir.OnDeviceExternalDrift(ctx, dev.ID, drift, slug); err != nil {
+				h.log.Error("drift-gate check failed; event still mirrored, reconcile backstops",
+					"device_id", dev.ID, "fields", drift, "err", err)
 			}
 		}
 		if len(claimed) == 0 {

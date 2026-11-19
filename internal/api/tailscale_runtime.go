@@ -39,6 +39,8 @@ const tailscaleKeyExpirySeconds = 2 * 60 * 60
 //   - no minter is configured (dev/test, or the OAuth client secret absent);
 //   - NetBox is off or the machine isn't bound to a device (no pop/hostname);
 //   - the device has no site slug (can't derive the tag);
+//   - the device name doesn't give a valid tailnet hostname
+//     (model.ValidHostname) — logged, not fatal;
 //   - minting fails (API error, tag not owned, etc.) — logged, not fatal.
 func (s *Server) resolveTailscaleRuntime(ctx context.Context, machineID uuid.UUID, params *model.OpParams) error {
 	if s.tailscaleMinter == nil {
@@ -70,6 +72,16 @@ func (s *Server) resolveTailscaleRuntime(ctx context.Context, machineID uuid.UUI
 	pop := dev.Site.Slug
 	tag := "tag:" + pop
 	hostname := tailnetHostname(dev.Name, pop)
+	// NetBox stores the device name as free text, and the hostname rides the
+	// deploy iPXE script's kernel line, where a newline would add an iPXE
+	// command and a space would add kernel parameters. Don't mint a key for
+	// a name that doesn't make a valid hostname.
+	if !model.ValidHostname(hostname) {
+		s.log.Warn("tailscale enrollment skipped: NetBox device name does not give a valid tailnet hostname; "+
+			"rename the device to letters, digits and hyphens (dot-separated)",
+			"machine_id", machineID, "device", dev.Name, "hostname", hostname)
+		return nil
+	}
 
 	minted, err := s.tailscaleMinter.Mint(ctx, tailscale.KeyRequest{
 		Tags:          []string{tag},

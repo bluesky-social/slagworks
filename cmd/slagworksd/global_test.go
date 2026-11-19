@@ -63,7 +63,7 @@ func TestBuildGlobal_SmokeTest(t *testing.T) {
 		// respond successfully. Expect 404 (route not registered) or
 		// similar. What we're guarding against is the route being
 		// wired to a nil hub and panicking.
-		resp, err := http.Get(httpSrv.URL + "/api/v1/ws/site?token=irrelevant")
+		resp, err := http.Get(httpSrv.URL + "/api/v1/ws/site")
 		if err != nil {
 			t.Fatalf("GET /api/v1/ws/site: %v", err)
 		}
@@ -121,9 +121,14 @@ func TestBuildGlobal_SmokeTest(t *testing.T) {
 		// With a valid-looking token (still not in DB), expect 401
 		// again — auth still rejects but the route is definitely
 		// there.
-		resp2, err := http.Get(httpSrv.URL + "/api/v1/ws/site?token=not-a-real-token-hash")
+		req, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/api/v1/ws/site", nil)
 		if err != nil {
-			t.Fatalf("GET /api/v1/ws/site?token=: %v", err)
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer not-a-real-token")
+		resp2, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET /api/v1/ws/site with a bearer: %v", err)
 		}
 		resp2.Body.Close()
 		if resp2.StatusCode != http.StatusUnauthorized {

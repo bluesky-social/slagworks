@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -87,8 +88,9 @@ func (s *Server) getDeviceCreds(c *echo.Context) error {
 // doesn't match a device id is retried as a name and a serial, since some
 // vendors ship all-numeric serials. The name-then-serial step covers dotted
 // names ("leaf-3.pop1"), dotless names ("pdu-0102-left"), and bare serials
-// uniformly. A serial matching more than one device is a NetBox data error
-// and is surfaced rather than guessed.
+// uniformly. A name or serial matching more than one device is surfaced as
+// 409 rather than guessed: NetBox only enforces name uniqueness within a
+// site, and a shared serial is a NetBox data error.
 func (s *Server) resolveDevice(ctx context.Context, ident string) (*netbox.Device, error) {
 	ident = strings.TrimSpace(ident)
 	if ident == "" {
@@ -110,10 +112,14 @@ func (s *Server) resolveDevice(ctx context.Context, ident string) (*netbox.Devic
 		}
 	}
 
-	// Exact name match (siteID 0 = any site; names like "leaf-3.pop1"
-	// encode the site, and dotless names like "pdu-0102-left" are unique
-	// enough in practice).
+	// Exact name match across all sites (siteID 0). A name several sites
+	// share, such as a rack-position PDU name, is refused, not guessed.
 	dev, err := s.netbox.FindDeviceByName(ctx, ident, 0)
+	var ambig *netbox.AmbiguousNameError
+	if errors.As(err, &ambig) {
+		return nil, echo.NewHTTPError(http.StatusConflict,
+			ambig.Error()+"; pass the NetBox device id or serial instead")
+	}
 	if err != nil {
 		return nil, echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("netbox lookup by name: %v", err))
 	}

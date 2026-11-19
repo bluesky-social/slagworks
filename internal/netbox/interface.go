@@ -59,7 +59,19 @@ func BuildInterfaceDescription(nic NICData) string {
 // recreated bare (the failure that stripped kworker bond members' LAG
 // links and dropped deployed hosts onto single-NIC DHCP fallback,
 // kworker-l56-1.pop1 2026-06-11). MAC-less NICs (and MAC-less existing
-// rows) fall back to name matching.
+// rows) fall back to name matching. Every NIC's MAC is matched before
+// any NIC falls back to name (see matchInterfaces), so a NIC that kernel
+// enumeration moved onto another NIC's old name can never take that
+// NIC's row.
+//
+// A name can pass from one NIC to another between commissions: a card
+// is removed or moved, path-based names shift after a PCIe renumber, or
+// ethN probe order changes. So every NIC's row is resolved before
+// anything is written, and each name a row must take is freed first
+// (planNameMoves): a stale row holding it is deleted, and a row holding
+// it that is itself being renamed is moved to a temporary name.
+// Refusing such a MAC-bearing holder instead failed every commission of
+// the host until NetBox was edited by hand.
 //
 // Rows matching neither MAC nor name of any observed NIC are deleted,
 // except mgmt/BMC interfaces, bonds, and virtual interfaces (including
@@ -102,8 +114,8 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 	}
 
 	byName := make(map[string]Interface, len(existing))
-	byMAC := make(map[string]Interface, len(existing))
-	mgmtMACs := make(map[string]string) // lowercased MAC -> mgmt row name
+	byMAC := make(map[string][]Interface, len(existing)) // lowercased MAC -> every row carrying it
+	mgmtMACs := make(map[string]string)                  // lowercased MAC -> mgmt row name
 	for _, iface := range existing {
 		if isMgmtInterface(iface) {
 			if mac := strings.ToLower(iface.GetMAC()); mac != "" {
@@ -115,37 +127,29 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 		}
 		byName[iface.Name] = iface
 		if mac := strings.ToLower(iface.GetMAC()); mac != "" {
-			byMAC[mac] = iface
+			byMAC[mac] = append(byMAC[mac], iface)
 		}
 	}
 
-	consumed := make(map[int]bool) // existing-row IDs claimed by an observed NIC
-
+	// Drop the NICs reconcile leaves alone before matching, so a skipped
+	// NIC never claims a row.
+	observed := make([]NICData, 0, len(nics))
+	// Protected mgmt rows a mgmt_only NIC re-reported unchanged. The write
+	// phase touches only their primary MAC (ensureInterfaceMAC).
+	var mgmtMACRepairs []ifaceWrite
 	for _, nic := range nics {
-		desc := BuildInterfaceDescription(nic)
-		ifType := nic.IntfType
-		if ifType == "" {
-			ifType = InterfaceType(nic.Speed)
-		}
-
-		body := map[string]any{
-			"device":      deviceID,
-			"name":        nic.Name,
-			"type":        ifType,
-			"enabled":     true,
-			"mgmt_only":   nic.MgmtOnly,
-			"description": desc,
-		}
-		if nic.Speed > 0 {
-			body["speed"] = nic.Speed
-		}
-
 		// A mgmt_only NIC matching an existing protected management row
 		// by name AND MAC is a rerun of a prior reconcile's own
 		// creation (e.g. the synthetic "ipmi" NICData SyncCommissionData
 		// emits every run for the BMC MAC) — SyncCommissionData promises
-		// idempotency, so this must be a no-op skip, never an error and
-		// never a patch. This check must run BEFORE the byMAC match
+		// idempotency, so this must skip the row: never a modeling-conflict
+		// error and never a field patch. The one write it may make, queued
+		// in mgmtMACRepairs for the write phase, is finishing that prior run's
+		// MAC write when it assigned the MAC object but failed before
+		// marking it primary (the MAC match below goes through GetMAC,
+		// which accepts an assigned non-primary object); ensureInterfaceMAC
+		// is a no-op once the primary is set.
+		// This check must run BEFORE the byMAC match
 		// below: on shared-LOM hardware an unprotected host row can
 		// carry the same MAC as the BMC, and byMAC (which excludes
 		// protected rows) would resolve to that host row instead,
@@ -155,6 +159,7 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 		if nic.MgmtOnly {
 			if protected, exists := findProtectedInterfaceByName(existing, nic.Name); exists &&
 				protected.MgmtOnly && nic.MAC != "" && strings.EqualFold(protected.GetMAC(), nic.MAC) {
+				mgmtMACRepairs = append(mgmtMACRepairs, ifaceWrite{nic: nic, row: protected, matched: true})
 				continue
 			}
 		}
@@ -174,55 +179,35 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 			}
 		}
 
-		// Resolve the existing row: an exact name+MAC match first,
-		// then MAC alone (physical identity), then name alone (MAC-less
-		// rows, virtual interfaces, or a MAC row another NIC already
-		// claimed — duplicate MACs happen on bonded/virtual NICs). A
-		// row already claimed by an earlier NIC counts as no-match at
-		// every stage, so the fallback can still adopt a name row
-		// instead of POSTing into NetBox's device+name uniqueness
-		// constraint.
-		//
-		// The exact match must come first because byMAC holds only one
-		// row per MAC. Once two same-MAC NICs have been reconciled,
-		// NetBox has a row for each carrying that MAC; a MAC-first
-		// lookup could hand NIC eth0 the eth1 row, and the rename
-		// below would then refuse eth0's own MAC-bearing row as a
-		// squatter, failing every later commission of the host.
-		//
-		// A mgmt_only NIC never participates in this ordinary matching
-		// at all: its only legitimate match is the idempotency check
-		// above (its own prior protected row). Letting it fall through
-		// to byMAC/byName here would claim an UNPROTECTED host row on
-		// the first-ever reconcile of shared-LOM hardware (no protected
-		// BMC row exists yet to make the idempotency check fire) and
-		// rename that host interface to the BMC's name with
-		// mgmt_only=true — the same modeling corruption row protection exists
-		// to prevent, from the opposite direction. If the idempotency
-		// check didn't match, treat the mgmt NIC as always-new: skip to
-		// create, where the protected-name-collision check (below)
-		// still guards against colliding with an existing protected row
-		// under a changed BMC MAC.
-		var match Interface
-		var ok bool
-		if !nic.MgmtOnly {
-			if row, exists := byName[nic.Name]; exists && !consumed[row.ID] &&
-				nic.MAC != "" && strings.EqualFold(row.GetMAC(), nic.MAC) {
-				match, ok = row, true
-			}
-			if !ok {
-				match, ok = byMAC[strings.ToLower(nic.MAC)]
-				if ok && consumed[match.ID] {
-					ok = false
-				}
-			}
-			if !ok || nic.MAC == "" {
-				match, ok = byName[nic.Name]
-				if ok && consumed[match.ID] {
-					ok = false
-				}
-			}
+		observed = append(observed, nic)
+	}
+
+	// Resolve every NIC's row before writing anything (matchInterfaces),
+	// so the name moves below are planned over the whole claim set rather
+	// than discovered one NIC at a time.
+	matches := matchInterfaces(observed, byMAC, byName)
+	consumed := make(map[int]bool, len(existing)) // existing-row IDs claimed by an observed NIC
+	var writes []ifaceWrite
+	for i, nic := range observed {
+		desc := BuildInterfaceDescription(nic)
+		ifType := nic.IntfType
+		if ifType == "" {
+			ifType = InterfaceType(nic.Speed)
 		}
+
+		body := map[string]any{
+			"device":      deviceID,
+			"name":        nic.Name,
+			"type":        ifType,
+			"enabled":     true,
+			"mgmt_only":   nic.MgmtOnly,
+			"description": desc,
+		}
+		if nic.Speed > 0 {
+			body["speed"] = nic.Speed
+		}
+
+		match, ok := matches[i]
 
 		if !ok && operatorNames {
 			// A kernel-named row would sit beside the operator's row for
@@ -232,12 +217,9 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 			continue
 		}
 
-		var ifaceID int
-		var currentMAC string
+		w := ifaceWrite{nic: nic, body: body, row: match, matched: ok}
 		if ok {
 			consumed[match.ID] = true
-			ifaceID = match.ID
-			currentMAC = match.GetMAC()
 			if match.Name != nic.Name && operatorNames {
 				// The PATCH below would carry the kernel name; drop it so
 				// only the non-name fields update.
@@ -246,48 +228,16 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 					"name", match.Name, "commission_name", nic.Name, "mac", nic.MAC, "device_id", deviceID)
 			} else if match.Name != nic.Name {
 				// A rename can collide with a protected row's name just
-				// as easily as a fresh create can (see the POST-branch
+				// as easily as a fresh create can (see the create-branch
 				// comment below): protected rows are excluded from
-				// byName, so the squatter lookup just below can never
-				// see one. Check existing directly first, or the PATCH
-				// falls through to NetBox's device+name uniqueness 400
-				// instead of the loud modeling-conflict error.
+				// byName, so planNameMoves can never see one. Check
+				// existing directly, or the PATCH falls through to
+				// NetBox's device+name uniqueness 400 instead of the loud
+				// modeling-conflict error.
 				if protected, exists := findProtectedInterfaceByName(existing, nic.Name); exists {
 					return fmt.Errorf("renaming interface %q to %q: name held by protected interface %q (id=%d): modeling conflict, resolve in NetBox",
 						match.Name, nic.Name, protected.Name, protected.ID)
 				}
-				// NetBox enforces device+name uniqueness, so a rename
-				// must first evict any other row squatting on the
-				// target name (e.g. a MAC-less "eth0" placeholder next
-				// to the MAC-matched ens2f0np0 we're renaming). Only
-				// MAC-less, unprotected, unclaimed rows are evicted —
-				// a MAC-bearing squatter may be a later NIC's match,
-				// and anything protected/claimed holding the name is a
-				// modeling conflict worth failing loudly on. (The
-				// isProtectedInterface(squatter) check just below is now
-				// unreachable — protected rows never appear in byName —
-				// but stays as defense in depth.)
-				if squatter, exists := byName[nic.Name]; exists && squatter.ID != match.ID {
-					if consumed[squatter.ID] || isProtectedInterface(squatter) || squatter.GetMAC() != "" {
-						return fmt.Errorf("renaming interface %q to %q: name held by interface id=%d (protected, already claimed, or MAC-bearing)",
-							match.Name, nic.Name, squatter.ID)
-					}
-					path := fmt.Sprintf("/api/dcim/interfaces/%d/", squatter.ID)
-					if err := c.Delete(ctx, path); err != nil {
-						return fmt.Errorf("deleting placeholder interface %q (id=%d) blocking rename: %w",
-							nic.Name, squatter.ID, err)
-					}
-					consumed[squatter.ID] = true // claimed-by-deletion; skip in the stale sweep
-					c.log.Info("deleted placeholder interface blocking rename",
-						"name", nic.Name, "id", squatter.ID, "device_id", deviceID)
-				}
-				c.log.Info("renaming interface to commission-observed name",
-					"from", match.Name, "to", nic.Name, "mac", nic.MAC, "device_id", deviceID)
-			}
-			path := fmt.Sprintf("/api/dcim/interfaces/%d/", match.ID)
-			var updated Interface
-			if err := c.Patch(ctx, path, body, &updated); err != nil {
-				return fmt.Errorf("updating interface %q: %w", nic.Name, err)
 			}
 		} else {
 			// No unprotected row matched by MAC or name. Before
@@ -304,17 +254,64 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 				return fmt.Errorf("interface %q collides with protected interface %q (id=%d): modeling conflict, resolve in NetBox",
 					nic.Name, protected.Name, protected.ID)
 			}
+		}
+		writes = append(writes, w)
+	}
+
+	evict, aside, err := planNameMoves(writes, byName, consumed, nics)
+	if err != nil {
+		return err
+	}
+	for _, m := range mgmtMACRepairs {
+		if err := c.ensureInterfaceMAC(ctx, m.row, m.nic.MAC); err != nil {
+			return fmt.Errorf("setting MAC on interface %q: %w", m.nic.Name, err)
+		}
+	}
+	for _, row := range evict {
+		if err := c.Delete(ctx, fmt.Sprintf("/api/dcim/interfaces/%d/", row.ID)); err != nil {
+			return fmt.Errorf("deleting interface %q (id=%d) to free its name for an observed NIC: %w",
+				row.Name, row.ID, err)
+		}
+		consumed[row.ID] = true // claimed-by-deletion; skip in the stale sweep
+		c.log.Info("deleted stale interface holding an observed NIC's name",
+			"name", row.Name, "id", row.ID, "mac", row.GetMAC(), "device_id", deviceID)
+	}
+	for _, row := range aside {
+		tmp := renameAsideName(row.ID)
+		var updated Interface
+		if err := c.Patch(ctx, fmt.Sprintf("/api/dcim/interfaces/%d/", row.ID), map[string]any{"name": tmp}, &updated); err != nil {
+			return fmt.Errorf("renaming interface %q (id=%d) aside to %q to free its name: %w",
+				row.Name, row.ID, tmp, err)
+		}
+		c.log.Info("renamed interface aside to free its name",
+			"name", row.Name, "temporary_name", tmp, "id", row.ID, "device_id", deviceID)
+	}
+
+	for _, w := range writes {
+		nic := w.nic
+		var target Interface // the row nic is reconciled onto
+		if w.matched {
+			target = w.row
+			if w.newName() != "" {
+				c.log.Info("renaming interface to commission-observed name",
+					"from", w.row.Name, "to", nic.Name, "mac", nic.MAC, "device_id", deviceID)
+			}
+			var updated Interface
+			if err := c.Patch(ctx, fmt.Sprintf("/api/dcim/interfaces/%d/", w.row.ID), w.body, &updated); err != nil {
+				return fmt.Errorf("updating interface %q: %w", nic.Name, err)
+			}
+		} else {
 			var created Interface
-			if err := c.Post(ctx, "/api/dcim/interfaces/", body, &created); err != nil {
+			if err := c.Post(ctx, "/api/dcim/interfaces/", w.body, &created); err != nil {
 				return fmt.Errorf("creating interface %q: %w", nic.Name, err)
 			}
 			consumed[created.ID] = true
-			ifaceID = created.ID
+			target = created
 			c.log.Info("created interface", "name", nic.Name, "device_id", deviceID)
 		}
 
 		if nic.MAC != "" {
-			if err := c.ensureInterfaceMAC(ctx, ifaceID, currentMAC, nic.MAC); err != nil {
+			if err := c.ensureInterfaceMAC(ctx, target, nic.MAC); err != nil {
 				return fmt.Errorf("setting MAC on interface %q: %w", nic.Name, err)
 			}
 		}
@@ -346,6 +343,170 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 	}
 
 	return nil
+}
+
+// matchInterfaces pairs observed NICs, by index into nics, with the
+// unprotected existing rows they reconcile into. It matches all NICs at
+// once, strongest evidence first, so no NIC can take a row that a NIC
+// later in the report owns by stronger evidence:
+//
+//  1. MAC and name: the steady state. This also picks the right row when
+//     several rows carry one MAC (NICs reporting a shared MAC, e.g.
+//     bonded or virtual NICs, keep their own rows).
+//  2. MAC alone: a NIC the kernel now names differently. Its row is
+//     renamed in place, keeping its lag, IPs and cables.
+//  3. Name alone, among rows still unclaimed: MAC-less NICs and rows, or
+//     a replaced NIC whose old MAC no NIC reports any more.
+//
+// Resolving each NIC in report order instead (its MAC, then its name) let
+// a NIC that missed on MAC claim, by name, the row a later NIC's MAC
+// owned. The initrd names NICs in driver-probe order, so a card that
+// probes first takes eth0 from a bond member that shifts to eth1: the
+// member's row was re-MACed to the new card and the member got a bare new
+// row.
+//
+// A mgmt_only NIC never participates in this ordinary matching at all:
+// its only legitimate match is the idempotency check in
+// ReconcileInterfaces (its own prior protected row). Letting it match
+// here would claim an UNPROTECTED host row on the first-ever reconcile of
+// shared-LOM hardware (no protected BMC row exists yet to make the
+// idempotency check fire) and rename that host interface to the BMC's
+// name with mgmt_only=true — the same modeling corruption row protection
+// exists to prevent, from the opposite direction. An unmatched mgmt NIC
+// is always-new: it goes to create, where the protected-name-collision
+// check still guards against colliding with an existing protected row
+// under a changed BMC MAC.
+func matchInterfaces(nics []NICData, byMAC map[string][]Interface, byName map[string]Interface) map[int]Interface {
+	matches := make(map[int]Interface, len(nics))
+	claimed := make(map[int]bool, len(nics)) // row IDs
+	claim := func(i int, row Interface) {
+		matches[i] = row
+		claimed[row.ID] = true
+	}
+	for i, nic := range nics {
+		if nic.MgmtOnly || nic.MAC == "" {
+			continue
+		}
+		if row, ok := byName[nic.Name]; ok && !claimed[row.ID] && strings.EqualFold(row.GetMAC(), nic.MAC) {
+			claim(i, row)
+		}
+	}
+	for i, nic := range nics {
+		if _, done := matches[i]; done || nic.MgmtOnly || nic.MAC == "" {
+			continue
+		}
+		for _, row := range byMAC[strings.ToLower(nic.MAC)] {
+			if !claimed[row.ID] {
+				claim(i, row)
+				break
+			}
+		}
+	}
+	for i, nic := range nics {
+		if _, done := matches[i]; done || nic.MgmtOnly {
+			continue
+		}
+		if row, ok := byName[nic.Name]; ok && !claimed[row.ID] {
+			claim(i, row)
+		}
+	}
+	return matches
+}
+
+// ifaceWrite is the write ReconcileInterfaces plans for one observed NIC:
+// a PATCH of the existing row it matched, or a POST when it matched none.
+type ifaceWrite struct {
+	nic     NICData
+	body    map[string]any // no "name" key: the row keeps its name
+	row     Interface      // the matched row, when matched
+	matched bool
+}
+
+// newName returns the name this write gives a row that does not hold it
+// yet (a rename or a create), or "" when the write takes no new name.
+func (w ifaceWrite) newName() string {
+	name, ok := w.body["name"].(string)
+	if !ok || (w.matched && w.row.Name == name) {
+		return ""
+	}
+	return name
+}
+
+func (w ifaceWrite) String() string {
+	if w.matched {
+		return fmt.Sprintf("renaming interface %q to %q", w.row.Name, w.nic.Name)
+	}
+	return fmt.Sprintf("creating interface %q", w.nic.Name)
+}
+
+// planNameMoves decides, before anything is written, how to free each
+// name a planned write takes. NetBox enforces device+name uniqueness, so
+// an unprotected row holding the name must give it up first:
+//
+//   - A row another NIC claimed is renamed away by that NIC's own write
+//     (two NICs swapped names, or path-based names shifted after a PCIe
+//     renumber). It goes in aside: renamed to a temporary name first, so
+//     every write can then take its final name in any order.
+//   - A row no NIC claimed is stale: its NIC is gone and the stale sweep
+//     would delete it anyway. It goes in evict, deleted first. This
+//     covers both a MAC-less placeholder and the row of a removed card
+//     whose name the kernel now gives to another NIC.
+//   - A row no NIC claimed whose MAC an observed NIC does report is not
+//     stale: it shares that MAC with the row the NIC matched instead.
+//     Deleting it would drop the cables and IPs modeled on it, so fail.
+//
+// byName and consumed describe the rows as listed and the rows the
+// writes claimed; protected rows are absent from byName, and the
+// caller has already failed on a protected row holding a target name.
+func planNameMoves(writes []ifaceWrite, byName map[string]Interface, consumed map[int]bool, nics []NICData) (evict, aside []Interface, err error) {
+	observedMACs := make(map[string]bool, len(nics))
+	for _, nic := range nics {
+		// A mgmt_only NIC never matches an unprotected row, so its MAC
+		// does not make a row any NIC's match.
+		if !nic.MgmtOnly && nic.MAC != "" {
+			observedMACs[strings.ToLower(nic.MAC)] = true
+		}
+	}
+	finalName := make(map[int]string, len(writes)) // claimed row id -> name its write leaves it with
+	for _, w := range writes {
+		if w.matched {
+			finalName[w.row.ID] = w.row.Name
+			if name := w.newName(); name != "" {
+				finalName[w.row.ID] = name
+			}
+		}
+	}
+
+	for _, w := range writes {
+		name := w.newName()
+		holder, held := byName[name]
+		if name == "" || !held {
+			continue
+		}
+		switch mac := strings.ToLower(holder.GetMAC()); {
+		case consumed[holder.ID] && finalName[holder.ID] != name:
+			aside = append(aside, holder)
+		case consumed[holder.ID]:
+			return nil, nil, fmt.Errorf("%s: interface id=%d keeps that name for another observed NIC: the commission data reports two NICs named %q, check the agent's NIC inventory",
+				w, holder.ID, name)
+		case mac != "" && observedMACs[mac]:
+			return nil, nil, fmt.Errorf("%s: name held by interface id=%d, which shares MAC %s with another row (an observed NIC reports that MAC, so the row is not stale): remove the duplicate MAC in NetBox",
+				w, holder.ID, holder.GetMAC())
+		default:
+			evict = append(evict, holder)
+		}
+	}
+	return evict, aside, nil
+}
+
+// renameAsideName is the temporary name planNameMoves's aside rows hold
+// until their own write renames them. It is longer than any kernel
+// interface name (IFNAMSIZ allows 15 characters), so no observed NIC
+// can want it, and the row id keeps it unique on the device. A run that
+// fails between the two renames leaves it behind; the next run
+// MAC-matches the row and renames it to its final name.
+func renameAsideName(id int) string {
+	return fmt.Sprintf("slagworks-rename-%d", id)
 }
 
 // findProtectedInterfaceByName scans existing (not byName — protected
@@ -438,27 +599,47 @@ func (c *Client) ListDeviceInterfaces(ctx context.Context, deviceID int) ([]Inte
 	return results, nil
 }
 
-// ensureInterfaceMAC creates a MAC address object and sets it as primary on the
-// interface. NetBox v4.3+ requires MAC addresses as separate objects.
-// currentMAC is the MAC already on the interface (avoids an extra API call).
-func (c *Client) ensureInterfaceMAC(ctx context.Context, ifaceID int, currentMAC, wantMAC string) error {
-	if strings.EqualFold(currentMAC, wantMAC) {
+// ensureInterfaceMAC makes wantMAC the primary MAC of iface. NetBox v4.3+
+// requires MAC addresses as separate objects assigned to the interface.
+// iface is the row as last listed, or as returned by its create (avoids an
+// extra API call).
+//
+// Setting a new MAC takes two writes, creating the MAC object and then
+// marking it primary, so a run that fails between them (or loses the
+// create response) leaves the object assigned but not primary. The next
+// run finds that object in iface.MACAddresses and marks it primary rather
+// than creating a duplicate. The check is on the primary, not GetMAC,
+// whose fallback to the first assigned object would read that half-done
+// state as finished on every later run.
+func (c *Client) ensureInterfaceMAC(ctx context.Context, iface Interface, wantMAC string) error {
+	if strings.EqualFold(iface.primaryMACAddress(), wantMAC) {
 		return nil
 	}
 
-	var macObj MACAddressRef
-	if err := c.Post(ctx, "/api/dcim/mac-addresses/", map[string]any{
-		"mac_address":          wantMAC,
-		"assigned_object_type": "dcim.interface",
-		"assigned_object_id":   ifaceID,
-	}, &macObj); err != nil {
-		return fmt.Errorf("creating MAC address: %w", err)
+	var macID int
+	found := false
+	for _, m := range iface.MACAddresses {
+		if strings.EqualFold(m.MACAddress, wantMAC) {
+			macID, found = m.ID, true
+			break
+		}
+	}
+	if !found {
+		var macObj MACAddressRef
+		if err := c.Post(ctx, "/api/dcim/mac-addresses/", map[string]any{
+			"mac_address":          wantMAC,
+			"assigned_object_type": "dcim.interface",
+			"assigned_object_id":   iface.ID,
+		}, &macObj); err != nil {
+			return fmt.Errorf("creating MAC address: %w", err)
+		}
+		macID = macObj.ID
 	}
 
 	var updated Interface
-	path := fmt.Sprintf("/api/dcim/interfaces/%d/", ifaceID)
+	path := fmt.Sprintf("/api/dcim/interfaces/%d/", iface.ID)
 	if err := c.Patch(ctx, path, map[string]any{
-		"primary_mac_address": macObj.ID,
+		"primary_mac_address": macID,
 	}, &updated); err != nil {
 		return fmt.Errorf("setting primary MAC: %w", err)
 	}
