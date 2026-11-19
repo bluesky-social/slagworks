@@ -177,18 +177,34 @@ exit
 	// the iPXE-maintainer-recommended idiom for UEFI local boot (ipxe/ipxe
 	// issues #428, #1676).
 	//
-	// The 0x81 fallback handles single-disk-loss recovery only on hardware
-	// where both disks have a populated bootloader. The current production
-	// storage scripts (assets/storage/200-*) leave disk1's ESP partition
-	// unformatted, so 0x81 is a no-op for our kworker fleet today. Boot
-	// redundancy on disk failure is tracked separately; leaving the
-	// fallback in place so it lights up automatically once both ESPs carry
-	// the bootloader.
+	// The script walks drives 0x80-0x9f and boots the first one whose ESP
+	// holds \EFI\BOOT\BOOTX64.EFI. iPXE numbers whole local disks from 0x80
+	// in the firmware's block-device order (efi_block.c), and a storage
+	// script may put the ESP on any of them: stopping at 0x81 left a machine
+	// whose ESP is on its third disk unbootable after the deploy's one-shot
+	// BootNext. 32 drives covers a 24-bay chassis plus boot NVMe and BMC
+	// virtual media; each number past the last real disk is one quick failed
+	// sanboot. A loader that returns does not end the walk, so a second ESP
+	// (RAID1 root) still gets its turn.
+	//
+	// When no drive boots, a plain `exit` (status 0) makes embed.ipxe's
+	// chain succeed, so iPXE exits to the firmware with EFI_SUCCESS: the
+	// same hand-back the BIOS script uses. Firmware that continues its boot
+	// order then reaches the "Slagworks" Boot#### entry the agent
+	// registered; EDK2-based firmware with a boot menu (OVMF) shows that
+	// menu instead, as the UEFI spec allows after a successful return. A
+	// nonzero status would fail the chain, which embed.ipxe retries 20 times
+	// before dropping to an iPXE shell. A served script cannot make iPXE
+	// itself return a failure status; that would take an embed.ipxe change.
 	return fmt.Sprintf(`#!ipxe
 echo slagworks: boot-local for mac %s
-sanboot --no-describe --drive 0x80 ||
-sanboot --no-describe --drive 0x81 ||
-exit 1
+set drive:uint8 0x80
+:try_drive
+sanboot --no-describe --drive ${drive} ||
+inc drive
+iseq ${drive} 0xa0 || goto try_drive
+echo slagworks: boot-local: no drive 0x80-0x9f booted, handing back to the firmware
+exit
 `, mac)
 }
 

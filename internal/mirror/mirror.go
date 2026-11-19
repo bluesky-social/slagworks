@@ -3,10 +3,11 @@
 // spec: serial required and unique, site slug immutable once managed.
 //
 // On NetBox device deletion the corresponding Machine row is hard-deleted
-// (cascading to machine_interfaces; child rows in operations/deploy_logs
-// are cleaned up by the deletion path). On NetBox device re-creation
-// with a serial that matches an existing row, the row is rebound (its
-// netbox_device_id is updated); state is preserved.
+// once the machine is idle (cascading to machine_interfaces; child rows in
+// operations/log_envelopes are cleaned up by the deletion path); a machine
+// with an operation in flight is kept, see OnDeviceDeleted. On NetBox
+// device re-creation with a serial that matches an existing row, the row
+// is rebound (its netbox_device_id is updated); state is preserved.
 //
 // The webhook handler (internal/netbox/webhook.go) and the reconciler
 // (internal/snapshot/reconcile.go) both delegate here so the
@@ -83,12 +84,15 @@ type Store interface {
 	GetMachine(id uuid.UUID) (*model.Machine, error)
 	GetMachineByNetBoxDeviceID(id int) (*model.Machine, error)
 	GetMachineByNetBoxSerial(serial string) (*model.Machine, error)
-	UpdateMachine(m *model.Machine) error
 	// SetMachineNetBoxDeviceID writes ONLY netbox_device_id. The rebind path
-	// uses this instead of full-row UpdateMachine so it can't clobber columns
-	// the mirror doesn't own (e.g. state, locked) with a stale in-memory value.
+	// uses this instead of a full-row write so it can't clobber columns the
+	// mirror doesn't own (e.g. state, locked) with a stale in-memory value.
 	SetMachineNetBoxDeviceID(id uuid.UUID, netboxDeviceID int) error
-	DeleteMachine(id uuid.UUID) error
+	// DeleteMachineIfIdle hard-deletes the machine and its op history
+	// unless it has an active op, checking and deleting in one transaction
+	// that a concurrent op create cannot slip into. Returns false (nothing
+	// deleted) when an active op exists, true when the row is gone.
+	DeleteMachineIfIdle(id uuid.UUID) (bool, error)
 	// FailInFlightOpsForMachine fails every non-terminal op on the
 	// machine (B7: external NetBox drift mid-operation). Returns the
 	// post-mutation outcomes (failed row + the durable machine state the
@@ -161,7 +165,7 @@ func (m *Mirror) OnDeviceCreated(ctx context.Context, d Device) error {
 			return fmt.Errorf("serial %s is already bound to active device %d; refusing to rebind to %d",
 				d.Serial, *existing.NetBoxDeviceID, d.ID)
 		}
-		// Write ONLY netbox_device_id — NOT a full-row UpdateMachine(Save).
+		// Write ONLY netbox_device_id — NOT a full-row gorm Save.
 		// A full-row save here clobbers columns the mirror doesn't own with the
 		// stale values in `existing` (loaded above), racing any concurrent
 		// writer of those columns (state transitions, lock).
@@ -200,12 +204,18 @@ func (m *Mirror) OnDeviceUpdated(ctx context.Context, d Device) error {
 }
 
 // OnDeviceDeleted hard-deletes the machine row when its NetBox device is
-// deleted. Cascades to machine_interfaces; call sites in the migration
-// path also clean operations and deploy_logs. Called with the device_id
-// and the claiming config slug because the Device object itself is gone.
-// configSlug keys the invalidation; it may be empty when the caller
-// couldn't resolve a claim (the row is still deleted by device_id — the
-// snapshot just refreshes on the next reconcile tick).
+// deleted and the machine is idle. Cascades to machine_interfaces; the
+// store also deletes its operations and log_envelopes. Called with the
+// device_id and the claiming config slug because the Device object itself
+// is gone. configSlug keys the invalidation; it may be empty when the
+// caller couldn't resolve a claim (the row is still deleted by device_id —
+// the snapshot just refreshes on the next reconcile tick).
+//
+// B7: a NetBox delete landing mid-operation is a blow-up-the-world event,
+// not a cleanup. Fail the in-flight ops (freezing the machine in `failed`),
+// keep the row and its op history for the operator to inspect, and alarm.
+// The row is NOT deleted this pass — once the machine is idle, the next
+// reconcile sweep confirms the device is still gone and removes it.
 func (m *Mirror) OnDeviceDeleted(ctx context.Context, deviceID int, configSlug string) error {
 	existing, err := m.st.GetMachineByNetBoxDeviceID(deviceID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -216,35 +226,60 @@ func (m *Mirror) OnDeviceDeleted(ctx context.Context, deviceID int, configSlug s
 	if err != nil {
 		return fmt.Errorf("lookup machine by device id %d: %w", deviceID, err)
 	}
-	// B7: a NetBox delete landing mid-operation is a blow-up-the-world
-	// event, not a cleanup. Fail the in-flight ops (freezing the
-	// machine in `failed`), keep the row and its op history for the
-	// operator to inspect, and alarm. The row is NOT deleted this
-	// pass — once the machine is idle, the next reconcile sweep
-	// confirms the device is still gone and removes it.
-	outcomes, err := m.st.FailInFlightOpsForMachine(existing.ID,
-		"netbox device deleted mid-operation")
+	if failed, err := m.failInFlightOnDelete(existing.ID, deviceID, configSlug); err != nil || failed {
+		return err
+	}
+	// An operator request already past its own checks when the device was
+	// deleted can still create an op after failInFlightOnDelete looked.
+	// DeleteMachineIfIdle re-checks under the machine row lock and refuses
+	// to delete a machine with an active op; that op then gets the same B7
+	// treatment instead of vanishing with the row after the operator was
+	// handed its ID.
+	deleted, err := m.st.DeleteMachineIfIdle(existing.ID)
 	if err != nil {
-		return fmt.Errorf("fail in-flight ops for machine %s: %w", existing.ID, err)
-	}
-	if len(outcomes) > 0 {
-		m.log.Error("netbox device deleted MID-OPERATION; in-flight ops failed, machine row retained for inspection",
-			"uuid", existing.ID, "device_id", deviceID, "ops_failed", len(outcomes))
-		// Drop the failed ops on the workers' op stream — without this a
-		// worker keeps a zombie active op until reconnect, which under the
-		// fail-closed boot rule is what authorizes actuation. The identity
-		// rebuild below delivers the pulled-down machine state.
-		m.publishRemoved(outcomes)
-		m.inv.Invalidate(configSlug)
-		return nil
-	}
-	if err := m.st.DeleteMachine(existing.ID); err != nil {
 		return fmt.Errorf("delete machine: %w", err)
+	}
+	if !deleted {
+		failed, err := m.failInFlightOnDelete(existing.ID, deviceID, configSlug)
+		if err != nil {
+			return err
+		}
+		if !failed {
+			// The op finished before it could be failed. The row stays
+			// for the next reconcile sweep, but the device is gone from
+			// NetBox, so the snapshot still needs rebuilding.
+			m.inv.Invalidate(configSlug)
+		}
+		return nil
 	}
 	m.log.Info("deleted machine on netbox device deletion",
 		"uuid", existing.ID, "device_id", deviceID)
 	m.inv.Invalidate(configSlug)
 	return nil
+}
+
+// failInFlightOnDelete is OnDeviceDeleted's B7 branch: it fails the
+// machine's in-flight ops, drops them on the workers' op stream and
+// invalidates the snapshot, reporting whether there were any. The caller
+// keeps the row whenever this fails an op.
+func (m *Mirror) failInFlightOnDelete(machineID uuid.UUID, deviceID int, configSlug string) (bool, error) {
+	outcomes, err := m.st.FailInFlightOpsForMachine(machineID,
+		"netbox device deleted mid-operation")
+	if err != nil {
+		return false, fmt.Errorf("fail in-flight ops for machine %s: %w", machineID, err)
+	}
+	if len(outcomes) == 0 {
+		return false, nil
+	}
+	m.log.Error("netbox device deleted MID-OPERATION; in-flight ops failed, machine row retained for inspection",
+		"uuid", machineID, "device_id", deviceID, "ops_failed", len(outcomes))
+	// Drop the failed ops on the workers' op stream — without this a
+	// worker keeps a zombie active op until reconnect, which under the
+	// fail-closed boot rule is what authorizes actuation. The identity
+	// rebuild below delivers the pulled-down machine state.
+	m.publishRemoved(outcomes)
+	m.inv.Invalidate(configSlug)
+	return true, nil
 }
 
 // OnDeviceExternalDrift handles an externally-driven change to a

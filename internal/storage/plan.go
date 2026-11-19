@@ -20,8 +20,14 @@ func (c Command) String() string {
 type BlockDevice struct {
 	Name      string `json:"name"`
 	SizeBytes int64  `json:"size_bytes"`
-	Transport string `json:"transport,omitempty"`
-	Model     string `json:"model,omitempty"`
+	// LogicalSectorBytes is the disk's logical sector size (lsblk LOG-SEC):
+	// 512 on most disks, 4096 on 4Kn disks. Plan needs it for every disk
+	// carrying a vfat partition, because the smallest FAT32 filesystem
+	// depends on it (see fat32MinBytes). Zero means the inventory did not
+	// report one.
+	LogicalSectorBytes int64  `json:"logical_sector_bytes,omitempty"`
+	Transport          string `json:"transport,omitempty"`
+	Model              string `json:"model,omitempty"`
 }
 
 // Plan translates a storage layout into an ordered list of commands.
@@ -32,9 +38,9 @@ func Plan(layout Layout, inventory []BlockDevice) ([]Command, error) {
 		return nil, err
 	}
 
-	inventorySet := make(map[string]bool, len(inventory))
+	inventoryByName := make(map[string]BlockDevice, len(inventory))
 	for _, bd := range inventory {
-		inventorySet[bd.Name] = true
+		inventoryByName[bd.Name] = bd
 	}
 
 	// Process devices in deterministic order: disks first (sorted), then
@@ -44,12 +50,12 @@ func Plan(layout Layout, inventory []BlockDevice) ([]Command, error) {
 
 	// Verify all referenced disks exist in inventory.
 	for _, name := range diskNames {
-		if !inventorySet[name] {
+		if _, ok := inventoryByName[name]; !ok {
 			return nil, fmt.Errorf("disk %q in layout not found in inventory", name)
 		}
 	}
 	for _, name := range retainNames {
-		if !inventorySet[name] {
+		if _, ok := inventoryByName[name]; !ok {
 			return nil, fmt.Errorf("retained disk %q in layout not found in inventory", name)
 		}
 	}
@@ -59,6 +65,9 @@ func Plan(layout Layout, inventory []BlockDevice) ([]Command, error) {
 	// Phase 1: Partition disks.
 	for _, name := range diskNames {
 		dev := layout.Devices[name]
+		if err := checkVFATSizes(name, dev, inventoryByName[name]); err != nil {
+			return nil, err
+		}
 		diskCmds, err := planDisk(name, dev)
 		if err != nil {
 			return nil, fmt.Errorf("planning disk %s: %w", name, err)
@@ -82,18 +91,25 @@ func Plan(layout Layout, inventory []BlockDevice) ([]Command, error) {
 	}
 
 	// Phase 3: Format devices that have fs set (disks already formatted their partitions).
-	// RAID arrays with fs are formatted here. Preserve devices are never
-	// formatted — that's the entire point.
+	// RAID arrays with fs are formatted here. A RAID array without fs is
+	// cleared instead: mdadm --create over the same members puts the data
+	// area where the previous array's was, so that array's filesystem or
+	// LVM label would show through on the new one. Only Linux reads an md
+	// array's data area, so wipefs alone is enough here; partitions also
+	// zero their boot sector because firmware reads those. Preserve
+	// devices are never formatted or cleared — that's the entire point.
 	for _, name := range raidNames {
 		dev := layout.Devices[name]
-		if dev.FS != "" {
-			mdDev := mdDevMap[name]
-			fmtCmd, err := mkfsCommand(dev.FS, mdDev)
-			if err != nil {
-				return nil, err
-			}
-			cmds = append(cmds, fmtCmd)
+		mdDev := mdDevMap[name]
+		if dev.FS == "" {
+			cmds = append(cmds, Command{"wipefs", []string{"-a", mdDev}})
+			continue
 		}
+		fmtCmd, err := mkfsCommand(dev.FS, mdDev)
+		if err != nil {
+			return nil, err
+		}
+		cmds = append(cmds, fmtCmd)
 	}
 
 	// Phase 4: Mount in correct order (/ first, then deeper paths).
@@ -251,12 +267,39 @@ func planDisk(name string, dev Device) ([]Command, error) {
 	// declarative list.
 	cmds = append(cmds, Command{"blockdev", []string{"--rereadpt", diskPath}})
 
-	// Format partitions that have a filesystem specified.
+	// Format each partition that declares a filesystem, and clear every
+	// other one. A new partition starts with whatever bytes sat at its
+	// offset; sgdisk --zap-all rewrites only the partition tables, and the
+	// agent's --destructive wipe clears whole-disk and md signatures only.
+	// mkfs overwrites a formatted partition, but an unformatted one (a spare
+	// ESP slot, a BIOS boot partition, a RAID member) would keep the
+	// filesystem an earlier layout put there: an old ESP left on the
+	// firmware's first disk boots the old bootloader, which asks for a root
+	// filesystem that no longer exists.
+	//
+	// Clearing takes two commands. wipefs -a erases the filesystem, RAID and
+	// LVM signatures libblkid knows, at the head or the tail (an md 1.0
+	// superblock lives at the end), which is what Linux and mdadm probe. It
+	// erases only the magic bytes, though, and UEFI firmware mounts FAT from
+	// the boot sector's BPB without checking them: after wipefs alone, a
+	// redeployed VM still booted the old ESP. Zeroing the first 4 KiB,
+	// logical sector 0 at any sector size, removes the boot sector itself.
+	// It also removes the MBR signature and GPT protective MBR of a nested
+	// partition table, which wipefs leaves alone on a partition without
+	// --force; libblkid, the kernel and firmware read no GPT without one.
+	// --force is not used because it also drops wipefs's O_EXCL open, so a
+	// partition something still holds would be written instead of failing
+	// the deploy. Both run after the re-read, so the partition nodes exist,
+	// and before Phase 2's mdadm uses any member.
 	for i, part := range dev.Partitions {
+		partPath := partitionDevPath(name, i+1)
 		if part.FS == "" {
+			cmds = append(cmds,
+				Command{"wipefs", []string{"-a", partPath}},
+				Command{"dd", []string{"if=/dev/zero", "of=" + partPath, "bs=4096", "count=1", "conv=fsync"}},
+			)
 			continue
 		}
-		partPath := partitionDevPath(name, i+1)
 		fmtCmd, err := mkfsCommand(part.FS, partPath)
 		if err != nil {
 			return nil, err

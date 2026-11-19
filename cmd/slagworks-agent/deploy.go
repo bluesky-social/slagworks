@@ -37,10 +37,10 @@ type deployParams struct {
 // runDeploy drives the deploy sequence: identity check, storage
 // resolve/plan, network-config render, storage apply, root extraction,
 // bootloader install, target finalization (fstab/cloud-init/network/
-// hostname/keys), tailscale enrollment, BMC reconcile, deploy_complete
-// report, and reboot. Everything that can hard-fail on inputs known at
-// start (the storage and network scripts) runs before the first disk is
-// touched.
+// hostname/keys), tailscale enrollment, target unmount, BMC reconcile,
+// deploy_complete report, and reboot. Everything that can hard-fail on
+// inputs known at start (the storage and network scripts) runs before the
+// first disk is touched.
 func runDeploy(ctx *agent.Context, p deployParams) {
 	setPhase, fatal := p.setPhase, p.fatal
 
@@ -96,6 +96,16 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 		ctx.Log.Info("--destructive set, skipping disk safety check")
 	} else if err := storageapply.CheckDisksClean(ctx, layout); err != nil {
 		fatal("safety check", err)
+	}
+
+	// A raid that pins its array UUID is identified at boot by that UUID
+	// alone, so a member superblock with the same UUID on a device this
+	// deploy leaves unwritten (the disk a redeploy moved the array off)
+	// races the real members and can stop the boot in emergency mode.
+	// Refuse now, with the host as found, unless --wipe-all-disks will zero
+	// that device below.
+	if err := storageapply.CheckStaleArrayMembers(ctx, layout, p.wipeAllDisks); err != nil {
+		fatal("stale array member check", err)
 	}
 
 	// Verify every preserve array by its expected UUID BEFORE any
@@ -238,7 +248,7 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 	// The installed system's mdadm.conf decides which arrays its initramfs
 	// assembles; a host whose initramfs lacks it can boot into an array the
 	// layout does not name, or lose its root array to one. Hard fail.
-	if err := target.ConfigureRAID(ctx, layout); err != nil {
+	if err := target.ConfigureRAID(ctx, "/target", layout); err != nil {
 		fatal("configuring RAID", err)
 	}
 
@@ -295,6 +305,15 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 		}
 	}
 
+	// Unmount the target last of all disk work, and before BMC reconcile
+	// and the deploy_complete report: a filesystem that will not unmount
+	// would reboot dirty, so it fails the deploy here, while the op can
+	// still fail and before reconcile has rotated any BMC password that a
+	// failed op would never report.
+	if err := storageapply.CleanupMounts(ctx, layout); err != nil {
+		fatal("unmounting target filesystems", err)
+	}
+
 	// Reconcile BMC users + persistent boot order. This is what gets
 	// the `monitor` scrape account onto the BMC for the first time and
 	// disables any stray account (including a `slagworks` account left
@@ -346,20 +365,17 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 			}
 		}
 
-		// Report before cleanup -- networking is still up and state
-		// is known-good. Single deploy_complete POST carries the
-		// BMCCreds payload AND signals phase=awaiting_phone_home (the
-		// worker's HandleProgressReport promotes the op phase on the
-		// event). One round-trip eliminates the split-brain risk
-		// where the phase landed but the creds were dropped, which on
-		// a rotation deploy would permanently desync the BMC from
-		// slagworks's stored passwords.
+		// Single deploy_complete POST carries the BMCCreds payload AND
+		// signals phase=awaiting_phone_home (the worker's
+		// HandleProgressReport promotes the op phase on the event). One
+		// round-trip eliminates the split-brain risk where the phase
+		// landed but the creds were dropped, which on a rotation deploy
+		// would permanently desync the BMC from slagworks's stored
+		// passwords.
 		if err := p.reporter.ReportDeployComplete(bmcCreds); err != nil {
 			fatal("reporting deploy_complete", err)
 		}
 	}
-
-	storageapply.CleanupMounts(ctx, layout)
 
 	ctx.Log.Info("deploy complete")
 	close(p.done)

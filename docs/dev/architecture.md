@@ -95,7 +95,8 @@ Modes (dispatched from `main.go` around line 165):
   image, installs a bootloader, configures RAID, writes fstab, seeds
   cloud-init, writes the rendered network configuration into the
   target, writes the hostname, installs SSH keys,
-  enrolls in Tailscale, writes the phone-home unit, reconciles the
+  enrolls in Tailscale, writes the phone-home unit, unmounts the target
+  (a filesystem that will not unmount fails the deploy), reconciles the
   BMC, reports `deploy_complete`, and reboots.
 
 All agent-to-site traffic is plain HTTP against the site worker's
@@ -294,7 +295,8 @@ Types are in `internal/model/snapshot.go`:
 - `SnapshotInterface` (`snapshot.go:126`) — `Type` is one of
   `physical`, `ipmi`, `lag`; only physical NICs are matched by DHCP.
   A `mgmt_only` interface is `ipmi` only when the device has a canonical
-  NetBox `oob_ip`; on a BMC-less device it remains a physical host/PXE NIC.
+  NetBox `oob_ip`; on a BMC-less device the flag is ignored, so a NIC
+  remains a physical host/PXE NIC and a bond remains `lag`.
 - `ContentHash()` (`snapshot.go:280`) — SeqNum stripped, slices sorted
   in copy, sha256. This is the dispatcher's push-decision key.
 
@@ -420,8 +422,9 @@ Global to site:
 - `op_delta` / `op_resync` / `op_removed` (`OpDeltaMsg`, line 434 /
   `OpResyncMsg`, 450 / `OpRemovedMsg`, 462) — the op-event stream.
   Operations left `SiteSnapshot` (Tier 2 Phase 2); they flow as per-op
-  `op_delta`s, a full `op_resync` on every (re)connect, and
-  `op_removed` for terminal ops.
+  `op_delta`s (re-sent for the whole site after every pushed snapshot),
+  a full `op_resync` on every (re)connect, and `op_removed` for terminal
+  ops.
 - `power_status_request` / `boot_status_request` (`131`, `150`) —
   synchronous RPCs invoked by the API for operator reads.
 

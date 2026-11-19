@@ -36,12 +36,19 @@ esac
 # force in:
 #   overlay/squashfs/loop : the overlay-root mount in /scripts/slagworks
 #   nvme/ahci             : storage controllers the agent partitions
-#   md_mod/raid0/1/10     : software-RAID personalities (kworker RAID1 boot);
-#                           mdadm RUN_ARRAY fails without the level's module
+#   md_mod/raid0/1/10/456 : md core + the personality of every RAID level the
+#                           planner accepts (raidLevels in
+#                           internal/storage/validate.go; a unit test fails if
+#                           one is missing here). The kernel loads a
+#                           personality by running modprobe in THIS initramfs,
+#                           not in the agent's chroot, so mdadm --create fails
+#                           "RUN_ARRAY failed: Invalid argument" without the
+#                           level's module. manual_add_modules pulls in
+#                           raid456's dependencies (async_*, raid6_pq, ...).
 #   dm_mod               : device-mapper foundation (future LVM/dm-crypt)
 for m in overlay squashfs loop \
          nvme nvme_core ahci libahci \
-         md_mod raid0 raid1 raid10 dm_mod; do
+         md_mod raid0 raid1 raid10 raid456 dm_mod; do
     manual_add_modules "$m"
 done
 

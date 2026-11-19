@@ -104,9 +104,10 @@ and set the device's `oob_ip` to the IP assigned to that interface. Slagworks
 uses `oob_ip` as the canonical BMC-presence signal; names vary too much across
 vendors and operator habit (`ipmi`, `ipmi0`, `bmc`, `mgmt`, `lom`,
 `dedicated`) to key on. A `mgmt_only` interface on a device with `oob_ip`
-becomes type `ipmi`. On a BMC-less device, such as an SN2700 switch, a
-`mgmt_only` host management/PXE NIC remains type `physical` and participates
-in DHCP machine identity.
+becomes type `ipmi`. On a BMC-less device, such as an SN2700 switch,
+`mgmt_only` does not change the type: a `mgmt_only` host management/PXE NIC
+remains type `physical` and participates in DHCP machine identity, and a
+`mgmt_only` bond (NetBox type `lag`) remains type `lag`.
 
 A BMC-less device gets console capture (`slagctl machine logs --sol`) only
 through its serial console: model a console port on the device and cable it
@@ -173,8 +174,9 @@ the shape; the interesting bits:
   `/boot/efi`.
 
 The planner (`internal/storage/plan.go`) translates the JSON into an ordered
-list of `sgdisk`, `mdadm`, `mkfs.*`, `blockdev --rereadpt`, `mkdir`, and
-`mount` commands. Anything the planner does not know how to express is a
+list of `sgdisk`, `mdadm`, `mkfs.*`, `wipefs` and `dd` (which clear every
+partition and array it creates without `fs`), `blockdev --rereadpt`,
+`mkdir`, and `mount` commands. Anything the planner does not know how to express is a
 layout you cannot describe with a storage script; extend the planner rather
 than trying to smuggle raw shell into the script.
 

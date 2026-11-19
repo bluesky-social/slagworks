@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -158,8 +159,9 @@ func exportValue(out, key string) string {
 // regenerated initrd replaces the stock one InstallSystemdBoot put on the
 // ESP; on BIOS, GRUB's menu already points at the /boot initrd this
 // rewrites. Every failure is returned: a host whose initramfs lacks the
-// file can boot into the wrong arrays, or none.
-func ConfigureRAID(ctx *agent.Context, layout storage.Layout) error {
+// file can boot into the wrong arrays, or none. root is the mounted target
+// tree (/target in a deploy).
+func ConfigureRAID(ctx *agent.Context, root string, layout storage.Layout) (err error) {
 	conf, ok, err := layoutMDADMConf(ctx, layout)
 	if err != nil {
 		return err
@@ -169,45 +171,60 @@ func ConfigureRAID(ctx *agent.Context, layout storage.Layout) error {
 	}
 
 	ctx.Log.Info("configuring RAID for local boot")
-	if err := os.MkdirAll("/target/etc/mdadm", 0755); err != nil {
-		return fmt.Errorf("create /target/etc/mdadm: %w", err)
+	if err := os.MkdirAll(root+"/etc/mdadm", 0755); err != nil {
+		return fmt.Errorf("create %s/etc/mdadm: %w", root, err)
 	}
-	if err := os.WriteFile("/target/etc/mdadm/mdadm.conf", []byte(conf), 0644); err != nil {
+	if err := os.WriteFile(root+"/etc/mdadm/mdadm.conf", []byte(conf), 0644); err != nil {
 		return fmt.Errorf("write mdadm.conf: %w", err)
 	}
 
-	// Regenerate initrd so it includes mdadm array assembly
-	// Bind-mount pseudo-filesystems for chroot operations
+	// Regenerate initrd so it includes mdadm array assembly, with the
+	// pseudo-filesystems bind-mounted for the chroot. The chroot can mount
+	// beneath a bind, and on UEFI it does: Debian's mdadm initramfs hook
+	// mounts efivarfs at /sys/firmware/efi/efivars when it finds that
+	// directory empty, which it is under a non-recursive bind of /sys. So
+	// each bind is unmounted recursively, and a failure is returned: a bind
+	// left behind keeps the target root from unmounting before reboot.
+	var mounted []string
+	defer func() {
+		for _, m := range slices.Backward(mounted) {
+			if uerr := ctx.Exec.Run("umount", "--recursive", m); uerr != nil {
+				err = errors.Join(err, fmt.Errorf("unmount chroot bind %s after update-initramfs: %w; "+
+					"while it stays mounted the target root cannot be unmounted for reboot", m, uerr))
+			}
+		}
+	}()
 	for _, m := range []struct{ src, dst string }{
-		{"/dev", "/target/dev"},
-		{"/proc", "/target/proc"},
-		{"/sys", "/target/sys"},
+		{"/dev", root + "/dev"},
+		{"/proc", root + "/proc"},
+		{"/sys", root + "/sys"},
 	} {
-		_ = os.MkdirAll(m.dst, 0755)
-		_ = ctx.Exec.Run("mount", "--bind", m.src, m.dst)
+		if err := os.MkdirAll(m.dst, 0755); err != nil {
+			return fmt.Errorf("create bind-mount target %s: %w", m.dst, err)
+		}
+		if err := ctx.Exec.Run("mount", "--bind", m.src, m.dst); err != nil {
+			return fmt.Errorf("bind-mount %s: %w", m.dst, err)
+		}
+		mounted = append(mounted, m.dst)
 	}
 
 	ctx.Log.Info("regenerating initrd with RAID support")
-	if err := ctx.Exec.Run("chroot", "/target", "update-initramfs", "-u"); err != nil {
+	if err := ctx.Exec.Run("chroot", root, "update-initramfs", "-u"); err != nil {
 		return fmt.Errorf("update-initramfs: %w", err)
-	}
-
-	for _, dst := range []string{"/target/sys", "/target/proc", "/target/dev"} {
-		_ = ctx.Exec.Run("umount", dst)
 	}
 
 	// UEFI: replace the stock initrd InstallSystemdBoot put on the ESP with
 	// the regenerated one. BIOS has no ESP copy; GRUB boots /boot's initrd.
-	const espInitrd = "/target/boot/efi/slagworks/initrd.img"
+	espInitrd := root + "/boot/efi/slagworks/initrd.img"
 	if _, err := os.Stat(espInitrd); errors.Is(err, fs.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("stat %s: %w", espInitrd, err)
 	}
-	matches, _ := filepath.Glob("/target/boot/initrd.img-*")
+	matches, _ := filepath.Glob(root + "/boot/initrd.img-*")
 	if len(matches) == 0 {
-		return fmt.Errorf("update-initramfs left no /target/boot/initrd.img-*; the ESP keeps the stock initrd, " +
-			"which would not carry mdadm.conf")
+		return fmt.Errorf("update-initramfs left no %s/boot/initrd.img-*; the ESP keeps the stock initrd, "+
+			"which would not carry mdadm.conf", root)
 	}
 	if err := ctx.Exec.Run("cp", matches[0], espInitrd); err != nil {
 		return fmt.Errorf("copy initrd to ESP: %w", err)

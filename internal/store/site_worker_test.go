@@ -195,6 +195,35 @@ func TestTouchSiteWorker_Serial(t *testing.T) {
 	}
 }
 
+// TestListSiteWorkersBySerial_IgnoresCase: the column holds the worker's
+// SMBIOS spelling and callers pass NetBox's spelling. The hello gate matched
+// the two case-insensitively, so the lookup must too; an empty serial still
+// matches nothing.
+func TestListSiteWorkersBySerial_IgnoresCase(t *testing.T) {
+	st := testStore(t)
+	if _, _, err := st.RegisterSiteWorker("pop3", "worker-a", "a.pop3"); err != nil {
+		t.Fatal(err)
+	}
+	reported := "abc123"
+	if _, err := st.TouchSiteWorker("pop3", "worker-a", "", &reported); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.RegisterSiteWorker("pop3", "worker-b", "b.pop3"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.ListSiteWorkersBySerial("ABC123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].WorkerID != "worker-a" {
+		t.Fatalf("ListSiteWorkersBySerial(%q) = %+v, want worker-a (serial %q)", "ABC123", got, reported)
+	}
+	if got, err := st.ListSiteWorkersBySerial(""); err != nil || len(got) != 0 {
+		t.Fatalf("empty serial matched %+v (err %v), want nothing", got, err)
+	}
+}
+
 func TestResolveSiteWorker_ByUUID(t *testing.T) {
 	st := testStore(t)
 	w, _, err := st.RegisterSiteWorker("pop3", "worker-a", "a.pop3")

@@ -3,7 +3,11 @@
 package storageapply
 
 import (
+	"errors"
+	"fmt"
+	"os/exec"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/bluesky-social/slagworks/internal/storage"
@@ -148,6 +152,88 @@ func TestParseBystanderDisks_DevPrefixedMemberNormalizes(t *testing.T) {
 	}
 }
 
+// TestParseExamineArrayUUIDs pins which `mdadm --examine` lines name the
+// array a member belongs to: "Array UUID" for 1.x metadata, "UUID" for 0.90
+// (with its "(local to host ...)" suffix dropped), never "Device UUID".
+func TestParseExamineArrayUUIDs(t *testing.T) {
+	tests := []struct {
+		name    string
+		examine string
+		want    []string
+	}{
+		{
+			name: "1.2 member",
+			examine: `/dev/vdb:
+          Magic : a92b4efc
+        Version : 1.2
+     Array UUID : 5d1f0c1e:7a3b4c2d:9e8f0a1b:2c3d4e5f
+           Name : ubuntu-server:0
+    Device UUID : 0b3c8f6e:1d2a4b5c:6e7f8091:a2b3c4d5
+   Array State : AA ('A' == active, '.' == missing, 'R' == replacing)`,
+			want: []string{"5d1f0c1e:7a3b4c2d:9e8f0a1b:2c3d4e5f"},
+		},
+		{
+			name: "0.90 member",
+			examine: `/dev/sdb1:
+          Magic : a92b4efc
+        Version : 0.90.00
+           UUID : 5d1f0c1e:7a3b4c2d:9e8f0a1b:2c3d4e5f (local to host builder)`,
+			want: []string{"5d1f0c1e:7a3b4c2d:9e8f0a1b:2c3d4e5f"},
+		},
+		{
+			name:    "no superblock",
+			examine: "",
+			want:    nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseExamineArrayUUIDs(tt.examine); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseExamineArrayUUIDs = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// pinnedRAIDLayout is a root disk vda plus a raid that pins its array UUID.
+func pinnedRAIDLayout() storage.Layout {
+	return storage.Layout{Devices: map[string]storage.Device{
+		"vda":    {Type: "disk"},
+		"mddata": {Type: "raid", Level: 1, Members: []string{"vda1", "vda2"}, ArrayUUID: testArrayUUID},
+	}}
+}
+
+// TestCheckStaleArrayMembers_PartitionMember: a stale member on a partition
+// of a disk outside the layout is found, not only one on a whole disk.
+func TestCheckStaleArrayMembers_PartitionMember(t *testing.T) {
+	r := newScriptRunner()
+	r.output["lsblk -dnlo NAME,TYPE"] = "vda disk\nvdb disk"
+	r.output["lsblk -nlo NAME /dev/vdb"] = "vdb\nvdb1"
+	r.output["mdadm --examine /dev/vdb1"] = "/dev/vdb1:\n     Array UUID : e8c9aa81:11112222:33334444:55556666"
+
+	err := CheckStaleArrayMembers(scriptCtx(r), pinnedRAIDLayout(), false)
+	if err == nil || !strings.Contains(err.Error(), "/dev/vdb1") || !strings.Contains(err.Error(), `"mddata"`) {
+		t.Fatalf("want a refusal naming /dev/vdb1 and mddata, got %v", err)
+	}
+	if r.ran("lsblk -nlo NAME /dev/vda") {
+		t.Errorf("the layout's own disk vda is wiped by the deploy and must not be examined; calls: %v", r.calls)
+	}
+}
+
+// TestCheckStaleArrayMembers_PartitionListingFails: a disk whose partitions
+// cannot be listed has not been checked, so the deploy must not proceed as
+// though it were clean.
+func TestCheckStaleArrayMembers_PartitionListingFails(t *testing.T) {
+	r := newScriptRunner()
+	r.output["lsblk -dnlo NAME,TYPE"] = "vda disk\nvdb disk"
+	r.outputErr["lsblk -nlo NAME /dev/vdb"] = errors.New("exit status 32")
+
+	err := CheckStaleArrayMembers(scriptCtx(r), pinnedRAIDLayout(), false)
+	if err == nil || !strings.Contains(err.Error(), "/dev/vdb") {
+		t.Fatalf("want an error naming /dev/vdb, got %v", err)
+	}
+}
+
 // TestParentDisk pins the partition-name -> parent-whole-disk inversion of
 // internal/storage/plan.go's partName, across both device-naming families.
 func TestParentDisk(t *testing.T) {
@@ -231,5 +317,114 @@ unused devices: <none>`
 	got := parseMdstat(native)
 	if len(got) != 1 || got[0].name != "md0" || got[0].isContainer {
 		t.Errorf("native md0 should parse as one non-container device, got %+v", got)
+	}
+}
+
+// shellExit returns the real *exec.ExitError of a command that writes
+// stderr and exits with code, captured the way Exec.Output's cmd.Output()
+// captures it in production (Stderr populated).
+func shellExit(t *testing.T, stderr string, code int) error {
+	t.Helper()
+	_, err := exec.Command("sh", "-c", fmt.Sprintf(`printf '%%s' "$1" >&2; exit %d`, code), "sh", stderr).Output()
+	if _, ok := errors.AsType[*exec.ExitError](err); !ok {
+		t.Fatalf("sh exiting %d: got %v, want an *exec.ExitError", code, err)
+	}
+	return err
+}
+
+// TestCheckDisksClean pins the boot-disk safety check that guards a deploy
+// without --destructive. The fake answers both util-linux probes the way
+// they answer for the disk each case describes, so the cases hold whichever
+// probe the check uses. A disk passes only when it is known to carry no
+// signature; a probe that cannot run is not evidence of a blank disk.
+func TestCheckDisksClean(t *testing.T) {
+	// `blkid -p` prints nothing on stdout for a blank disk and for one
+	// whose signatures it will not choose between. It exits 2 for the
+	// blank disk (and for one it cannot open or read) and 8 for the
+	// ambivalent one.
+	blkidNothing := shellExit(t, "", 2)
+	blkidAmbivalent := shellExit(t, "blkid: /dev/vda: ambivalent result (probably more filesystems on the device, use wipefs(8) to see more details)\n", 8)
+	ioErr := "wipefs: error: /dev/vda: probing initialization failed: Input/output error\n"
+	notFound := func(name string) error { return &exec.Error{Name: name, Err: exec.ErrNotFound} }
+
+	cases := []struct {
+		name      string
+		blkidOut  string
+		blkidErr  error
+		wipefsOut string
+		wipefsErr error
+		wantErr   []string // substrings of the refusal; nil means the disk passes
+	}{
+		{
+			name:     "blank disk passes",
+			blkidErr: blkidNothing,
+		},
+		{
+			name:      "partition table is refused",
+			blkidOut:  `/dev/vda: PTUUID="93680f81-d24c-4751-9019-86595a378c03" PTTYPE="gpt"`,
+			wipefsOut: "gpt  0x200\ngpt  0x1fffffe00\nPMBR 0x1fe",
+			wantErr:   []string{"/dev/vda", "(gpt at 0x200 and 1 more, PMBR at 0x1fe)", "--destructive"},
+		},
+		{
+			name:      "filesystem is refused",
+			blkidOut:  `/dev/vda: UUID="b427ce1f-d0e1-41af-a9ef-034e23e4098c" BLOCK_SIZE="4096" TYPE="ext4" USAGE="filesystem"`,
+			wipefsOut: "ext4 0x438",
+			wantErr:   []string{"/dev/vda", "ext4 at 0x438", "--destructive"},
+		},
+		{
+			// An ext4 disk later handed to ZFS without a wipe: blkid -p
+			// prints nothing for it, as for a blank disk.
+			// wipefs lists one zfs_member line per uberblock; the
+			// refusal names each type once.
+			name:      "conflicting signatures are refused",
+			blkidErr:  blkidAmbivalent,
+			wipefsOut: "ext4       0x438\nzfs_member 0x23c00\nzfs_member 0x23800\nzfs_member 0x23400",
+			wantErr:   []string{"/dev/vda", "(ext4 at 0x438, zfs_member at 0x23c00 and 2 more)", "--destructive"},
+		},
+		{
+			name:      "unreadable disk is refused",
+			blkidErr:  blkidNothing,
+			wipefsErr: shellExit(t, ioErr, 1),
+			wantErr:   []string{"/dev/vda", "Input/output error", "--destructive"},
+		},
+		{
+			name:      "missing probe binary is refused",
+			blkidErr:  notFound("blkid"),
+			wipefsErr: notFound("wipefs"),
+			wantErr:   []string{"/dev/vda", "executable file not found", "--destructive"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newScriptRunner()
+			r.output["blkid "], r.outputErr["blkid "] = tc.blkidOut, tc.blkidErr
+			r.output["wipefs "], r.outputErr["wipefs "] = tc.wipefsOut, tc.wipefsErr
+			layout := storage.Layout{Devices: map[string]storage.Device{
+				"vda": {Type: "disk", Boot: true},
+				"md0": {Type: "raid", Level: 1, Members: []string{"vda2", "vdb2"}},
+			}}
+
+			err := CheckDisksClean(scriptCtx(r), layout)
+
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("CheckDisksClean refused a blank disk: %v (probes: %q)", err, r.calls)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("CheckDisksClean passed the disk; a deploy without --destructive would partition it (probes: %q)", r.calls)
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal does not mention %q:\n%v", want, err)
+				}
+			}
+			for _, c := range r.calls {
+				if strings.Contains(c, "md0") {
+					t.Errorf("probed the non-disk device md0: %q", c)
+				}
+			}
+		})
 	}
 }
