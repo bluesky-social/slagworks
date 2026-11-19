@@ -240,7 +240,12 @@ Connection setup:
    configured, when `serial` is empty or does not resolve to exactly one
    NetBox device inside the worker's site-config scope.
 3. Global replies with `snapshot` (worker is behind) or `no_change`, then
-   sends `op_resync`.
+   sends `op_resync`. The worker drops the connection when its first message
+   is anything else; a `snapshot` pushed by a content change may precede the
+   reply, but op-stream messages and the `power_status`, `boot_status` and
+   `dhcp_leases` RPC requests never do. Until the reply is sent the worker is
+   not an RPC target, so a site whose only workers are still waiting for it
+   answers those reads as if no worker were connected.
 
 Worker to global:
 

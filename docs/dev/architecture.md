@@ -464,7 +464,10 @@ cast pipeline, and the `SourceSOL` constant no longer exists.
   `handleCastResume` (901), `handleClaimOp` (962).
 - Provides `PowerStatus` / `BootStatus` synchronous RPCs (453, 503)
   used by the operator API; the response is routed to the calling
-  goroutine by `deliverRPCReply` (551).
+  goroutine by `deliverRPCReply` (551). These and the `DHCPLeases`
+  fan-out target only connections whose hello reply has been sent
+  (`rpcTargets`): a connection registers before that reply, and the
+  worker accepts only `snapshot` or `no_change` as its first message.
 
 The concrete handler implementations wired in `buildGlobal` live in
 `internal/hubhandlers`:
