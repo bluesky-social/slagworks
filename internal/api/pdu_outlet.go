@@ -537,9 +537,9 @@ func (s *Server) powerPDUOutlet(c *echo.Context) error {
 	// downstream is a serving worker AND the operator did NOT pass
 	// --allow-self, some connected, claim-eligible NON-SELF worker must exist
 	// to serve it (the self-worker will decline its own claim via INV-2). An
-	// eligible partner is a connection whose verified serial != "" AND !=
-	// DownstreamSerial. Without one, the op could only ever time out — refuse
-	// creation with an actionable message. AllowSelf skips this (the operator
+	// eligible partner is a connection whose verified serial != "" AND does
+	// not match DownstreamSerial. Without one, the op could only ever time
+	// out — refuse creation with an actionable message. AllowSelf skips this (the operator
 	// accepted the self-cycle).
 	if (body.Verb == "cycle" || body.Verb == "on") && downstreamIsWorker && !body.AllowSelf {
 		if !s.eligiblePartnerConnected(ctx, r, body.Verb) {
@@ -593,9 +593,11 @@ func (s *Server) powerPDUOutlet(c *echo.Context) error {
 // eligiblePartnerConnected reports whether some connected, claim-eligible
 // NON-SELF worker exists to serve a self-feed cycle/on outlet op. "Eligible"
 // mirrors the claim-time predicates: a connection whose verified serial is
-// non-empty AND != the downstream serial (a bare connected worker with an
-// empty serial is claim-ineligible, so counting it would reproduce the very
-// timeout this check prevents). Routing uses the PDU device's owning
+// non-empty AND does not match the downstream serial under
+// model.SameHardwareSerial, the case-insensitive relation the hello gate
+// verified it with (a bare connected worker with an empty serial is
+// claim-ineligible, so counting it would reproduce the very timeout this
+// check prevents). Routing uses the PDU device's owning
 // site-config slug — the same slug the claim will arrive under.
 //
 // When no hub is wired (powerStatusRPC nil — tests / a global without the WS
@@ -612,7 +614,7 @@ func (s *Server) eligiblePartnerConnected(ctx context.Context, r outletResolutio
 		return false
 	}
 	for _, serial := range s.powerStatusRPC.ConnectedWorkerSerials(slug) {
-		if serial != "" && serial != r.DownstreamSerial {
+		if serial != "" && !model.SameHardwareSerial(serial, r.DownstreamSerial) {
 			return true
 		}
 	}

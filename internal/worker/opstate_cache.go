@@ -78,12 +78,15 @@ type opState struct {
 
 	// selfSerial is this worker's own verified hardware serial (SMBIOS,
 	// P4a). Used by pendingPowerOps as the P4b worker-side defense-in-depth:
-	// an outlet op whose DownstreamSerial == selfSerial is skipped (the
+	// an outlet op whose DownstreamSerial matches selfSerial is skipped (the
 	// worker would be cutting its own feed) UNLESS the op carries AllowSelf
 	// for cycle/on. Redundant with the global claim-time interlock (INV-2),
 	// but cheap insurance against a global bug or a lagged claimant-serial
 	// view. "" (unverified) never matches a real downstream, so the skip is
-	// inert for an unverified worker. Immutable after construction.
+	// inert for an unverified worker. selfSerial is the SMBIOS spelling and
+	// DownstreamSerial is NetBox's; global verified one against the other
+	// case-insensitively, so the match is model.SameHardwareSerial.
+	// Immutable after construction.
 	selfSerial string
 }
 
@@ -727,9 +730,10 @@ func (o *opState) pendingPowerOps() []model.Operation {
 }
 
 // skipSelfOutletOp reports whether an outlet op should be skipped by the
-// worker-side self-power interlock: its DownstreamSerial == this worker's
-// selfSerial (it feeds this very worker). The AllowSelf exception applies ONLY
-// to cycle/on; a self-serial off is always skipped (INV-1). Non-outlet ops
+// worker-side self-power interlock: its DownstreamSerial matches this
+// worker's selfSerial ignoring case (it feeds this very worker). The
+// AllowSelf exception applies ONLY to cycle/on; a self-serial off is always
+// skipped (INV-1). Non-outlet ops
 // (PDURuntime absent or Outlet==false) and a worker with no verified serial
 // ("" never matches) are never skipped. Caller holds mu (read is fine).
 func (o *opState) skipSelfOutletOp(op model.Operation) bool {
@@ -747,7 +751,7 @@ func (o *opState) skipSelfOutletOp(op model.Operation) bool {
 	if rt == nil || !rt.Outlet {
 		return false // not an outlet op: outside the worker-side interlock
 	}
-	if rt.DownstreamSerial != o.selfSerial {
+	if !model.SameHardwareSerial(rt.DownstreamSerial, o.selfSerial) {
 		return false // feeds some other device
 	}
 	// Feeds this worker. Serve only an explicit AllowSelf cycle/on; skip off

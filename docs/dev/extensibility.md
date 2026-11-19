@@ -187,7 +187,9 @@ end-to-end script emission against representative inputs.
 
 Packages: `internal/snapshot/netscript.go` (match + selection),
 `internal/snapshot/netplan.go` (relay pools from NetBox), and
-`cmd/slagworks-agent/main.go` `applyNetworkConfig` (execution).
+`internal/agent/netapply` (execution: `RenderNetworkConfig` runs the
+script before any disk is touched, `ApplyNetworkConfig` writes the
+rendered bundle into the target in the finalizing phase).
 
 ### Match
 
@@ -241,14 +243,21 @@ script's topology interpretation and its hard-fail error messages stay
 in the script (host-family-specific, test-asserted); netlib owns only
 the shared mechanics.
 
-Failure semantics (`cmd/slagworks-agent/main.go:1730-1786`):
+Failure semantics (`netapply.RenderNetworkConfig` /
+`ApplyNetworkConfig`):
 
 - HTTP 204 (no script matched) or empty machineID: write the built-in
   all-`en*`-DHCP netplan and continue.
-- Script matched but exec fails, JSON is invalid, or a path escapes
-  `/target`: FAIL the deploy loudly. The alternative — a host that
+- Script matched but exec fails, JSON is invalid, or a file has a
+  relative path or a non-octal mode: FAIL the deploy loudly, before
+  the boot-disk safety check or any disk is touched (the script is a
+  pure function of the facts, so a NetBox model it rejects costs a
+  failed deploy, not a wiped host). The alternative — a host that
   should get L3 netplan + FRR silently coming up DHCP-only — is a
   latent fabric break.
+- Writing the bundle into `/target` (path containment against the
+  installed tree, `chown`, unit enable) can only fail in the
+  finalizing phase, after the install.
 
 stderr is the script's diagnostics channel, for both script kinds
 (`execkit.RunConfigScript`): it streams to the serial console, each

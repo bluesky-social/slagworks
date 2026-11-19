@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v5"
+	"gorm.io/gorm"
 
 	"github.com/bluesky-social/slagworks/internal/awssecrets"
 	"github.com/bluesky-social/slagworks/internal/model"
@@ -205,6 +208,82 @@ func TestAbortMachine_PublishesOpRemovedAndInvalidatesOnDurable(t *testing.T) {
 	// rebuild must fire.
 	if got := len(inv.seen()); got != beforeInv+1 {
 		t.Errorf("durable abort must invalidate once, got %d", got-beforeInv)
+	}
+}
+
+// TestAbortMachine_PublishesOpRemovedWhenTheAbortErrorsAfterFailingTheOp
+// pins abort's publish contract when the abort fails partway. AbortMachine
+// fails the active op in its own transaction and then re-reads the machine;
+// if that read errors (a dropped connection), the op is already failed in
+// the database. A retried abort finds no active op and publishes nothing, so
+// the erroring call itself must publish op_removed and fire the identity
+// rebuild before returning the error. Otherwise the worker keeps the op as
+// active, and an active op is what authorizes it to serve a deploy boot.
+func TestAbortMachine_PublishesOpRemovedWhenTheAbortErrorsAfterFailingTheOp(t *testing.T) {
+	s, st, inv, pub := opFlowServer(t)
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	id := seedMachine(t, st, model.MachineStateCommissioned)
+	op, err := st.CreateMachineOp(id, model.OpDeploy, nil, model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatalf("create deploy op: %v", err)
+	}
+	if _, err := st.ClaimOperation(op.ID, "worker-1"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// Fault: once the op row has been updated (the fail), every read of the
+	// machines table errors. For a deploy op the only such read left is
+	// AbortMachine's trailing re-read. gorm callbacks live on the shared
+	// testpg handle, so they are removed before the assertions.
+	db := st.DB()
+	var opUpdated atomic.Bool
+	if err := db.Callback().Update().After("gorm:update").Register("test:op-updated", func(tx *gorm.DB) {
+		if tx.Statement.Table == "operations" && tx.Error == nil && tx.RowsAffected > 0 {
+			opUpdated.Store(true)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Callback().Query().Before("gorm:query").Register("test:fail-machine-read", func(tx *gorm.DB) {
+		if tx.Statement.Table == "machines" && opUpdated.Load() {
+			_ = tx.AddError(errors.New("injected fault"))
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	removeFault := func() {
+		_ = db.Callback().Update().Remove("test:op-updated")
+		_ = db.Callback().Query().Remove("test:fail-machine-read")
+	}
+	t.Cleanup(removeFault)
+
+	resp := postJSON(t, srv, "/api/v1/machines/"+id.String()+"/abort", `{}`)
+	_ = resp.Body.Close()
+	removeFault()
+
+	// Setup checks: the abort reported the error, yet the op is failed.
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("setup: abort status = %d, want 500 from the injected read fault", resp.StatusCode)
+	}
+	if got, err := st.GetOperation(op.ID); err != nil || got.Status != model.OpFailed {
+		t.Fatalf("setup: op = %+v, err %v; want failed by the abort", got, err)
+	}
+
+	pub.mu.Lock()
+	removed := append([]model.Operation(nil), pub.removed...)
+	removedSt := append([]model.MachineState(nil), pub.removeSt...)
+	pub.mu.Unlock()
+	if len(removed) != 1 || removed[0].ID != op.ID {
+		t.Fatalf("op %s is failed in the database, but the abort published op_removed for %v; want exactly that op (the worker keeps it as an active op)",
+			op.ID, opIDs(removed))
+	}
+	if removedSt[0] != model.MachineStateFailed {
+		t.Errorf("op_removed machine state = %q, want failed", removedSt[0])
+	}
+	if got := len(inv.seen()); got != 1 {
+		t.Errorf("identity rebuilds = %d, want 1 (the fail wrote durable state)", got)
 	}
 }
 

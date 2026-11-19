@@ -84,10 +84,9 @@ type Store interface {
 	GetMachine(id uuid.UUID) (*model.Machine, error)
 	GetMachineByNetBoxDeviceID(id int) (*model.Machine, error)
 	GetMachineByNetBoxSerial(serial string) (*model.Machine, error)
-	UpdateMachine(m *model.Machine) error
 	// SetMachineNetBoxDeviceID writes ONLY netbox_device_id. The rebind path
-	// uses this instead of full-row UpdateMachine so it can't clobber columns
-	// the mirror doesn't own (e.g. state, locked) with a stale in-memory value.
+	// uses this instead of a full-row write so it can't clobber columns the
+	// mirror doesn't own (e.g. state, locked) with a stale in-memory value.
 	SetMachineNetBoxDeviceID(id uuid.UUID, netboxDeviceID int) error
 	// DeleteMachineIfIdle hard-deletes the machine and its op history
 	// unless it has an active op, checking and deleting in one transaction
@@ -166,7 +165,7 @@ func (m *Mirror) OnDeviceCreated(ctx context.Context, d Device) error {
 			return fmt.Errorf("serial %s is already bound to active device %d; refusing to rebind to %d",
 				d.Serial, *existing.NetBoxDeviceID, d.ID)
 		}
-		// Write ONLY netbox_device_id — NOT a full-row UpdateMachine(Save).
+		// Write ONLY netbox_device_id — NOT a full-row gorm Save.
 		// A full-row save here clobbers columns the mirror doesn't own with the
 		// stale values in `existing` (loaded above), racing any concurrent
 		// writer of those columns (state transitions, lock).

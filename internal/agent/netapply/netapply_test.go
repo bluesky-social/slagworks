@@ -3,12 +3,17 @@
 package netapply
 
 import (
+	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/bluesky-social/slagworks/internal/agent"
 )
 
 // recordRunner captures the commands applyNetBundle would exec (chroot
@@ -427,6 +432,45 @@ func TestApplyNetBundle_EnableFailureHardFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "enable unit") {
 		t.Errorf("error should name the failed unit, got: %v", err)
+	}
+}
+
+// TestRenderNetworkConfig_RejectsInvalidBundle pins that the bundle checks
+// that need no target tree (absolute paths, octal modes) happen at render
+// time, which the deploy runs before touching a disk, not at apply time
+// after the install.
+func TestRenderNetworkConfig_RejectsInvalidBundle(t *testing.T) {
+	const machineID = "6b1f0c3e-9a52-4d55-8f0e-1c2d3e4f5a6b"
+	cases := []struct {
+		name, bundle, want string
+	}{
+		{"relative path", `{"files":[{"path":"etc/netplan/x.yaml","content":"x"}]}`, "not absolute"},
+		{"non-octal mode", `{"files":[{"path":"/etc/x","content":"x","mode":"rw-r--r--"}]}`, "invalid octal mode"},
+		{"not JSON", `files: []`, "parse bundle JSON"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v1/machines/" + machineID + "/network-script":
+					fmt.Fprintf(w, "#!/bin/sh\ncat <<'EOF'\n%s\nEOF\n", tc.bundle)
+				case "/api/v1/machines/" + machineID + "/network-facts":
+					fmt.Fprint(w, "[]")
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			ctx := &agent.Context{Log: slog.Default(), Server: strings.TrimPrefix(srv.URL, "http://")}
+
+			cfg, err := RenderNetworkConfig(ctx, machineID)
+			if err == nil {
+				t.Fatalf("RenderNetworkConfig accepted an invalid bundle: %+v", cfg)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want it to mention %q", err, tc.want)
+			}
+		})
 	}
 }
 

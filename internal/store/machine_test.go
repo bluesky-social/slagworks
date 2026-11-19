@@ -332,6 +332,37 @@ func TestGetMachineNotFound(t *testing.T) {
 	}
 }
 
+// SetMachineDesiredOS writes desired_os and nothing else, reports a missing
+// machine as ErrMachineNotFound (instead of inserting it), and treats
+// re-setting the current value as success.
+func TestSetMachineDesiredOS(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-OS", State: model.MachineStateRunning, Locked: true, DesiredOS: "jammy"}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // the second pass re-sets the value it already holds
+		if err := st.SetMachineDesiredOS(m.ID, "noble"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.GetMachine(m.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DesiredOS != "noble" || got.State != model.MachineStateRunning || !got.Locked {
+		t.Errorf("after SetMachineDesiredOS: desired_os=%q state=%q locked=%v, want noble/running/true", got.DesiredOS, got.State, got.Locked)
+	}
+
+	missing := uuid.New()
+	if err := st.SetMachineDesiredOS(missing, "noble"); !errors.Is(err, ErrMachineNotFound) {
+		t.Errorf("unknown machine: got %v, want ErrMachineNotFound", err)
+	}
+	if _, err := st.GetMachine(missing); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Errorf("SetMachineDesiredOS created a row for an unknown machine (GetMachine err=%v)", err)
+	}
+}
+
 // TestMigrate_DropsMachineBMCCreds pins migration 00030: the machines
 // table carries no BMC credential columns. The device's
 // pop/<pop>/bmc-creds-admin entry is the only BMC credential, so a
