@@ -155,8 +155,8 @@ the real values over the WebSocket op stream. See
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/images` | read | List image rows. |
-| POST | `/images` | admin | Create a row. Body `{"name","version","sha256","url","arch"}`; all but `arch` (default `amd64`) are required. 409 on conflict. Pushes a fresh snapshot to every site. |
-| PUT | `/images/:name` | admin | Create or replace the row named in the path (the path name wins over the body). Used by `slagctl image follow-latest`. Pushes a fresh snapshot to every site. |
+| POST | `/images` | admin | Create a row. Body `{"name","version","sha256","url","arch"}`; all but `arch` (default `amd64`) are required. The name must match `^[a-z0-9][a-z0-9._-]*$` (`model.ValidateImageName`), since it becomes a directory on every site worker; 400 otherwise. 409 on conflict. Pushes a fresh snapshot to every site. |
+| PUT | `/images/:name` | admin | Create or replace the row named in the path (the path name wins over the body). Same name rule as POST. Used by `slagctl image follow-latest`. Pushes a fresh snapshot to every site. |
 | DELETE | `/images/:name` | admin | Delete by name or UUID. 204. Does not push a snapshot. |
 
 ## Storage and network scripts
