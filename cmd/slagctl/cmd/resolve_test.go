@@ -199,6 +199,44 @@ func TestResolveMachine_ExactMatchIsCaseInsensitive(t *testing.T) {
 	}
 }
 
+// TestResolveMachine_DuplicateExactHostnameIsAmbiguous: NetBox device
+// names are unique only within a site (and tenant), so two machines in
+// different sites can both be `db1` (the resolver compares names
+// case-insensitively, so a stored `DB1` counts as the same name). A
+// typed `db1` then names both, and the resolver must refuse rather
+// than return whichever row the server listed first; otherwise
+// `machine deploy db1 --destructive` wipes an arbitrary one of them.
+// Because the hostnames collide, the error has to carry the full
+// UUIDs, the only argument shape that still tells the two apart.
+func TestResolveMachine_DuplicateExactHostnameIsAmbiguous(t *testing.T) {
+	pop1 := uuid.MustParse("11111111-0000-4000-8000-000000000001")
+	pop2 := uuid.MustParse("22222222-0000-4000-8000-000000000002")
+	sibling := uuid.MustParse("33333333-0000-4000-8000-000000000003")
+	f := &resolverFixture{
+		machines: []model.Machine{
+			{ID: pop1, NetBoxSerial: "S-1", Hostname: "db1"},
+			{ID: pop2, NetBoxSerial: "S-2", Hostname: "DB1"},
+			{ID: sibling, NetBoxSerial: "S-3", Hostname: "db10"},
+		},
+	}
+	cl := slclient.New(slclient.Config{BaseURL: testHTTPServer(t, f.handler(t))})
+	r, err := cmd.ResolveMachine(context.Background(), cl, "db1")
+	if err == nil {
+		t.Fatalf("%q names two machines (%s, %s) but resolved silently to %s", "db1", pop1, pop2, r.ID)
+	}
+	if !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("expected 'ambiguous' in error, got: %v", err)
+	}
+	for _, want := range []string{pop1.String(), pop2.String()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("expected candidate UUID %s in error, got: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), sibling.String()) {
+		t.Errorf("substring-only sibling db10 is not an exact match and must not be listed, got: %v", err)
+	}
+}
+
 func TestResolveMachine_NoMatch(t *testing.T) {
 	f := &resolverFixture{machines: nil}
 	cl := slclient.New(slclient.Config{BaseURL: testHTTPServer(t, f.handler(t))})
