@@ -4,6 +4,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/iana"
 )
 
@@ -246,5 +247,161 @@ func TestOldBug_UnknownRenewNeverGetsDifferentYiaddr(t *testing.T) {
 	}
 	if !isNAK(reply) {
 		t.Fatalf("expected NAK, got message type %v", reply.MessageType())
+	}
+}
+
+// removableReservation returns a ReserveIP that reserves ip for reservedMAC
+// until remove is called, standing in for a snapshot that drops the
+// reservation while the MAC's lease on ip is still live.
+func removableReservation(ip string) (reserve func(string) net.IP, remove func()) {
+	present := true
+	reserve = func(mac string) net.IP {
+		if present && mac == reservedMAC {
+			return net.ParseIP(ip)
+		}
+		return nil
+	}
+	return reserve, func() { present = false }
+}
+
+// TestClassify_OwnLeaseNoLongerServable_NAKs: a REQUEST naming an address is
+// answered at that address or NAKed, never ACKed with a different one. Here
+// the MAC DOES hold a live lease on the requested address, but a snapshot has
+// since taken that address out of the pool, so the REQUEST must be NAKed and
+// the client re-DISCOVERs. Before the fix, classifyRequest treated any match
+// with the live lease as a normal renew, but allocateIP renews only a lease
+// inside the pool's dynamic range: for any other lease it allocated a fresh
+// address and ACKed that, or, on a reservations-only gateway, found nothing
+// and the REQUEST was dropped as "pool exhausted".
+func TestClassify_OwnLeaseNoLongerServable_NAKs(t *testing.T) {
+	type scenario struct {
+		h      *Handler
+		iface  string
+		held   string // address the DISCOVER must offer
+		change func(h *Handler)
+	}
+	scenarios := []struct {
+		name  string
+		build func() scenario
+	}{
+		{
+			name: "reservation removed, address outside the dynamic range",
+			build: func() scenario {
+				reserve, remove := removableReservation("10.99.1.20")
+				cfg := testConfig() // dynamic range .100-.200
+				cfg.ReserveIP = reserve
+				return scenario{h: NewHandler(cfg), held: "10.99.1.20", change: func(*Handler) { remove() }}
+			},
+		},
+		{
+			name: "dynamic range reloaded away from the address",
+			build: func() scenario {
+				cfg := testConfig()
+				cfg.RangeEnd = net.ParseIP("10.99.1.150")
+				moved := cfg.PoolConfig
+				moved.RangeStart = net.ParseIP("10.99.1.151")
+				moved.RangeEnd = net.ParseIP("10.99.1.200")
+				return scenario{h: NewHandler(cfg), held: "10.99.1.100", change: func(h *Handler) { h.UpdatePools(moved) }}
+			},
+		},
+		{
+			name: "split-pool slices rebalanced, address now in a peer's slice",
+			build: func() scenario {
+				h := NewHandler(testConfig())
+				h.SetIfaceParams("eno3", splitPoolParams()) // mine .241.100-.149
+				rebalanced := splitPoolParams()
+				rebalanced.RangeStart = net.ParseIP("10.254.241.120")
+				rebalanced.DynamicSlices = []DynamicSlice{
+					{Start: net.ParseIP("10.254.241.120"), End: net.ParseIP("10.254.241.149")},
+					{Start: net.ParseIP("10.254.241.100"), End: net.ParseIP("10.254.241.119")},
+					{Start: net.ParseIP("10.254.241.150"), End: net.ParseIP("10.254.241.199")},
+				}
+				return scenario{h: h, iface: "eno3", held: "10.254.241.100", change: func(h *Handler) { h.SetIfaceParams("eno3", rebalanced) }}
+			},
+		},
+		{
+			name: "reservation removed on a reservations-only gateway",
+			build: func() scenario {
+				reserve, remove := removableReservation("10.254.240.50")
+				cfg := testConfig()
+				cfg.ReserveIP = reserve
+				h := NewHandler(cfg)
+				h.SetIfaceParams("eno3", reservationsOnlyParams())
+				return scenario{h: h, iface: "eno3", held: "10.254.240.50", change: func(*Handler) { remove() }}
+			},
+		},
+	}
+	shapes := []struct {
+		name  string
+		build func(t *testing.T, mac net.HardwareAddr, ip string) *dhcpv4.DHCPv4
+	}{
+		{"RENEWING/REBINDING (ciaddr)", rebinding},
+		{"INIT-REBOOT (option 50)", initReboot},
+	}
+	mac, _ := net.ParseMAC(reservedMAC)
+	for _, sc := range scenarios {
+		for _, shape := range shapes {
+			t.Run(sc.name+"/"+shape.name, func(t *testing.T) {
+				s := sc.build()
+				offer := s.h.HandlePacketOn(mustDiscover(t, mac), s.iface)
+				if offer == nil || offer.YourIPAddr.String() != s.held {
+					t.Fatalf("setup: want an OFFER of %s, got %v", s.held, offer)
+				}
+				s.change(s.h)
+
+				reply := s.h.HandlePacketOn(shape.build(t, mac, s.held), s.iface)
+				switch {
+				case reply == nil:
+					t.Fatalf("REQUEST for %s got no reply; want NAK", s.held)
+				case isACK(reply):
+					t.Fatalf("REQUEST for %s was ACKed with yiaddr %v; want NAK", s.held, reply.YourIPAddr)
+				case !isNAK(reply):
+					t.Fatalf("REQUEST for %s got %v; want NAK", s.held, reply.MessageType())
+				}
+				for _, l := range s.h.Leases() {
+					if l.MAC == mac.String() && l.IP != s.held {
+						t.Fatalf("NAKed REQUEST for %s moved the MAC's lease to %s", s.held, l.IP)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestClassify_RelayedLeaseUnicastRenew_NeverGetsDirectPoolAddress: a client
+// that got its lease through a relay renews by unicast straight to the
+// server (RFC 2131 RENEWING: ciaddr set, giaddr 0; the same packet shape the
+// rebinding helper builds), so poolForRequest resolves the direct pool,
+// which does not cover the relayed lease. Before the fix the renew was ACKed
+// with a direct-pool address and router: an address from another subnet. It
+// must be answered at the held address or NAKed, and after a NAK the
+// client's re-DISCOVER through the relay gets the same address back.
+func TestClassify_RelayedLeaseUnicastRenew_NeverGetsDirectPoolAddress(t *testing.T) {
+	h := NewHandler(relayConfig()) // direct 10.99.1.0/24, relay 10.99.2.0/24
+	mac, _ := net.ParseMAC("52:54:00:00:01:0c")
+	relay := net.ParseIP("10.99.2.1")
+
+	offer := h.HandlePacket(mustDiscover(t, mac, withGiaddr(relay)))
+	if offer == nil || offer.YourIPAddr.String() != "10.99.2.100" {
+		t.Fatalf("setup: want a relayed OFFER of 10.99.2.100, got %v", offer)
+	}
+	held := offer.YourIPAddr.String()
+
+	reply := h.HandlePacket(rebinding(t, mac, held))
+	switch {
+	case reply == nil:
+		t.Fatalf("unicast renew of %s got no reply; want NAK or ACK at %s", held, held)
+	case isACK(reply):
+		if reply.YourIPAddr.String() != held {
+			t.Fatalf("unicast renew of %s was ACKed with yiaddr %v (router %v); want NAK or ACK at %s",
+				held, reply.YourIPAddr, reply.Router(), held)
+		}
+	case !isNAK(reply):
+		t.Fatalf("unicast renew of %s got %v; want NAK or ACK at %s", held, reply.MessageType(), held)
+	}
+
+	again := h.HandlePacket(mustDiscover(t, mac, withGiaddr(relay)))
+	if again == nil || again.YourIPAddr.String() != held {
+		t.Fatalf("re-DISCOVER through the relay: want an OFFER of %s, got %v", held, again)
 	}
 }
