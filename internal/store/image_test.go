@@ -51,6 +51,45 @@ func TestDeleteImage_ByUUID(t *testing.T) {
 	}
 }
 
+// TestDeleteImage_NameThatParsesAsUUID: image names are free-form, and 32
+// hex digits (an md5-style name) parse as a uuid. Deleting by that name
+// must reach the image even though no row has that id.
+func TestDeleteImage_NameThatParsesAsUUID(t *testing.T) {
+	st := testStore(t)
+	const name = "0123456789abcdef0123456789abcdef"
+	seedImage(t, st, name)
+	if err := st.DeleteImage(name); err != nil {
+		t.Fatalf("delete %q: %v", name, err)
+	}
+	images, err := st.ListImages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(images) != 0 {
+		t.Fatalf("expected 0 images after delete, got %d", len(images))
+	}
+}
+
+// TestDeleteImage_IDWinsOverUUIDShapedName: when the identifier is one
+// image's id and another image's name, the id match wins and only that
+// row goes. slagctl always sends the uuid it resolved, so the name of some
+// other image must never redirect the delete.
+func TestDeleteImage_IDWinsOverUUIDShapedName(t *testing.T) {
+	st := testStore(t)
+	byID := seedImage(t, st, "noble-pxe")
+	byName := seedImage(t, st, byID.ID.String())
+	if err := st.DeleteImage(byID.ID.String()); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	images, err := st.ListImages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(images) != 1 || images[0].ID != byName.ID {
+		t.Fatalf("after delete got %+v, want only the image named %q", images, byName.Name)
+	}
+}
+
 func TestDeleteImage_NotFound(t *testing.T) {
 	st := testStore(t)
 	if err := st.DeleteImage("ghost"); err == nil {

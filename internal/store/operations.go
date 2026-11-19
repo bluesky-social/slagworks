@@ -845,11 +845,15 @@ func (s *Store) ExpirePhoneHomeOperations(timeout time.Duration) ([]OpOutcome, e
 // outcomes (one per op that transitioned) for the op-event publisher.
 // On error the outcomes still list every op failed before the error:
 // those ops are terminal in the database and a retried abort no longer
-// sees them, so the caller publishes them whatever the error.
+// sees them, so the caller publishes them whatever the error. Returns
+// ErrMachineNotFound, having changed nothing, when no machine has the ID.
 func (s *Store) AbortMachine(machineID uuid.UUID) (*model.Machine, []OpOutcome, error) {
 	var existing model.Machine
 	if err := s.db.Where("id = ?", machineID).First(&existing).Error; err != nil {
-		return nil, nil, fmt.Errorf("machine not found: %w", err)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, ErrMachineNotFound
+		}
+		return nil, nil, fmt.Errorf("load machine: %w", err)
 	}
 	var activeOps []model.Operation
 	if err := s.db.Where("machine_id = ? AND status IN ?", machineID, opstate.ActiveStatuses).
