@@ -1,6 +1,7 @@
 package clientauth
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -42,25 +43,28 @@ func DecodeIdentity(accessToken string) (*Identity, error) {
 	return &id, nil
 }
 
-// Logout deletes the cached token (and lock) for the app. Safe to call when no
-// cache exists.
-func Logout(cfg Config) error {
+// Logout deletes the cached token for the app. Safe to call when no cache
+// exists. It waits for a refresh in flight in another invocation, which would
+// otherwise write the session back after the delete.
+func Logout(ctx context.Context, cfg Config) error {
 	path, err := defaultTokenPath(cfg.AppName)
 	if err != nil {
 		return err
 	}
-	return deleteCache(path)
+	return removeToken(ctx, path)
 }
 
 // WriteCachedToken persists a freshly-obtained token to the app's default cache
 // location (used by `auth login`). Bearer() handles caching on its own login
-// path; this is the explicit-login entrypoint.
-func WriteCachedToken(cfg Config, tok *oauth2.Token) error {
+// path; this is the explicit-login entrypoint. It waits for a refresh in flight
+// in another invocation, which would otherwise overwrite the new token with the
+// refreshed old session.
+func WriteCachedToken(ctx context.Context, cfg Config, tok *oauth2.Token) error {
 	path, err := defaultTokenPath(cfg.AppName)
 	if err != nil {
 		return err
 	}
-	return writeCache(path, tok)
+	return storeToken(ctx, path, tok)
 }
 
 // CachedIdentity loads the cached access token and decodes its identity for
