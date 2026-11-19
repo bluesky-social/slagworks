@@ -241,3 +241,16 @@ func TestDecodeParams_AMTRuntimeNullFailsClosed(t *testing.T) {
 		t.Fatal("expected error on amt_runtime:null, got nil (silent BMC fallback)")
 	}
 }
+
+// TestDecodeParams_TransportNullInOtherCaseFailsClosed: encoding/json matches
+// {"PDU_Runtime": null} to pdu_runtime and leaves PDURuntime nil, while the
+// null check above looks the key up by its exact spelling, so the op would
+// fall back to the BMC transport after all. DecodeParams refuses the
+// spelling instead.
+func TestDecodeParams_TransportNullInOtherCaseFailsClosed(t *testing.T) {
+	for _, raw := range []string{`{"PDU_Runtime": null}`, `{"AMT_RUNTIME": null}`} {
+		if _, err := DecodeParams([]byte(raw)); err == nil {
+			t.Errorf("DecodeParams(%s): got nil error, want a refusal (silent BMC fallback)", raw)
+		}
+	}
+}

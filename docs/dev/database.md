@@ -199,10 +199,12 @@ Tables (all defined by GORM structs in `localdb.go`):
   operations, seq — as a JSON blob).
 - `outbox(id autoincrement, payload text, created_at)` — every
   observation the worker sends to global is persisted here first
-  and only deleted when global's `rpc_response{ok:true}` arrives
-  (`AckOutboxRow`). Retry state (`Attempts`, `NextAttempt`) is
-  in-memory only; a worker restart resets the backoff ladder
-  intentionally.
+  and only deleted (`AckOutboxRow`) when global's
+  `rpc_response{ok:true}` or a terminal rejection arrives, or when the
+  drain finds the observation too large to send (over
+  `ws.MaxMessageBytes`) or impossible to encode. Retry state
+  (`Attempts`, `NextAttempt`) is in-memory only; a worker restart
+  resets the backoff ladder intentionally.
 - `cached_machines(machine_id PK, state, data)` — the machine
   snapshot list, one row each. Written in the same transaction as
   the `snapshot_meta` kv row (`SaveSnapshot`) so the machine list

@@ -127,10 +127,15 @@ func (r *Ring) grow() {
 	r.tail = r.count
 }
 
-// Drain returns up to max envelopes from the head, removing them.
-// Returns zero-length slice (not nil) if empty.
-func (r *Ring) Drain(max int) []slogkit.Envelope {
-	if max <= 0 {
+// Drain removes and returns envelopes from the head: at most maxCount
+// of them, totalling at most maxBytes of marshalled JSON, so a caller
+// that ships each drain as one message gets a hard size bound. An
+// envelope larger than maxBytes on its own can never be returned, so
+// Drain drops it and counts it in Dropped rather than let it stall the
+// ring. Returns zero-length slice (not nil) if nothing is drained, and
+// nil without touching the ring if either bound is not positive.
+func (r *Ring) Drain(maxCount int, maxBytes int64) []slogkit.Envelope {
+	if maxCount <= 0 || maxBytes <= 0 {
 		return nil
 	}
 	r.mu.Lock()
@@ -139,15 +144,24 @@ func (r *Ring) Drain(max int) []slogkit.Envelope {
 	if r.count == 0 {
 		return []slogkit.Envelope{}
 	}
-	n := min(max, r.count)
-	out := make([]slogkit.Envelope, 0, n)
-	for range n {
+	out := make([]slogkit.Envelope, 0, min(maxCount, r.count))
+	var total int64
+	for r.count > 0 && len(out) < maxCount {
 		e := r.items[r.head]
-		out = append(out, e.env)
+		oversized := e.size > maxBytes
+		if !oversized && total+e.size > maxBytes {
+			break
+		}
 		r.bytes -= e.size
 		r.items[r.head] = entry{}
 		r.head = (r.head + 1) % len(r.items)
 		r.count--
+		if oversized {
+			r.dropped.Add(1)
+			continue
+		}
+		total += e.size
+		out = append(out, e.env)
 	}
 	return out
 }

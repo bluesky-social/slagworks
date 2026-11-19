@@ -577,11 +577,15 @@ requesting MAC, asks the `MachineProvider` for the current
   early-boot / one-shot cases (`kernelBootScript`,
   `chainloadCompleteScript`).
 
-Console params come from `consoleParams` (`handler.go:290-302`),
+Console params come from `consoleParams`,
 which reads the per-machine value the provider sourced from
-`NetBox.device_type.custom_fields.slagworks_kernel_params`. A literal
-`"none"` opts the host out of any `console=`; an unset value falls
-back to the historical `tty0 + ttyS1@115200`.
+`NetBox.device_type.custom_fields.slagworks_kernel_params`, trimmed of
+surrounding whitespace as the agent trims it. A literal
+`"none"` opts the host out of any `console=`; an unset value refuses a
+deploy and broadcasts to every candidate console for a commission. A
+value iPXE would read as more than kernel arguments (`checkKernelParams`)
+refuses the boot, and so does any other value on the deploy line that
+can't ride as one `key=value` argument (`checkKernelArgValue`).
 
 ### The image row and mode split
 
@@ -595,8 +599,8 @@ and the mode is a cmdline, not a separate image (`handler.go:467-475`).
 table for the site worker's PXE / boot HTTP endpoint:
 
 - `/boot/ipxe` — the entry the DHCP OFFER points at.
-- `/api/v1/report`, `/api/v1/inventory`, `/api/v1/phone-home` — the
-  agent's callbacks.
+- `/api/v1/report`, `/api/v1/inventory` — the agent's callbacks, and
+  the installed OS's phone-home (a `phone_home` report).
 - `/api/v1/machines/:id/network-script`, `network-facts`,
   `kernel-params`, `hostname`, `storage-script` — per-machine config
   served to the agent in the deploy initrd.

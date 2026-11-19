@@ -123,6 +123,39 @@ func TestMachineShow_RendersStepsTable(t *testing.T) {
 	}
 }
 
+// TestMachineShow_EscapesTerminalControlsInSteps: commission_data is the
+// commissioning target's own report, so step names, statuses and
+// error/warning strings are host-controlled. The steps table must show
+// escape sequences in them as text, not hand them to the terminal.
+func TestMachineShow_EscapesTerminalControlsInSteps(t *testing.T) {
+	machineID := uuid.New()
+	commissionData := json.RawMessage(`{"steps":[
+        {"name":"inventory\u001b]52;c;cHduZWQ=\u0007","status":"failed","duration_ms":5,"error":"disk\u001b[2Jgone"},
+        {"name":"lldp","status":"ok\u001b[1A","duration_ms":7,"warning":"no\rneighbor\u009b2J"}
+    ]}`)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/machines/"+machineID.String(), func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(model.Machine{
+			ID:             machineID,
+			NetBoxSerial:   "SN-X",
+			State:          model.MachineStateCommissioned,
+			CommissionData: commissionData,
+			CreatedAt:      time.Now(),
+		})
+	})
+	cl := testServer(t, mux)
+	out, err := execCmd(t, cl, "machine", "show", machineID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoTerminalControls(t, out)
+	for _, want := range []string{`inventory\x1b]52;c;cHduZWQ=\x07`, `disk\x1b[2Jgone`, `ok\x1b[1A`, `no\rneighbor\u009b2J`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected the escaped text %q in output, got: %s", want, out)
+		}
+	}
+}
+
 // TestMachineShow_NoStepsArrayOmitsTable ensures older commission_data
 // without a `steps` field doesn't produce a stray "Commission steps"
 // header. Earlier commissions stored only the inventory; treating

@@ -58,7 +58,9 @@ precondition for deploy: the deploy preflight in
 to serve a deploy boot script, and the agent's bootloader install refuses to
 run, if the field is empty. There is deliberately no fallback console — a
 guessed `console=` produces a host whose serial output silently misses the
-BMC SOL port.
+BMC SOL port. The value is one line of space-separated kernel arguments:
+the agent trims leading and trailing whitespace and refuses the bootloader
+install if a control character (a tab or a line break, say) remains.
 
 **You usually don't set this by hand: commission determines it.** When the
 field is empty (the normal state for a device type commission just created
@@ -68,7 +70,10 @@ nonce marker (`consoleprobe.Sweep` in `internal/agent/consoleprobe/probe.go`),
 and global resolves which nonce actually arrived over BMC SOL in
 `console_cast_events` — then writes the winning `console=` back to the
 device type (`internal/commission/consolesweep.go`, WARN-logged with the
-evidence; it never overwrites a non-empty field). If no nonce arrives (no
+evidence; it never overwrites a non-empty field). Only a candidate from the
+probed set (`ttyS0` or `ttyS1` at 115200, with the 16-hex-character nonce the
+agent generates) can win; global ignores and WARN-logs any other candidate a
+commission report carries. If no nonce arrives (no
 SOL, no serial hardware), the field stays empty and deploy keeps refusing
 until you set a value manually or the explicit opt-out:
 
@@ -76,6 +81,14 @@ until you set a value manually or the explicit opt-out:
   more than one so `/dev/console` binds to a device that QEMU also emits on.
 - No serial console at all: the literal string `none`. This is the explicit
   opt-out and passes preflight.
+
+Surrounding whitespace is ignored. The value also goes onto the iPXE
+`kernel` line verbatim, and iPXE reads that line before the kernel does, so
+the boot handler refuses to boot the host (an iPXE `shell` with an error
+naming the field) when the value contains a control character or non-ASCII
+byte, contains `${`, or has a word that is `||`, `&&` or `;` or starts with
+`#`. Each of those would make iPXE run a command, expand a setting or drop
+the rest of the boot line instead of passing kernel arguments.
 
 The old convention of a `# slagworks:kernel_params` comment in the storage
 script is retired and now rejected at upload time (`internal/storage/script.go`

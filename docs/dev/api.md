@@ -36,18 +36,22 @@ The Auth column in the tables below uses these classes:
 |---|---|
 | `read`, `admin` | OIDC bearer token: `Authorization: Bearer <JWT>`, on WebSocket upgrades too. Verified against `SLAGWORKS_OIDC_ISSUER`, `SLAGWORKS_OIDC_AUDIENCE` and the JWKS (`SLAGWORKS_OIDC_JWKS_URL`, default `<issuer>/jwks/`); the token must carry at least one of `SLAGWORKS_OIDC_REQUIRED_GROUPS` (required; global refuses to start without one). 401 for a missing, malformed, invalid or expired token; 403 for a valid token outside the required groups. |
 | `creds` | As `read`, and when `SLAGWORKS_OIDC_CREDENTIAL_GROUPS` is set the token must also carry at least one of those groups; otherwise 403 with a message naming that setting (the body echoes no group names; the refusal is logged at Info with the subject and both group lists). Unset, the same as `read`. |
-| `worker` | Per-worker token minted by `POST /api/v1/site-workers`, passed as `?token=` on the WebSocket upgrade. Checked against `site_workers.token_hash` (SHA-256); a bad token gets 401 before the upgrade. |
+| `worker` | Per-worker token minted by `POST /api/v1/site-workers`, passed as `Authorization: Bearer <token>` on the WebSocket upgrade, never in the URL (a token in the query is ignored). Checked against `site_workers.token_hash` (SHA-256); a missing or bad token gets 401 before the upgrade. |
 | `hmac` | `X-Hook-Signature` header: hex HMAC-SHA512 of the body keyed with `SLAGWORKS_WEBHOOK_SECRET`; a missing or wrong signature gets 403. When that secret is empty every delivery gets 503 and nothing is processed. |
 | `none` | No authentication. |
 
 `read` and `admin` are two route groups in `server.go`, but both use the
 same middleware and the same group check. There is no read-only role: any
 token that passes the check can call every `read` and `admin` route. The
-one finer check is `creds`, on the only route that returns a stored device
-credential in plaintext (`GET /devices/:ident/creds`); its route-level
-`credentialAuth` middleware runs after the operator check. Routes that use
-a credential only server-side (operation creation, power and boot status)
-are not `creds`.
+one finer check is `creds`, on the routes that hand out stored device
+credentials in plaintext: `GET /devices/:ident/creds`, which returns them,
+and `POST /site-workers`, which mints a worker token. A worker token is
+credential-equivalent: the op stream gives a connected worker every
+operation for its site with the credentials unredacted (see Operations),
+so whoever can mint one can read them. The route-level `credentialAuth`
+middleware runs after the operator check. Routes that use a credential
+only server-side (operation creation, power and boot status) are not
+`creds`.
 
 The operator WebSocket streams (`/api/v1/logs/stream`,
 `/api/v1/console/stream`) are `read` routes: the token goes in the upgrade
@@ -141,7 +145,8 @@ a restart then invalidates outstanding tokens.
 | GET | `/operations/:id` | read | One operation by UUID. |
 
 Site workers claim operations over the WebSocket (`claim_op`), never over
-REST. The claim uses the connection's authenticated worker identity.
+REST. The claim uses the connection's authenticated worker identity, and a
+worker can claim only operations on its own site's machines.
 
 Every response that returns an operation (these two reads and the 201
 from each op-creating POST) shows each credential in `params`
@@ -157,8 +162,8 @@ the real values over the WebSocket op stream. See
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/images` | read | List image rows. |
-| POST | `/images` | admin | Create a row. Body `{"name","version","sha256","url","arch"}`; all but `arch` (default `amd64`) are required. 409 on conflict. Pushes a fresh snapshot to every site. |
-| PUT | `/images/:name` | admin | Create or replace the row named in the path (the path name wins over the body). Used by `slagctl image follow-latest`. Pushes a fresh snapshot to every site. |
+| POST | `/images` | admin | Create a row. Body `{"name","version","sha256","url","arch"}`; all but `arch` (default `amd64`) are required. The name must match `^[a-z0-9][a-z0-9._-]*$` (`model.ValidateImageName`), since it becomes a directory on every site worker; 400 otherwise. 409 on conflict. Pushes a fresh snapshot to every site. |
+| PUT | `/images/:name` | admin | Create or replace the row named in the path (the path name wins over the body). Same name rule as POST. Used by `slagctl image follow-latest`. Pushes a fresh snapshot to every site. |
 | DELETE | `/images/:name` | admin | Delete by name or UUID. 204. Does not push a snapshot. |
 
 ## Storage and network scripts
@@ -189,7 +194,10 @@ snapshot build for each site.
 | POST | `/ssh-keys` | admin | Add a key. Body `{"public_key","comment"}`; the key must parse as an OpenSSH authorized-keys line. |
 | DELETE | `/ssh-keys/:id` | admin | Delete by UUID. 204. |
 
-Deploys are refused while no SSH key is registered.
+Adding or deleting a key pushes a fresh snapshot to every site, so the next
+deploy's agent fetch of `/boot/ssh-keys` reflects the change. Keys are written
+only at deploy time: deleting one does not remove it from hosts already
+deployed. Deploys are refused while no SSH key is registered.
 
 ## Site configs
 
@@ -212,7 +220,7 @@ in [`configuration.md`](../user/configuration.md#site-config-model).
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/workers` | read | List registered workers: `id`, `site_slug`, `worker_id`, `fqdn`, `serial`, `first_seen_at`, `last_seen_at`, plus for connected workers `smcipmitool` (`installed`, `missing`, `missing-required`, `disabled`) and `supermicro_machines`. |
-| POST | `/site-workers` | admin | Register a worker, or rotate its token. Body `{"site_slug","worker_id","fqdn"}`; `site_slug` and `worker_id` are required. Returns `{"id","site_slug","worker_id","fqdn","first_seen_at","token"}`; the plaintext token appears only in this response. |
+| POST | `/site-workers` | creds | Register a worker, or rotate its token. Body `{"site_slug","worker_id","fqdn"}`; `site_slug` and `worker_id` are required. Returns `{"id","site_slug","worker_id","fqdn","first_seen_at","token"}`; the plaintext token appears only in this response. `creds` because the token receives the site's device credentials on the op stream. |
 | DELETE | `/site-workers/:ident` | admin | Delete a registration. `:ident` is the row id, `worker_id` or FQDN. 409 when ambiguous, when the worker is connected, or when it has claimed operations in flight. 204. |
 
 ## NetBox
@@ -231,11 +239,13 @@ in [`configuration.md`](../user/configuration.md#site-config-model).
 
 The only channel between global and site workers. Every frame is an
 envelope `{"type": "<string>", "request_id": "<id>", "data": <payload>}`.
-Request/reply pairs share a `request_id`.
+Request/reply pairs share a `request_id`. Both ends read messages of up to
+16 MiB (`ws.MaxMessageBytes`) and close the connection on a larger one.
 
 Connection setup:
 
-1. The worker connects with `?token=`.
+1. The worker connects with its token in the `Authorization: Bearer`
+   header.
 2. Its first message must be `hello`. Global rejects the connection when
    `hello.worker_id` differs from the token's worker, when `proto` is below
    the current op-stream protocol (`OpStreamProto`, 1), when, with NetBox
@@ -264,7 +274,7 @@ Worker to global:
 | `heartbeat` | `{"worker_id"}`. Refreshes `site_workers.last_seen_at`. No reply. |
 | `observation` | An outbox entry: `{"machine_id","op_id","event","timestamp","data"}`. Events: `commission_report`, `deploy_complete`, `bmc_reconcile_report`, `dhcp_lease`, `phone_home`, `inventory_import`. Acknowledged with `rpc_response`. |
 | `op_update` | `{"op_id","status","phase","result"}`. Processed in order; no reply. |
-| `log_batch` | `{"envelopes":[...]}`. Persisted to `log_envelopes` and re-emitted on global's stdout. |
+| `log_batch` | `{"envelopes":[...]}`. The site worker sends at most 256 envelopes per batch whose encoded envelopes total at most 4 MiB (the array and message wrapper add a little), and drops a single envelope over 4 MiB, counting it in `slagworks_site_logring_dropped_total`; global enforces only the 16 MiB message limit. Persisted to `log_envelopes` and re-emitted on global's stdout. Every envelope must be `source=agent` or `site`; a batch carrying any other source (`global` is global's own op-lifecycle events) is dropped whole. |
 | `claim_op` | `{"op_id"}`. Global replies with `claim_op_response`. |
 | `cast_batch` | `{"frames":[{"machine_id","t_us","data"}]}`: console bytes for the console stream. |
 | `cast_resume` | `{"machine_id"}`. Global replies with `rpc_response` carrying `{"cast_id","cast_started_at","width","height","prev_max_us"}`. |
@@ -285,7 +295,7 @@ Global to worker:
 | `boot_status` | RPC request `{"machine_id","bmc_runtime"}`. |
 | `dhcp_leases` | RPC request `{}`, sent to every connected worker for the site. |
 | `rpc_response` | `{"data","error","terminal"}`. Reply to `observation` and `cast_resume`. `terminal: true` tells the worker to drop the entry rather than retry. |
-| `claim_op_response` | `rpc_response`-shaped; `data` is `{"operation"}` when the worker won the claim or `{"already_claimed": true}` when it lost. |
+| `claim_op_response` | `rpc_response`-shaped; `data` is `{"operation"}` when the worker won the claim or `{"already_claimed": true}` when it lost, including when the operation's machine is not in the worker's site. |
 | `error` | `{"code","message","proto"}`, e.g. a rejected hello. |
 
 `internal/ws/messages.go` also defines `op_dispatch` and `cast_resume_ok`,
@@ -365,6 +375,16 @@ crash between them and the acknowledgement is safe to replay. A
 NetBox is unreachable. Deployed machines keep running from the last
 snapshot.
 
+An entry too large to send is never queued and never retried.
+`/api/v1/report` and `/api/v1/inventory` answer 413 for a body over
+`ws.MaxObservationDataBytes` (10 MiB, which leaves the rest of the 16 MiB
+message limit for the envelope), measured after the JSON escaping the
+worker applies when it re-encodes the body. The worker also drops an entry
+itself, logging an error, when its `observation` message would still exceed
+the 16 MiB message limit or cannot be encoded. Global could never read it,
+and resending it on every reconnect would hold up every observation and
+`op_update` queued behind it.
+
 ---
 
 ## Not in the API
@@ -376,4 +396,4 @@ snapshot.
 - **NetBox proxying.** Query NetBox directly.
 - **Per-endpoint roles.** Every operator route uses the same group check;
   the only addition is the optional credential-group check on
-  `GET /devices/:ident/creds` (see Auth).
+  `GET /devices/:ident/creds` and `POST /site-workers` (see Auth).

@@ -309,20 +309,30 @@ func (h *LogBatch) HandleLogBatch(ctx context.Context, workerID string, msg ws.L
 	if len(msg.Envelopes) == 0 {
 		return nil
 	}
-	// SOL bytes go through the asciinema cast pipeline now,
-	// not the log envelope path. Reject any worker that's still
-	// emitting source=sol envelopes — that's a stale binary the
-	// operator should redeploy. Returning an error fails the WS
-	// frame; the worker treats this as a transient and retries,
-	// which is fine because the malformed batch will continue to
-	// be rejected until the binary is updated.
+	// A worker relays only what its site ring holds: its own
+	// envelopes (source=site) and the agent's (source=agent, the only
+	// source /logs/ingest accepts). Any other source rejects the whole frame,
+	// before anything is persisted or re-emitted. source=global in
+	// particular is global's own: op-lifecycle envelopes are written
+	// inside the store transaction that makes the transition
+	// (store/op_events.go), and the watch TUI treats a source=global
+	// status=completed/failed envelope as the op's authoritative
+	// terminal signal, so a worker-relayed one would be a forged op
+	// outcome. Rejecting the frame rather than dropping the one
+	// envelope matches the stale-binary case below: a healthy worker
+	// never sends either, so the batch is not trusted.
 	for _, env := range msg.Envelopes {
-		// String literal: the SourceSOL constant no longer exists.
-		// A pre-cast-pipeline binary that emits source=sol gets
-		// rejected loud here so an operator-noticed retry loop is
-		// the failure mode, not a silent stale-binary stream.
-		if string(env.Source) == "sol" {
+		switch env.Source {
+		case slogkit.SourceAgent, slogkit.SourceSite:
+		case "sol":
+			// String literal: the SourceSOL constant no longer
+			// exists. SOL bytes ride the asciinema cast pipeline;
+			// a pre-cast-pipeline binary that still emits them
+			// gets a redeploy hint.
 			return fmt.Errorf("worker=%s emitted source=sol envelope; SOL rides the cast pipeline — redeploy the worker", workerID)
+		default:
+			return fmt.Errorf("worker=%s relayed a source=%q envelope (machine_id=%s op_id=%s); workers may relay only agent and site envelopes, so the batch was dropped — upgrade the worker if it predates /logs/ingest refusing non-agent envelopes, and look for a host posting forged envelopes to its /logs/ingest",
+				workerID, env.Source, env.MachineID, env.OpID)
 		}
 	}
 	if err := h.logs.InsertBatch(ctx, msg.Envelopes); err != nil {

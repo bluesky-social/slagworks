@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/model"
@@ -172,16 +173,36 @@ func dialHub(t *testing.T, srv *httptest.Server, token string) *Conn {
 	t.Helper()
 	u, _ := url.Parse(srv.URL)
 	u.Scheme = "ws"
+	h := http.Header{}
 	if token != "" {
-		u.RawQuery = "token=" + token
+		h.Set("Authorization", "Bearer "+token)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	conn, err := Dial(ctx, u.String(), nil)
+	conn, err := Dial(ctx, u.String(), &websocket.DialOptions{HTTPHeader: h})
 	if err != nil {
 		return nil
 	}
 	return conn
+}
+
+// getWithBearer sends a plain GET to target with the given Authorization
+// header value (none when empty) and returns the status code.
+func getWithBearer(t *testing.T, target, authorization string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
 }
 
 func TestHub_UnauthorizedMissingToken(t *testing.T) {
@@ -204,14 +225,33 @@ func TestHub_UnauthorizedBadToken(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "?token=nope")
-	if err != nil {
-		t.Fatal(err)
+	if got := getWithBearer(t, srv.URL, "Bearer nope"); got != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", got)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", resp.StatusCode)
+}
+
+// TestHub_TokenOnlyFromAuthorizationHeader: the hub reads the worker
+// token from the Authorization header and nowhere else. A registered
+// token in the URL query, or in the header without the Bearer scheme, is
+// refused: a URL-borne token is quoted by request loggers and by net/http
+// dial errors, which put it in logs that every operator can read.
+func TestHub_TokenOnlyFromAuthorizationHeader(t *testing.T) {
+	h, auth, _ := newTestHub(t)
+	auth.register("tok-1", "site-c", "worker-1")
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	if got := getWithBearer(t, srv.URL+"?token=tok-1", ""); got != http.StatusUnauthorized {
+		t.Errorf("token in the URL query: got %d, want 401", got)
 	}
+	if got := getWithBearer(t, srv.URL, "tok-1"); got != http.StatusUnauthorized {
+		t.Errorf("token in the header without the Bearer scheme: got %d, want 401", got)
+	}
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial with the token as Authorization: Bearer failed")
+	}
+	_ = conn.CloseNow()
 }
 
 func TestHub_HelloColdTriggersRebuild(t *testing.T) {
@@ -1375,6 +1415,100 @@ func TestHub_ClaimOp_IgnoresClientWorkerID(t *testing.T) {
 	}
 }
 
+// TestHub_ClaimOp_DeclinesOpOutsideClaimantsSite: a worker may claim only
+// ops whose machine is in its own site's snapshot. A won claim replies with
+// the full op row, and Operation.Params carries the op's site credentials,
+// which op_delta and op_resync keep inside the site by the same snapshot
+// membership. Here a worker authenticated for site-b presents the ID of a
+// pending deploy op on a site-a machine. The hub must decline before asking
+// the store to claim, send no op row, and leave the op for site-a. The
+// decline is already_claimed, the answer a lost race or an absent op gets,
+// so it does not tell the claimant that the op exists. A site-a worker then
+// claims the same op.
+func TestHub_ClaimOp_DeclinesOpOutsideClaimantsSite(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-site-a", "site-a", "worker-site-a")
+	auth.register("tok-site-b", "site-b", "worker-site-b")
+	siteAMachine, siteBMachine := uuid.New(), uuid.New()
+	pending := &model.Operation{
+		ID: uuid.New(), MachineID: siteAMachine, Type: model.OpDeploy, Status: model.OpPending,
+		Params: json.RawMessage(`{"bmc_runtime":{"username":"admin","password":"site-a-bmc-password"}}`),
+	}
+	claimed := *pending
+	claimed.Status = model.OpClaimed
+	claimed.Version = 1
+	// The fake store grants every claim it is asked for and records who
+	// asked, so a missing site check shows up as a granted claim, not as a
+	// lost race.
+	claimer := &fakeOpClaimer{pendingOp: pending, op: &claimed}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, OpClaimer: claimer})
+	h.Push("site-a", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "site-a"},
+		Machines: []model.MachineSnapshot{{ID: siteAMachine}}})
+	h.Push("site-b", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "site-b"},
+		Machines: []model.MachineSnapshot{{ID: siteBMachine}}})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	siteB := dialHub(t, srv, "tok-site-b")
+	if siteB == nil {
+		t.Fatal("dial failed")
+	}
+	defer siteB.CloseNow()
+	helloAndDrain(t, siteB, "worker-site-b")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	reqID := "claim-foreign"
+	if err := siteB.WriteTyped(ctx, TypeClaimOp, reqID, ClaimOpMsg{OperationID: pending.ID.String()}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := siteB.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Type != TypeClaimOpResp || env.RequestID != reqID {
+		t.Fatalf("envelope: got %+v, want the claim_op_response for %s", env, reqID)
+	}
+	if strings.Contains(string(env.Data), "site-a-bmc-password") {
+		t.Errorf("claim_op_response to a site-b worker carries the site-a op's credentials: %s", env.Data)
+	}
+	var resp RPCResponseMsg
+	if err := unmarshalData(env.Data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	var claimResp ClaimOpResponse
+	if err := unmarshalData(resp.Data, &claimResp); err != nil {
+		t.Fatalf("decode ClaimOpResponse: %v", err)
+	}
+	if claimResp.Operation != nil {
+		t.Errorf("a site-b worker was granted op %s, whose machine %s is only in site-a's snapshot",
+			pending.ID, siteAMachine)
+	}
+	if resp.Error != "" || !claimResp.AlreadyClaimed {
+		t.Errorf("out-of-site claim answered error=%q already_claimed=%v; want already_claimed and no error",
+			resp.Error, claimResp.AlreadyClaimed)
+	}
+	if calls := claimer.calls(); len(calls) != 0 {
+		t.Fatalf("the hub asked the store to claim a site-a op for %+v; want no store claim for an out-of-site op", calls)
+	}
+
+	// The decline is scoped to the claimant's site: site-a's worker claims
+	// the op as usual.
+	siteA := dialHub(t, srv, "tok-site-a")
+	if siteA == nil {
+		t.Fatal("dial failed")
+	}
+	defer siteA.CloseNow()
+	helloAndDrain(t, siteA, "worker-site-a")
+	got, errStr := claimAndRead(t, siteA, pending.ID)
+	if errStr != "" || got.Operation == nil {
+		t.Fatalf("site-a claim of its own op: error=%q granted=%v, want granted", errStr, got.Operation != nil)
+	}
+	if calls := claimer.calls(); len(calls) != 1 || calls[0].WorkerID != "worker-site-a" {
+		t.Errorf("store claims: got %+v, want exactly one, for worker-site-a", calls)
+	}
+}
+
 // helloAndDrain is a small helper used by op_update/log_lines tests
 // that only care about the post-hello state.
 func helloAndDrain(t *testing.T, conn *Conn, workerID string) {
@@ -1476,6 +1610,59 @@ func TestHub_LogBatchDispatchedToHandler(t *testing.T) {
 	got := logHandler.received[0]
 	if len(got.Envelopes) != 1 || got.Envelopes[0].Msg != "starting" {
 		t.Fatalf("received: %+v", got)
+	}
+}
+
+// A worker message larger than 1 MiB is legitimate: the worker ships its
+// log ring in log_batch messages of up to 256 envelopes, and one agent
+// exec envelope carries up to 16 KiB of stdout. The hub must read such a
+// message and keep serving the connection, not close it with
+// StatusMessageTooBig.
+func TestHub_AcceptsMultiMiBLogBatch(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "site-c", "worker-1")
+	logHandler := &fakeLogBatchHandler{}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, LogBatchHandler: logHandler})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	// 256 exec envelopes, each with a full 16 KiB stdout capture: about
+	// 4.3 MiB on the wire.
+	stdout := strings.Repeat("rsync: copied another file\n", (16<<10)/27)
+	batch := LogBatchMsg{}
+	for range 256 {
+		batch.Envelopes = append(batch.Envelopes, slogkit.Envelope{
+			TS: time.Unix(1_700_000_000, 0), Level: slogkit.LevelInfo, Source: slogkit.SourceAgent,
+			Msg: "exec", Extra: map[string]any{"argv": "rsync -a /mnt/image/ /target/", "stdout": stdout},
+		})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeLogBatch, "", batch); err != nil {
+		t.Fatalf("write log_batch: %v", err)
+	}
+	// The worker's next message on the same connection: an RPC whose
+	// reply proves the hub read past the batch and kept the connection.
+	if err := conn.WriteTyped(ctx, TypeClaimOp, "req-after-logs", ClaimOpMsg{OperationID: uuid.NewString()}); err != nil {
+		t.Fatalf("write claim_op after the log batch: %v", err)
+	}
+	env, err := conn.ReadMessage(ctx)
+	if err != nil {
+		t.Fatalf("hub dropped the connection on a multi-MiB log batch instead of processing it: %v", err)
+	}
+	if env.Type != TypeClaimOpResp || env.RequestID != "req-after-logs" {
+		t.Fatalf("got %q/%q, want the claim_op_response", env.Type, env.RequestID)
+	}
+	logHandler.mu.Lock()
+	defer logHandler.mu.Unlock()
+	if len(logHandler.received) != 1 || len(logHandler.received[0].Envelopes) != 256 {
+		t.Fatalf("log handler received %d batches, want one batch of 256 envelopes", len(logHandler.received))
 	}
 }
 
