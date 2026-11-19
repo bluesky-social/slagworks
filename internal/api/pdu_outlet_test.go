@@ -566,6 +566,42 @@ func TestResolvePDUOutletPower_DownstreamNoSerial(t *testing.T) {
 	}
 }
 
+// TestResolvePDUOutletPower_NoSecretStore: global runs without a secret store
+// when the AWS SDK configuration fails to load. Resolution must then still
+// work from NetBox alone (mgmt IP, serial, topology) instead of reading the
+// nil store; it used to panic, which echo surfaced as an opaque 500.
+func TestResolvePDUOutletPower_NoSecretStore(t *testing.T) {
+	f := singleFeedFixture()
+	s, st := outletFixtureServer(t, f, nil, nil) // nil secret: no secret store
+	seedPDUMachine(t, st, pduNBID)
+
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	resp := getJSON(t, srv, "/api/v1/pdus/pdu-0102-left/outlet/5/power/resolve?verb=cycle")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var r OutletResolution
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if r.PDUMgmtIP != "10.254.240.154" {
+		t.Errorf("pdu_mgmt_ip = %q, want 10.254.240.154 (from NetBox)", r.PDUMgmtIP)
+	}
+	if r.PDUSerial != "ZA2451003321" {
+		t.Errorf("pdu_serial = %q, want ZA2451003321", r.PDUSerial)
+	}
+	if !r.Connected || r.Classification != "sole" || r.DownstreamSerial != "SN-KWORKER1" {
+		t.Errorf("resolution = connected %v, classification %q, downstream_serial %q; want true, sole, SN-KWORKER1",
+			r.Connected, r.Classification, r.DownstreamSerial)
+	}
+	if r.PreflightToken == "" {
+		t.Error("expected non-empty preflight_token for connected outlet")
+	}
+}
+
 // TestResolvePDUOutletPower_MissingVerb: missing verb query param returns 400.
 func TestResolvePDUOutletPower_MissingVerb(t *testing.T) {
 	f := singleFeedFixture()
@@ -703,6 +739,40 @@ func TestPowerPDUOutlet_HappyPath_AllVerbs(t *testing.T) {
 				t.Error("pdu_runtime.allow_self = true, want false (no override requested)")
 			}
 		})
+	}
+}
+
+// TestPowerPDUOutlet_NoSecretStore: without a secret store the POST re-resolves
+// through the same path as the GET, so it must not panic either. It creates
+// the op with the PDU's NetBox mgmt IP and serial and no credential, the same
+// credential-less envelope `--via pdu` builds in this mode.
+func TestPowerPDUOutlet_NoSecretStore(t *testing.T) {
+	f := singleFeedFixture()
+	s, st := outletFixtureServer(t, f, nil, nil) // nil secret: no secret store
+	seedPDUMachine(t, st, pduNBID)
+
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	op, status := roundtrip(t, srv, "pdu-0102-left", 5, "cycle")
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", status)
+	}
+	got, err := st.GetOperation(op.ID)
+	if err != nil {
+		t.Fatalf("get op: %v", err)
+	}
+	params, err := got.DecodeParams()
+	if err != nil {
+		t.Fatalf("decode params: %v", err)
+	}
+	if params.PDURuntime == nil || len(params.PDURuntime.Outlets) != 1 {
+		t.Fatalf("pdu_runtime = %+v, want exactly one outlet", params.PDURuntime)
+	}
+	o := params.PDURuntime.Outlets[0]
+	want := model.PDUOutlet{PDUHost: "10.254.240.154", Outlet: 5, Serial: "ZA2451003321"}
+	if o != want {
+		t.Errorf("outlet = %+v, want %+v (NetBox mgmt IP and serial, no credential)", o, want)
 	}
 }
 
