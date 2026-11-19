@@ -341,8 +341,11 @@ func TestInterlock_NonOutletOpMalformedParams_Unaffected(t *testing.T) {
 }
 
 // TestInterlock_StoreErrorResolvingRegistered_FailClosed: a store error
-// resolving the registered-serial set for an outlet op declines the claim
-// fail-closed (never falls through to ClaimOperation).
+// resolving the registered-serial set for an outlet op fails closed (never
+// falls through to ClaimOperation, never grants) and is answered as a
+// retryable rpc error, not a decline: every worker on the slug would hit the
+// same failing read, so a decline would leave the op pending with no worker
+// left to claim it.
 func TestInterlock_StoreErrorResolvingRegistered_FailClosed(t *testing.T) {
 	op := outletOp(t, model.OpPowerCycle, "SN-SOMEWHERE", false)
 	auth := newFakeAuth()
@@ -363,14 +366,63 @@ func TestInterlock_StoreErrorResolvingRegistered_FailClosed(t *testing.T) {
 	helloAndDrainSerial(t, conn, "worker-1", "SN-PARTNER")
 
 	resp, errStr := claimAndRead(t, conn, op.ID)
-	if errStr != "" {
-		t.Fatalf("fail-closed decline must not be an rpc error, got %q", errStr)
+	if resp.Operation != nil {
+		t.Fatal("store error resolving registered serials must not grant the claim")
 	}
-	if !resp.AlreadyClaimed {
-		t.Error("store error resolving registered serials must fail closed (decline)")
+	if errStr == "" || resp.AlreadyClaimed {
+		t.Errorf("store error resolving registered serials was answered already_claimed=%v error=%q; "+
+			"want a retryable rpc error", resp.AlreadyClaimed, errStr)
 	}
 	if n := len(claimer.calls()); n != 0 {
-		t.Errorf("fail-closed decline must not reach ClaimOperation, got %d", n)
+		t.Errorf("fail-closed claim must not reach ClaimOperation, got %d", n)
+	}
+}
+
+// TestInterlock_StoreErrorReadingOp_Retryable: the interlock reads the op row
+// before it can tell whether the op is an outlet op, so that read runs for
+// every claim, deploys included. A store failure on it must be answered as an
+// rpc error: the worker treats that as retryable (it rolls its local claimed
+// mark back to pending and claims again on its next tick). Answering
+// already_claimed instead tells the worker another worker owns the op, so it
+// stops asking and the op sits pending with nothing driving it. No claim is
+// granted either way, and the retry claims normally once the store recovers.
+func TestInterlock_StoreErrorReadingOp_Retryable(t *testing.T) {
+	params, err := json.Marshal(model.OpParams{BMCRuntime: &model.BMCRuntime{Username: "admin", Password: "x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := &model.Operation{
+		ID: uuid.New(), MachineID: uuid.New(), Type: model.OpDeploy,
+		Status: model.OpPending, Params: params,
+	}
+	_, claimer, srv := interlockHub(t, op, nil)
+	claimer.setGetErr(errors.New("driver: bad connection"))
+
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrainSerial(t, conn, "worker-1", "SN-PARTNER")
+
+	resp, errStr := claimAndRead(t, conn, op.ID)
+	if resp.Operation != nil {
+		t.Fatal("a failed pre-claim read must not grant the claim")
+	}
+	if errStr == "" || resp.AlreadyClaimed {
+		t.Fatalf("store read failure on a pending deploy op was answered already_claimed=%v error=%q; "+
+			"want an rpc error so the worker retries instead of abandoning a still-pending op",
+			resp.AlreadyClaimed, errStr)
+	}
+	if n := len(claimer.calls()); n != 0 {
+		t.Errorf("a failed pre-claim read must not reach ClaimOperation, got %d", n)
+	}
+
+	// The store recovers; the worker's next claim attempt wins the op.
+	claimer.setGetErr(nil)
+	resp, errStr = claimAndRead(t, conn, op.ID)
+	if errStr != "" || resp.Operation == nil {
+		t.Fatalf("retry after the store recovered: error=%q granted=%v, want the op granted", errStr, resp.Operation != nil)
 	}
 }
 

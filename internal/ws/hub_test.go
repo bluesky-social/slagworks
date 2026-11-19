@@ -826,6 +826,14 @@ func (f *fakeOpClaimer) ClaimOperation(opID uuid.UUID, workerID string) (*model.
 	return f.op, nil
 }
 
+// setGetErr changes the pre-CAS read's injected error while the hub is
+// serving, so a test can fail the read and then let the store recover.
+func (f *fakeOpClaimer) setGetErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getErr = err
+}
+
 func (f *fakeOpClaimer) GetOperationIfExists(_ uuid.UUID) (*model.Operation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
