@@ -69,6 +69,8 @@ Partition `name` is the device node the kernel gives the partition at that posit
 
 A `vfat` partition is formatted FAT32, which needs at least 65525 clusters, so its minimum size depends on the disk's logical sector size: `33M` on a disk with 512-byte sectors, `257M` on a 4Kn disk (4096-byte sectors). Below that, `mkfs.fat` would format the partition anyway and UEFI firmware could not read it, so the agent refuses the layout before touching any disk, naming the minimum ("make the partition at least 257M"). The inventory a script reads does not carry the sector size, so size an ESP that may land on a 4Kn disk for 4Kn; the `512M` ESPs on this page fit both.
 
+A fixed size is the size the installed system keeps. The agent turns off cloud-init's `growpart` and `resizefs` on the deployed host, so free space after a fixed-size root partition stays free; use `"rest"` for a root that fills the disk.
+
 **RAID arrays** — software RAID via mdadm. Members reference partition names or whole-disk names from the layout.
 
 ```json

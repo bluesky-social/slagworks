@@ -364,7 +364,8 @@ What the agent actually does, in order:
     `/slagworks/initrd.img` with it. The installed system then assembles
     those arrays and no others (see `docs/user/storage-scripts.md`). Any
     failure here is a hard fail.
-- `finalizing`: write `/etc/fstab`, seed cloud-init, apply the network
+- `finalizing`: write `/etc/fstab`, seed cloud-init (it leaves the
+  network, hostname, locale and partition sizes alone), apply the network
   config script (with NetBox facts injected), write the hostname, disable
   first-boot apt timers, write operator SSH keys, enroll on tailscale (if
   an auth key rode the cmdline), and write the
