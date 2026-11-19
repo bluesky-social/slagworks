@@ -104,9 +104,10 @@ and set the device's `oob_ip` to the IP assigned to that interface. Slagworks
 uses `oob_ip` as the canonical BMC-presence signal; names vary too much across
 vendors and operator habit (`ipmi`, `ipmi0`, `bmc`, `mgmt`, `lom`,
 `dedicated`) to key on. A `mgmt_only` interface on a device with `oob_ip`
-becomes type `ipmi`. On a BMC-less device, such as an SN2700 switch, a
-`mgmt_only` host management/PXE NIC remains type `physical` and participates
-in DHCP machine identity.
+becomes type `ipmi`. On a BMC-less device, such as an SN2700 switch,
+`mgmt_only` does not change the type: a `mgmt_only` host management/PXE NIC
+remains type `physical` and participates in DHCP machine identity, and a
+`mgmt_only` bond (NetBox type `lag`) remains type `lag`.
 
 A BMC-less device gets console capture (`slagctl machine logs --sol`) only
 through its serial console: model a console port on the device and cable it
@@ -163,14 +164,18 @@ the shape; the interesting bits:
   `partitions: […]`) or a RAID array (`type: "raid"`, `level`, `members`).
   Set `boot: true` on a disk that carries the ESP so the layout is
   self-describing (the flag itself is advisory today).
-- Partitions carry `name`, `size` (`"512M"`, `"100G"`, or `"rest"`), an
+- Partitions carry `name` (the kernel's device node for that position on
+  the disk: `sda2`, `nvme0n1p2`), `size` (`"512M"`, `"100G"`, or `"rest"`), an
   optional `fs` (`vfat`, `ext4`, `xfs`, `swap`), and one of `bootable: true`
   (marks the ESP, GPT type EF00) or `bios_grub: true` (marks a legacy BIOS
   boot partition, GPT type EF02, for the legacy-GRUB install path). The
   latter two are mutually exclusive with `fs`.
 - Mounts are keyed by mount point and reference a device or partition name
   from the layout. The planner sorts by depth so `/` mounts before
-  `/boot/efi`.
+  `/boot/efi`. A mount point must be a clean absolute path (`/var/lib`, not
+  `var/lib`, `/var/lib/` or `/var//lib`) with no whitespace, control
+  characters or backslashes; the planner rejects anything else (see
+  [Storage Templates](../storage-scripts.md)).
 
 The planner (`internal/storage/plan.go`) translates the JSON into an ordered
 list of `sgdisk`, `mdadm`, `mkfs.*`, `wipefs` and `dd` (which clear every
@@ -196,8 +201,10 @@ slagctl storage-script delete <id>
 ```
 
 The API parses the script through `storage.ParseScript` at upload time, so a
-typo in a match field name, a bad regex, or a lingering `slagworks:kernel_params`
-header fails loudly rather than silently never matching.
+typo in a match field name, a bad regex, a misspelled directive
+(`slagworks:mtach`, `slagworks:match:`), or a lingering `slagworks:kernel_params`
+header fails the upload instead of silently changing which hosts the script
+matches.
 
 ### Hardware-allowlist census
 
@@ -307,9 +314,13 @@ posture the storage matcher takes.
 The site worker exposes `/api/v1/machines/<id>/network-facts` — a JSON list
 of `model.SnapshotInterface` records (`NetBoxID`, `Name`, `MAC`, `Type`,
 `IP`, `LAG`, `VLAN`, `MTU`, `Gateway`). `Type` is `physical`, `lag`, or
-`ipmi`. `Gateway` is the longest-prefix-match of the interface CIDR against
-site prefixes' `gateway_ip` custom field. The script owns all topology
-interpretation from these facts; slagworks itself is topology-agnostic. See
+`ipmi`. `IP` is the interface's one `status=active` NetBox address. An
+interface with more than one active address fails the site's snapshot build,
+naming the device, the interface and its addresses; set every address but one
+to `reserved` or `deprecated`. `Gateway` is the longest-prefix-match of the
+interface CIDR against site prefixes' `gateway_ip` custom field. The script
+owns all topology interpretation from these facts; slagworks itself is
+topology-agnostic. See
 `assets/network/100-hot-spare-pop2` for a worked L2-bond example.
 
 ### Uploading

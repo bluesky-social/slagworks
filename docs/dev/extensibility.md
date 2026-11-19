@@ -36,20 +36,29 @@ highest-priority match.
 ### Header grammar
 
 Only top-of-file comment lines are scanned. Scanning stops at the
-first non-comment line (`configscript.go:44-56`). Shebangs are
+first non-comment line (`configscript.go:51-62`). Shebangs are
 skipped. Two directives:
 
 - `# slagworks:match <field>=<value>` — one match rule, ANDed with
   the others.
 - `# slagworks:priority <int>` — tiebreaker on ties among matching
-  scripts, higher wins (`configscript.go:80-86`).
+  scripts, higher wins (`configscript.go:95-100`).
 
 `<value>` is either a literal string (exact equality against the
 resolver's result) or a `/regex/` (anchored `^(?:...)$`,
-`configscript.go:71-78`). A `slagworks:match` against a field not in
+`configscript.go:86-93`). A `slagworks:match` against a field not in
 the caller's `validFields` map is a parse error, so a typo fails at
 upload time rather than silently never matching
-(`configscript.go:68-70`).
+(`configscript.go:83-85`).
+
+Any whitespace may separate a directive from its argument. A header
+line whose first word starts with `slagworks:` in any case is a
+directive, and any directive other than the two above
+(`slagworks:mtach`, `slagworks:match:`, `Slagworks:match`, a bare
+`slagworks:`) is a parse error (`configscript.go:101-102`). Treating
+it as prose would drop the rule or priority without a word, which
+widens the script's match or lets a lower-priority script win. Prose
+that mentions slagworks without that colon prefix is unaffected.
 
 ### Selection
 
@@ -59,7 +68,7 @@ walks in order, and:
 - Returns the first script whose rules all evaluate to true.
 - If two scripts tie at the winning priority AND both match, returns
   an error rather than picking one non-deterministically
-  (`configscript.go:106-144`). Priority is the tiebreaker; a tie is a
+  (`configscript.go:123-161`). Priority is the tiebreaker; a tie is a
   configuration bug the operator must resolve (raise one script's
   priority, or tighten a rule).
 - A script with zero rules never matches.
@@ -128,7 +137,10 @@ just before deploy (see `cmd/slagworks-agent/script_exec.go:9-72`).
   Disks carry `partitions[]`; raids carry `level`, `members[]`, and
   an optional filesystem for the array itself.
 - `mounts` — a map from mount point (`/`, `/boot/efi`, ...) to a
-  `Device` reference by name.
+  `Device` reference by name. Mount points must be clean absolute
+  paths with no whitespace, control characters or backslashes
+  (`validateMountPoint` in `storage/validate.go`), because the
+  planner and the fstab writer use them verbatim.
 
 Partitions declare `name`, `size` (`"512M"`, `"100G"`, `"rest"`),
 optional `fs` (`vfat`, `ext4`, `xfs`, `swap`), and two boolean
@@ -277,11 +289,15 @@ should say what is wrong in the NetBox model and what to change.
 ### Relay-pool generation
 
 `internal/snapshot/netplan.go` generates a `[]RelayPool` from the
-NetBox interfaces of DHCP-served hosts: any `/31` on a physical
-interface becomes a single-address relay pool. Only host-side `/31`s
-show up (leaves have no machine row), and the pool subnet is the
-`/31` itself so duplicates collapse by construction
-(`netplan.go:55-93`).
+NetBox interfaces of every device in the site's scope: any `/31` on a
+physical interface becomes a single-address relay pool. The pool
+subnet is the `/31` itself, so when a leaf is modeled in the same site
+its end of the link collapses into the host's pool; with both ends
+present the higher address is taken as the host side. Pools are sorted
+by subnet so the snapshot hash does not depend on NetBox's list order
+(`netplan.go:45-105`). The site worker derives both ends of a `/31`
+pool from the relayed packet's giaddr, so the recorded host side never
+changes a DHCP answer.
 
 ### Test expectation
 

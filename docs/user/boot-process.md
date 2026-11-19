@@ -69,6 +69,9 @@ a machine ever gets booted:
   `RangeStart` (reservations-only segment) still serves the full reservation
   set; a non-reserved MAC on such a segment gets no offer, which is what
   lets a slice-owning peer answer in an active/active split-pool cage.
+- **Client requests only.** A packet whose BOOTP op is not BOOTREQUEST is
+  dropped on every segment, whatever its option 53 says (RFC 2131), and
+  counted under the `not_bootrequest` drop reason.
 - **Known-MAC filter.** When a segment is non-promiscuous and `KnownMACs` is
   set, an unregistered MAC's DHCP is silently dropped at debug level
   (`handler.go:424-428`). A promiscuous segment (typical for OOB where you
@@ -346,6 +349,13 @@ What the agent actually does, in order:
     and deletes the backups, which on an XFS root can leave a hole in
     that directory; GRUB 2.12 cannot read past one and stops at
     `error: not a correct XFS inode.`
+  - **RAID** (layouts with md arrays): `target.ConfigureRAID` writes
+    `/etc/mdadm/mdadm.conf` with `AUTO -all` and an `ARRAY` line, by UUID,
+    for each array the layout names, regenerates the target's initramfs so
+    it carries that file, and on UEFI replaces the ESP's
+    `/slagworks/initrd.img` with it. The installed system then assembles
+    those arrays and no others (see `docs/user/storage-scripts.md`). Any
+    failure here is a hard fail.
 - `finalizing`: write `/etc/fstab`, seed cloud-init, apply the network
   config script (with NetBox facts injected), write the hostname, disable
   first-boot apt timers, write operator SSH keys, enroll on tailscale (if

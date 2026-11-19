@@ -34,10 +34,13 @@ type fakeStore struct {
 
 	// bindingTypes records the op type every ValidateOperationBinding
 	// call asked for; finalized records CompleteOperationWithState /
-	// FailOperationOutcome calls (the bmc_reconcile_report path).
-	bindingTypes []model.OperationType
-	finalized    []finalizedOp
-	finalizeErr  error
+	// FailOperationOutcome calls (the bmc_reconcile_report and
+	// phone_home paths). bindingAlreadyCompleted makes
+	// ValidateOperationBinding report an accepted replay of a completed op.
+	bindingTypes            []model.OperationType
+	bindingAlreadyCompleted bool
+	finalized               []finalizedOp
+	finalizeErr             error
 
 	dhcpLeaseEvents []recordedDHCPLeaseEvent
 	dhcpLeaseErr    error // injectable error for RecordDHCPLeaseEvent
@@ -172,7 +175,10 @@ func (s *fakeStore) ValidateOperationBinding(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.bindingTypes = append(s.bindingTypes, opType)
-	return false, s.bindingErr
+	if s.bindingErr != nil {
+		return false, s.bindingErr
+	}
+	return s.bindingAlreadyCompleted, nil
 }
 
 func (s *fakeStore) CommitCommissionResult(
@@ -459,6 +465,111 @@ func TestHandleObservation_NonCommissionEventsAckedQuietly(t *testing.T) {
 		if err != nil {
 			t.Errorf("event %q: unexpected error %v", event, err)
 		}
+	}
+}
+
+// phoneHomeFixture is a Handler with an op publisher and an invalidator,
+// for the phone_home path.
+func phoneHomeFixture() (*Handler, *fakeStore, *fakeOpPublisher, *fakeInvalidator) {
+	st := newFakeStore()
+	inv := &fakeInvalidator{}
+	pub := &fakeOpPublisher{}
+	h := New(st, &fakeNetBox{}, inv)
+	h.SetPublisher(pub)
+	return h, st, pub, inv
+}
+
+// TestHandlePhoneHome_CompletesDeployOp: a phone_home observation that
+// names the deploy op completes it and moves the machine to running. The
+// worker's op_update for the same completion is memory-only and
+// unacknowledged; this observation is the copy that survives a worker
+// restart or a dropped connection, so global must act on it rather than
+// ack and ignore it (which left the op to fail at PhoneHomeTimeout).
+func TestHandlePhoneHome_CompletesDeployOp(t *testing.T) {
+	h, st, pub, inv := phoneHomeFixture()
+	machineID, opID := uuid.New(), uuid.New()
+	err := h.HandleObservation(context.Background(), model.Observation{
+		MachineID: machineID, OperationID: opID, Event: "phone_home", SiteSlug: "pop1",
+	})
+	if err != nil {
+		t.Fatalf("HandleObservation: %v", err)
+	}
+	if len(st.bindingTypes) != 1 || st.bindingTypes[0] != model.OpDeploy {
+		t.Errorf("binding must be validated against deploy, got %v", st.bindingTypes)
+	}
+	if len(st.finalized) != 1 || st.finalized[0].OpID != opID ||
+		st.finalized[0].Status != model.OpCompleted || st.finalized[0].Target != model.MachineStateRunning {
+		t.Fatalf("expected deploy op %s completed with target running, got %+v", opID, st.finalized)
+	}
+	if len(pub.removed) != 1 || pub.removed[0].ID != opID {
+		t.Errorf("op_removed not published for %s: %+v", opID, pub.removed)
+	}
+	if len(inv.invalid) != 1 || inv.invalid[0] != "pop1" {
+		t.Errorf("sending site's snapshot not invalidated: %+v", inv.invalid)
+	}
+}
+
+// TestHandlePhoneHome_NoOpCases: the observation is acked without a
+// transition when it names no op (a late phone-home: the worker held no
+// active deploy op) or when the op_update path already completed the op.
+func TestHandlePhoneHome_NoOpCases(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		opID             uuid.UUID
+		alreadyCompleted bool
+	}{
+		{name: "no operation ID", opID: uuid.Nil},
+		{name: "already completed", opID: uuid.New(), alreadyCompleted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, st, pub, inv := phoneHomeFixture()
+			st.bindingAlreadyCompleted = tc.alreadyCompleted
+			err := h.HandleObservation(context.Background(), model.Observation{
+				MachineID: uuid.New(), OperationID: tc.opID, Event: "phone_home", SiteSlug: "pop1",
+			})
+			if err != nil {
+				t.Fatalf("HandleObservation: %v", err)
+			}
+			if len(st.finalized) != 0 || len(pub.removed) != 0 || len(inv.invalid) != 0 {
+				t.Errorf("no-op phone_home changed state: finalized=%+v removed=%+v invalidated=%+v",
+					st.finalized, pub.removed, inv.invalid)
+			}
+		})
+	}
+}
+
+// TestHandlePhoneHome_BindingRejectedIsTerminal: a phone_home for an op
+// that is failed (aborted, or already swept at PhoneHomeTimeout), belongs
+// to another machine, or is not a deploy must not complete anything, and
+// is dropped terminally so the worker stops replaying it.
+func TestHandlePhoneHome_BindingRejectedIsTerminal(t *testing.T) {
+	h, st, _, _ := phoneHomeFixture()
+	st.bindingErr = fmt.Errorf("operation is terminal (failed): %w", store.ErrOperationBinding)
+	err := h.HandleObservation(context.Background(), model.Observation{
+		MachineID: uuid.New(), OperationID: uuid.New(), Event: "phone_home",
+	})
+	if !errors.Is(err, ws.ErrTerminal) {
+		t.Fatalf("binding rejection must be terminal, got %v", err)
+	}
+	if len(st.finalized) != 0 {
+		t.Errorf("rejected phone_home finalized an op: %+v", st.finalized)
+	}
+}
+
+// TestHandlePhoneHome_StoreErrorIsRetried: a transient store failure
+// returns a non-terminal error, so the worker keeps the outbox row and
+// replays it. This is the case the op_update path drops on the floor.
+func TestHandlePhoneHome_StoreErrorIsRetried(t *testing.T) {
+	h, st, pub, _ := phoneHomeFixture()
+	st.finalizeErr = errors.New("connection reset by peer")
+	err := h.HandleObservation(context.Background(), model.Observation{
+		MachineID: uuid.New(), OperationID: uuid.New(), Event: "phone_home",
+	})
+	if err == nil || errors.Is(err, ws.ErrTerminal) {
+		t.Fatalf("transient store failure must be retryable, got %v", err)
+	}
+	if len(pub.removed) != 0 {
+		t.Errorf("op_removed published for a failed completion: %+v", pub.removed)
 	}
 }
 

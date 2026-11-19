@@ -54,3 +54,67 @@ func TestCommissionReplayWithExponentNumberIsAccepted(t *testing.T) {
 		})
 	}
 }
+
+// A commission report reaches the store as the booted host sent it, and
+// parts of it (lldpctl's JSON, firmware strings) are outside text. A report
+// holding an escape jsonb refuses must still commit, with the escape
+// replaced by U+FFFD: the handler retries every error that is not a binding
+// rejection, so a refused write re-runs the report until the op times out.
+// A redelivery of the same report is then an accepted replay, though the
+// stored copy differs from it at the escape.
+func TestCommissionReportWithEscapeJSONBRefusesIsStoredAndReplayable(t *testing.T) {
+	st := testStore(t)
+	for _, tc := range []struct{ name, escape string }{
+		{"NUL", `\u0000`},
+		{"lone high surrogate", `\ud800`},
+		{"lone low surrogate", `\udc00`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-escape-" + uuid.NewString(), State: model.MachineStateNew, PXEEligible: true}
+			if err := st.CreateMachine(m); err != nil {
+				t.Fatal(err)
+			}
+			op, err := st.CreateMachineOp(m.ID, model.OpCommission, nil, model.MachineStateNew)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.ClaimOperation(op.ID, "worker-1"); err != nil {
+				t.Fatal(err)
+			}
+			report := json.RawMessage(`{"serial":"S1","lldp":{"chassis":{"descr":"switch ` + tc.escape + ` os"}}}`)
+			out, already, err := st.CommitCommissionResult(op.ID, m.ID, report)
+			if err != nil || already || out == nil {
+				t.Fatalf("first delivery: outcome set=%v alreadyCompleted=%v err=%v; want true, false, nil", out != nil, already, err)
+			}
+			gotM, err := st.GetMachine(m.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotM.State != model.MachineStateCommissioned {
+				t.Errorf("machine is %s, want commissioned", gotM.State)
+			}
+			var inv struct {
+				LLDP struct {
+					Chassis struct {
+						Descr string `json:"descr"`
+					} `json:"chassis"`
+				} `json:"lldp"`
+			}
+			if err := json.Unmarshal(gotM.CommissionData, &inv); err != nil {
+				t.Fatal(err)
+			}
+			if want := "switch \uFFFD os"; inv.LLDP.Chassis.Descr != want {
+				t.Errorf("stored descr = %q, want %q", inv.LLDP.Chassis.Descr, want)
+			}
+
+			already, err = st.ValidateOperationBinding(op.ID, m.ID, model.OpCommission, report)
+			if err != nil || !already {
+				t.Errorf("ValidateOperationBinding on an identical redelivery: alreadyCompleted=%v err=%v; want true, nil", already, err)
+			}
+			out, already, err = st.CommitCommissionResult(op.ID, m.ID, report)
+			if err != nil || !already || out != nil {
+				t.Errorf("CommitCommissionResult on an identical redelivery: outcome set=%v alreadyCompleted=%v err=%v; want false, true, nil", out != nil, already, err)
+			}
+		})
+	}
+}
