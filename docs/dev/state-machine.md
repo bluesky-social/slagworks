@@ -175,7 +175,10 @@ decides:
   quarantine lock).
 - Any other target: state only, lock untouched.
 
-That helper has six call sites.
+That helper has five call sites. `PATCH /machines/:id` is not one: it
+rejects a body containing `state` and writes only the `desired_os`
+column, so it cannot revert a transition that commits while the request
+is in flight.
 
 | # | Function | File and line | Trigger | Preconditions | Effect on `machine.state` |
 |---|---|---|---|---|---|
@@ -184,7 +187,6 @@ That helper has six call sites.
 | 3 | `CompleteOperationWithState` | `internal/store/store.go:576` | hub receives `op_update{status=completed}` | op not already terminal | sets target state; deploy passes `MachineStateRunning`; empty target means no state change (power ops, per `internal/hubhandlers/hubhandlers.go:60`) |
 | 4 | `CommitCommissionResult` | `internal/store/commission_result.go` | commission observation handler | exact active commission op ID belongs to the reported machine | atomically stores inventory, completes that op, and moves its machine to `commissioned` |
 | 5 | `FailOperation` | `internal/store/store.go:772` | worker `op_update{status=failed}`, `AbortMachine`, or one of the three timeout sweeps | op not already terminal | per-rule branching, see below |
-| 6 | `updateMachine` (`PATCH /machines/:id`) | `internal/api/server.go:704` | operator PATCH | value passes `.Valid()` | direct write; mirrors auto-lock policy (`server.go:732`) but does not enforce `claimTransition` — see [rough edges](#open-questions-and-rough-edges) |
 
 ### `claimTransition` allowed sources
 
@@ -810,12 +812,6 @@ a reserved non-machine BMC, PDU, or unmanaged switch port).
 
 ## Open questions and rough edges
 
-- **`PATCH /machines/:id` bypasses `claimTransition`.**
-  `internal/api/server.go:726` allows setting `state` to any valid
-  value. The auto-lock policy is mirrored at line 732, but the
-  transition legality is not enforced. An operator can PATCH
-  `state = running` on a `new` machine. This is a documented soft
-  hole around the state machine.
 - **The commission branch of `hubhandlers.completionState`
   (`hubhandlers.go:50`) is effectively unused.** Commission
   completion runs through `commission.Handler` and
