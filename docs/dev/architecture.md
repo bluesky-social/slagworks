@@ -894,7 +894,10 @@ via the site slog handler's sink.
 From the site ring:
 
 1. `WSConn.logRingDrainLoop` (`worker/wsconn.go:601`) drains the ring
-   and calls `sendLogBatch` (691) with `TypeLogBatch`.
+   and calls `sendLogBatch` (691) with `TypeLogBatch`. A batch holds at
+   most 256 envelopes and 4 MiB, so it stays under the 16 MiB message
+   limit both ends of the WebSocket read with; `Ring.Drain` drops (and
+   counts in `dropped`) a single envelope too large for a batch.
 2. Hub dispatches to `hubhandlers.LogBatch.HandleLogBatch`.
 3. Handler inserts into `log_envelopes` and pushes into the global
    `logring.Ring`, and re-emits JSONL on stdout for the fleet

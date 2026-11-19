@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -15,9 +17,11 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/bluesky-social/slagworks/internal/logring"
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/power"
 	"github.com/bluesky-social/slagworks/internal/power/smcipmitool"
+	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/ws"
 )
 
@@ -88,6 +92,85 @@ func TestWSConn_RPCPlumbing_Timeout(t *testing.T) {
 	_, err := w.waitResponse(ctx, ch)
 	if err == nil {
 		t.Fatal("expected timeout error")
+	}
+}
+
+// A log backlog that a count-only batch would ship as one message larger
+// than the hub's read limit (256 envelopes of 64 KiB each, about 16 MiB)
+// must reach global as several log_batch messages, each within
+// logBatchMaxBytes, rather than one message the hub rejects with
+// StatusMessageTooBig.
+func TestLogRingDrainLoop_BoundsBatchBytes(t *testing.T) {
+	const n = 256
+	ring := logring.New(100<<20, 0)
+	stdout := strings.Repeat("x", 64<<10)
+	for range n {
+		ring.Push(slogkit.Envelope{
+			TS: time.Now(), Level: slogkit.LevelInfo, Source: slogkit.SourceAgent,
+			Msg: "exec", Extra: map[string]any{"stdout": stdout},
+		})
+	}
+
+	type batch struct {
+		dataBytes, envelopes int
+	}
+	batches := make(chan batch, n)
+	readErr := make(chan error, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		conn, err := ws.Accept(rw, r, nil)
+		if err != nil {
+			readErr <- err
+			return
+		}
+		defer conn.CloseNow()
+		conn.SetReadLimit(ws.MaxMessageBytes) // what the hub reads with
+		for {
+			env, err := conn.ReadMessage(r.Context())
+			if err != nil {
+				readErr <- err
+				return
+			}
+			var msg ws.LogBatchMsg
+			if err := json.Unmarshal(env.Data, &msg); err != nil {
+				readErr <- err
+				return
+			}
+			batches <- batch{dataBytes: len(env.Data), envelopes: len(msg.Envelopes)}
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := ws.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	w := NewWSConn(WSConnConfig{}, nil, nil, ring)
+	go w.logRingDrainLoop(ctx, conn)
+
+	// A batch's data is {"envelopes":[...]}: the ring's marshalled
+	// envelopes separated by commas.
+	wrapper := len(`{"envelopes":[]}`)
+	got, count := 0, 0
+	for got < n {
+		select {
+		case b := <-batches:
+			count++
+			if limit := int(logBatchMaxBytes) + wrapper + b.envelopes; b.dataBytes > limit {
+				t.Fatalf("log_batch %d is %d bytes (%d envelopes), over the %d-byte batch bound",
+					count, b.dataBytes, b.envelopes, limit)
+			}
+			got += b.envelopes
+		case err := <-readErr:
+			t.Fatalf("receiver lost the connection after %d of %d envelopes: %v", got, n, err)
+		case <-ctx.Done():
+			t.Fatalf("only %d of %d envelopes arrived", got, n)
+		}
+	}
+	if got != n || count < 2 {
+		t.Fatalf("got %d envelopes in %d batches, want %d in several byte-bounded batches", got, count, n)
 	}
 }
 

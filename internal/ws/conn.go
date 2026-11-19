@@ -16,6 +16,14 @@ const (
 	defaultPongTimeout  = 10 * time.Second
 )
 
+// MaxMessageBytes is the read limit both ends of the site-worker link
+// set, so it is the largest message either end may send: the hub's
+// snapshot (commission data for every machine at the site) and the
+// worker's batches each travel as one message. A receiver closes the
+// connection with StatusMessageTooBig on anything larger, so a sender
+// that batches must keep every message under this bound.
+const MaxMessageBytes = 16 << 20
+
 // Conn wraps a coder/websocket connection with JSON envelope read/write.
 type Conn struct {
 	conn *websocket.Conn

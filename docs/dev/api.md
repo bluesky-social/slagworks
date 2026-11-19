@@ -229,7 +229,8 @@ in [`configuration.md`](../user/configuration.md#site-config-model).
 
 The only channel between global and site workers. Every frame is an
 envelope `{"type": "<string>", "request_id": "<id>", "data": <payload>}`.
-Request/reply pairs share a `request_id`.
+Request/reply pairs share a `request_id`. Both ends read messages of up to
+16 MiB (`ws.MaxMessageBytes`) and close the connection on a larger one.
 
 Connection setup:
 
@@ -250,7 +251,7 @@ Worker to global:
 | `heartbeat` | `{"worker_id"}`. Refreshes `site_workers.last_seen_at`. No reply. |
 | `observation` | An outbox entry: `{"machine_id","op_id","event","timestamp","data"}`. Events: `commission_report`, `deploy_complete`, `bmc_reconcile_report`, `dhcp_lease`, `phone_home`, `inventory_import`. Acknowledged with `rpc_response`. |
 | `op_update` | `{"op_id","status","phase","result"}`. Processed in order; no reply. |
-| `log_batch` | `{"envelopes":[...]}`. Persisted to `log_envelopes` and re-emitted on global's stdout. |
+| `log_batch` | `{"envelopes":[...]}`: at most 256 envelopes and 4 MiB; the site worker drops a single envelope over 4 MiB and counts it in `slagworks_site_logring_dropped_total`. Persisted to `log_envelopes` and re-emitted on global's stdout. |
 | `claim_op` | `{"op_id"}`. Global replies with `claim_op_response`. |
 | `cast_batch` | `{"frames":[{"machine_id","t_us","data"}]}`: console bytes for the console stream. |
 | `cast_resume` | `{"machine_id"}`. Global replies with `rpc_response` carrying `{"cast_id","cast_started_at","width","height","prev_max_us"}`. |

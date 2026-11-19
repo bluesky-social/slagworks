@@ -607,6 +607,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn("ws accept failed", "slug", worker.SiteSlug, "worker", worker.WorkerID, "err", err)
 		return
 	}
+	// Worker messages can exceed Accept's 1 MiB default (a log batch of
+	// exec output reaches several MiB); read up to the same bound the
+	// worker reads the snapshot with.
+	conn.SetReadLimit(MaxMessageBytes)
 
 	ctx := r.Context()
 	wc := &workerConn{
