@@ -6,6 +6,7 @@
 package execkit
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,14 @@ import (
 // the worst case. When truncated, the envelope's "stdout"/"stderr"
 // field includes a trailing "...[truncated, total N bytes]" marker.
 const outputCapBytes = 16 << 10
+
+// configScriptStderrCap bounds how much of a config script's stderr
+// RunConfigScript keeps for its error and log lines. The text ends up in the
+// operation result, so a runaway script must not bloat it; 8 KiB holds any
+// realistic diagnostic many times over. The TAIL is kept, not the head:
+// a script's decisive message (an ERROR line, a Python traceback's final
+// exception) is the last thing it writes.
+const configScriptStderrCap = 8 << 10
 
 // Exec is the production Runner: it spawns real processes, tees their
 // output live to Tee (falling back to the agent's stdout/stderr when
@@ -141,6 +150,58 @@ func (b *boundedBuffer) String() string {
 	return string(b.buf) + fmt.Sprintf("...[truncated, total %d bytes]", b.total)
 }
 
+// tailBuffer is boundedBuffer's mirror image: it retains at most cap bytes
+// of the END of the stream, plus a count of total bytes written. Used for
+// config-script stderr, where the decisive message comes last.
+type tailBuffer struct {
+	cap   int
+	buf   []byte
+	total int
+	// lastDropped is the most recent byte to fall out of the window, so
+	// String can tell whether the retained text starts on a line boundary.
+	lastDropped byte
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.total += len(p)
+	drop := len(b.buf) + len(p) - b.cap
+	if drop <= 0 {
+		b.buf = append(b.buf, p...)
+		return len(p), nil
+	}
+	if i := drop - 1; i < len(b.buf) {
+		b.lastDropped = b.buf[i]
+	} else {
+		b.lastDropped = p[i-len(b.buf)]
+	}
+	if drop >= len(b.buf) {
+		b.buf = append(b.buf[:0], p[drop-len(b.buf):]...)
+	} else {
+		b.buf = append(b.buf[:0], b.buf[drop:]...)
+		b.buf = append(b.buf, p...)
+	}
+	return len(p), nil
+}
+
+// String returns the retained tail. When the head was dropped mid-line, that
+// partial first line is discarded too so the text starts on a line boundary,
+// unless it is the only line retained (one line longer than cap): then its
+// end is kept, with any rune the cut split repaired. A leading marker reports
+// how much was written in total.
+func (b *tailBuffer) String() string {
+	if b.total <= len(b.buf) {
+		return string(b.buf)
+	}
+	tail := b.buf
+	if b.lastDropped != '\n' {
+		if i := bytes.IndexByte(tail, '\n'); i >= 0 && i < len(tail)-1 {
+			tail = tail[i+1:]
+		}
+	}
+	tail = bytes.ToValidUTF8(tail, []byte("\uFFFD"))
+	return fmt.Sprintf("...[truncated, total %d bytes]\n", b.total) + string(tail)
+}
+
 // RunConfigScript runs a pluggable per-host config script in the deploy
 // initrd and returns its stdout. It is the shared execution harness behind
 // both pluggable-script seams:
@@ -164,9 +225,14 @@ func (b *boundedBuffer) String() string {
 //
 // Everything lands in one per-invocation temp directory that is removed before
 // returning (no /tmp leak, and no cross-invocation collision on the sidecar
-// names). stderr is streamed to the agent's stderr (so the script's own
-// diagnostics reach the SOL/log path); only stdout carries the structured
-// result.
+// names). Only stdout carries the structured result. stderr is the script's
+// diagnostics channel (the scripts' hard-fail "fix the NetBox model" ERRORs,
+// their degraded-but-valid WARNINGs): it streams live to the agent's stderr
+// (the serial console), and its tail (configScriptStderrCap) is also logged
+// through log, one Warn record per line, whether or not the script succeeded,
+// and appended to the returned error on failure. Without that the failure
+// reached the operation result as a bare "exit status 1" and the script's
+// explanation of what to fix was visible only on the serial console.
 func RunConfigScript(log *slog.Logger, kind string, scriptContent []byte, envName string, data []byte, sidecars map[string][]byte) ([]byte, error) {
 	dir, err := os.MkdirTemp("", "slagworks-"+kind+"-*")
 	if err != nil {
@@ -195,10 +261,21 @@ func RunConfigScript(log *slog.Logger, kind string, scriptContent []byte, envNam
 	log.Info("executing config script", "kind", kind)
 	cmd := exec.Command(scriptPath)
 	cmd.Env = append(os.Environ(), envName+"="+dataPath)
-	cmd.Stderr = os.Stderr
+	stderr := &tailBuffer{cap: configScriptStderrCap}
+	cmd.Stderr = io.MultiWriter(os.Stderr, stderr)
 	out, err := cmd.Output()
+
+	diag := strings.TrimSpace(stderr.String())
+	for line := range strings.SplitSeq(diag, "\n") {
+		if line = strings.TrimRight(line, "\r"); line != "" {
+			log.Warn(kind+" script stderr: "+line, "kind", kind)
+		}
+	}
 	if err != nil {
-		return nil, fmt.Errorf("%s script failed: %w", kind, err)
+		if diag == "" {
+			return nil, fmt.Errorf("%s script failed: %w (the script wrote nothing to stderr)", kind, err)
+		}
+		return nil, fmt.Errorf("%s script failed: %w; script stderr:\n%s", kind, err, diag)
 	}
 	return out, nil
 }

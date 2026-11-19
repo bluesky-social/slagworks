@@ -373,7 +373,7 @@ func renderFrame(in frameInput) string {
 		// remains — NOT errorPaneBody + a blind tail in renderLogBody, which
 		// would chop the prepended cause off the top once the history exceeds
 		// logRows, hiding the very line the error pane exists to show.
-		logBody = errorPaneBody(in, logRows)
+		logBody = errorPaneBody(in, logsInnerW, logRows)
 	}
 	logsBox := box(logsTitle, renderLogBody(logBody, logsInnerW, logRows), logsInnerW)
 
@@ -539,7 +539,9 @@ func renderLogBody(lines []string, innerW, rows int) string {
 	out := make([]string, rows)
 	for i := range out {
 		if i < len(lines) {
-			out[i] = clampWidth(lines[i], innerW)
+			// Cell-aware, to agree with the wrapped failure cause
+			// (wrapLines): a rune count would cut a row that fits.
+			out[i] = ansi.Truncate(lines[i], innerW, "…")
 		} else {
 			out[i] = "" // pad to full height
 		}
@@ -548,26 +550,50 @@ func renderLogBody(lines []string, innerW, rows int) string {
 }
 
 // errorPaneBody pins the failure cause on top of the tail of log lines, per the
-// failure mockup. It reserves a row for the cause and tails the log history to
+// failure mockup. It reserves rows for the cause and tails the log history to
 // whatever rows remain, so a long history never pushes the pinned cause off the
 // top (renderLogBody tails blindly; tailing here keeps the cause at index 0).
-func errorPaneBody(in frameInput, rows int) []string {
+//
+// The cause is WRAPPED to innerW, one row per line of it, not clamped to a
+// single row like a log line: it is the one thing the error pane exists to
+// show, and an agent failure carries the failing script's own diagnostics
+// (often several lines, ending in what to fix) after the stage prefix. A
+// cause taller than the pane keeps its first row (the failed stage) and its
+// END (where a script's decisive ERROR is), with a marker for what was cut.
+func errorPaneBody(in frameInput, innerW, rows int) []string {
+	cause := wrapLines(in.failReason, innerW)
+	if len(cause) > rows {
+		switch {
+		case rows <= 0:
+			cause = nil
+		case rows == 1:
+			cause = cause[len(cause)-1:]
+		case rows == 2:
+			cause = []string{cause[0], cause[len(cause)-1]}
+		default:
+			cause = append([]string{cause[0], clampWidth(causeOmittedMarker, innerW)}, cause[len(cause)-(rows-2):]...)
+		}
+	}
 	lines := in.logLines
-	avail := rows
-	if in.failReason != "" {
-		avail-- // reserve the top row for the cause
-	}
-	if avail < 0 {
-		avail = 0
-	}
+	avail := max(rows-len(cause), 0)
 	if len(lines) > avail {
 		lines = lines[len(lines)-avail:]
 	}
-	body := make([]string, 0, len(lines)+1)
-	if in.failReason != "" {
-		body = append(body, in.failReason)
+	return append(cause, lines...)
+}
+
+// causeOmittedMarker replaces the middle of a failure cause too tall for the
+// error pane. The full text is in the operation's result.
+const causeOmittedMarker = "[... lines omitted; full error: slagctl operation show <op-id>]"
+
+// wrapLines splits s on newlines and hard-wraps each line to w terminal cells
+// (cell-aware, so wide characters in a script's stderr cannot overflow the
+// row budget). Empty s yields no lines; w < 1 disables wrapping.
+func wrapLines(s string, w int) []string {
+	if s == "" {
+		return nil
 	}
-	return append(body, lines...)
+	return strings.Split(ansi.Hardwrap(strings.TrimRight(s, "\n"), w, true), "\n")
 }
 
 // clampWidth truncates a line to w display cells (rune count; log lines are
