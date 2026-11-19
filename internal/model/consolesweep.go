@@ -1,5 +1,11 @@
 package model
 
+import (
+	"fmt"
+	"regexp"
+	"slices"
+)
+
 // Console determination sweep (commission-time discovery of
 // slagworks_kernel_params).
 //
@@ -42,4 +48,29 @@ type ConsoleSweepCandidate struct {
 	TTY   string `json:"tty"`
 	Baud  int    `json:"baud"`
 	Nonce string `json:"nonce"`
+}
+
+// consoleSweepNonceRE is the shape of the nonce the agent generates for
+// each candidate: 8 random bytes, hex-encoded (consoleprobe.randomNonce).
+var consoleSweepNonceRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+// Validate returns an error unless c is a candidate the agent's sweep can
+// produce: a tty in ConsoleSweepTTYs, probed at ConsoleSweepBaud, with a
+// 16-lowercase-hex nonce. The commission report that carries the sweep is
+// written by the machine under commission, so global checks every
+// candidate before its TTY and Baud can become the device-type's shared
+// slagworks_kernel_params or its Nonce is scanned for in the console
+// stream (an empty, wildcard or short literal nonce matches ordinary boot
+// output).
+func (c ConsoleSweepCandidate) Validate() error {
+	if !slices.Contains(ConsoleSweepTTYs, c.TTY) {
+		return fmt.Errorf("tty %q is not a sweep candidate %v", c.TTY, ConsoleSweepTTYs)
+	}
+	if c.Baud != ConsoleSweepBaud {
+		return fmt.Errorf("baud %d is not the sweep baud %d", c.Baud, ConsoleSweepBaud)
+	}
+	if !consoleSweepNonceRE.MatchString(c.Nonce) {
+		return fmt.Errorf("nonce %q is not 16 lowercase hex characters", c.Nonce)
+	}
+	return nil
 }

@@ -1225,6 +1225,7 @@ func TestCacheHandleProgressReport_PhoneHomeReplayAfterCompletionIsIdempotent(t 
 	}}})
 	seedOpsResync(c, model.Operation{
 		ID: opID, MachineID: machineID, Type: model.OpDeploy, Status: model.OpRunning,
+		Phase: "awaiting_phone_home",
 	})
 
 	report := &model.ProgressReport{

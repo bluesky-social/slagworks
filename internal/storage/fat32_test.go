@@ -38,12 +38,12 @@ func TestPlan_VFATPartitionBelowFAT32MinimumRejected(t *testing.T) {
 		wantMin string // "" when the size is accepted
 	}{
 		{512, "32M", "33M"},
-		{512, "67583", "33M"}, // 33 MiB less one sector
+		{512, "33791K", "33M"}, // 33 MiB less two sectors
 		{512, "33M", ""},
 		{512, "34M", ""},
 		{512, "256M", ""},
 		{4096, "256M", "257M"},
-		{4096, "65791", "257M"}, // 257 MiB less one sector
+		{4096, "263164K", "257M"}, // 257 MiB less one sector
 		{4096, "257M", ""},
 		{4096, "258M", ""},
 		{4096, "512M", ""},
@@ -136,8 +136,7 @@ func TestPartitionBytes(t *testing.T) {
 		{"1G", 512, 1 << 30},
 		{"2T", 4096, 2 << 40},
 		{"64K", 4096, 64 << 10},
-		{"2048", 512, 1 << 20},  // no suffix: sectors, as sgdisk reads it
-		{"2048", 4096, 8 << 20}, // no suffix: sectors, as sgdisk reads it
+		{"6K", 4096, 4 << 10}, // rounded down to whole sectors
 	}
 	for _, c := range cases {
 		got, err := partitionBytes(c.size, c.sector)
@@ -145,9 +144,12 @@ func TestPartitionBytes(t *testing.T) {
 			t.Errorf("partitionBytes(%q, %d) = %d, %v; want %d", c.size, c.sector, got, err, c.want)
 		}
 	}
-	for _, bad := range []string{"", "M", "1.5G", "-1G", "512MB", "10X", "99999999999999E"} {
+	// A bare number is a sector count to sgdisk, so its size would depend on
+	// the disk; the layout grammar requires a unit. Under 4K is no sectors
+	// at all on a 4Kn disk.
+	for _, bad := range []string{"", "M", "2048", "0M", "3K", "1.5G", "-1G", "+1G", "512MB", "10X", "1P", "9999999999T"} {
 		if _, err := partitionBytes(bad, 512); err == nil {
-			t.Errorf("partitionBytes(%q) accepted a size sgdisk would not read as one", bad)
+			t.Errorf("partitionBytes(%q) accepted a size outside the layout grammar", bad)
 		}
 	}
 }

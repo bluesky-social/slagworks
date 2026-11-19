@@ -1,6 +1,30 @@
 package consoleprobe
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/bluesky-social/slagworks/internal/model"
+)
+
+// TestSweepCandidatesPassGlobalValidation: global ignores any sweep
+// candidate that fails model.ConsoleSweepCandidate.Validate, so the
+// candidates Sweep builds (each tty in model.ConsoleSweepTTYs at
+// model.ConsoleSweepBaud with a randomNonce) must pass it, or every
+// determination sweep would silently resolve nothing.
+func TestSweepCandidatesPassGlobalValidation(t *testing.T) {
+	for _, tty := range model.ConsoleSweepTTYs {
+		for range 64 {
+			nonce, err := randomNonce()
+			if err != nil {
+				t.Fatalf("randomNonce: %v", err)
+			}
+			c := model.ConsoleSweepCandidate{TTY: tty, Baud: model.ConsoleSweepBaud, Nonce: nonce}
+			if err := c.Validate(); err != nil {
+				t.Fatalf("candidate %+v as Sweep builds it fails global validation: %v", c, err)
+			}
+		}
+	}
+}
 
 // TestParseConsoleParams pins the kernel-cmdline parsing for
 // Probe. The big subtle point is "last match wins" —

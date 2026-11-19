@@ -3,6 +3,9 @@ package power
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -19,8 +22,14 @@ type fakePDUConn struct {
 	states map[int]State
 	// cmds records every cli() invocation in order.
 	cmds []string
-	// failCmd: if the command string contains this substring, cli errors.
+	// failCmd: if the command string contains this substring, cli errors
+	// without applying the command (the NMC never ran it).
 	failCmd string
+	// lostOutputCmd: if the command string contains this substring, cli
+	// applies the command and then returns the transport error the
+	// production conn gives when the session drops before the E-code
+	// arrives (the NMC ran it, but the caller cannot tell).
+	lostOutputCmd string
 	// stateErr: outletState returns this error when non-nil.
 	stateErr error
 }
@@ -49,6 +58,9 @@ func (f *fakePDUConn) cli(_ context.Context, command string) (string, error) {
 		// Atomic cycle: ends with the outlet back On.
 		fmt.Sscanf(command, "olDlyReboot %d", &idx)
 		f.states[idx] = StateOn
+	}
+	if f.lostOutputCmd != "" && strings.Contains(command, f.lostOutputCmd) {
+		return "", fmt.Errorf("pdu %s %q: no output (transport failure)", f.host, command)
 	}
 	return "E000: Success", nil
 }
@@ -184,6 +196,50 @@ func TestPDU_PowerOff_PartialFailureRollsBack(t *testing.T) {
 	}
 }
 
+// TestPDU_PowerOff_LostOutputRollsBackFailingFeed covers an olOff the NMC
+// executed but whose output the transport lost (session dropped before the
+// E-code arrived). The cli error does not mean the outlet stayed on, so the
+// rollback must also issue olOn to the feed whose olOff errored; otherwise
+// the box is left on one PSU while the error claims redundancy was restored.
+func TestPDU_PowerOff_LostOutputRollsBackFailingFeed(t *testing.T) {
+	fa := newFakePDUConn("pdu-left")
+	fb := newFakePDUConn("pdu-right")
+	fb.lostOutputCmd = "olOff" // right feed is cut, but its result is lost
+	specs := []PDUOutletSpec{
+		{Host: "pdu-left", Outlet: 4},
+		{Host: "pdu-right", Outlet: 4},
+	}
+	p := newTestPDUController(t, specs, map[string]*fakePDUConn{"pdu-left": fa, "pdu-right": fb})
+
+	if err := p.PowerOff(context.Background()); err == nil {
+		t.Fatal("expected PowerOff to fail when a feed's olOff result is lost")
+	}
+	if fa.states[4] != StateOn || fb.states[4] != StateOn {
+		t.Errorf("after a failed PowerOff: left=%s right=%s, want both On (rolled back to fully redundant)",
+			fa.states[4], fb.states[4])
+	}
+	wantRight := []string{"olOff 4", "olOn 4"}
+	if len(fb.cmds) != 2 || fb.cmds[0] != wantRight[0] || fb.cmds[1] != wantRight[1] {
+		t.Errorf("right cmds = %v, want %v (failed cut, then rollback)", fb.cmds, wantRight)
+	}
+}
+
+// TestPDU_PowerOff_SingleFeedLostOutputRollsBack is the single-feed form:
+// the only outlet's olOff runs but its output is lost. A failed PowerOff
+// must not leave the box off.
+func TestPDU_PowerOff_SingleFeedLostOutputRollsBack(t *testing.T) {
+	f := newFakePDUConn("pdu-a")
+	f.lostOutputCmd = "olOff"
+	p := newTestPDUController(t, []PDUOutletSpec{{Host: "pdu-a", Outlet: 5}}, map[string]*fakePDUConn{"pdu-a": f})
+
+	if err := p.PowerOff(context.Background()); err == nil {
+		t.Fatal("expected PowerOff to fail when the olOff result is lost")
+	}
+	if f.states[5] != StateOn {
+		t.Errorf("after a failed PowerOff: outlet 5 is %s, want On (rolled back)", f.states[5])
+	}
+}
+
 func TestPDU_PowerStatus_AnyOnPinsOn(t *testing.T) {
 	fa := newFakePDUConn("pdu-left")
 	fb := newFakePDUConn("pdu-right")
@@ -224,6 +280,63 @@ func TestPDU_PowerStatus_NoLiveFeedPlusErrorIsUnknown(t *testing.T) {
 	}
 	if err == nil {
 		t.Error("expected error surfaced with Unknown")
+	}
+}
+
+// TestPDU_PowerStatus_UnrecognizedPlusOffIsUnknown: one feed answers with a
+// state that is neither On nor Off, the other reads Off. The unrecognized
+// feed may be the one powering the box, so the aggregate must be Unknown,
+// not Off (Off would make the executor PowerOn instead of PowerCycle a box
+// that is already running).
+func TestPDU_PowerStatus_UnrecognizedPlusOffIsUnknown(t *testing.T) {
+	fa := newFakePDUConn("pdu-left")
+	fb := newFakePDUConn("pdu-right")
+	fa.states[4] = StateUnknown
+	fb.states[4] = StateOff
+	specs := []PDUOutletSpec{{Host: "pdu-left", Outlet: 4}, {Host: "pdu-right", Outlet: 4}}
+	p := newTestPDUController(t, specs, map[string]*fakePDUConn{"pdu-left": fa, "pdu-right": fb})
+
+	st, err := p.PowerStatus(context.Background())
+	if st != StateUnknown || err != nil {
+		t.Errorf("PowerStatus = (%s, %v), want (unknown, nil): the unrecognized feed may be live", st, err)
+	}
+}
+
+// TestPDU_PowerStatus_UnrecognizedRedfishPlusOffIsUnknown drives the same
+// case through the production Redfish reader: two TLS servers stand in for
+// the two NMCs. Feed A answers HTTP 200 with a SwitchedState the reader does
+// not recognize (or none at all), which it reports as (Unknown, nil); feed B
+// answers Off.
+func TestPDU_PowerStatus_UnrecognizedRedfishPlusOffIsUnknown(t *testing.T) {
+	serve := func(t *testing.T, body string) string {
+		t.Helper()
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(srv.Close)
+		return strings.TrimPrefix(srv.URL, "https://")
+	}
+	for _, bodyA := range []string{
+		`{"Oem":{"SwitchedState":"Rebooting"}}`,
+		`{"Oem":{}}`,
+		`{}`,
+	} {
+		t.Run(bodyA, func(t *testing.T) {
+			hostA := serve(t, bodyA)
+			hostB := serve(t, `{"Oem":{"SwitchedState":"Off"}}`)
+			p, err := NewPDUController(context.Background(),
+				[]PDUOutletSpec{{Host: hostA, Outlet: 1}, {Host: hostB, Outlet: 1}}, nil)
+			if err != nil {
+				t.Fatalf("NewPDUController: %v", err)
+			}
+			t.Cleanup(func() { _ = p.Close(context.Background()) })
+
+			st, err := p.PowerStatus(context.Background())
+			if st != StateUnknown || err != nil {
+				t.Errorf("PowerStatus = (%s, %v), want (unknown, nil): feed A's state is unreadable and may be live", st, err)
+			}
+		})
 	}
 }
 

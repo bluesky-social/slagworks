@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/bluesky-social/slagworks/internal/agent"
 )
@@ -21,6 +22,12 @@ import (
 // custom field; the site worker mirrors it via snapshot. A 204 (empty
 // body) means the device-type's slagworks_kernel_params is unset, which
 // is a hard fail (deploy refused).
+//
+// The value is trimmed and then refused if it still contains a control
+// character. Both bootloader configs carry the kernel params on a single
+// line (the systemd-boot entry's options line, and the linux line that
+// update-grub writes into grub.cfg), so a line break would add a line of
+// its own and a tab would not reach the kernel as written.
 //
 // Empty machineID is a development-only stdout-mode convenience; the
 // production deploy path always sets it on the cmdline. Fall back to a
@@ -37,7 +44,15 @@ func FetchKernelParams(ctx *agent.Context, machineID string) (string, error) {
 	if len(kpBytes) == 0 {
 		return "", fmt.Errorf("kernel-params: device-type has no slagworks_kernel_params; refusing deploy")
 	}
-	return strings.TrimSpace(string(kpBytes)), nil
+	kp := strings.TrimSpace(string(kpBytes))
+	for i, r := range kp {
+		if unicode.IsControl(r) {
+			return "", fmt.Errorf("kernel-params %q: control character %U at byte %d; refusing deploy. "+
+				"Set the NetBox device-type custom field slagworks_kernel_params to one line of "+
+				"space-separated kernel arguments", kp, r, i)
+		}
+	}
+	return kp, nil
 }
 
 // download fetches a URL to a local path via wget, with retries.
@@ -267,11 +282,17 @@ func grubInstallOnDisks(ctx *agent.Context, target string, disks []string) error
 // already exists it's replaced; otherwise the line is appended. The
 // stock noble file ships GRUB_CMDLINE_LINUX="" so the replace branch is
 // the common case.
+//
+// The file is a shell fragment that update-grub sources as root, so the
+// value is single-quoted, with each embedded single quote written as
+// close-quote, backslash-quote, reopen-quote. The shell then reads it back
+// byte for byte and expands nothing. Double quotes would leave $, ` and \
+// live.
 func SetGrubDefaultCmdline(path, cmdline string) error {
 	// gosec G304/G703: path is a parameter but the sole production
 	// caller passes the constant /target/etc/default/grub (tests pass a
 	// t.TempDir path). Not attacker-controlled.
-	line := fmt.Sprintf("GRUB_CMDLINE_LINUX=%q", cmdline)
+	line := "GRUB_CMDLINE_LINUX='" + strings.ReplaceAll(cmdline, "'", `'\''`) + "'"
 	existing, err := os.ReadFile(path) //nolint:gosec // constant path in prod
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -628,8 +649,9 @@ func SplitDiskPart(part string) (string, int, error) {
 // installed OS. kernelParams comes from the site worker's
 // /api/v1/machines/<id>/kernel-params endpoint, which mirrors
 // MachineSnapshot.KernelParams (sourced from NetBox device-type
-// custom field). Sentinel "none" -> no console= written. Empty
-// string is rejected by the caller before reaching here.
+// custom field). Sentinel "none" -> no console= written. FetchKernelParams
+// refuses an empty value and any control character before it gets here,
+// so kernelParams cannot add a line to the entry.
 func GenerateBootEntry(rootUUID, kernelParams string) string {
 	cmdlineExtra := ""
 	if kernelParams != "none" {

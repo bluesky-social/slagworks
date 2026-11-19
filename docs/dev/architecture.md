@@ -102,7 +102,9 @@ Modes (dispatched from `main.go` around line 165):
 All agent-to-site traffic is plain HTTP against the site worker's
 HTTP-boot server (see [Boot handlers](#boot-handlers)). The final
 phone-home is done by a systemd unit written by the agent
-(`generatePhoneHomeUnit`, `main.go:1484`), not by the agent itself.
+(`target.GeneratePhoneHomeUnit`, `internal/agent/target/target.go`), not
+by the agent itself; it POSTs a `phone_home` report carrying the machine
+and operation IDs to `/api/v1/report`.
 
 ### `slagctl`
 
@@ -166,9 +168,12 @@ Site-only components (constructed in `runSite`):
 - VIP monitor (`internal/worker/ha.go`).
 
 The site worker connects up over WebSocket. URL is built in
-`internal/worker/wsconn.go:443` (`buildURL`): it takes `GlobalURL`
+`internal/worker/wsconn.go:515` (`buildURL`): it takes `GlobalURL`
 (`SLAGWORKS_API_URL`), rewrites `http[s]://` to `ws[s]://`, and
-appends `/api/v1/ws/site?token=<SLAGWORKS_TOKEN>`. The token is
+appends `/api/v1/ws/site`. The worker sends `SLAGWORKS_TOKEN` in the
+upgrade request's `Authorization: Bearer` header (`dialOptions`), never
+in the URL: net/http quotes the full URL in dial errors, which the worker
+logs and forwards to global, and request loggers record it. The token is
 opaque; the hub looks it up in `site_workers.token_hash` (via
 `store.HashWorkerToken`) and derives the site slug from the row, so a
 worker cannot claim a site it does not own. On connect the worker
@@ -239,7 +244,12 @@ that the endpoint is disabled. Handled models:
 
 - `device`: `created` / `updated` / `deleted` — resolves the owning
   `site_config` via `snapshot.ClaimResolver` and calls the matching
-  `mirror.OnDevice*` verb.
+  `mirror.OnDevice*` verb. An `updated` that changes the device's site
+  or location also calls `mirror.OnDeviceMoved`, which invalidates every
+  `site_config`: the resolver names only the config that claims the
+  device now, and NetBox's prechange snapshot names the old site and
+  location only by id, so the config the device left can't be resolved
+  directly.
 - `site`: only `updated` — enforces slug immutability and returns 409
   on a rename of a managed site.
 
@@ -270,7 +280,15 @@ Interfaces and cables are more permissive: `ReconcileInterfaces` will
 create, patch (including rename), and delete NetBox interfaces to match
 the NICs the agent reports, but with a protected-set
 (`isProtectedInterface`) that leaves management, LAG, and virtual
-interfaces alone. On switches (device role `leaf`, `spine`,
+interfaces alone. A row's identity is its MAC: every reported MAC is
+matched to its row before any NIC falls back to matching by name, so
+when the initrd's kernel names shift (a card added or replaced) a row is
+renamed to follow its MAC and keeps its lag, IPs and cable. Setting a
+NIC's MAC is two writes (assign a MAC object, then mark it primary); a
+run that finds the MAC object already assigned but not primary marks it
+primary instead of creating another. That includes the protected `ipmi`
+row matching the BMC MAC, the one write reconcile makes to a protected
+row. On switches (device role `leaf`, `spine`,
 `oob-switch`) interface names and the row set are operator-owned: the
 commission initrd's kernel names (`enp3s0npN`, `eno1`) are not the
 operational `swpN`/`eth0`, so reconcile only patches non-name fields of
@@ -456,8 +474,15 @@ cast pipeline, and the `SourceSOL` constant no longer exists.
 - Registers each connection under its `SiteSlug` derived from the
   token (`register`, 373).
 - Fans snapshot pushes out to every connected worker for the slug
-  (`Push`, 301) — one goroutine per worker, per-connection write
-  order preserved via `workerConn.writeMu`.
+  (`Push`, 301). Each connection has one outbound queue, drained by its
+  own writer goroutine, that carries both snapshot pushes and op-stream
+  messages, so a worker receives them in the order the hub published
+  them and a slow worker never delays the others. A queue that fills
+  (the worker stopped reading) force-closes the connection, and the
+  reconnect's hello resends the snapshot and the op set. A push whose
+  SeqNum is below the cached one closes the slug's connections instead,
+  so each worker reconnects and adopts the new snapshot from its hello
+  reply.
 - On hello, sends a snapshot or `no_change`. Coalesces concurrent
   hello-triggered rebuilds through a
   `singleflight.Group` (`helloRebuild`, 226).
@@ -541,7 +566,11 @@ under the cache lock:
   snapshot (see [WebSocket transport](#websocket-transport)).
 
 The cache rejects an out-of-order snapshot (SeqNum equal or less than
-the current). It runs `imagepull.SyncImages` synchronously under
+the current), except the first snapshot on each connection, which
+`WSConn` applies with `AdoptSnapshot` whatever its SeqNum: it is
+global's current view, and global's per-site counter can go backwards
+(site config deleted and recreated, database restored, worker pointed
+at another global). It runs `imagepull.SyncImages` synchronously under
 `imageSyncMu` on every apply (`cache.go:578`) — that is what pulls
 images to disk if the snapshot points at a new SHA. `OnSnapshotApplied`
 callbacks fire outside the lock; today the cast manager and DHCP
@@ -562,8 +591,8 @@ handler, and the executor):
 - `GetDHCPConfig`, `GetOOBConfig`, `GetSSHKeys`, `GetSiteInfo`.
 
 Observation intake (called from the HTTP-boot handler when the agent
-POSTs `/api/v1/report` or `/api/v1/inventory` or the phone-home
-service POSTs `/api/v1/phone-home`):
+or the installed OS's phone-home service POSTs `/api/v1/report`, or
+the agent POSTs `/api/v1/inventory`):
 
 - `RecordDeployComplete` (382), `RecordPhoneHome` (404),
   `RecordCommissionReport` (434), `RecordInventoryReport` (446).
@@ -582,7 +611,12 @@ rides an observation. Both are queued for the WebSocket drain
 (`cache.go:334 appendObservation`, `685 DrainOutbox`, `805 RequeueOutbox`,
 `824 AckObservation`, `843 ReloadOutboxFromDisk`). Retry backoff is in
 `armRetryTimerLocked` (724) and `RequeueRejected` (772). This is why
-a site worker restart does not lose commission reports.
+a site worker restart does not lose commission reports. The one entry
+the drain never sends is one whose encoded `observation` message exceeds
+`ws.MaxMessageBytes` (16 MiB, the hub's read limit) or cannot be encoded:
+`WSConn.drainOnce` logs it at error level and deletes its row, because
+the hub would close the connection on it and the reconnect would put it
+first in line again.
 
 ### Executor — `internal/worker/executor.go`
 
@@ -652,7 +686,10 @@ snapshot's images map. For each image it compares the on-disk
 `sha256`; on mismatch it downloads the tarball from the URL in the
 image row and calls `extractTarGz` (`imagepull.go:173`). Idempotent
 and safe under concurrent snapshot applies (see
-`imageSyncMu` in the cache).
+`imageSyncMu` in the cache). The image name becomes the directory it
+removes and replaces, so it skips, with an error, a name that fails
+`model.ValidateImageName` before downloading anything, and still syncs
+the other images; the API applies the same rule when the row is written.
 
 ## The on-target agent
 
@@ -670,10 +707,9 @@ matter to contributors:
   `internal/httpboot/handler.go`):
 
   ```text
-  POST /api/v1/report                            (progress, phase, failure, deploy_complete, commission_report)
+  POST /api/v1/report                            (progress, phase, failure, deploy_complete, commission_report; phone_home from the installed OS)
   POST /api/v1/inventory
   POST /logs/ingest                              (log envelopes)
-  POST /api/v1/phone-home?mac=...                (from the installed OS)
   GET  /boot/ipxe?mac=...
   GET  /boot/ssh-keys
   GET  /files/bin/slagworks-agent
@@ -719,8 +755,8 @@ Unauthenticated:
 - `GET /metrics` — Prometheus.
 - `GET /api/v1/client-config` — the OIDC issuer and public client ID
   `slagctl auth login` reads before it has a token.
-- `GET /api/v1/ws/site` — the hub mount. Auth is `?token=`, checked
-  by the hub itself.
+- `GET /api/v1/ws/site` — the hub mount. Auth is the worker token in
+  the `Authorization: Bearer` header, checked by the hub itself.
 - `POST /api/v1/hooks/netbox` — the NetBox webhook. HMAC-signed.
 
 OIDC-protected under `/api/v1` (middleware in `internal/api/oidcauth.go`):
@@ -873,8 +909,13 @@ store.
 `internal/slogkit/envelope.go`:
 
 - `Source` (line 20) — `SourceGlobal`, `SourceSite`, `SourceAgent`.
-  (`source=sol` was the older SOL path; ingest rejects it loudly so a
-  stale worker binary fails visibly. SOL rides the cast pipeline.)
+  `source=global` rows are written only by global's store, inside
+  the op-transition transaction (`store/op_events.go`), and the watch
+  TUI trusts them as the op's terminal signal; a worker `log_batch`
+  carrying one is rejected whole, as is any source other than `agent`
+  or `site`. (`source=sol` was the older SOL path; ingest rejects it
+  loudly so a stale worker binary fails visibly. SOL rides the cast
+  pipeline.)
 - `Envelope` (line 42) — `TS`, `Level`, `Source`, `Host`, `Msg`,
   `MachineID`, `MachineName`, `OpID`, `Phase`, `TraceID`,
   `ReceivedAt`, `Extra` (map). `MarshalJSON` elides zero UUIDs.
@@ -906,7 +947,12 @@ Agent produces a slog line:
 2. `agentlog.Client.Run` batches envelopes and
    POSTs to `http://<site>/logs/ingest`.
 3. The site's `httpboot.Handler.handleLogsIngest` unmarshals and
-   pushes into the site's `logring.Ring`.
+   pushes into the site's `logring.Ring`. The endpoint is
+   unauthenticated, so it refuses (400) any batch holding an envelope
+   whose `source` is not `agent`: global and site envelopes carry op
+   lifecycle and phase events that the interactive
+   `slagctl operation watch` trusts, and no host on a served segment
+   may assert them.
 
 Site produces a slog line: directly into the same `logring.Ring`
 via the site slog handler's sink.
@@ -914,10 +960,16 @@ via the site slog handler's sink.
 From the site ring:
 
 1. `WSConn.logRingDrainLoop` (`worker/wsconn.go:601`) drains the ring
-   and calls `sendLogBatch` (691) with `TypeLogBatch`.
+   and calls `sendLogBatch` (691) with `TypeLogBatch`. A batch holds at
+   most 256 envelopes whose encoded sizes total at most 4 MiB (plus the
+   array and message wrapper), so it stays well under the 16 MiB message
+   limit both ends of the WebSocket read with; `Ring.Drain` drops (and
+   counts in `dropped`) a single envelope too large for a batch. Global
+   checks only the 16 MiB limit, not the batch policy.
 2. Hub dispatches to `hubhandlers.LogBatch.HandleLogBatch`.
-3. Handler inserts into `log_envelopes` and pushes into the global
-   `logring.Ring`, and re-emits JSONL on stdout for the fleet
+3. Handler rejects the batch if any envelope's source is not `agent`
+   or `site`, then inserts into `log_envelopes` and pushes into the
+   global `logring.Ring`, and re-emits JSONL on stdout for the fleet
    log-shipper.
 
 `slagctl logs` and `slagctl operation watch` open a WebSocket to
