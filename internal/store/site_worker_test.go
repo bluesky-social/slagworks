@@ -269,6 +269,48 @@ func TestResolveSiteWorker_ByFQDN(t *testing.T) {
 	}
 }
 
+// TestResolveSiteWorker_ByUUIDShapedWorkerID: slagworksd generates a uuid
+// for its worker_id unless SLAGWORKS_WORKER_ID overrides it, so a worker_id
+// that parses as a uuid is the default, and it must still resolve even
+// though no row has that id.
+func TestResolveSiteWorker_ByUUIDShapedWorkerID(t *testing.T) {
+	st := testStore(t)
+	workerID := uuid.NewString()
+	w, _, err := st.RegisterSiteWorker("pop3", workerID, "a.pop3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.ResolveSiteWorker(workerID)
+	if err != nil {
+		t.Fatalf("resolve worker_id %s: %v", workerID, err)
+	}
+	if got.ID != w.ID {
+		t.Fatalf("resolved id %s, want %s", got.ID, w.ID)
+	}
+}
+
+// TestResolveSiteWorker_IDWinsOverWorkerID: when the identifier is one
+// row's id and another row's worker_id, the id match wins. The uuid is
+// what slagctl tells an operator to use to disambiguate, so it must keep
+// naming exactly one row.
+func TestResolveSiteWorker_IDWinsOverWorkerID(t *testing.T) {
+	st := testStore(t)
+	byID, _, err := st.RegisterSiteWorker("pop3", "worker-a", "a.pop3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.RegisterSiteWorker("pop4", byID.ID.String(), "b.pop4"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.ResolveSiteWorker(byID.ID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != byID.ID {
+		t.Fatalf("resolved id %s, want %s", got.ID, byID.ID)
+	}
+}
+
 func TestResolveSiteWorker_NotFound(t *testing.T) {
 	st := testStore(t)
 	if _, err := st.ResolveSiteWorker("ghost"); !errors.Is(err, ErrSiteWorkerNotFound) {

@@ -2,9 +2,20 @@ package model
 
 import (
 	"encoding/json"
+	"errors"
 
 	"github.com/google/uuid"
 )
+
+// ErrOperationNotActive is wrapped by MachineProvider.HandleProgressReport
+// when the report names an operation the site knows is over: global removed
+// it (operator abort, a timeout sweep, completion) or it reached a terminal
+// status locally. It is a final answer, not a transient one: nothing the
+// reporter retries will make the operation active again. The report
+// endpoint answers it with 410 Gone, and an on-target agent whose own final
+// report has not been accepted stops on it. A provider that cannot tell yet
+// (its operation set is not synchronized with global) must not wrap it.
+var ErrOperationNotActive = errors.New("operation is not active")
 
 type BootAction int
 
@@ -173,5 +184,8 @@ type MachineProvider interface {
 	DeployOpForMAC(mac string) *Operation
 	CommissionOpForMAC(mac string) *Operation
 	GetSSHKeys() []string
+	// HandleProgressReport validates and applies one agent report. An
+	// error wrapping ErrOperationNotActive means the report's operation is
+	// over for good; any other error is a rejection the reporter may retry.
 	HandleProgressReport(report *ProgressReport) error
 }
