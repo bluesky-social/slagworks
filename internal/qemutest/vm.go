@@ -146,6 +146,21 @@ type VMConfig struct {
 	// test can construct a FakeBMC that dials it.
 	BMCQMPPath string
 
+	// NetBootIndex, when > 0, puts bootindex=<n> on the primary NIC and
+	// drops the legacy `-boot order=` argument. OVMF ignores `-boot order`
+	// and, with no bootindex anywhere, tries disks before the NIC, so a VM
+	// whose disk already carries a bootloader never PXE-boots. Redeploy
+	// tests (the storage property suite) set this to 1 so the NIC is first
+	// under both firmwares, matching the production "PXE is boot-order #1"
+	// invariant. Default 0 preserves every existing test.
+	NetBootIndex int
+
+	// ExtraArgs are raw QEMU arguments appended after the harness-built
+	// device list. The storage property suite uses them with NoPrimaryDisk
+	// to attach disks with a bus, block size, bootindex and discard mode
+	// ExtraDisk cannot express.
+	ExtraArgs []string
+
 	// BMC, when non-nil, attaches a simulated BMC to the VM via
 	// QEMU's ipmi-bmc-extern + isa-ipmi-kcs devices. Inside the guest
 	// this surfaces as /dev/ipmi0 once the kernel's ipmi_si +
@@ -265,6 +280,9 @@ func (vm *VM) buildArgs() []string {
 	net0Device := fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s", vm.Config.MAC)
 	if vm.Config.Firmware == UEFI {
 		net0Device += ",romfile=" + iPXEEFIROMPath()
+	}
+	if vm.Config.NetBootIndex > 0 {
+		net0Device += fmt.Sprintf(",bootindex=%d", vm.Config.NetBootIndex)
 	}
 	// Two serial ports, both captured.
 	//   - ttyS0: unix-socket chardev. Carries iPXE/SeaBIOS firmware
@@ -409,10 +427,17 @@ func (vm *VM) buildArgs() []string {
 		bootOrder = "n"
 	}
 	bootOpts := []string{"order=" + bootOrder}
+	if vm.Config.NetBootIndex > 0 {
+		// bootindex and the legacy order string are alternatives.
+		bootOpts = nil
+	}
 	if vm.Config.StrictBoot {
 		bootOpts = append(bootOpts, "strict=on")
 	}
-	args = append(args, "-boot", strings.Join(bootOpts, ","))
+	if len(bootOpts) > 0 {
+		args = append(args, "-boot", strings.Join(bootOpts, ","))
+	}
+	args = append(args, vm.Config.ExtraArgs...)
 	if vm.Config.StartPaused {
 		args = append(args, "-S")
 	}
