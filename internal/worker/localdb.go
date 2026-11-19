@@ -78,7 +78,10 @@ type currentDeployOpRow struct {
 func (currentDeployOpRow) TableName() string { return "current_deploy_ops" }
 
 func OpenLocalDB(path string) (*LocalDB, error) {
-	db, err := gorm.Open(sqlite.Open(path+"?_journal_mode=WAL"), &gorm.Config{
+	// glebarez/go-sqlite runs each _pragma= value on every new pool
+	// connection, after its default busy_timeout(5000). It ignores
+	// mattn/go-sqlite3-style parameters such as _journal_mode.
+	db, err := gorm.Open(sqlite.Open(path+"?_pragma=journal_mode(WAL)"), &gorm.Config{
 		Logger: logger.Discard,
 	})
 	if err != nil {

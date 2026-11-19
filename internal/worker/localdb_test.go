@@ -199,6 +199,69 @@ func TestLocalDB_ReopenIdempotent(t *testing.T) {
 	}
 }
 
+// TestLocalDB_OpensInWALMode verifies OpenLocalDB leaves the file in WAL
+// journal mode, as LocalDB's doc comment promises. In the default
+// rollback-journal (delete) mode a reader and a writer block each other
+// and only the driver's 5s busy timeout absorbs the wait; past it,
+// AppendOutbox fails and the observation stays in memory only. The
+// glebarez/go-sqlite driver applies pragmas only from _pragma=... DSN
+// parameters, so a mattn-style _journal_mode=WAL is silently ignored.
+//
+// The existing-file case is the upgrade path: a worker.db created in
+// delete mode by an earlier binary must be switched to WAL on open.
+func TestLocalDB_OpensInWALMode(t *testing.T) {
+	t.Run("fresh file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "worker.db")
+		assertWALAfterOpen(t, path)
+	})
+
+	t.Run("existing delete-mode file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "worker.db")
+		raw, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatalf("open raw sqlite: %v", err)
+		}
+		var mode string
+		if err := raw.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+			t.Fatalf("read seed journal_mode: %v", err)
+		}
+		if mode != "delete" {
+			t.Fatalf("seed journal_mode = %q, want delete (test precondition)", mode)
+		}
+		if _, err := raw.Exec(preGooseSchema[0]); err != nil {
+			t.Fatalf("seed ddl: %v", err)
+		}
+		raw.Close()
+		assertWALAfterOpen(t, path)
+	})
+}
+
+// assertWALAfterOpen opens path with OpenLocalDB, closes it, and checks
+// journal_mode from an independent connection. WAL mode is recorded in
+// the database file, so a fresh connection (or a second process, such as
+// `slagworksd site worker-id`) sees it without any DSN parameters.
+func assertWALAfterOpen(t *testing.T, path string) {
+	t.Helper()
+	db, err := OpenLocalDB(path)
+	if err != nil {
+		t.Fatalf("OpenLocalDB: %v", err)
+	}
+	closeLocalDB(t, db)
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("reopen raw sqlite: %v", err)
+	}
+	defer raw.Close()
+	var mode string
+	if err := raw.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("read journal_mode: %v", err)
+	}
+	if mode != "wal" {
+		t.Fatalf("journal_mode = %q after OpenLocalDB, want wal", mode)
+	}
+}
+
 func gooseVersion(t *testing.T, path string) int64 {
 	t.Helper()
 	raw, err := sql.Open("sqlite", path)
