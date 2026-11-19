@@ -250,6 +250,14 @@ Failure semantics (`cmd/slagworks-agent/main.go:1730-1786`):
   should get L3 netplan + FRR silently coming up DHCP-only — is a
   latent fabric break.
 
+stderr is the script's diagnostics channel, for both script kinds
+(`execkit.RunConfigScript`): it streams to the serial console, each
+line of its last 8 KiB is logged as a Warn envelope
+(`<kind> script stderr: ...`, visible in `slagctl machine logs`)
+whether or not the script succeeds, and on failure that tail is
+appended to the error the operation fails with. So a hard-fail message
+should say what is wrong in the NetBox model and what to change.
+
 ### Where the site worker serves them
 
 - `GET /api/v1/machines/:id/network-script` → 200 with the script
