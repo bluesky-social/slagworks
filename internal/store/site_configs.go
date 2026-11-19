@@ -67,14 +67,21 @@ func (s *Store) DeleteSiteConfig(slug string) error {
 	return s.db.Delete(&model.SiteConfig{}, "slug = ?", slug).Error
 }
 
-// BumpSiteSnapshotMeta atomically bumps last_snapshot_seq by 1 and sets
-// last_snapshot_hash in one UPDATE, returning the new seq. Called by the
-// snapshot dispatcher after determining the snapshot content changed.
+// BumpSiteSnapshotMeta sets last_snapshot_seq to the next value of the
+// site_snapshot_seq sequence and last_snapshot_hash to newHash in one
+// UPDATE, returning the new seq. Called by the snapshot dispatcher after
+// determining the snapshot content changed.
+//
+// The value comes from the sequence, not the row, so it is above every
+// SeqNum issued before, for this slug or any other. A slug's workers keep
+// their persisted SeqNum when its row is deleted, and drop any snapshot
+// whose SeqNum is not above it; a per-row counter would restart at 1 when
+// the row is re-created.
 func (s *Store) BumpSiteSnapshotMeta(slug, newHash string) (int64, error) {
 	var newSeq int64
 	err := s.db.Raw(`
 		UPDATE site_configs
-		SET last_snapshot_seq = last_snapshot_seq + 1,
+		SET last_snapshot_seq = nextval('site_snapshot_seq'),
 		    last_snapshot_hash = ?
 		WHERE slug = ?
 		RETURNING last_snapshot_seq

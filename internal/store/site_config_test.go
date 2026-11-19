@@ -72,26 +72,75 @@ func TestBumpSiteSnapshotMeta(t *testing.T) {
 	if err := st.CreateSiteConfig(&model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}); err != nil {
 		t.Fatal(err)
 	}
-	seq, err := st.BumpSiteSnapshotMeta("pop3", "hash-a")
+	first, err := st.BumpSiteSnapshotMeta("pop3", "hash-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seq != 1 {
-		t.Fatalf("first bump should return 1, got %d", seq)
+	if first <= 0 {
+		t.Fatalf("first bump should return a positive seq, got %d", first)
 	}
-	seq, err = st.BumpSiteSnapshotMeta("pop3", "hash-b")
+	second, err := st.BumpSiteSnapshotMeta("pop3", "hash-b")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seq != 2 {
-		t.Fatalf("second bump should return 2, got %d", seq)
+	if second <= first {
+		t.Fatalf("second bump returned %d, not above the first %d", second, first)
 	}
 	got, err := st.GetSiteConfig("pop3")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.LastSnapshotHash != "hash-b" || got.LastSnapshotSeq != 2 {
-		t.Fatalf("got hash=%q seq=%d", got.LastSnapshotHash, got.LastSnapshotSeq)
+	if got.LastSnapshotHash != "hash-b" || got.LastSnapshotSeq != second {
+		t.Fatalf("got hash=%q seq=%d, want hash=%q seq=%d", got.LastSnapshotHash, got.LastSnapshotSeq, "hash-b", second)
+	}
+}
+
+// TestBumpSiteSnapshotMetaSurvivesRecreate covers `slagctl site-config
+// delete` followed by `create` with the same slug. The slug's workers keep
+// their tokens and their persisted snapshot SeqNum across that, and
+// worker.Cache.ApplySnapshot drops any snapshot whose SeqNum is not above
+// the one it holds. So the first SeqNum issued after the re-create must be
+// above every SeqNum issued before the delete, or the workers silently
+// ignore global until the new count catches up.
+func TestBumpSiteSnapshotMetaSurvivesRecreate(t *testing.T) {
+	st := testStore(t)
+	mk := func() *model.SiteConfig {
+		return &model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}
+	}
+	if err := st.CreateSiteConfig(mk()); err != nil {
+		t.Fatal(err)
+	}
+	var last int64
+	for _, h := range []string{"hash-a", "hash-b", "hash-c"} {
+		seq, err := st.BumpSiteSnapshotMeta("pop3", h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seq <= last {
+			t.Fatalf("bump for %s returned %d, not above the previous %d", h, seq, last)
+		}
+		last = seq
+	}
+
+	if err := st.DeleteSiteConfig("pop3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSiteConfig(mk()); err != nil {
+		t.Fatal(err)
+	}
+	seq, err := st.BumpSiteSnapshotMeta("pop3", "hash-d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq <= last {
+		t.Fatalf("after delete and re-create, the next SeqNum for pop3 is %d, not above the %d its workers already applied", seq, last)
+	}
+	got, err := st.GetSiteConfig("pop3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastSnapshotSeq != seq || got.LastSnapshotHash != "hash-d" {
+		t.Fatalf("row holds seq=%d hash=%q, want seq=%d hash=%q", got.LastSnapshotSeq, got.LastSnapshotHash, seq, "hash-d")
 	}
 }
 

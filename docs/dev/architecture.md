@@ -343,7 +343,11 @@ and push it" lives. Interfaces at the top (`dispatcher.go:19`):
 gather all reads, call `Build`, compute `ContentHash`, compare with
 `cfg.LastSnapshotHash`, and either skip (metric label
 `skipped_no_change`) or bump `site_configs.last_snapshot_seq` and
-push (`success`). The per-scope filtering lives in
+push (`success`). The bump takes the next value of the
+`site_snapshot_seq` Postgres sequence, not the row's value plus one,
+so a slug's SeqNum keeps rising when its site config is deleted and
+re-created: its workers keep their persisted SeqNum and would drop
+anything lower. The per-scope filtering lives in
 `internal/snapshot/scope.go`: a device is included in a site's
 snapshot only if `Scope.ClaimsDevice(d)` returns true (whole-site
 configs claim everything under the NetBox site; location-scoped
