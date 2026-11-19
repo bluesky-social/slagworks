@@ -2421,6 +2421,9 @@ func (s *Server) updateSiteConfig(c *echo.Context) error {
 		return herr
 	}
 	if err := s.store.UpdateSiteConfig(cfg); err != nil {
+		if errors.Is(err, store.ErrSiteConfigNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound, "site_config not found")
+		}
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 	s.invalidateSite(cfg.Slug)
