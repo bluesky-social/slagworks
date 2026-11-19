@@ -473,6 +473,55 @@ func TestStaleResyncKeepsAwaitingPhoneHome(t *testing.T) {
 	}
 }
 
+// TestStalePendingRowKeepsAwaitingPhoneHome: the install finished on a deploy
+// op global still holds pending (the host PXEd on the pending-op clause while
+// the executor's claim kept failing), so global's echo of an earlier phase
+// update, or a reconnect resync built before the awaiting_phone_home update
+// reached it, carries a pending row at an older phase. It must not knock the
+// op off awaiting_phone_home any more than a claimed row may: the machine is
+// still commissioned, so the post-install PXE would get BootDeploy.
+func TestStalePendingRowKeepsAwaitingPhoneHome(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		apply func(c *Cache, row model.Operation)
+	}{
+		{"op_delta", func(c *Cache, row model.Operation) { c.ApplyOpDelta(row, "") }},
+		{"op_resync", func(c *Cache, row model.Operation) { seedOpsResync(c, row) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const mac = "52:54:00:15:10:58"
+			c := NewCache(nil)
+			id, opID := uuid.New(), uuid.New()
+			c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 1, Machines: []model.MachineSnapshot{{
+				ID: id, State: model.MachineStateCommissioned, PXEEligible: true,
+				Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}},
+			}}})
+			row := model.Operation{
+				ID: opID, MachineID: id, Type: model.OpDeploy,
+				Status: model.OpPending, Phase: "rsyncing_os", Version: 5,
+			}
+			seedOpsResync(c, row)
+			if err := c.HandleProgressReport(&model.ProgressReport{
+				MachineID: id.String(), OperationID: opID.String(), Event: "deploy_complete",
+			}); err != nil {
+				t.Fatalf("deploy_complete: %v", err)
+			}
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("precondition: got %d, want BootLocal", got)
+			}
+
+			row.Phase, row.Version = "finalizing", 6
+			tc.apply(c, row)
+			if op := c.GetOperation(opID.String()); op == nil || op.Version != 6 || op.Phase != "awaiting_phone_home" {
+				t.Fatalf("op = %+v, want version 6 phase awaiting_phone_home", op)
+			}
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("after a stale pending %s: got %d, want BootLocal (%d)", tc.name, got, model.BootLocal)
+			}
+		})
+	}
+}
+
 // TestAwaitingPhoneHomeSurvivesRestart: the install finishes while global is
 // unreachable, so the awaiting_phone_home phase update (and, once the host
 // phones home, the completion) sit in the in-memory op_update queue and
