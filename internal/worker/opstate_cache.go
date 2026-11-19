@@ -112,7 +112,10 @@ type phaseState struct {
 // post-install PXE gets BootDeploy, and the host re-deploys over the disk it
 // just installed (leaf-5.pop1 2026-10-24). Only completion
 // (op_removed) or failure may leave awaiting_phone_home — the same rule
-// updatePhase enforces against local phase writes.
+// updatePhase enforces against local phase writes. A pending row is held
+// too: the host can install on the pending-op boot clause while the claim
+// keeps failing, and global never moves an op back to pending, so a pending
+// row for a latched op is always older than the latch.
 func keepTerminalWait(existing, incoming *model.Operation) {
 	if existing == nil || existing.Phase != "awaiting_phone_home" {
 		return
@@ -120,7 +123,8 @@ func keepTerminalWait(existing, incoming *model.Operation) {
 	if incoming.Type != model.OpDeploy {
 		return
 	}
-	if incoming.Status != model.OpClaimed && incoming.Status != model.OpRunning {
+	if incoming.Status != model.OpPending && incoming.Status != model.OpClaimed &&
+		incoming.Status != model.OpRunning {
 		return
 	}
 	if incoming.Phase == "failed" {
@@ -446,12 +450,11 @@ func (o *opState) bootActionLocked(mac string) bootAction {
 	activeOp := o.activeLifecycleOpLocked(m.ID)
 	state := o.effectiveState(m.ID, m.State)
 
-	// The awaiting_phone_home latch holds in every machine state, not only
-	// deploying: the deploying overlay arrives on the claim's op_delta, so
-	// the install can finish while the machine still reads commissioned or
-	// failed here (a late claim delta, or a pending op the host PXE-booted
-	// on its own). The commissioned and failed rows below would otherwise
-	// serve BootDeploy and re-wipe the disk just installed.
+	// The install is done and the host is rebooting into its fresh disk, in
+	// every machine state, not only deploying: a host can PXE on the
+	// pending-op clause below and finish the install before the claim's
+	// op_delta moves the machine off commissioned/failed. Serving the
+	// installer here would run it over the disk it just wrote.
 	if activeOp != nil && activeOp.Type == model.OpDeploy && activeOp.Phase == "awaiting_phone_home" {
 		return bootAction{action: model.BootLocal}
 	}

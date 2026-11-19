@@ -201,8 +201,10 @@ slagctl storage-script delete <id>
 ```
 
 The API parses the script through `storage.ParseScript` at upload time, so a
-typo in a match field name, a bad regex, or a lingering `slagworks:kernel_params`
-header fails loudly rather than silently never matching.
+typo in a match field name, a bad regex, a misspelled directive
+(`slagworks:mtach`, `slagworks:match:`), or a lingering `slagworks:kernel_params`
+header fails the upload instead of silently changing which hosts the script
+matches.
 
 ### Hardware-allowlist census
 
@@ -312,9 +314,13 @@ posture the storage matcher takes.
 The site worker exposes `/api/v1/machines/<id>/network-facts` — a JSON list
 of `model.SnapshotInterface` records (`NetBoxID`, `Name`, `MAC`, `Type`,
 `IP`, `LAG`, `VLAN`, `MTU`, `Gateway`). `Type` is `physical`, `lag`, or
-`ipmi`. `Gateway` is the longest-prefix-match of the interface CIDR against
-site prefixes' `gateway_ip` custom field. The script owns all topology
-interpretation from these facts; slagworks itself is topology-agnostic. See
+`ipmi`. `IP` is the interface's one `status=active` NetBox address. An
+interface with more than one active address fails the site's snapshot build,
+naming the device, the interface and its addresses; set every address but one
+to `reserved` or `deprecated`. `Gateway` is the longest-prefix-match of the
+interface CIDR against site prefixes' `gateway_ip` custom field. The script
+owns all topology interpretation from these facts; slagworks itself is
+topology-agnostic. See
 `assets/network/100-hot-spare-pop2` for a worked L2-bond example.
 
 ### Uploading

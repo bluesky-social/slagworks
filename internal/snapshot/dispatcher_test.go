@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/uuid"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/netbox"
+	"github.com/bluesky-social/slagworks/internal/worker"
 )
 
 func dispatcherFixture(t *testing.T) (*Dispatcher, *countingSink, *fakeStore, *fakeNetBox) {
@@ -194,5 +196,71 @@ func TestDispatcherEmitsMetrics(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(d.metrics.DirtyGen.WithLabelValues("pop3")); got != 6 {
 		t.Fatalf("dirty_gen after skip: got %v, want 6", got)
+	}
+}
+
+// TestDispatcherSeqNumSurvivesSiteConfigRecreate drives rebuilds into a real
+// worker.Cache across `slagctl site-config delete` and `create` of the same
+// slug. The worker keeps its token and its persisted SeqNum through that, and
+// Cache.ApplySnapshot drops any snapshot whose SeqNum is not above the one it
+// holds, so a SeqNum that restarts with the re-created row freezes the worker
+// on pre-delete content. The fake store's BumpSiteSnapshotMeta models the
+// Postgres sequence; store TestBumpSiteSnapshotMetaSurvivesRecreate checks the
+// real one.
+func TestDispatcherSeqNumSurvivesSiteConfigRecreate(t *testing.T) {
+	ctx := context.Background()
+	d, sink, fs, nb := dispatcherFixture(t)
+	m1 := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	m2 := uuid.MustParse("00000000-0000-0000-0000-000000000002")
+	nb.devices = []netbox.Device{{ID: 1, Name: "host-1", Serial: "SN-1"}}
+	fs.machines = []model.Machine{{ID: m1, NetBoxDeviceID: new(1), NetBoxSerial: "SN-1", State: model.MachineStateNew}}
+
+	localDB, err := worker.OpenLocalDB(filepath.Join(t.TempDir(), "worker.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := worker.NewCache(localDB)
+	// Stands in for the hub: every pushed snapshot reaches the worker.
+	rebuildAndDeliver := func() {
+		t.Helper()
+		before := sink.Count()
+		if _, err := d.rebuild(ctx, "pop3", 0); err != nil {
+			t.Fatalf("rebuild: %v", err)
+		}
+		if sink.Count() == before {
+			t.Fatal("rebuild pushed nothing; each step needs a content change")
+		}
+		snap := sink.Last()
+		cache.ApplySnapshot(&snap)
+	}
+
+	rebuildAndDeliver()
+	fs.machines[0].State = model.MachineStateCommissioned
+	rebuildAndDeliver()
+	fs.machines[0].State = model.MachineStateRunning
+	rebuildAndDeliver()
+	held := cache.LastSeqNum()
+	if held != sink.Last().SeqNum {
+		t.Fatalf("setup: worker holds SeqNum %d, global pushed %d", held, sink.Last().SeqNum)
+	}
+
+	// Delete and re-create: CreateSiteConfig inserts a fresh row with
+	// last_snapshot_seq 0 and last_snapshot_hash "".
+	fresh := *fs.configs["pop3"]
+	fresh.LastSnapshotSeq, fresh.LastSnapshotHash = 0, ""
+	delete(fs.configs, "pop3")
+	fs.configs["pop3"] = &fresh
+
+	// A machine enrolled after the re-create must reach the worker.
+	nb.devices = append(nb.devices, netbox.Device{ID: 2, Name: "host-2", Serial: "SN-2"})
+	fs.machines = append(fs.machines, model.Machine{ID: m2, NetBoxDeviceID: new(2), NetBoxSerial: "SN-2", State: model.MachineStateNew})
+	rebuildAndDeliver()
+
+	if got := sink.Last().SeqNum; got <= held {
+		t.Errorf("after the re-create global pushed SeqNum %d; the worker already holds %d for this slug", got, held)
+	}
+	if cache.MachineByID(m2) == nil {
+		t.Errorf("worker dropped the post-re-create snapshot: it holds SeqNum %d, global pushed %d",
+			cache.LastSeqNum(), sink.Last().SeqNum)
 	}
 }

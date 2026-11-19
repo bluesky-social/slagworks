@@ -296,7 +296,7 @@ func (c *Cache) HelloSeqNum() int64 {
 //
 // Decision table (forward-path scope; redeploy-from-running is punted):
 //
-//   - any state + deploy op at awaiting_phone_home  → BootLocal
+//   - any state, deploy op phase == awaiting_phone_home → BootLocal
 //     (post-deploy reboot; the install is done, the OS should boot)
 //   - state new + pending commission op             → BootCommission
 //   - state failed + pending commission op          → BootCommission
@@ -306,21 +306,18 @@ func (c *Cache) HelloSeqNum() int64 {
 //   - state deploying + deploy op                   → BootDeploy
 //   - anything else (running with no ops, etc.)     → BootLocal
 //
-// The first row wins over every row below it.
-//
 // Two clauses are critical and not obvious:
 //
-//   - "deploy op at awaiting_phone_home → BootLocal" prevents the
-//     post-deploy PXE loop. The op holds that phase until phone-home;
-//     without phase-aware dispatch, the post-deploy reboot would
-//     re-serve the deploy initrd and infinite-loop. It must not depend
-//     on the machine reading `deploying`: that overlay arrives only on
-//     the claim's op_delta (or an op_resync), so the install can finish
-//     while the machine still reads commissioned or failed here.
+//   - "awaiting_phone_home → BootLocal" prevents the post-deploy PXE
+//     loop. The machine stays in `deploying` until phone-home; without
+//     phase-aware dispatch, the post-deploy reboot would re-serve the
+//     deploy initrd and infinite-loop. It holds in every machine state
+//     because the pending-op clauses let an install finish before the
+//     claim's op_delta moves the machine off commissioned/failed.
 //   - The pending-op clauses are what make the state-on-claim model
 //     work: the host PXEs while the machine is in a resting state,
 //     boot-action sees the pending op and serves the right initrd,
-//     and the executor's claim advances the state.
+//     the agent boots and claims the op (which advances the state).
 //
 // Combined read: machine identity comes from the view, machine State and
 // the active op come from the op-layer overlay. opState holds opState.mu
@@ -355,20 +352,19 @@ func (c *Cache) NotifyLogWrite() {
 }
 
 // recordDeployComplete records the agent's "install done, rebooting"
-// signal. The deploy op is NOT completed here — it stays `claimed`
+// signal. The deploy op is NOT completed here — it stays active
 // with phase=`awaiting_phone_home` while we wait for the installed
-// OS to phone home. Local machine state stays in `deploying`.
+// OS to phone home. Local machine state does not change.
 //
 // data is the JSON-serialized payload that travels with the
 // deploy_complete observation — currently the agent's BMCCreds from
 // the BMC reconcile phase. nil is allowed; the observation goes out
 // without a Data field.
 //
-// The boot-action decision table reads `deploy op at phase=
-// awaiting_phone_home → BootLocal`, which lets the post-install
-// reboot chain to disk instead of looping back into the deploy
-// initrd. The op transitions to `completed` only when phone-home
-// arrives (RecordPhoneHome).
+// The boot-action decision table reads `phase=awaiting_phone_home →
+// BootLocal`, which lets the post-install reboot chain to disk
+// instead of looping back into the deploy initrd. The op transitions
+// to `completed` only when phone-home arrives (RecordPhoneHome).
 func (c *Cache) recordDeployComplete(machineID, operationID uuid.UUID, data []byte) {
 	obs := model.Observation{
 		MachineID:   machineID,
@@ -1198,12 +1194,12 @@ func (c *Cache) HandleProgressReport(report *model.ProgressReport) error {
 
 	switch report.Event {
 	case "deploy_complete":
-		// Phase moves to awaiting_phone_home. Op stays claimed; it
+		// Phase moves to awaiting_phone_home. Op stays active; it
 		// completes when the installed OS phones home (handled in
 		// RecordPhoneHome). Without this phase, the boot-action
 		// would re-serve the deploy initrd on the post-install
 		// reboot and loop forever — see BootActionForMAC's
-		// "deploy op at awaiting_phone_home → BootLocal" clause.
+		// "awaiting_phone_home → BootLocal" clause.
 		c.UpdateOpPhase(opID, "awaiting_phone_home")
 		var data []byte
 		if report.BMCCreds != nil {

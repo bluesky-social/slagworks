@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -681,10 +682,28 @@ func (h *Hub) snapshotFor(slug string) (model.SiteSnapshot, bool) {
 	return snap, ok
 }
 
-// ErrNoWorkerForSite is returned by PowerStatus when the target site
-// has no connected worker. Callers (the API handler) translate it to
-// a 503 with an operator-actionable message.
+// ErrNoWorkerForSite is returned by PowerStatus and BootStatus when the
+// target site has no connected worker that can take an RPC (rpcTargets).
+// Callers (the API handler) translate it to a 503 with an
+// operator-actionable message.
 var ErrNoWorkerForSite = errors.New("no connected site worker for site")
+
+// rpcTargets returns the slug's connections that can take a hub-originated
+// RPC: those whose hello reply has been sent (workerConn.helloReplied). A
+// connection still waiting for its reply is skipped, so an RPC never
+// becomes the worker's first message and an HA partner that is ready is
+// used instead.
+func (h *Hub) rpcTargets(slug string) []*workerConn {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	conns := make([]*workerConn, 0, len(h.connections[slug]))
+	for c := range h.connections[slug] {
+		if c.helloReplied.Load() {
+			conns = append(conns, c)
+		}
+	}
+	return conns
+}
 
 // ConnectedWorkerSerials returns the verified hardware serials of the workers
 // CURRENTLY CONNECTED for a slug (one entry per connection; "" for a connected
@@ -762,16 +781,11 @@ func (h *Hub) IsWorkerConnected(siteSlug, workerID string) bool {
 // selected by the machine's credential kind); they carry the creds, so
 // they must never be logged.
 func (h *Hub) PowerStatus(ctx context.Context, siteSlug string, machineID uuid.UUID, bmcRuntime, amtRuntime json.RawMessage) (PowerStatusResponseMsg, error) {
-	h.mu.RLock()
-	var target *workerConn
-	for c := range h.connections[siteSlug] {
-		target = c
-		break
-	}
-	h.mu.RUnlock()
-	if target == nil {
+	targets := h.rpcTargets(siteSlug)
+	if len(targets) == 0 {
 		return PowerStatusResponseMsg{}, fmt.Errorf("%w: %s", ErrNoWorkerForSite, siteSlug)
 	}
+	target := targets[0]
 
 	reqID := uuid.NewString()
 	ch := make(chan RPCResponseMsg, 1)
@@ -813,16 +827,11 @@ func (h *Hub) PowerStatus(ctx context.Context, siteSlug string, machineID uuid.U
 // envelope type and payload differ. bmcRuntime carries creds and must never
 // be logged.
 func (h *Hub) BootStatus(ctx context.Context, siteSlug string, machineID uuid.UUID, bmcRuntime json.RawMessage) (BootStatusResponseMsg, error) {
-	h.mu.RLock()
-	var target *workerConn
-	for c := range h.connections[siteSlug] {
-		target = c
-		break
-	}
-	h.mu.RUnlock()
-	if target == nil {
+	targets := h.rpcTargets(siteSlug)
+	if len(targets) == 0 {
 		return BootStatusResponseMsg{}, fmt.Errorf("%w: %s", ErrNoWorkerForSite, siteSlug)
 	}
+	target := targets[0]
 
 	reqID := uuid.NewString()
 	ch := make(chan RPCResponseMsg, 1)
@@ -882,12 +891,7 @@ type WorkerDHCPLeases struct {
 // answerable question ("no workers connected"), not a hub-level error;
 // the API layer turns nil into a 200 with an empty workers array.
 func (h *Hub) DHCPLeases(ctx context.Context, siteSlug string) []WorkerDHCPLeases {
-	h.mu.RLock()
-	conns := make([]*workerConn, 0, len(h.connections[siteSlug]))
-	for c := range h.connections[siteSlug] {
-		conns = append(conns, c)
-	}
-	h.mu.RUnlock()
+	conns := h.rpcTargets(siteSlug)
 	if len(conns) == 0 {
 		return nil
 	}
@@ -1028,6 +1032,16 @@ type workerConn struct {
 	// resync is already scoped by that snapshot.
 	opStreamMu sync.Mutex
 	opReady    bool
+
+	// helloReplied is set once the hello reply (snapshot or no_change) is
+	// on the wire, and never cleared. The conn registers before that
+	// reply, and on a cold slug the reply waits on a rebuild for up to
+	// RebuildTimeout; the worker accepts only snapshot or no_change as its
+	// first message and drops the connection on anything else. The
+	// hub-originated RPCs therefore target only conns with helloReplied
+	// set (rpcTargets). Push fan-out needs no such gate, because a snapshot
+	// is a valid first message, and op-stream messages have opReady.
+	helloReplied atomic.Bool
 }
 
 func (c *workerConn) serve(ctx context.Context) error {
@@ -1103,11 +1117,20 @@ func (c *workerConn) serve(ctx context.Context) error {
 	c.fqdn = hello.FQDN
 	c.smcipmitool = hello.SMCIPMITool
 
+	// Persist the serial BEFORE the conn registers, and refuse the hello if
+	// that fails. The outlet-op interlock (INV-1) and the API's creation-time
+	// check decide which devices are serving site workers from
+	// site_workers.serial, not from live connections, so a worker connected
+	// under a serial the store does not hold is invisible to both: an outlet
+	// off for its own feed would be created and granted to a partner. The
+	// worker reconnects and its next hello retries the write. (Heartbeat
+	// touches carry no serial and stay non-fatal.)
 	if _, err := c.hub.cfg.Auth.TouchSiteWorker(c.slug, c.workerID, hello.FQDN, &hello.Serial); err != nil {
-		c.log.Warn("touch site_worker failed", "err", err)
-		// Non-fatal; the worker is already authenticated and we don't
-		// want to drop the connection over a last_seen_at bookkeeping
-		// hiccup.
+		c.log.Error("recording worker hello in site_workers failed; refusing connection",
+			"serial", hello.Serial, "err", err)
+		c.writeError(ctx, "serial_persist_failed",
+			fmt.Sprintf("global could not record this worker's hardware serial %q in site_workers: %v; the worker reconnects and retries, check global's database if this persists", hello.Serial, err))
+		return fmt.Errorf("record hello serial (serial=%q slug=%q): %w", hello.Serial, c.slug, err)
 	}
 
 	// Phase 1 of version-pin: log every connecting worker's build SHA
@@ -1141,7 +1164,8 @@ func (c *workerConn) serve(ctx context.Context) error {
 	// the NEXT push. We accept the other side of the tradeoff — a
 	// possible stale hello-reply reaching the worker after a newer
 	// fan-out snapshot — and rely on Cache.ApplySnapshot's SeqNum
-	// monotonicity check to drop it.
+	// monotonicity check to drop it. Until the reply is sent, op-stream
+	// messages skip the conn (opReady) and so do RPCs (helloReplied).
 	c.hub.register(c)
 	defer c.hub.unregister(c)
 
@@ -1207,6 +1231,10 @@ func (c *workerConn) handleHello(ctx context.Context, hello HelloMsg) error {
 			return err
 		}
 	}
+	// The reply is on the wire: RPCs may now target this conn. Set before
+	// the op_resync write, so whoever has read the op_resync can rely on
+	// the conn being an RPC target.
+	c.helloReplied.Store(true)
 
 	// Unconditional op_resync after the snapshot/no_change decision: the
 	// worker full-replaces its op set + rebuilds machine-state overlays
@@ -1816,10 +1844,12 @@ func (c *workerConn) outletClaimEligible(opID uuid.UUID) (bool, string, error) {
 
 // registeredWorkerSerials returns the set of non-empty verified hardware
 // serials for the workers registered against this conn's slug (connected or
-// not), for the INV-1 serving-worker check. An unverified worker (serial "")
-// contributes no entry — it can't be matched as a downstream anyway. Entries
-// keep the workers' SMBIOS spelling; outletClaimEligibility matches them
-// against the NetBox downstream serial ignoring case.
+// not), for the INV-1 serving-worker check. It covers every connected worker
+// because serve() refuses a hello whose serial it cannot persist. An
+// unverified worker (serial "") contributes no entry — it can't be matched as
+// a downstream anyway. Entries keep the workers' SMBIOS spelling;
+// outletClaimEligibility matches them against the NetBox downstream serial
+// ignoring case.
 func (c *workerConn) registeredWorkerSerials() (map[string]bool, error) {
 	workers, err := c.hub.cfg.Auth.ListSiteWorkers(c.slug)
 	if err != nil {

@@ -346,15 +346,15 @@ it. The authoritative implementation is `Cache.BootActionForMAC`
 |---|---|---|---|
 | Unknown MAC (not in the snapshot) | — | — | `BootLocal` (`cache.go:254`) |
 | Any state with `!PXEEligible` | — | — | `BootLocal` (`cache.go:257`) |
-| Any state | deploy op | `awaiting_phone_home` | `BootLocal` (checked before the state rows below) |
+| Any state | deploy op | `awaiting_phone_home` | `BootLocal` (`opState.bootActionLocked`) |
 | `commissioning` | commission op already claimed | — | `BootCommission` (`cache.go:278`) |
 | `deploying` | deploy op | anything except `awaiting_phone_home` | `BootDeploy` (`cache.go:285`) |
 | `new` | commission op | — | `BootCommission` |
 | `new` | — | — | `BootLocal` |
 | `failed` | pending commission op | — | `BootCommission` (`cache.go:300`) |
-| `failed` | pending deploy op | — | `BootDeploy` (`cache.go:303`) |
+| `failed` | pending deploy op | anything except `awaiting_phone_home` | `BootDeploy` (`cache.go:303`) |
 | `failed` | no operation | — | `BootLocal` (`cache.go:307`) |
-| `commissioned` | pending deploy op | — | `BootDeploy` (`cache.go:309`) |
+| `commissioned` | pending deploy op | anything except `awaiting_phone_home` | `BootDeploy` (`cache.go:309`) |
 | `commissioned` | no deploy op | — | `BootLocal` (`cache.go:312`) |
 | `running` | any | — | `BootLocal` (`cache.go:313`) |
 | default | — | — | `BootLocal` (`cache.go:317`) |
@@ -370,9 +370,9 @@ Notes:
   binding; inventory can validate identity but cannot select another machine.
 - The `awaiting_phone_home` row is the reason the post-deploy reboot
   does not loop-wipe the disk; see [The `awaiting_phone_home`
-  latch](#the-awaiting_phone_home-latch). It is tested before the
-  machine state, so the `failed` and `commissioned` deploy rows apply
-  only to a deploy op that has not finished its install.
+  latch](#the-awaiting_phone_home-latch). It is checked before the
+  machine state because the pending-op rows let an install finish
+  while the machine is still `commissioned` or `failed`.
 
 ### How the boot action reaches the target
 
@@ -760,20 +760,22 @@ either, so the op stays on the phone-home timeout. Tests:
 `TestUpdateOpPhase_AwaitingPhoneHomeNotClobbered` and
 `TestUpdateOpPhase_AwaitingPhoneHomeOnlyLeftByFailure`
 (`cache_test.go`). `keepTerminalWait` holds the phase the same way
-against a claimed or running deploy row in an op_delta or op_resync
-from global (`TestStaleEchoKeepsAwaitingPhoneHome`,
-`opstream_test.go`).
+against a pending, claimed or running deploy row in an op_delta or
+op_resync from global (`TestStaleEchoKeepsAwaitingPhoneHome`,
+`TestStalePendingRowKeepsAwaitingPhoneHome`, `opstream_test.go`).
 
 `Cache.BootActionForMAC` reads the phase and returns `BootLocal`
-whenever the active deploy op is at `phase = awaiting_phone_home`,
-whatever the machine's state. It does not require `state =
-deploying`: the worker learns that state only from the claim's
-op_delta (or an op_resync), so a late claim delta, or a pending op
-whose host PXE-booted on its own, lets the install finish while the
-machine still reads `commissioned` or `failed`. The target boots off
-disk, its phone-home service POSTs `/api/v1/phone-home`,
-`RecordPhoneHome` fires the completion path described earlier, and
-the op transitions to `completed` with `machine.state = running`.
+whenever the machine's active deploy op is at `awaiting_phone_home`,
+whatever the machine state. The state is usually `deploying`, but a
+host that PXEs on the pending-op clause while the executor's claim
+keeps failing installs with the machine still `commissioned` or
+`failed`: only the claim's op_delta moves it to `deploying`, and
+`HandleProgressReport` accepts reports for a pending op
+(`TestBootAction_AwaitingPhoneHomeOnUnclaimedDeploy`, `cache_test.go`).
+The target boots off disk, its phone-home
+service POSTs `/api/v1/phone-home`, `RecordPhoneHome` fires the
+completion path described earlier, and the op transitions to
+`completed` with `machine.state = running`.
 
 The latch has to survive a worker restart. The phase and the completion
 reach global only as op_updates, which the outbox keeps in memory, so
