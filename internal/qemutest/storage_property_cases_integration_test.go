@@ -69,7 +69,7 @@ func propDataLayout(boot string, typ string, level int, members ...string) propL
 }
 
 // propDeepEnv, when set to 1, makes TestStoragePropDeep play every pinned
-// history the default tests leave out: about forty more VM boots.
+// history the default tests leave out: about thirty more VM boots.
 const propDeepEnv = "SLAGWORKS_STORAGE_PROP_DEEP"
 
 func propAll(ids ...string) []string { return ids }
@@ -486,7 +486,7 @@ func TestStoragePropArrays(t *testing.T) { runPropPinned(t) }
 // -parallel the host's memory allows (each VM takes 4 GB).
 func TestStoragePropDeep(t *testing.T) {
 	if os.Getenv(propDeepEnv) != "1" {
-		t.Skipf("set %s=1 to play the remaining pinned histories (about forty VM boots)", propDeepEnv)
+		t.Skipf("set %s=1 to play the remaining pinned histories (about thirty VM boots)", propDeepEnv)
 	}
 	inDefault := map[string]bool{}
 	for _, names := range propDefaultRuns {

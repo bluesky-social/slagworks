@@ -514,11 +514,11 @@ func (r *propRun) checkWrites(i int, st propStep, got string, agentW, bootW map[
 // snapshots themselves.
 func (r *propRun) splitPhases(ctx context.Context, i int, st propStep, vm *qemutest.VM) {
 	if err := vm.Serial.WaitFor(ctx, "slagworks: rebooting", 30*time.Second); err != nil {
-		r.notef(i, "no reboot marker after deploy complete, agent and installed-system writes are not separated: %v", err)
+		r.failf(i, "no reboot marker after deploy complete, agent and installed-system writes cannot be separated: %v", err)
 		return
 	}
 	if err := vm.QMP.Stop(); err != nil {
-		r.notef(i, "could not pause the VM to separate writes: %v", err)
+		r.failf(i, "could not pause the VM to separate writes: %v", err)
 		return
 	}
 	for _, id := range st.Attach {
@@ -527,7 +527,9 @@ func (r *propRun) splitPhases(ctx context.Context, i int, st propStep, vm *qemut
 			"device": "prop" + id, "snapshot-file": top, "format": "qcow2",
 		})
 		if err != nil {
-			r.notef(i, "could not snapshot disk %s at the reboot: %v", id, err)
+			// Without the split the agent's writes cannot be told from the
+			// installed system's, and the no-write rules would go unchecked.
+			r.failf(i, "could not snapshot disk %s at the reboot: %v", id, err)
 			continue
 		}
 		r.bootTop[id] = top
@@ -686,15 +688,32 @@ func (r *propRun) checkCanaries(i int, st propStep, cli *ssh.Client) {
 // the same root filesystem.
 func (r *propRun) checkReboot(ctx context.Context, i int, vm *qemutest.VM, cli *ssh.Client, ip string, before *propInspect) bool {
 	cursor := vm.Serial.Cursor()
+	// The kernel's boot ID tells the second boot from the first: an ssh
+	// connection alone would also succeed against a system that never went
+	// down.
+	const bootIDCmd = "cat /proc/sys/kernel/random/boot_id"
+	firstID, err := r.sshRun(cli, bootIDCmd)
+	if firstID = strings.TrimSpace(firstID); err != nil || firstID == "" {
+		r.failf(i, "second boot: cannot read the first boot's ID: %v (%q)", err, firstID)
+		return false
+	}
 	_, _ = r.sshRun(cli, "sync; systemctl reboot")
 	_ = cli.Close()
-	time.Sleep(15 * time.Second)
 	var c2 *ssh.Client
-	var err error
-	for deadline := time.Now().Add(propBootBudget); time.Now().Before(deadline); {
-		if c2, err = dialRecoverySSH(ctx, ip, r.signer, r.network); err == nil {
+	err = fmt.Errorf("the system never went down")
+	for deadline := time.Now().Add(propBootBudget); time.Now().Before(deadline) && ctx.Err() == nil; {
+		probe, dialErr := dialRecoverySSH(ctx, ip, r.signer, r.network)
+		if dialErr != nil {
+			err = dialErr
+			continue
+		}
+		id, idErr := r.sshRun(probe, bootIDCmd)
+		if id = strings.TrimSpace(id); idErr == nil && id != "" && id != firstID {
+			c2, err = probe, nil
 			break
 		}
+		_ = probe.Close()
+		time.Sleep(2 * time.Second)
 	}
 	if err != nil {
 		lines := vm.Serial.Lines()

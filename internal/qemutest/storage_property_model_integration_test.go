@@ -809,8 +809,10 @@ func propCheckTree(c propCase, st propStep, ins *propInspect) *propTreeReport {
 			continue
 		}
 		if len(want) == 0 {
-			// An unformatted partition or array: a filesystem showing there
-			// already failed the filesystem check above.
+			// An unformatted partition or array. The plan clears each one
+			// it creates, so nothing an earlier layout left at that offset
+			// may show, whether or not it reads as a filesystem.
+			rep.hard("stale-signature: %s carries %v, the layout leaves it unformatted", dev, got)
 			continue
 		}
 		rep.soft("stale-signature: %s carries %v, layout implies %v", dev, got, want)
