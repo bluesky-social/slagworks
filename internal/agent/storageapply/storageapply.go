@@ -51,17 +51,20 @@ func RunCommand(ctx *agent.Context, cmd storage.Command) error {
 // Inventory returns the list of physical block devices suitable for
 // installation. Skips loop, ram, and optical devices.
 func Inventory(ctx *agent.Context) ([]storage.BlockDevice, error) {
-	out, err := ctx.Exec.Output("lsblk", "-Jb", "-d", "-o", "NAME,SIZE,TRAN,MODEL")
+	out, err := ctx.Exec.Output("lsblk", "-Jb", "-d", "-o", "NAME,SIZE,TRAN,MODEL,LOG-SEC")
 	if err != nil {
 		return nil, fmt.Errorf("lsblk: %w", err)
 	}
 
+	// Numeric columns are strings or numbers depending on the util-linux
+	// version.
 	var raw struct {
 		Blockdevices []struct {
-			Name  string `json:"name"`
-			Size  any    `json:"size"` // string or number depending on util-linux version
-			Tran  string `json:"tran"`
-			Model string `json:"model"`
+			Name   string `json:"name"`
+			Size   any    `json:"size"`
+			Tran   string `json:"tran"`
+			Model  string `json:"model"`
+			LogSec any    `json:"log-sec"`
 		} `json:"blockdevices"`
 	}
 	if err := json.Unmarshal([]byte(out), &raw); err != nil {
@@ -73,24 +76,32 @@ func Inventory(ctx *agent.Context) ([]storage.BlockDevice, error) {
 		if strings.HasPrefix(bd.Name, "loop") || strings.HasPrefix(bd.Name, "ram") || strings.HasPrefix(bd.Name, "sr") {
 			continue
 		}
-		dev := storage.BlockDevice{
-			Name:      bd.Name,
-			Transport: bd.Tran,
-			Model:     strings.TrimSpace(bd.Model),
-		}
-		switch v := bd.Size.(type) {
-		case float64:
-			dev.SizeBytes = int64(v)
-		case string:
-			fmt.Sscanf(v, "%d", &dev.SizeBytes)
-		}
-		disks = append(disks, dev)
+		disks = append(disks, storage.BlockDevice{
+			Name:               bd.Name,
+			SizeBytes:          lsblkInt(bd.Size),
+			LogicalSectorBytes: lsblkInt(bd.LogSec),
+			Transport:          bd.Tran,
+			Model:              strings.TrimSpace(bd.Model),
+		})
 	}
 
 	if len(disks) == 0 {
 		return nil, fmt.Errorf("no suitable disks found")
 	}
 	return disks, nil
+}
+
+// lsblkInt reads a numeric lsblk JSON column, which util-linux emits as a
+// number or a string depending on its version. Zero means absent.
+func lsblkInt(v any) int64 {
+	var n int64
+	switch v := v.(type) {
+	case float64:
+		n = int64(v)
+	case string:
+		fmt.Sscanf(v, "%d", &n)
+	}
+	return n
 }
 
 // ScriptFetcher fetches the per-machine storage script from the site

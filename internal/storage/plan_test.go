@@ -33,7 +33,7 @@ func TestPlan_SingleDisk_ESPAndRoot(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "vda", SizeBytes: 10737418240},
+		{Name: "vda", SizeBytes: 10737418240, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -75,7 +75,7 @@ func TestPlan_NVMe_PartitionDevPaths(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "nvme0n1", SizeBytes: 1920383410176},
+		{Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -118,8 +118,8 @@ func TestPlan_RAID1_Root(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "nvme0n1", SizeBytes: 1920383410176},
-		{Name: "nvme1n1", SizeBytes: 1920383410176},
+		{Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
+		{Name: "nvme1n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -186,10 +186,10 @@ func TestPlan_RAID1_Boot_RAID0_Data(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "nvme0n1", SizeBytes: 1920383410176},
-		{Name: "nvme1n1", SizeBytes: 1920383410176},
-		{Name: "nvme2n1", SizeBytes: 15360747397120},
-		{Name: "nvme3n1", SizeBytes: 15360747397120},
+		{Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
+		{Name: "nvme1n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
+		{Name: "nvme2n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
+		{Name: "nvme3n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -241,11 +241,11 @@ func TestPlan_RAID10(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "sda", SizeBytes: 500107862016},
-		{Name: "nvme0n1", SizeBytes: 15360747397120},
-		{Name: "nvme1n1", SizeBytes: 15360747397120},
-		{Name: "nvme2n1", SizeBytes: 15360747397120},
-		{Name: "nvme3n1", SizeBytes: 15360747397120},
+		{Name: "sda", SizeBytes: 500107862016, LogicalSectorBytes: 512},
+		{Name: "nvme0n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
+		{Name: "nvme1n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
+		{Name: "nvme2n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
+		{Name: "nvme3n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -279,7 +279,7 @@ func TestPlan_SwapPartition(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "vda", SizeBytes: 1099511627776},
+		{Name: "vda", SizeBytes: 1099511627776, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -316,7 +316,7 @@ func TestPlan_MountOrdering(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "vda", SizeBytes: 1099511627776},
+		{Name: "vda", SizeBytes: 1099511627776, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -340,7 +340,7 @@ func TestPlan_MountOrdering(t *testing.T) {
 
 func TestDefaultLayout_VirtioDisk(t *testing.T) {
 	layout := DefaultLayout("vda")
-	inventory := []BlockDevice{{Name: "vda", SizeBytes: 10737418240}}
+	inventory := []BlockDevice{{Name: "vda", SizeBytes: 10737418240, LogicalSectorBytes: 512}}
 
 	cmds, err := Plan(layout, inventory)
 	if err != nil {
@@ -356,7 +356,7 @@ func TestDefaultLayout_VirtioDisk(t *testing.T) {
 
 func TestDefaultLayout_NVMeDisk(t *testing.T) {
 	layout := DefaultLayout("nvme0n1")
-	inventory := []BlockDevice{{Name: "nvme0n1", SizeBytes: 1920383410176}}
+	inventory := []BlockDevice{{Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512}}
 
 	cmds, err := Plan(layout, inventory)
 	if err != nil {
@@ -481,7 +481,7 @@ func TestResolveMountDevices_SATA(t *testing.T) {
 	}
 
 	// Verify these match what Plan actually mounts.
-	cmds, err := Plan(layout, []BlockDevice{{Name: "sda", SizeBytes: 21474836480}})
+	cmds, err := Plan(layout, []BlockDevice{{Name: "sda", SizeBytes: 21474836480, LogicalSectorBytes: 512}})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -501,7 +501,7 @@ func TestResolveMountDevices_NVMe(t *testing.T) {
 		t.Errorf("expected /dev/nvme0n1p1 for /boot/efi, got %q", devs["/boot/efi"])
 	}
 
-	cmds, err := Plan(layout, []BlockDevice{{Name: "nvme0n1", SizeBytes: 21474836480}})
+	cmds, err := Plan(layout, []BlockDevice{{Name: "nvme0n1", SizeBytes: 21474836480, LogicalSectorBytes: 512}})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -660,7 +660,7 @@ func TestPlan_BIOSGrub_HybridLayout(t *testing.T) {
 		}
 	}`)
 
-	cmds, err := Plan(layout, []BlockDevice{{Name: "vda", SizeBytes: 10737418240}})
+	cmds, err := Plan(layout, []BlockDevice{{Name: "vda", SizeBytes: 10737418240, LogicalSectorBytes: 512}})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -883,8 +883,8 @@ func TestPlan_RAIDCreate_WithArrayUUID_And_Preserve(t *testing.T) {
 	// keeps them out of the wipe/zap set. Only the boot disks need
 	// inventory entries (Plan checks disk-type devices against inventory).
 	inventory := []BlockDevice{
-		{Name: "nvme0n1", SizeBytes: 1920383410176},
-		{Name: "nvme1n1", SizeBytes: 1920383410176},
+		{Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
+		{Name: "nvme1n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -1346,7 +1346,7 @@ func TestPlan_AcceptsValidPreserve(t *testing.T) {
 		}
 	}`)
 	cmds, err := Plan(layout, []BlockDevice{
-		{Name: "nvme0n1", SizeBytes: 10737418240},
+		{Name: "nvme0n1", SizeBytes: 10737418240, LogicalSectorBytes: 512},
 	})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)

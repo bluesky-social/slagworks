@@ -131,6 +131,7 @@ func genScenario() *rapid.Generator[scenario] {
 			devices[d.name] = Device{Type: "disk", PTable: "gpt", Partitions: d.parts}
 			inventory = append(inventory, BlockDevice{
 				Name: d.name, SizeBytes: 107374182400, Transport: d.transport,
+				LogicalSectorBytes: rapid.SampledFrom([]int64{512, 4096}).Draw(t, "logicalSector"),
 			})
 			if len(d.parts) == 0 {
 				raidCandidates = append(raidCandidates, d.name) // whole-disk RAID member
