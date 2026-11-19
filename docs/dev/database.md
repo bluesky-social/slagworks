@@ -112,6 +112,9 @@ detail; this is the map.
   mirrors, so two workers can serve disjoint cages of one NetBox site.
   `relay_pools` (00018) is the list of relayed DHCP scopes the worker
   serves in addition to its directly-attached ephemeral pool.
+  `last_snapshot_seq` is drawn from the `site_snapshot_seq` sequence
+  (00031), so it is never reissued and keeps rising across a delete and
+  re-create of the same slug; per-slug values are not contiguous.
 - `site_workers(id, site_slug, worker_id, fqdn, first_seen_at,
   last_seen_at, token_hash)`. `token_hash` (00012) is `sha256(bearer)`;
   the plaintext is returned once at registration and never persisted.

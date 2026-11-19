@@ -149,6 +149,7 @@ func (f *fakeNetBox) ListDeviceTypesByIDs(ctx context.Context, ids []int) ([]net
 // fakeStore implements StoreReader.
 type fakeStore struct {
 	mu             sync.Mutex
+	snapshotSeq    int64 // models the site_snapshot_seq sequence; outlives configs rows
 	configs        map[string]*model.SiteConfig
 	machines       []model.Machine
 	images         []model.Image
@@ -203,7 +204,8 @@ func (f *fakeStore) BumpSiteSnapshotMeta(slug, hash string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c := f.configs[slug]
-	c.LastSnapshotSeq++
+	f.snapshotSeq++
+	c.LastSnapshotSeq = f.snapshotSeq
 	c.LastSnapshotHash = hash
 	return c.LastSnapshotSeq, nil
 }
