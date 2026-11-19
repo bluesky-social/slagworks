@@ -98,6 +98,16 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 		fatal("safety check", err)
 	}
 
+	// A raid that pins its array UUID is identified at boot by that UUID
+	// alone, so a member superblock with the same UUID on a device this
+	// deploy leaves unwritten (the disk a redeploy moved the array off)
+	// races the real members and can stop the boot in emergency mode.
+	// Refuse now, with the host as found, unless --wipe-all-disks will zero
+	// that device below.
+	if err := storageapply.CheckStaleArrayMembers(ctx, layout, p.wipeAllDisks); err != nil {
+		fatal("stale array member check", err)
+	}
+
 	// Verify every preserve array by its expected UUID BEFORE any
 	// destructive command runs. The destructive ordering the preserve
 	// feature mandates is verify -> wipe -> create root -> reassemble ->

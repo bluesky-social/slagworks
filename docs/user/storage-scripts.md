@@ -79,6 +79,8 @@ Partition `size` is `"512M"`, `"100G"`, or `"rest"` (fill remaining). `fs` is op
 
 Supported levels: 0, 1, 5, 6, 10.
 
+`array_uuid` (optional) pins the array's md UUID instead of letting mdadm pick a random one, so a later `preserve` deploy can find the array by it. At boot the array is identified by that UUID alone, so the agent refuses a deploy when a disk it leaves unwritten still carries a member superblock with the same UUID, typically the disk a redeploy moved the array off: that stale member could claim the array ahead of the real members. Redeploy with `--wipe-all-disks` to zero such disks, or zero the named device with `mdadm --zero-superblock` from a `--recovery` boot.
+
 **Mounts** — maps mount points to device names from the layout.
 
 ```json
