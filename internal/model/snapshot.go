@@ -352,7 +352,10 @@ func (s SiteSnapshot) ContentHash() (string, error) {
 	// hash stability (NetBox/API order isn't guaranteed). Copy the slice so
 	// we don't mutate the caller's backing array. DNS/NTP order is
 	// authored (CSV order in NetBox) and deterministic, so they're not
-	// re-sorted — that order is intentional and stable.
+	// re-sorted — that order is intentional and stable. DHCP.RelayPools
+	// isn't re-sorted either: configured pools keep their authored order
+	// (the worker serves from the first pool containing giaddr), and the
+	// builder emits the generated /31 pools sorted by subnet.
 	copied.OOB.DynamicSlices = append([]OOBDynamicSlice(nil), s.OOB.DynamicSlices...)
 
 	// Machine.ID is a UUID and guaranteed unique, so a simple comparator
