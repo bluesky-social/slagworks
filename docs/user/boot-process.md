@@ -194,7 +194,10 @@ policy lives. `Handler.ServeHTTP`
   (`destructive`, `wipe_all_disks`, `recovery`, `tailscale_authkey`, etc.).
   If the machine has never been commissioned (no `SystemUUID`), the
   handler refuses to serve a deploy script and returns an iPXE `shell`
-  drop instead (`handler.go:441-444`). It refuses the same way when a
+  drop instead (`handler.go:441-444`). It also refuses a deploy whose
+  operation params it cannot decode, rather than booting the installer
+  without them (which would drop `recovery` and every other
+  params-derived argument). It refuses the same way when a
   value it would put on the kernel line as one `key=value` argument (the
   tailnet auth key, the system UUID, the test-only knobs) contains a
   space, a control or non-ASCII byte, `"`, `\` or `${`, any of which

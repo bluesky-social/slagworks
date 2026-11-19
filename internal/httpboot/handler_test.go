@@ -710,6 +710,32 @@ func TestDeployBootScript_FreeTextValuesRideAsOneArgument(t *testing.T) {
 	}
 }
 
+// TestDeployBootScript_RefusesParamsThatDoNotDecode: params DecodeParams
+// refuses (a null transport block, a credential key in another letter case)
+// refuse the boot. Serving the installer without them would silently drop
+// recovery and every other params-derived argument.
+func TestDeployBootScript_RefusesParamsThatDoNotDecode(t *testing.T) {
+	for name, params := range map[string]string{
+		"null transport block":    `{"recovery":true,"pdu_runtime":null}`,
+		"case-variant secret key": `{"recovery":true,"bmc_runtime":{"username":"admin","Password":"fixture-bmc-pw"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := deployScriptFor(t, params, nil)
+			if strings.Contains(body, "kernel ") {
+				t.Fatalf("expected the boot to be refused, got an installer:\n%s", body)
+			}
+			for _, want := range []string{"ERROR:", "cannot decode", "shell"} {
+				if !strings.Contains(body, want) {
+					t.Errorf("expected %q in the refusal script, got:\n%s", want, body)
+				}
+			}
+			if strings.Contains(body, "fixture-bmc-pw") {
+				t.Errorf("refusal script echoes op params:\n%s", body)
+			}
+		})
+	}
+}
+
 // TestDeployBootScript_RefusesValuesThatSplitTheKernelLine: a value that
 // can't ride the kernel line as one argument refuses the boot instead of
 // adding kernel arguments or iPXE commands. Whitespace splits it into more

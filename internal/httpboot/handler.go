@@ -346,6 +346,19 @@ shell
 `, key, mac)
 }
 
+// badOpParamsScript is served instead of a deploy boot when the deploy op's
+// params do not decode. The decode error is logged, not echoed: it can quote
+// a params key and the op's params carry credentials.
+func (h *Handler) badOpParamsScript(mac, opID string, err error) string {
+	h.log.Error("refusing deploy boot: the deploy operation's params do not decode",
+		"mac", mac, "op_id", opID, "err", err)
+	return fmt.Sprintf(`#!ipxe
+echo slagworks: ERROR: deploy operation %s for mac %s has params the site worker cannot decode
+echo slagworks: the site worker log says why; abort the operation and create it again
+shell
+`, opID, mac)
+}
+
 // broadcastConsoleParams is the determination-mode console cmdline for
 // commissioning a device whose type has no slagworks_kernel_params
 // yet: every sweep-candidate tty plus tty0. The kernel mirrors output
@@ -527,80 +540,86 @@ func (h *Handler) deployBootScript(mac string) string {
 			if op.TraceID != uuid.Nil {
 				traceID = op.TraceID.String()
 			}
-			if p, err := model.DecodeParams(op.Params); err == nil {
-				if p.Destructive {
-					extra = " slagworks.destructive"
-				}
-				if p.WipeAllDisks {
-					extra += " slagworks.wipe_all_disks"
-				}
-				if p.Recovery {
-					extra += " slagworks.recovery"
-				}
-				// fatal_at is a TEST-ONLY parameter wired through to the
-				// agent's SLAGWORKS_FATAL_AT env var. Used by the recovery
-				// sshd integration test to force a clean late-stage
-				// fatal. Not exposed via slagctl.
-				if p.FatalAt != "" {
-					addArg("slagworks.fatal_at", p.FatalAt)
-				}
-				// efivarfs is a TEST-ONLY parameter wired through to
-				// the BOOT hook's slagworks.efivarfs= kernel
-				// cmdline knob. The qemutest matrix uses
-				// efivarfs=skip to repro the pop1 ship-blocker
-				// (efivarfs not mounted -> efibootmgr -c fails ->
-				// agent FATALs in the new behavior, silent-Warned
-				// in the old). Production deploys leave this unset.
-				//
-				// This (and fatal_at above) is not yet gated on
-				// SLAGWORKS_TEST=1, so a stray test-fixture op.Params
-				// in production could re-introduce the pop1 bug.
-				// Deferred until before pop1 takes real traffic.
-				if p.Efivarfs != "" {
-					addArg("slagworks.efivarfs", p.Efivarfs)
-				}
-				// data_marker is a TEST-ONLY parameter wired to the
-				// agent's slagworks.data_marker= cmdline token. The
-				// preserve-data qemu test uses it to drop a first-boot
-				// unit that writes+echoes /data/PRESERVE_MARKER, proving
-				// a preserved array survives a redeploy. Production
-				// deploys leave this unset (same gating concern
-				// as fatal_at/efivarfs).
-				if p.DataMarker != "" {
-					addArg("slagworks.data_marker", p.DataMarker)
-				}
-				// Tailscale deploy-time enrollment (plan
-				// 2026-06-21-tailscale-enrollment-at-deploy). The auth
-				// key + hostname ride the kernel cmdline; the agent reads
-				// them from /proc/cmdline (visible in its chroot) and
-				// enrolls before reboot. Absent block => no tokens => the
-				// agent skips enrollment. The key is single-use and
-				// auto-expiring; cmdline exposure on the box we're imaging
-				// is out of the threat model (see the plan). Both tokens
-				// are emitted only when the auth key is present so a
-				// half-populated block can't produce a hostname-only
-				// cmdline the agent would misread.
-				//
-				// The hostname derives from the NetBox device name, which
-				// is free text. A hostname that isn't valid drops both
-				// tokens (the agent skips enrollment) rather than refusing
-				// the deploy: global declines to mint for such a name, so
-				// this only covers an op written some other way. A valid
-				// hostname and the key still go through addArg like the
-				// rest, so no value can split the line.
-				if ts := p.TailscaleRuntime; ts != nil && ts.AuthKey != "" {
-					if ts.Hostname != "" && !model.ValidHostname(ts.Hostname) {
-						h.log.Warn("tailscale enrollment skipped: the op's tailnet hostname is not a valid hostname",
-							"machine_id", machineID, "op_id", opID, "hostname", ts.Hostname)
-					} else {
-						addArg("slagworks.tailscale_authkey", ts.AuthKey)
-						if ts.Hostname != "" {
-							addArg("slagworks.tailscale_hostname", ts.Hostname)
-						}
+			// Params the decoder refuses (a null transport block, a credential
+			// key in another letter case, a type error) refuse the boot: serving
+			// the installer without them would drop recovery, the tailnet
+			// enrollment and every other params-derived argument, and the
+			// executor fails such an op anyway once it is claimed.
+			p, err := model.DecodeParams(op.Params)
+			if err != nil {
+				return h.badOpParamsScript(mac, opID, err)
+			}
+			if p.Destructive {
+				extra = " slagworks.destructive"
+			}
+			if p.WipeAllDisks {
+				extra += " slagworks.wipe_all_disks"
+			}
+			if p.Recovery {
+				extra += " slagworks.recovery"
+			}
+			// fatal_at is a TEST-ONLY parameter wired through to the
+			// agent's SLAGWORKS_FATAL_AT env var. Used by the recovery
+			// sshd integration test to force a clean late-stage
+			// fatal. Not exposed via slagctl.
+			if p.FatalAt != "" {
+				addArg("slagworks.fatal_at", p.FatalAt)
+			}
+			// efivarfs is a TEST-ONLY parameter wired through to
+			// the BOOT hook's slagworks.efivarfs= kernel
+			// cmdline knob. The qemutest matrix uses
+			// efivarfs=skip to repro a past ship-blocker
+			// (efivarfs not mounted -> efibootmgr -c fails ->
+			// agent FATALs in the new behavior, silent-Warned
+			// in the old). Production deploys leave this unset.
+			//
+			// This (and fatal_at above) is not yet gated on
+			// SLAGWORKS_TEST=1, so a stray test-fixture op.Params
+			// in production could re-introduce that bug.
+			if p.Efivarfs != "" {
+				addArg("slagworks.efivarfs", p.Efivarfs)
+			}
+			// data_marker is a TEST-ONLY parameter wired to the
+			// agent's slagworks.data_marker= cmdline token. The
+			// preserve-data qemu test uses it to drop a first-boot
+			// unit that writes+echoes /data/PRESERVE_MARKER, proving
+			// a preserved array survives a redeploy. Production
+			// deploys leave this unset (same gating concern
+			// as fatal_at/efivarfs).
+			if p.DataMarker != "" {
+				addArg("slagworks.data_marker", p.DataMarker)
+			}
+			// Tailscale deploy-time enrollment (plan
+			// 2026-06-21-tailscale-enrollment-at-deploy). The auth
+			// key + hostname ride the kernel cmdline; the agent reads
+			// them from /proc/cmdline (visible in its chroot) and
+			// enrolls before reboot. Absent block => no tokens => the
+			// agent skips enrollment. The key is single-use and
+			// auto-expiring; cmdline exposure on the box we're imaging
+			// is out of the threat model (see the plan). Both tokens
+			// are emitted only when the auth key is present so a
+			// half-populated block can't produce a hostname-only
+			// cmdline the agent would misread.
+			//
+			// The hostname derives from the NetBox device name, which
+			// is free text. A hostname that isn't valid drops both
+			// tokens (the agent skips enrollment) rather than refusing
+			// the deploy: global declines to mint for such a name, so
+			// this only covers an op written some other way. A valid
+			// hostname and the key still go through addArg like the
+			// rest, so no value can split the line.
+			if ts := p.TailscaleRuntime; ts != nil && ts.AuthKey != "" {
+				if ts.Hostname != "" && !model.ValidHostname(ts.Hostname) {
+					h.log.Warn("tailscale enrollment skipped: the op's tailnet hostname is not a valid hostname",
+						"machine_id", machineID, "op_id", opID, "hostname", ts.Hostname)
+				} else {
+					addArg("slagworks.tailscale_authkey", ts.AuthKey)
+					if ts.Hostname != "" {
+						addArg("slagworks.tailscale_hostname", ts.Hostname)
 					}
 				}
-				extra += bmcAdminUserKernelArg(machine, p)
 			}
+			extra += bmcAdminUserKernelArg(machine, p)
 		}
 
 		// Append system UUID for the identity check — agent refuses to
