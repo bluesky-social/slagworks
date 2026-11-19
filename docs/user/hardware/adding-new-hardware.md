@@ -173,8 +173,9 @@ the shape; the interesting bits:
   `/boot/efi`.
 
 The planner (`internal/storage/plan.go`) translates the JSON into an ordered
-list of `sgdisk`, `mdadm`, `mkfs.*`, `blockdev --rereadpt`, `mkdir`, and
-`mount` commands. Anything the planner does not know how to express is a
+list of `sgdisk`, `mdadm`, `mkfs.*`, `wipefs` and `dd` (which clear every
+partition and array it creates without `fs`), `blockdev --rereadpt`,
+`mkdir`, and `mount` commands. Anything the planner does not know how to express is a
 layout you cannot describe with a storage script; extend the planner rather
 than trying to smuggle raw shell into the script.
 

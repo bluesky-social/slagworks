@@ -254,7 +254,9 @@ type Command struct {
 func Plan(layout LayoutJSON, inventory []BlockDevice) ([]Command, error)
 ```
 
-The plan is deterministic: same inputs always produce the same command list. Command ordering follows dependency order: wipe disks, create partitions, re-read partition table (`blockdev --rereadpt`), create RAID arrays, format filesystems, mount.
+The plan is deterministic: same inputs always produce the same command list. Command ordering follows dependency order: wipe disks, create partitions, re-read partition table (`blockdev --rereadpt`), format each new partition that declares `fs` and clear every other one, create RAID arrays, format each array that declares `fs` and clear every other one with `wipefs -a`, mount.
+
+The clearing matters on a redeploy. A new partition or array starts with whatever bytes were at its offset, and `sgdisk --zap-all` rewrites only the partition tables. Without clearing, a partition the layout leaves unformatted (a spare ESP slot, a BIOS boot partition, a RAID member) keeps the filesystem an earlier layout put there; an old ESP on the firmware's first disk then boots the old bootloader, which drops to an initramfs shell looking for a root filesystem that no longer exists. An unformatted partition is cleared in two steps: `wipefs -a` erases every signature Linux probes for, and `dd` zeroes its first 4 KiB, because UEFI firmware mounts a FAT filesystem from its boot sector even after `wipefs` has erased the magic bytes. Preserve arrays and retained disks are never cleared.
 
 Implementation notes:
 
@@ -298,13 +300,16 @@ func TestPlan_RAID1Root(t *testing.T) {
         {"sgdisk", []string{"-n", "1:0:+512M", "-t", "1:EF00", "-c", "1:nvme0n1p1", "/dev/nvme0n1"}},
         {"sgdisk", []string{"-n", "2:0:0", "-t", "2:8300", "-c", "2:nvme0n1p2", "/dev/nvme0n1"}},
         {"blockdev", []string{"--rereadpt", "/dev/nvme0n1"}},
-        // ... nvme1n1 ...
         {"mkfs.fat", []string{"-F", "32", "/dev/nvme0n1p1"}},
-        {"mkfs.fat", []string{"-F", "32", "/dev/nvme1n1p1"}},
+        {"wipefs", []string{"-a", "/dev/nvme0n1p2"}},
+        {"dd", []string{"if=/dev/zero", "of=/dev/nvme0n1p2", "bs=4096", "count=1", "conv=fsync"}},
+        // ... the same seven for nvme1n1 ...
         {"mdadm", []string{"--create", "/dev/md0", "--level=1", "--raid-devices=2",
-            "--metadata=1.2", "/dev/nvme0n1p2", "/dev/nvme1n1p2"}},
-        {"mkfs.xfs", []string{"/dev/md0"}},
+            "--metadata=1.2", "--run", "/dev/nvme0n1p2", "/dev/nvme1n1p2"}},
+        {"mkfs.xfs", []string{"-f", "/dev/md0"}},
+        {"mkdir", []string{"-p", "/target"}},
         {"mount", []string{"/dev/md0", "/target"}},
+        {"mkdir", []string{"-p", "/target/boot/efi"}},
         {"mount", []string{"/dev/nvme0n1p1", "/target/boot/efi"}},
     }, cmds)
 }
