@@ -229,7 +229,7 @@ func ResolveLayout(ctx *agent.Context, machineID string, disks []storage.BlockDe
 	// Write the script + live inventory to temp files and run it; the
 	// shared harness injects SLAGWORKS_INVENTORY and returns stdout. Storage
 	// scripts have no companion library, so no sidecars.
-	layoutJSON, err := execkit.RunConfigScript(ctx.Log, "storage", scriptContent, "SLAGWORKS_INVENTORY", commData, nil)
+	layoutJSON, err := execkit.RunConfigScript(ctx.Procs, ctx.Log, "storage", scriptContent, "SLAGWORKS_INVENTORY", commData, nil)
 	if err != nil {
 		return storage.Layout{}, err
 	}

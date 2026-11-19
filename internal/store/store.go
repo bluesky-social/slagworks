@@ -26,12 +26,12 @@ func (s *Store) DB() *gorm.DB { return s.db }
 
 // --- Meta ---
 
-// GetInstanceID returns the global instance ID. The ID is created by goose
-// migration 00006 on first boot — this method is read-only.
+// GetInstanceID returns the global instance ID. Migration 00032 creates the
+// ID when Migrate first runs against a database; this method only reads it.
 func (s *Store) GetInstanceID() (string, error) {
 	var meta model.Meta
 	if err := s.db.First(&meta).Error; err != nil {
-		return "", fmt.Errorf("querying instance ID (has migration 00006 run?): %w", err)
+		return "", fmt.Errorf("reading instance ID from the meta table (migration 00032 seeds it; check that Migrate ran against this database): %w", err)
 	}
 	return meta.InstanceID, nil
 }

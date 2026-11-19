@@ -2,15 +2,35 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/bluesky-social/slagworks/internal/agent"
 	"github.com/bluesky-social/slagworks/internal/model"
 )
 
+// livenessInterval is how often the flush loop reports to the site worker
+// when it has nothing else to say. It bounds how long an agent whose
+// operation was aborted keeps working before it finds out.
+const livenessInterval = 5 * time.Second
+
+// agentReporter posts the agent's progress, logs and final result to the
+// site worker's /api/v1/report, and is how the agent learns that its
+// operation is over.
+//
+// The site worker answers a report for an operation it knows has ended
+// (operator abort, a timeout sweep, a failure) with 410 Gone. That is the
+// only word an agent gets that nobody is waiting for its work any more, so
+// every report path checks for it, including the best-effort ones whose
+// status is otherwise ignored, and the first 410 calls onInactive. Any other
+// rejection keeps its old meaning: a best-effort report is dropped, a final
+// report is retried and then fails the run. In particular 409 covers a site
+// worker that restarted and has not resynchronized its operations, where the
+// operation may be perfectly healthy.
 type agentReporter struct {
 	log       *slog.Logger
 	server    string
@@ -18,6 +38,26 @@ type agentReporter struct {
 	machineID string
 	collector *logCollector
 	client    *http.Client
+	// liveness is the flush loop's tick; see livenessInterval.
+	liveness time.Duration
+	// onInactive is called once, from whichever goroutine's report drew the
+	// first 410, unless the final report was already accepted. main points
+	// it at the run's halt; nil ignores the signal.
+	onInactive func()
+
+	// mu serializes every report: one request is sent and its answer acted
+	// on before the next goes out. Without that a liveness report answered
+	// 410 because the final report just completed the operation could be
+	// read as an abort.
+	mu sync.Mutex
+	// finalAccepted is set once the site worker accepted the run's final
+	// report (deploy_complete, commission_report). The operation ending
+	// after that is the expected outcome, not a reason to stop: a commission
+	// agent still probes the console and reboots after global completed its
+	// operation.
+	finalAccepted bool
+	// inactive is set by the first 410 that arrives before finalAccepted.
+	inactive bool
 }
 
 func newAgentReporter(log *slog.Logger, server, opID, machineID string, collector *logCollector) *agentReporter {
@@ -28,7 +68,16 @@ func newAgentReporter(log *slog.Logger, server, opID, machineID string, collecto
 		machineID: machineID,
 		collector: collector,
 		client:    &http.Client{Timeout: 10 * time.Second},
+		liveness:  livenessInterval,
 	}
+}
+
+// opInactive reports whether the site worker has said this agent's
+// operation is over.
+func (r *agentReporter) opInactive() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.inactive
 }
 
 func (r *agentReporter) ReportPhase(phase string) {
@@ -52,18 +101,6 @@ func (r *agentReporter) ReportEvent(event string) {
 // holding a stale password with no record of the new one, breaking the
 // host's BMC scrapes.
 func (r *agentReporter) ReportDeployComplete(creds *model.BMCCreds) error {
-	report := model.ProgressReport{
-		OperationID: r.opID,
-		MachineID:   r.machineID,
-		Event:       "deploy_complete",
-		Logs:        r.drainLogs(),
-		BMCCreds:    creds,
-	}
-	body, err := json.Marshal(report)
-	if err != nil {
-		return fmt.Errorf("marshal deploy_complete report: %w", err)
-	}
-
 	// Four attempts with exponential backoff (1s, then *5 each retry:
 	// 1s/5s/25s). The site worker is reachable over the deploy network —
 	// a sustained 30+ second outage at this exact window is the only
@@ -71,8 +108,11 @@ func (r *agentReporter) ReportDeployComplete(creds *model.BMCCreds) error {
 	// operator-attention case anyway. Aggressive retry here is
 	// load-bearing: see the method doc — losing this report after the
 	// BMC rotation permanently desyncs creds. 2xx counts as success.
-	url := fmt.Sprintf("http://%s/api/v1/report", r.server)
-	return agent.PostJSON(r.log, url, body, agent.PostOptions{
+	return r.send(model.ProgressReport{
+		Event:    "deploy_complete",
+		Logs:     r.drainLogs(),
+		BMCCreds: creds,
+	}, true, agent.PostOptions{
 		Client:      r.client,
 		Attempts:    4,
 		Backoff:     time.Second,
@@ -86,19 +126,11 @@ func (r *agentReporter) ReportDeployComplete(creds *model.BMCCreds) error {
 // an active commission operation owned by machine_id, then validates the
 // inventory identity before queueing it for global persistence.
 func (r *agentReporter) ReportCommissionComplete(data json.RawMessage) error {
-	report := model.ProgressReport{
-		OperationID:    r.opID,
-		MachineID:      r.machineID,
+	return r.send(model.ProgressReport{
 		Event:          "commission_report",
 		Logs:           r.drainLogs(),
 		CommissionData: data,
-	}
-	body, err := json.Marshal(report)
-	if err != nil {
-		return fmt.Errorf("marshal commission report: %w", err)
-	}
-	url := fmt.Sprintf("http://%s/api/v1/report", r.server)
-	return agent.PostJSON(r.log, url, body, agent.PostOptions{
+	}, true, agent.PostOptions{
 		Client:   &http.Client{Timeout: 30 * time.Second},
 		Attempts: 3,
 		Backoff:  2 * time.Second,
@@ -117,21 +149,36 @@ func (r *agentReporter) ReportFailure(phase, errMsg string) {
 	})
 }
 
+// RunFlushLoop ships collected log lines and, every liveness interval,
+// reports to the site worker whether or not there is anything to ship. The
+// empty report is the liveness check: phase reports can be minutes apart
+// (the OS extract), and without it an aborted agent would keep writing to
+// the disks until its next phase.
 func (r *agentReporter) RunFlushLoop(done <-chan struct{}) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(r.liveness)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-done:
 			return
 		case <-ticker.C:
-			if r.collector.Len() > 0 {
-				r.post(model.ProgressReport{Logs: r.drainLogs()})
+			logs := r.drainLogs()
+			if len(logs) == 0 && r.finalReportAccepted() {
+				// The operation may be complete by now, and a refused
+				// probe would only be noise in the site worker's log.
+				continue
 			}
+			r.post(model.ProgressReport{Logs: logs})
 		case <-r.collector.FlushCh():
 			r.post(model.ProgressReport{Logs: r.drainLogs()})
 		}
 	}
+}
+
+func (r *agentReporter) finalReportAccepted() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.finalAccepted
 }
 
 func (r *agentReporter) drainLogs() []model.LogLine {
@@ -146,31 +193,55 @@ func (r *agentReporter) drainLogs() []model.LogLine {
 	return out
 }
 
+// post sends a best-effort report: single attempt, no retry. Progress spam
+// is flushed every few seconds (RunFlushLoop), so losing one batch is fine —
+// the next tick carries the backlog. Only a transport error is worth a log
+// line; a refused report is dropped, except that send still acts on 410.
 func (r *agentReporter) post(report model.ProgressReport) {
-	report.OperationID = r.opID
-	report.MachineID = r.machineID
-
-	// Skip the heartbeat-with-no-content case — the flush loop wakes
-	// every 5s, and an empty post just adds noise to slagworksd logs.
-	if report.Phase == "" && report.Event == "" && !report.Failed && len(report.Logs) == 0 && report.BMCCreds == nil && len(report.CommissionData) == 0 {
-		return
-	}
-
-	body, err := json.Marshal(report)
-	if err != nil {
-		r.log.Warn("marshal progress report", "err", err)
-		return
-	}
-	url := fmt.Sprintf("http://%s/api/v1/report", r.server)
-	// Fire-and-forget: single attempt, no retry. Progress spam is
-	// flushed every 5s (RunFlushLoop), so losing one batch is fine —
-	// the next tick carries the backlog. Status is deliberately not
-	// checked (accept-all); only a transport error is worth a log line,
-	// matching the pre-unification behavior. Return value ignored.
-	_ = agent.PostJSON(r.log, url, body, agent.PostOptions{
+	_ = r.send(report, false, agent.PostOptions{
 		Client:   r.client,
 		Attempts: 1,
 		Name:     "progress report",
 		AcceptFn: func(int) bool { return true },
 	})
+}
+
+// send is the one path every report takes. It stamps the operation binding,
+// posts with the caller's retry policy, and handles the answers that mean
+// more than success or failure of this one report: an accepted final report
+// seals the run, and 410 Gone before that marks the operation inactive and
+// calls onInactive. final marks deploy_complete and commission_report.
+func (r *agentReporter) send(report model.ProgressReport, final bool, opts agent.PostOptions) error {
+	report.OperationID = r.opID
+	report.MachineID = r.machineID
+	body, err := json.Marshal(report)
+	if err != nil {
+		r.log.Warn("marshal "+opts.Name, "err", err)
+		return fmt.Errorf("marshal %s: %w", opts.Name, err)
+	}
+	// 410 ends the retry loop: no later attempt can revive the operation.
+	opts.FinalFn = func(status int) bool { return status == http.StatusGone }
+	url := fmt.Sprintf("http://%s/api/v1/report", r.server)
+
+	r.mu.Lock()
+	if r.inactive {
+		// Already told to stop; the process is on its way out.
+		r.mu.Unlock()
+		return fmt.Errorf("%s not sent: the operation is no longer active", opts.Name)
+	}
+	err = agent.PostJSON(r.log, url, body, opts)
+	stop := false
+	if se, ok := errors.AsType[*agent.StatusError](err); ok && se.Status == http.StatusGone && !r.finalAccepted {
+		r.inactive = true
+		stop = true
+	}
+	if err == nil && final {
+		r.finalAccepted = true
+	}
+	r.mu.Unlock()
+
+	if stop && r.onInactive != nil {
+		r.onInactive()
+	}
+	return err
 }

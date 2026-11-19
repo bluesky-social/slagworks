@@ -31,7 +31,7 @@ func TestRegisterSiteWorker_MintsToken(t *testing.T) {
 func TestRegisterSiteWorker_RotatesOnReregister(t *testing.T) {
 	st := testStore(t)
 
-	_, token1, err := st.RegisterSiteWorker("pop3", "worker-1", "worker-1.pop3")
+	first, token1, err := st.RegisterSiteWorker("pop3", "worker-1", "worker-1.pop3")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,10 +43,16 @@ func TestRegisterSiteWorker_RotatesOnReregister(t *testing.T) {
 	if token1 == token2 {
 		t.Fatal("re-registration should mint a new token")
 	}
-	// Row identity (first.ID vs second.ID) is GORM-decided; the
-	// (slug, worker_id) upsert handles dedupe. We verify the rotation
-	// by confirming the new FQDN landed and the old token no longer
-	// authenticates.
+	// Rotation updates the existing row, so the returned struct is that
+	// row: same id and first_seen_at, new fqdn, and the old token no
+	// longer authenticates.
+	if second.ID != first.ID {
+		t.Fatalf("re-registration returned id %s; the registration's id is %s", second.ID, first.ID)
+	}
+	if !second.FirstSeenAt.Equal(first.FirstSeenAt) {
+		t.Fatalf("re-registration returned first_seen_at %s; the registration's is %s",
+			second.FirstSeenAt, first.FirstSeenAt)
+	}
 	if second.FQDN != "worker-1.pop3-renamed" {
 		t.Fatalf("fqdn not refreshed: %q", second.FQDN)
 	}
@@ -266,6 +272,48 @@ func TestResolveSiteWorker_ByFQDN(t *testing.T) {
 	}
 	if got.ID != w.ID {
 		t.Fatalf("resolved id %s, want %s", got.ID, w.ID)
+	}
+}
+
+// TestResolveSiteWorker_ByUUIDShapedWorkerID: slagworksd generates a uuid
+// for its worker_id unless SLAGWORKS_WORKER_ID overrides it, so a worker_id
+// that parses as a uuid is the default, and it must still resolve even
+// though no row has that id.
+func TestResolveSiteWorker_ByUUIDShapedWorkerID(t *testing.T) {
+	st := testStore(t)
+	workerID := uuid.NewString()
+	w, _, err := st.RegisterSiteWorker("pop3", workerID, "a.pop3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.ResolveSiteWorker(workerID)
+	if err != nil {
+		t.Fatalf("resolve worker_id %s: %v", workerID, err)
+	}
+	if got.ID != w.ID {
+		t.Fatalf("resolved id %s, want %s", got.ID, w.ID)
+	}
+}
+
+// TestResolveSiteWorker_IDWinsOverWorkerID: when the identifier is one
+// row's id and another row's worker_id, the id match wins. The uuid is
+// what slagctl tells an operator to use to disambiguate, so it must keep
+// naming exactly one row.
+func TestResolveSiteWorker_IDWinsOverWorkerID(t *testing.T) {
+	st := testStore(t)
+	byID, _, err := st.RegisterSiteWorker("pop3", "worker-a", "a.pop3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.RegisterSiteWorker("pop4", byID.ID.String(), "b.pop4"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.ResolveSiteWorker(byID.ID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != byID.ID {
+		t.Fatalf("resolved id %s, want %s", got.ID, byID.ID)
 	}
 }
 

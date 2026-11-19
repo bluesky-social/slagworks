@@ -352,7 +352,12 @@ func NewServer(cfg Config) *Server {
 	if len(cfg.CredentialGroups) > 0 {
 		credAuthz = tokenverify.RequireAnyGroup(cfg.CredentialGroups...)
 	}
-	instanceID, _ := cfg.Store.GetInstanceID()
+	// Nothing gates on the instance ID; it is only reported by /healthz,
+	// /readyz and `slagctl version`, so a failed read is logged, not fatal.
+	instanceID, idErr := cfg.Store.GetInstanceID()
+	if idErr != nil {
+		slog.Warn("instance ID unavailable: /healthz and /readyz will report an empty instance_id", "err", idErr)
+	}
 
 	// preflightKey: derive from webhookSecret if available (same config
 	// surface, no extra knob); otherwise generate a random 32-byte key at
@@ -407,6 +412,7 @@ func NewServer(cfg Config) *Server {
 	// Every operator-facing JSON response is encoded here, which is what
 	// keeps op-param credentials out of them (see operatorJSONSerializer).
 	s.echo.JSONSerializer = operatorJSONSerializer{}
+	s.echo.Binder = &jsonBodyBinder{}
 	s.echo.Use(middleware.Recover())
 	s.echo.Use(middleware.BodyLimit(12 << 20)) // 12 MiB
 	// The request log records the path, never the query string: a site
@@ -1134,7 +1140,12 @@ func (s *Server) deployMachine(c *echo.Context) error {
 		// host (e.g. a leaf switch).
 		Via string `json:"via,omitempty"`
 	}
-	_ = c.Bind(&body)
+	// The body is optional (Bind succeeds on none), but one that does not
+	// bind must not become a deploy with every flag false: a dropped
+	// recovery or via changes what the host does.
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid deploy body: "+err.Error())
+	}
 	if !validVia(body.Via) {
 		return echo.NewHTTPError(http.StatusBadRequest, invalidViaMsg(body.Via))
 	}
@@ -1197,7 +1208,10 @@ func (s *Server) commissionMachine(c *echo.Context) error {
 		// the device's PDU outlets — required for a BMC-less host.
 		Via string `json:"via,omitempty"`
 	}
-	_ = c.Bind(&body)
+	// Optional body, as for deploy: a body that does not bind is refused.
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid commission body: "+err.Error())
+	}
 	if !validVia(body.Via) {
 		return echo.NewHTTPError(http.StatusBadRequest, invalidViaMsg(body.Via))
 	}
@@ -1300,6 +1314,9 @@ func (s *Server) abortMachine(c *echo.Context) error {
 	}
 	if durable {
 		s.invalidateAllSites()
+	}
+	if errors.Is(err, store.ErrMachineNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "machine not found")
 	}
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())

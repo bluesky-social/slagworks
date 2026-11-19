@@ -91,8 +91,36 @@ func (p RelayPool) Validate() error {
 	if !subnet.Contains(gw) {
 		return fmt.Errorf("gateway %s not contained in subnet %s", p.Gateway, p.Subnet)
 	}
-	if ipToUint32(start) > ipToUint32(end) {
+	s, e, g := ipToUint32(start), ipToUint32(end), ipToUint32(gw)
+	if s > e {
 		return errors.New("range start must be <= end")
+	}
+	// The DHCP handler leases the range as given, upward from RangeStart,
+	// and its ARP probe runs on the worker's own segment, so it cannot see
+	// the gateway or anything else on a relayed subnet. Every address in
+	// the range must therefore be one a client can own.
+	if s <= g && g <= e {
+		return fmt.Errorf("gateway %s is inside range %s-%s, so DHCP would offer the router address to a client; move the range or the gateway so they do not overlap",
+			p.Gateway, p.RangeStart, p.RangeEnd)
+	}
+	// A subnet wider than /31 has a network and a broadcast address, and
+	// neither is a host address; a /31 (RFC 3021) or /32 has neither.
+	// prefixLen is derived from the host-bit count, so it is the IPv4
+	// prefix length whether net.ParseCIDR returned a 4- or 16-byte mask;
+	// subnet.Contains(start) above guarantees an IPv4 network, which
+	// keeps it within 0-32.
+	ones, bits := subnet.Mask.Size()
+	if prefixLen := 32 - (bits - ones); prefixLen <= 30 {
+		network := ipToUint32(subnet.IP.To4())
+		broadcast := network | ^uint32(0)>>prefixLen
+		if s == network {
+			return fmt.Errorf("range %s-%s includes the network address of %s, which no host can use; start the range after it",
+				p.RangeStart, p.RangeEnd, p.Subnet)
+		}
+		if e == broadcast {
+			return fmt.Errorf("range %s-%s includes the broadcast address of %s, which no host can use; end the range before it",
+				p.RangeStart, p.RangeEnd, p.Subnet)
+		}
 	}
 	return nil
 }

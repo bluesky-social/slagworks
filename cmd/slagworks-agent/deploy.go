@@ -32,15 +32,21 @@ type deployParams struct {
 	// expectUUID (verifyIdentity in production). A field so tests can
 	// drive runDeploy without dmidecode.
 	checkIdentity func(expectUUID string) error
+	// armBootNext points the firmware's next boot at the installed OS
+	// (bootloader.SetBootNextToInstalledOS in production) and reboot
+	// restarts the host (rebootInto in production). Fields so tests can
+	// drive completeDeploy without efibootmgr or a reboot.
+	armBootNext func(ctx *agent.Context)
+	reboot      func(ctx *agent.Context, reason string)
 }
 
 // runDeploy drives the deploy sequence: identity check, storage
 // resolve/plan, network-config render, storage apply, root extraction,
 // bootloader install, target finalization (fstab/cloud-init/network/
 // hostname/keys), tailscale enrollment, target unmount, BMC reconcile,
-// deploy_complete report, and reboot. Everything that can hard-fail on
-// inputs known at start (the storage and network scripts) runs before the
-// first disk is touched.
+// deploy_complete report, BootNext, and reboot. Everything that can
+// hard-fail on inputs known at start (the storage and network scripts) runs
+// before the first disk is touched.
 func runDeploy(ctx *agent.Context, p deployParams) {
 	setPhase, fatal := p.setPhase, p.fatal
 
@@ -325,6 +331,7 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 	// without --machine/--op for debugging). Running reconcile in
 	// that mode would set a monitor password with no way to phone it
 	// home. The reporter-required gate is the only safe shape.
+	var reportComplete func() error
 	if p.reporter != nil {
 		// An Intel AMT host (slagworks.oob=amt) has no IPMI BMC: skip
 		// reconcile entirely and report deploy_complete with nil creds, the
@@ -372,20 +379,43 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 		// landed but the creds were dropped, which on a rotation deploy
 		// would permanently desync the BMC from slagworks's stored
 		// passwords.
-		if err := p.reporter.ReportDeployComplete(bmcCreds); err != nil {
-			fatal("reporting deploy_complete", err)
+		reportComplete = func() error { return p.reporter.ReportDeployComplete(bmcCreds) }
+	}
+
+	completeDeploy(ctx, p, reportComplete)
+}
+
+// completeDeploy ends a deploy whose target is written and unmounted: it
+// reports deploy_complete, and only once the site worker has accepted that
+// does it commit the host's next boot to the installed OS (BootNext) and
+// reboot. reportComplete is nil when the agent has no reporter.
+//
+// The order is the point. The firmware honors BootNext ahead of everything,
+// the BMC's PXE override included, so while it is armed the host's next boot
+// is the installed disk no matter what a site worker asks of the BMC. Until
+// deploy_complete is accepted the deploy can still be aborted, time out or
+// fail right here, and an armed BootNext would then send the next deploy's
+// power cycle into the abandoned install instead of PXE. A report the site
+// worker refuses therefore ends in fatal with BootNext untouched.
+func completeDeploy(ctx *agent.Context, p deployParams, reportComplete func() error) {
+	if reportComplete != nil {
+		if err := reportComplete(); err != nil {
+			p.fatal("reporting deploy_complete", err)
 		}
 	}
+
+	p.armBootNext(ctx)
 
 	ctx.Log.Info("deploy complete")
 	close(p.done)
 
-	// Reboot into the freshly-installed OS. The boot-action's
-	// "awaiting_phone_home → BootLocal" clause makes the
-	// post-deploy PXE iteration sanboot from disk, the OS comes up,
-	// the slagworks-phone-home.service unit POSTs to /api/v1/report,
-	// and the deploy op completes (machine → running). Without this
-	// reboot the host stays in initrd and no one ever phones home.
+	// Reboot into the freshly-installed OS. BootNext takes the host
+	// straight to its disk; on firmware that network-boots anyway, the
+	// boot-action's "awaiting_phone_home → BootLocal" clause makes that
+	// PXE iteration sanboot from disk. Either way the OS comes up, the
+	// slagworks-phone-home.service unit POSTs to /api/v1/report, and the
+	// deploy op completes (machine → running). Without this reboot the
+	// host stays in initrd and no one ever phones home.
 	//
 	// Kernel cmdline `slagworks.no_reboot` disables this for ad-hoc
 	// debugging (drop the operator into a shell at the end of deploy
@@ -394,5 +424,5 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 		ctx.Log.Info("slagworks.no_reboot set, holding in initrd")
 		select {} // park forever
 	}
-	rebootInto(ctx, "deploy")
+	p.reboot(ctx, "deploy")
 }
