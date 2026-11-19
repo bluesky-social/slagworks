@@ -287,6 +287,37 @@ func TestBuildBMCIPFromBMClessSwitch(t *testing.T) {
 	}
 }
 
+// TestClassifyMachineInterface locks how mgmt_only combines with device BMC
+// presence. mgmt_only means "BMC interface" only on a device with oob_ip; on a
+// BMC-less device the flag must not change the classification at all, so a
+// mgmt_only bond still reports "lag" (the type the L2 bond network-config
+// script keys on) rather than collapsing to "physical".
+func TestClassifyMachineInterface(t *testing.T) {
+	lag := &netbox.NestedValue{Value: "lag"}
+	nic := &netbox.NestedValue{Value: "1000base-t"}
+	tests := []struct {
+		name   string
+		iface  netbox.Interface
+		hasBMC bool
+		want   string
+	}{
+		{"mgmt_only NIC with BMC", netbox.Interface{Name: "ipmi0", MgmtOnly: true, Type: nic}, true, "ipmi"},
+		{"mgmt_only NIC without BMC", netbox.Interface{Name: "mgmt0", MgmtOnly: true, Type: nic}, false, "physical"},
+		{"mgmt_only untyped NIC without BMC", netbox.Interface{Name: "mgmt0", MgmtOnly: true}, false, "physical"},
+		{"mgmt_only lag without BMC", netbox.Interface{Name: "bond0", MgmtOnly: true, Type: lag}, false, "lag"},
+		{"lag without BMC", netbox.Interface{Name: "bond0", Type: lag}, false, "lag"},
+		{"lag with BMC", netbox.Interface{Name: "bond0", Type: lag}, true, "lag"},
+		{"NIC with BMC", netbox.Interface{Name: "eno1", Type: nic}, true, "physical"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyMachineInterface(tt.iface, tt.hasBMC); got != tt.want {
+				t.Errorf("classifyMachineInterface(%s, hasBMC=%v) = %q, want %q", tt.name, tt.hasBMC, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestBuildBMCIPFromOOBIP locks the positive path: a normal server whose
 // NetBox device carries oob_ip gets that address (CIDR stripped) as its
 // BMCIP.

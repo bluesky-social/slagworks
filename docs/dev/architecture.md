@@ -295,7 +295,8 @@ Types are in `internal/model/snapshot.go`:
 - `SnapshotInterface` (`snapshot.go:126`) — `Type` is one of
   `physical`, `ipmi`, `lag`; only physical NICs are matched by DHCP.
   A `mgmt_only` interface is `ipmi` only when the device has a canonical
-  NetBox `oob_ip`; on a BMC-less device it remains a physical host/PXE NIC.
+  NetBox `oob_ip`; on a BMC-less device the flag is ignored, so a NIC
+  remains a physical host/PXE NIC and a bond remains `lag`.
 - `ContentHash()` (`snapshot.go:280`) — SeqNum stripped, slices sorted
   in copy, sha256. This is the dispatcher's push-decision key.
 
