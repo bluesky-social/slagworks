@@ -942,9 +942,11 @@ From the site ring:
 
 1. `WSConn.logRingDrainLoop` (`worker/wsconn.go:601`) drains the ring
    and calls `sendLogBatch` (691) with `TypeLogBatch`. A batch holds at
-   most 256 envelopes and 4 MiB, so it stays under the 16 MiB message
+   most 256 envelopes whose encoded sizes total at most 4 MiB (plus the
+   array and message wrapper), so it stays well under the 16 MiB message
    limit both ends of the WebSocket read with; `Ring.Drain` drops (and
-   counts in `dropped`) a single envelope too large for a batch.
+   counts in `dropped`) a single envelope too large for a batch. Global
+   checks only the 16 MiB limit, not the batch policy.
 2. Hub dispatches to `hubhandlers.LogBatch.HandleLogBatch`.
 3. Handler rejects the batch if any envelope's source is not `agent`
    or `site`, then inserts into `log_envelopes` and pushes into the
