@@ -32,7 +32,7 @@ func raid5CreateCommand(t *testing.T) storage.Command {
 			"/data":     {Device: "mddata"},
 		},
 	}
-	cmds, err := storage.Plan(layout, []storage.BlockDevice{{Name: "vda"}, {Name: "vdb"}, {Name: "vdc"}, {Name: "vdd"}})
+	cmds, err := storage.Plan(layout, []storage.BlockDevice{{Name: "vda", LogicalSectorBytes: 512}, {Name: "vdb", LogicalSectorBytes: 512}, {Name: "vdc", LogicalSectorBytes: 512}, {Name: "vdd", LogicalSectorBytes: 512}})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
