@@ -60,16 +60,20 @@ func (s *Store) ListImages() ([]model.Image, error) {
 // downloaded under the old name stays on disk (SyncImages only pulls
 // missing/mismatched entries — it does not prune), which is acceptable:
 // disk space on the image cache is not a slagworks-managed constraint.
+//
+// An ident that parses as a uuid is tried as an id first and, on a miss,
+// as a name: names are free text, so a uuid-shaped name must stay
+// deletable. The id match wins outright, so one call never deletes two
+// rows.
 func (s *Store) DeleteImage(ident string) error {
 	if id, err := uuid.Parse(ident); err == nil {
 		res := s.db.Delete(&model.Image{}, "id = ?", id)
 		if res.Error != nil {
 			return res.Error
 		}
-		if res.RowsAffected == 0 {
-			return fmt.Errorf("image %s not found", ident)
+		if res.RowsAffected > 0 {
+			return nil
 		}
-		return nil
 	}
 	res := s.db.Delete(&model.Image{}, "name = ?", ident)
 	if res.Error != nil {

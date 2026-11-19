@@ -269,6 +269,46 @@ func TestResolveSiteWorker_ByFQDN(t *testing.T) {
 	}
 }
 
+// TestResolveSiteWorker_ByUUIDShapedWorkerID pins that a worker_id which
+// parses as a UUID still resolves by worker_id. slagworksd generates its
+// worker_id with uuid.New, so this is the default shape, not a corner case.
+func TestResolveSiteWorker_ByUUIDShapedWorkerID(t *testing.T) {
+	st := testStore(t)
+	workerID := uuid.NewString()
+	w, _, err := st.RegisterSiteWorker("pop3", workerID, "a.pop3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.ResolveSiteWorker(workerID)
+	if err != nil {
+		t.Fatalf("ResolveSiteWorker(%q) by worker_id: %v", workerID, err)
+	}
+	if got.ID != w.ID {
+		t.Fatalf("resolved id %s, want %s", got.ID, w.ID)
+	}
+}
+
+// TestResolveSiteWorker_UUIDPrefersID pins the precedence when an ident is
+// both one row's id and another row's worker_id: the id match wins rather
+// than reporting the two rows as ambiguous.
+func TestResolveSiteWorker_UUIDPrefersID(t *testing.T) {
+	st := testStore(t)
+	byID, _, err := st.RegisterSiteWorker("pop3", "worker-a", "a.pop3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.RegisterSiteWorker("pop3", byID.ID.String(), "b.pop3"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.ResolveSiteWorker(byID.ID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != byID.ID {
+		t.Fatalf("resolved id %s, want the id match %s", got.ID, byID.ID)
+	}
+}
+
 func TestResolveSiteWorker_NotFound(t *testing.T) {
 	st := testStore(t)
 	if _, err := st.ResolveSiteWorker("ghost"); !errors.Is(err, ErrSiteWorkerNotFound) {

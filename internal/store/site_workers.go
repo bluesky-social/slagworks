@@ -171,17 +171,21 @@ func (s *Store) ListSiteWorkersBySerial(serial string) ([]model.SiteWorker, erro
 // Returns ErrSiteWorkerNotFound if nothing matches, *AmbiguousSiteWorkerError
 // if more than one row matches (e.g. the same worker_id registered under
 // two different site slugs, or two different workers sharing an fqdn).
+//
+// An ident that parses as a uuid is tried as an id first and, on a miss,
+// as a worker_id or fqdn: slagworksd generates its worker_id with
+// uuid.New, so a uuid-shaped ident is as likely to be a worker_id as a
+// row id. The id match wins outright.
 func (s *Store) ResolveSiteWorker(ident string) (*model.SiteWorker, error) {
 	if id, err := uuid.Parse(ident); err == nil {
 		var w model.SiteWorker
 		err := s.db.Where("id = ?", id).First(&w).Error
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrSiteWorkerNotFound
+		if err == nil {
+			return &w, nil
 		}
-		if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, err
 		}
-		return &w, nil
 	}
 	var matches []model.SiteWorker
 	if err := s.db.Where("worker_id = ? OR fqdn = ?", ident, ident).Find(&matches).Error; err != nil {

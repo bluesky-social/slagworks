@@ -51,6 +51,53 @@ func TestDeleteImage_ByUUID(t *testing.T) {
 	}
 }
 
+// TestDeleteImage_ByUUIDShapedName pins that a name which happens to parse
+// as a UUID still deletes by name. images.name is free text, and
+// uuid.Parse accepts more than the canonical form (32 bare hex digits,
+// braces, a urn:uuid: prefix), so the ident's shape alone must not rule
+// out the name lookup.
+func TestDeleteImage_ByUUIDShapedName(t *testing.T) {
+	for _, name := range []string{
+		"6f1c5f2e-1d2b-4c3a-9e4f-0a1b2c3d4e5f",
+		"6f1c5f2e1d2b4c3a9e4f0a1b2c3d4e5f",
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := testStore(t)
+			keep := seedImage(t, st, "noble-pxe")
+			seedImage(t, st, name)
+			if err := st.DeleteImage(name); err != nil {
+				t.Fatalf("DeleteImage(%q) by name: %v", name, err)
+			}
+			images, err := st.ListImages()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(images) != 1 || images[0].ID != keep.ID {
+				t.Fatalf("after deleting %q: got %+v, want only %q", name, images, keep.Name)
+			}
+		})
+	}
+}
+
+// TestDeleteImage_UUIDPrefersID pins the precedence when an ident is both
+// one row's id and another row's name: the id match wins and the
+// same-named row survives, so a delete never removes two rows.
+func TestDeleteImage_UUIDPrefersID(t *testing.T) {
+	st := testStore(t)
+	byID := seedImage(t, st, "noble-pxe")
+	byName := seedImage(t, st, byID.ID.String())
+	if err := st.DeleteImage(byID.ID.String()); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	images, err := st.ListImages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(images) != 1 || images[0].ID != byName.ID {
+		t.Fatalf("got %+v, want only the row named %q", images, byName.Name)
+	}
+}
+
 func TestDeleteImage_NotFound(t *testing.T) {
 	st := testStore(t)
 	if err := st.DeleteImage("ghost"); err == nil {
