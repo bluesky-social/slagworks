@@ -241,7 +241,7 @@ func (s *Store) SetMachinePXEEligible(id uuid.UUID, eligible bool) error {
 func (s *Store) StoreCommissionData(id uuid.UUID, data json.RawMessage) error {
 	now := time.Now().UTC()
 	return s.db.Model(&model.Machine{}).Where("id = ?", id).Updates(map[string]any{
-		"commission_data": data,
+		"commission_data": jsonbSafe(data),
 		"commissioned_at": now,
 	}).Error
 }
