@@ -18,6 +18,7 @@ package netbox
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +30,16 @@ import (
 
 	"pgregory.net/rapid"
 )
+
+// The properties in this package run from a fixed seed unless one is given,
+// so a plain go test explores the same cases every time. The default is set
+// before flags are parsed: -rapid.seed and -rapid.checks on the command
+// line still apply, and a deep run should pass a fresh seed.
+func init() {
+	if err := flag.Set("rapid.seed", "1"); err != nil {
+		panic(err)
+	}
+}
 
 type genDevice struct {
 	ID int
