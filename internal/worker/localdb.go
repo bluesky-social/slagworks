@@ -78,7 +78,10 @@ type currentDeployOpRow struct {
 func (currentDeployOpRow) TableName() string { return "current_deploy_ops" }
 
 func OpenLocalDB(path string) (*LocalDB, error) {
-	db, err := gorm.Open(sqlite.Open(path+"?_journal_mode=WAL"), &gorm.Config{
+	// glebarez/go-sqlite runs each _pragma= value on every new pool
+	// connection, after its default busy_timeout(5000). It ignores
+	// mattn/go-sqlite3-style parameters such as _journal_mode.
+	db, err := gorm.Open(sqlite.Open(path+"?_pragma=journal_mode(WAL)"), &gorm.Config{
 		Logger: logger.Discard,
 	})
 	if err != nil {
@@ -271,25 +274,34 @@ func (l *LocalDB) AckOutboxRow(rowID uint64) {
 }
 
 // PersistedOpState is the op-layer half of the worker's warm-restart
-// state (Tier 2 Phase 2): the active op set + the op-driven machine-state
-// overlay. It is persisted OUTSIDE the snapshot path (SaveOpState),
-// because operations left SiteSnapshot and now flow on the op-event
-// stream — the op set is written on every stream apply, not on snapshot
-// apply. On rehydration the loaded set is treated as UNTRUSTED until the
-// first op_resync (it may be stale: global could have failed/completed an
-// op during the outage), so a persisted active deploy op never actuates a
-// re-wipe on cold start.
+// state (Tier 2 Phase 2): the active op set, the op-driven machine-state
+// overlay, and the deploy ops that phone-homed locally. It is persisted
+// OUTSIDE the snapshot path (SaveOpState), because operations left
+// SiteSnapshot and now flow on the op-event stream — the op set is written
+// on every stream apply and on the two local mutations that guard an
+// installed host against a re-image (the awaiting_phone_home phase and
+// phone-home), not on snapshot apply. On rehydration the loaded set is
+// treated as UNTRUSTED until the first op_resync (it may be stale: global
+// could have failed/completed an op during the outage), so a persisted
+// active deploy op never actuates a re-wipe on cold start.
 type PersistedOpState struct {
 	Ops     []model.Operation             `json:"ops"`
 	Overlay map[string]model.MachineState `json:"overlay"`
+	// PhoneHomed is opState.phoneHomed: deploy op IDs whose installed OS
+	// phoned home to this worker. Global may not know yet (the completion
+	// op_update is not durable), so the first op_resync after a restart can
+	// still carry the op as claimed; the restored entry keeps the machine
+	// pinned to running instead of re-imaging it.
+	PhoneHomed []string `json:"phone_homed"`
 }
 
-// SaveOpState persists the op set + machine-state overlay to the kv table
-// under "op_state". Called on every op-stream apply (delta/resync/removed)
-// — small, bounded by active-op count. Best-effort: a failure is logged,
-// not fatal (the op set re-syncs from global on the next connect anyway).
-func (l *LocalDB) SaveOpState(ops []model.Operation, overlay map[string]model.MachineState) {
-	blob, err := json.Marshal(PersistedOpState{Ops: ops, Overlay: overlay})
+// SaveOpState persists the op layer to the kv table under "op_state".
+// Called on every op-stream apply (delta/resync/removed) and on the local
+// latch mutations (Cache.UpdateOpPhase to awaiting_phone_home,
+// Cache.RecordPhoneHome) — small, bounded by active-op count. Best-effort:
+// a failure is logged, not fatal.
+func (l *LocalDB) SaveOpState(st PersistedOpState) {
+	blob, err := json.Marshal(st)
 	if err != nil {
 		l.log.Error("marshal op_state", "err", err)
 		return
@@ -299,7 +311,7 @@ func (l *LocalDB) SaveOpState(ops []model.Operation, overlay map[string]model.Ma
 	}
 }
 
-// LoadOpState returns the persisted op set + overlay, or nil if none has
+// LoadOpState returns the persisted op layer, or nil if none has
 // been saved (fresh install, or a DB written by a pre-Tier-2 binary that
 // carried ops in the snapshot meta — those are simply absent here, so the
 // worker starts with an empty untrusted op set, which is correct). Corrupt
@@ -500,13 +512,28 @@ func (l *LocalDB) DeleteDHCPLease(mac net.HardwareAddr) {
 	l.db.Delete(&dhcpLeaseRow{}, "mac = ?", mac.String())
 }
 
-// LoadDHCPLeases returns all non-expired persisted leases.
+// LoadDHCPLeases returns all non-expired persisted leases and deletes the
+// expired ones.
+//
+// Expiry is judged in Go, never in SQL. The driver stores expires_at as
+// text carrying the writer's UTC offset ("2006-01-02 15:04:05.999999999-07:00"),
+// so an SQL comparison orders wall-clock readings, not instants: a row
+// written under a different offset than time.Now() has at load (a restart
+// around a DST change, or after the host's time zone changes) reads up to
+// the offset difference early or late. The driver parses the offset back
+// into time.Time, so comparing in Go is exact.
 func (l *LocalDB) LoadDHCPLeases() []DHCPLease {
 	var rows []dhcpLeaseRow
-	l.db.Where("expires_at > ?", time.Now()).Find(&rows)
+	l.db.Find(&rows)
 
+	now := time.Now()
 	leases := make([]DHCPLease, 0, len(rows))
+	var expired []string
 	for _, r := range rows {
+		if !r.ExpiresAt.After(now) {
+			expired = append(expired, r.MAC)
+			continue
+		}
 		mac, err := net.ParseMAC(r.MAC)
 		if err != nil {
 			l.log.Warn("corrupt DHCP lease MAC, skipping", "mac", r.MAC)
@@ -520,19 +547,28 @@ func (l *LocalDB) LoadDHCPLeases() []DHCPLease {
 		leases = append(leases, DHCPLease{MAC: mac, IP: ip, ExpiresAt: r.ExpiresAt})
 	}
 
-	// Clean up expired leases
-	l.db.Where("expires_at <= ?", time.Now()).Delete(&dhcpLeaseRow{})
+	if len(expired) > 0 {
+		l.db.Delete(&dhcpLeaseRow{}, "mac IN ?", expired)
+	}
 
 	return leases
 }
 
 // CountActiveDHCPLeases returns the number of currently-valid (non-expired)
 // DHCP leases persisted to the local DB. Used by site worker startup to
-// summarize what got loaded; cheap COUNT(*) instead of pulling the row
-// set when the site only needs the integer.
+// summarize what got loaded. It reads only the expiry column and judges it
+// in Go, for the reason given on LoadDHCPLeases.
 func (l *LocalDB) CountActiveDHCPLeases() int64 {
+	var expiries []time.Time
+	l.db.Model(&dhcpLeaseRow{}).Pluck("expires_at", &expiries)
+
+	now := time.Now()
 	var n int64
-	l.db.Model(&dhcpLeaseRow{}).Where("expires_at > ?", time.Now()).Count(&n)
+	for _, e := range expiries {
+		if e.After(now) {
+			n++
+		}
+	}
 	return n
 }
 

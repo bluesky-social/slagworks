@@ -65,6 +65,11 @@ const (
 	PrivAdmin    PrivLevel = 4
 )
 
+// privNoAccess is the NO ACCESS privilege limit (0xF), which bars a user
+// from the channel. Reconcile only writes it: parseUserList reads a slot
+// listing NO ACCESS as Privilege 0, disabled.
+const privNoAccess PrivLevel = 0xF
+
 func (p PrivLevel) String() string {
 	switch p {
 	case PrivCallback:
@@ -414,14 +419,15 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			// An existing-but-DISABLED user is treated as not-yet-fully-
 			// provisioned and gets a fresh password (needsPassword). This
 			// covers the partial-create crash window: create does
-			// set-name -> set-password -> priv -> ENABLE in that order, so a
-			// crash after set-name but before the password write leaves the
-			// slot named-but-disabled with no usable password. Without
-			// needsPassword we'd "fix" such a slot to enabled at the right
-			// priv with an unknown password and never report a cred — a
-			// stranded account (idempotency-of-partial-retry break). An
-			// ENABLED user with merely the wrong privilege is a genuine
-			// in-place priv fix: leave its working password alone.
+			// NO ACCESS -> set-name -> set-password -> priv -> ENABLE in
+			// that order, so a crash after set-name but before the priv
+			// write leaves the slot named and listing NO ACCESS, which
+			// parseUserList reads as disabled, with a password slagworksd
+			// never received. Without needsPassword we'd "fix" such a slot to enabled
+			// at the right priv with an unknown password and never report a
+			// cred — a stranded account (idempotency-of-partial-retry
+			// break). An ENABLED user with merely the wrong privilege is a
+			// genuine in-place priv fix: leave its working password alone.
 			plans = append(plans, plan{
 				desired:       d,
 				slot:          existing.Slot,
@@ -480,6 +486,18 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			// named-but-misconfigured slot with a known password is still
 			// reported when those fail.
 			if !p.exists {
+				// Drop the slot to NO ACCESS before naming it, so a run that
+				// stops before the priv write leaves a remnant the next run
+				// reads as disabled and re-passwords. A free slot keeps the
+				// privilege limit of whatever account held it last (the
+				// leftover pass disables and clears an account but leaves
+				// its limit); named at that limit, the remnant would read
+				// as an enabled account and get enabled without a password
+				// write, live with the previous occupant's password.
+				if err := runIPMIToolVoid(ctx, opt, "user", "priv",
+					strconv.Itoa(p.slot), strconv.Itoa(int(privNoAccess)), "1"); err != nil {
+					return res, fmt.Errorf("bmcreconcile: set NO ACCESS on slot %d before naming it: %w", p.slot, err)
+				}
 				if err := runIPMIToolVoid(ctx, opt, "user", "set", "name",
 					strconv.Itoa(p.slot), p.desired.Name); err != nil {
 					return res, fmt.Errorf("bmcreconcile: set name slot %d: %w", p.slot, err)
@@ -675,7 +693,8 @@ func checkAdminUser(users []User, adminUser string) error {
 }
 
 // ListUsers parses `ipmitool user list 1` output into User records.
-// ipmitool's list format is space-separated columns:
+// ipmitool's list format is fixed-width columns (parseUserList has the
+// byte-level detail):
 //
 //	ID  Name              Callin   Link Auth  IPMI Msg  Channel Priv Limit
 //	1                     true     false      false     ADMINISTRATOR
@@ -706,9 +725,19 @@ func ListUsers(ctx context.Context, opt Options) ([]User, error) {
 // blank, and `Fields` collapses runs of whitespace, so the columns
 // shift when name is empty.
 //
-// The header looks like:
+// In a terminal the header looks like:
 //
 //	ID  Name             Callin  Link Auth  IPMI Msg   Channel Priv Limit
+//
+// but that is a rendering: ipmitool prints it as a C literal holding two
+// TABs ("ID  Name\t     Callin  Link Auth\tIPMI Msg   Channel Priv Limit",
+// lib/ipmi_user.c dump_user_access), while each data row is
+// printf("%-4d%-17s%-8s%-11s%-11s%-s") and holds only spaces. The header's
+// offsets match the rows' columns (Name 4, Callin 21, Channel 51) only once
+// the TABs are expanded to 8-column stops, so the header is expanded before
+// its offsets are taken; on the raw bytes Callin lands at 14 and Channel at
+// 43, which truncates names and misses every privilege. The rows are sliced
+// as printed.
 //
 // We capture the start of "Name" and the start of "Callin" — those
 // bracket the Name field. The privilege string is everything from
@@ -733,6 +762,7 @@ func parseUserList(s string) ([]User, error) {
 	if headerLine == "" {
 		return nil, errors.New("no header row in user list output")
 	}
+	headerLine = expandTabs(headerLine)
 
 	nameStart := strings.Index(headerLine, "Name")
 	callinStart := strings.Index(headerLine, "Callin")
@@ -772,6 +802,20 @@ func parseUserList(s string) ([]User, error) {
 		return nil, errors.New("no user rows parsed (output format unexpected)")
 	}
 	return users, nil
+}
+
+// expandTabs replaces each TAB in s with the spaces that reach the next
+// 8-column tab stop, as a terminal renders it.
+func expandTabs(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\t' {
+			b.WriteByte(s[i])
+			continue
+		}
+		b.WriteString(strings.Repeat(" ", 8-b.Len()%8))
+	}
+	return b.String()
 }
 
 // safeSlice clamps start/end to the string's bounds so callers
@@ -865,6 +909,15 @@ type plan struct {
 // yet: try the v1.5 16-byte form (ipmitool default) first, then the v2.0
 // 20-byte form, then a short sleep + retry the v1.5. Generated passwords
 // are 12 ASCII chars, well under either byte limit.
+//
+// A failed attempt does not show that the slot lacks the password: the BMC
+// may have applied a write whose response was lost, or the slot may have
+// held the password already. AMI MegaRAC then refuses every further write
+// of it (0x19: it is the current password), so the ladder would fail with
+// the password live on the BMC, and a generated one would never reach the
+// caller. After each failure the slot is therefore tested (`user test`),
+// and a slot that holds the password is a success. A test that cannot run
+// proves nothing, so the ladder goes on.
 func setPassword(ctx context.Context, opt Options, slot int, password string) error {
 	var passErr error
 	for _, attempt := range []struct {
@@ -880,6 +933,9 @@ func setPassword(ctx context.Context, opt Options, slot int, password string) er
 		}
 		passErr = runIPMIToolVoid(ctx, opt, attempt.args...)
 		if passErr == nil {
+			return nil
+		}
+		if held, err := testPassword(ctx, opt, slot, password); err == nil && held {
 			return nil
 		}
 	}

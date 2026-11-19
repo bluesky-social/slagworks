@@ -178,6 +178,9 @@ func isVirtualDriver(driver string) bool {
 	return false
 }
 
+// parseTransceiver reads `ethtool -m` output. The keys are ethtool's own
+// labels; it prints the nominal wavelength as "Laser wavelength" for SFP,
+// QSFP and CMIS modules alike.
 func parseTransceiver(output string) *TransceiverInfo {
 	info := &TransceiverInfo{}
 	found := false
@@ -201,7 +204,7 @@ func parseTransceiver(output string) *TransceiverInfo {
 			case "Vendor SN":
 				info.VendorSN = v
 				found = true
-			case "Wavelength":
+			case "Laser wavelength":
 				info.Wavelength = v
 				found = true
 			}
@@ -244,8 +247,10 @@ func classifyInterfaceType(driver, speed, portType, supportedPorts string, xcvr 
 		}
 	}
 
-	// Determine fibre vs copper from port type, falling back to supported ports
-	isFibre := portType == "fibre" || portType == "da"
+	// Determine fibre vs copper from port type, falling back to supported ports.
+	// A direct-attach copper port is an SFP/QSFP cage, so it classifies with
+	// fibre; ethtool prints PORT_DA as "Direct Attach Copper".
+	isFibre := portType == "fibre" || portType == "direct attach copper"
 	if !isFibre && (portType == "other" || portType == "none" || portType == "") {
 		isFibre = strings.Contains(supportedPorts, "fibre")
 	}

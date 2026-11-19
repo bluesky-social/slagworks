@@ -64,7 +64,9 @@ func validateOperationBinding(op *model.Operation, machineID uuid.UUID, wantType
 			// wrong-type, and fabricated-operation reports.
 			return true, nil
 		}
-		if wantType == model.OpCommission && len(op.Result) > 0 && jsonSemanticallyEqual(op.Result, result) {
+		// The stored result went through jsonbSafe; a redelivery of the
+		// same report must compare equal to it.
+		if wantType == model.OpCommission && len(op.Result) > 0 && jsonSemanticallyEqual(op.Result, jsonbSafe(result)) {
 			return true, nil
 		}
 		return false, bindingErrorf("operation %s is already completed with a different result", op.ID)
@@ -78,6 +80,7 @@ func validateOperationBinding(op *model.Operation, machineID uuid.UUID, wantType
 // searches by machine/type, so another operation cannot be completed as a
 // fallback if opID is stale or mismatched.
 func (s *Store) CommitCommissionResult(opID, machineID uuid.UUID, data json.RawMessage) (*OpOutcome, bool, error) {
+	data = jsonbSafe(data)
 	now := time.Now().UTC()
 	var outcome *OpOutcome
 	var alreadyCompleted bool

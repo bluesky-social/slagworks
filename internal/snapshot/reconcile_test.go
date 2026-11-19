@@ -218,6 +218,80 @@ func TestReconcileSoftDecommissionsMissingDevice(t *testing.T) {
 	}
 }
 
+// TestReconcileSweepsMissingDeviceDespiteUnrelatedStaleConfig: a stale
+// site_config (its NetBox site renamed or deleted, or its location gone)
+// must not stop the missing-device sweep for the rest of the fleet. The
+// sweep deletes only on a per-device 404 from GetDeviceByID, so the
+// stale config's unreadable seen set cannot cause a false delete; skipping
+// the sweep instead strands the row of every device deleted while a
+// webhook was lost, and that row blocks re-enrolling the same serial.
+func TestReconcileSweepsMissingDeviceDespiteUnrelatedStaleConfig(t *testing.T) {
+	cases := []struct {
+		name  string
+		stale model.SiteConfig
+		nb    *fakeNetBox
+	}{
+		{
+			name:  "netbox site gone",
+			stale: model.SiteConfig{Slug: "pop9", NetBoxSite: "pop9"},
+			nb:    &fakeNetBox{sites: map[string]netbox.Site{"pop3": {Slug: "pop3"}}},
+		},
+		{
+			name:  "netbox location gone",
+			stale: model.SiteConfig{Slug: "pop9-cage-z", NetBoxSite: "pop9", NetBoxLocation: "cage-z"},
+			nb: &fakeNetBox{
+				sites:     map[string]netbox.Site{"pop3": {Slug: "pop3"}, "pop9": {Slug: "pop9"}},
+				locations: testLocations(), // no cage-z
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gone := 42
+			st := &reconcileFakeStore{
+				configs: []model.SiteConfig{{Slug: "pop3", NetBoxSite: "pop3"}, tc.stale},
+				// Device 42 was deleted from NetBox and the delete webhook
+				// never landed; GetDeviceByID(42) returns 404.
+				machines: []model.Machine{{NetBoxDeviceID: &gone, NetBoxSerial: "SN-GONE", State: model.MachineStateRunning}},
+			}
+			mir := &recordingMirror{}
+			r := NewReconciler(tc.nb, st, &countingInvalidator{}, mir)
+			r.ManualTick(context.Background())
+
+			if !r.IsStale(tc.stale.Slug) {
+				t.Fatalf("setup: %s should be stale", tc.stale.Slug)
+			}
+			if mir.deleteCount() != 1 || mir.deletes[0].DeviceID != gone {
+				t.Fatalf("device %d is gone from NetBox and pop3 reconciled, so the sweep should delete it despite stale %s; deletes=%+v",
+					gone, tc.stale.Slug, mir.deletes)
+			}
+		})
+	}
+}
+
+// TestReconcileSkipsSweepWhenNoConfigReconciled pins the guard the sweep
+// keeps: when no site_config reconciles (NetBox repointed at an empty or
+// wrong instance, every managed site missing), every GetDeviceByID would
+// 404 and the sweep would delete every machine. Skip it instead.
+func TestReconcileSkipsSweepWhenNoConfigReconciled(t *testing.T) {
+	id1, id2 := 42, 43
+	st := &reconcileFakeStore{
+		configs: []model.SiteConfig{{Slug: "pop3", NetBoxSite: "pop3"}, {Slug: "pop9", NetBoxSite: "pop9"}},
+		machines: []model.Machine{
+			{NetBoxDeviceID: &id1, NetBoxSerial: "SN-1", State: model.MachineStateRunning},
+			{NetBoxDeviceID: &id2, NetBoxSerial: "SN-2", State: model.MachineStateRunning},
+		},
+	}
+	nb := &fakeNetBox{sites: map[string]netbox.Site{}} // knows no site and no device
+	mir := &recordingMirror{}
+	r := NewReconciler(nb, st, &countingInvalidator{}, mir)
+	r.ManualTick(context.Background())
+
+	if mir.deleteCount() != 0 {
+		t.Fatalf("no config reconciled, so the sweep must not run; got deletes=%+v", mir.deletes)
+	}
+}
+
 func TestReconcileSkipsDeviceThatMovedToAnotherSite(t *testing.T) {
 	// Machine at pop3 but NetBox says device 42 is at pop4 now. The
 	// reconciler for pop3 must NOT decommission — pop4's reconcile

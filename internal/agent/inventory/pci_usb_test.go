@@ -60,7 +60,7 @@ func TestParseTransceiver(t *testing.T) {
 	Connector                                 : 0x07 (LC)
 	Vendor PN                                 : FTLX8574D3BCV-B1
 	Vendor SN                                 : ABC123
-	Wavelength                                : 850nm`,
+	Laser wavelength                          : 850nm`,
 			want: &TransceiverInfo{
 				Identifier: "0x03 (SFP)",
 				Connector:  "0x07 (LC)",

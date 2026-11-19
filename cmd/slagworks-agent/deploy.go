@@ -98,6 +98,16 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 		fatal("safety check", err)
 	}
 
+	// A raid that pins its array UUID is identified at boot by that UUID
+	// alone, so a member superblock with the same UUID on a device this
+	// deploy leaves unwritten (the disk a redeploy moved the array off)
+	// races the real members and can stop the boot in emergency mode.
+	// Refuse now, with the host as found, unless --wipe-all-disks will zero
+	// that device below.
+	if err := storageapply.CheckStaleArrayMembers(ctx, layout, p.wipeAllDisks); err != nil {
+		fatal("stale array member check", err)
+	}
+
 	// Verify every preserve array by its expected UUID BEFORE any
 	// destructive command runs. The destructive ordering the preserve
 	// feature mandates is verify -> wipe -> create root -> reassemble ->
@@ -235,8 +245,11 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 		}
 	}
 
-	if err := target.ConfigureRAID(ctx, "/target"); err != nil {
-		ctx.Log.Warn("RAID configuration", "err", err)
+	// The installed system's mdadm.conf decides which arrays its initramfs
+	// assembles; a host whose initramfs lacks it can boot into an array the
+	// layout does not name, or lose its root array to one. Hard fail.
+	if err := target.ConfigureRAID(ctx, "/target", layout); err != nil {
+		fatal("configuring RAID", err)
 	}
 
 	setPhase("finalizing")
@@ -368,7 +381,7 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 	close(p.done)
 
 	// Reboot into the freshly-installed OS. The boot-action's
-	// "deploying + awaiting_phone_home → BootLocal" clause makes the
+	// "awaiting_phone_home → BootLocal" clause makes the
 	// post-deploy PXE iteration sanboot from disk, the OS comes up,
 	// the slagworks-phone-home.service unit POSTs to /api/v1/report,
 	// and the deploy op completes (machine → running). Without this
