@@ -217,7 +217,11 @@ distinct concepts share the word "reconcile":
   net). `mirror.OnDeviceCreated`, `OnDeviceUpdated`, `OnDeviceDeleted`.
   Enforces `ErrSerialRequired` (`mirror.go:53`) and `ErrSlugImmutable`
   (`mirror.go:58`), and on a re-create with the same serial rebinds
-  the existing row via `SetMachineNetBoxDeviceID`.
+  the existing row via `SetMachineNetBoxDeviceID`. `OnDeviceUpdated`
+  only invalidates for a tracked device; for a serialled device with no
+  machine row (its serial was just filled in, or it just moved into a
+  claimed scope) it enrolls through `OnDeviceCreated`, the rule the
+  reconciler applies to untracked devices.
 - **`internal/snapshot.Reconciler`** — a 5-minute ticker
   (`reconcile.go:39`) that walks every `site_config`, lists its NetBox
   devices, and calls `mirror.OnDevice*` for each. This is the safety
