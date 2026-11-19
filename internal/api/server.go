@@ -407,6 +407,7 @@ func NewServer(cfg Config) *Server {
 	// Every operator-facing JSON response is encoded here, which is what
 	// keeps op-param credentials out of them (see operatorJSONSerializer).
 	s.echo.JSONSerializer = operatorJSONSerializer{}
+	s.echo.Binder = &jsonBodyBinder{}
 	s.echo.Use(middleware.Recover())
 	s.echo.Use(middleware.BodyLimit(12 << 20)) // 12 MiB
 	// The request log records the path, never the query string: a site
@@ -1134,7 +1135,12 @@ func (s *Server) deployMachine(c *echo.Context) error {
 		// host (e.g. a leaf switch).
 		Via string `json:"via,omitempty"`
 	}
-	_ = c.Bind(&body)
+	// The body is optional (Bind succeeds on none), but one that does not
+	// bind must not become a deploy with every flag false: a dropped
+	// recovery or via changes what the host does.
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid deploy body: "+err.Error())
+	}
 	if !validVia(body.Via) {
 		return echo.NewHTTPError(http.StatusBadRequest, invalidViaMsg(body.Via))
 	}
@@ -1197,7 +1203,10 @@ func (s *Server) commissionMachine(c *echo.Context) error {
 		// the device's PDU outlets — required for a BMC-less host.
 		Via string `json:"via,omitempty"`
 	}
-	_ = c.Bind(&body)
+	// Optional body, as for deploy: a body that does not bind is refused.
+	if err := c.Bind(&body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid commission body: "+err.Error())
+	}
 	if !validVia(body.Via) {
 		return echo.NewHTTPError(http.StatusBadRequest, invalidViaMsg(body.Via))
 	}
