@@ -357,7 +357,11 @@ Fields:
 - **`relay_pools`** — pools for subnets reached through a DHCP relay,
   selected by the relay's `giaddr`. Each is
   `{"subnet","range_start","range_end","gateway"}`; the range and gateway
-  must be IPv4 inside the subnet.
+  must be IPv4 inside the subnet, and the gateway must lie outside the
+  range. On a subnet of /30 or wider the range must also exclude the
+  network and broadcast addresses. The worker leases every address in
+  the range and cannot ARP-probe a relayed subnet, so an address left in
+  the range by mistake is handed to a client.
 - **`promiscuous`** — when `true`, the fabric DHCP server answers MACs it
   does not know and TFTP stops requiring a lease. Default `false`.
 - **`last_snapshot_seq`**, **`last_snapshot_hash`**, **`created_at`** —
