@@ -43,11 +43,15 @@ The Auth column in the tables below uses these classes:
 `read` and `admin` are two route groups in `server.go`, but both use the
 same middleware and the same group check. There is no read-only role: any
 token that passes the check can call every `read` and `admin` route. The
-one finer check is `creds`, on the only route that returns a stored device
-credential in plaintext (`GET /devices/:ident/creds`); its route-level
-`credentialAuth` middleware runs after the operator check. Routes that use
-a credential only server-side (operation creation, power and boot status)
-are not `creds`.
+one finer check is `creds`, on the routes that hand out stored device
+credentials in plaintext: `GET /devices/:ident/creds`, which returns them,
+and `POST /site-workers`, which mints a worker token. A worker token is
+credential-equivalent: the op stream gives a connected worker every
+operation for its site with the credentials unredacted (see Operations),
+so whoever can mint one can read them. The route-level `credentialAuth`
+middleware runs after the operator check. Routes that use a credential
+only server-side (operation creation, power and boot status) are not
+`creds`.
 
 The operator WebSocket streams (`/api/v1/logs/stream`,
 `/api/v1/console/stream`) are `read` routes: the token goes in the upgrade
@@ -211,7 +215,7 @@ in [`configuration.md`](../user/configuration.md#site-config-model).
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/workers` | read | List registered workers: `id`, `site_slug`, `worker_id`, `fqdn`, `serial`, `first_seen_at`, `last_seen_at`, plus for connected workers `smcipmitool` (`installed`, `missing`, `missing-required`, `disabled`) and `supermicro_machines`. |
-| POST | `/site-workers` | admin | Register a worker, or rotate its token. Body `{"site_slug","worker_id","fqdn"}`; `site_slug` and `worker_id` are required. Returns `{"id","site_slug","worker_id","fqdn","first_seen_at","token"}`; the plaintext token appears only in this response. |
+| POST | `/site-workers` | creds | Register a worker, or rotate its token. Body `{"site_slug","worker_id","fqdn"}`; `site_slug` and `worker_id` are required. Returns `{"id","site_slug","worker_id","fqdn","first_seen_at","token"}`; the plaintext token appears only in this response. `creds` because the token receives the site's device credentials on the op stream. |
 | DELETE | `/site-workers/:ident` | admin | Delete a registration. `:ident` is the row id, `worker_id` or FQDN. 409 when ambiguous, when the worker is connected, or when it has claimed operations in flight. 204. |
 
 ## NetBox
@@ -378,4 +382,4 @@ and resending it on every reconnect would hold up every observation and
 - **NetBox proxying.** Query NetBox directly.
 - **Per-endpoint roles.** Every operator route uses the same group check;
   the only addition is the optional credential-group check on
-  `GET /devices/:ident/creds` (see Auth).
+  `GET /devices/:ident/creds` and `POST /site-workers` (see Auth).

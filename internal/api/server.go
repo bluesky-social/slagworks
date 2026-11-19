@@ -47,8 +47,9 @@ type Server struct {
 	verifier           tokenverify.Verifier
 	authz              tokenverify.Authorizer
 	// credAuthz is the extra check credentialAuth applies to the routes
-	// that return a stored device credential in plaintext. nil: none, so
-	// every operator who passes authz may read credentials.
+	// that return a stored device credential in plaintext, or a site-worker
+	// token that receives them. nil: none, so every operator who passes
+	// authz may read credentials.
 	credAuthz tokenverify.Authorizer
 	// oidcIssuer/oidcAudience are retained to enrich the auth-rejection log
 	// line (the "expected" values shown next to a rejected token's own
@@ -129,9 +130,10 @@ type Config struct {
 	// slice form; the cobra/global layer parses the env and requires at least one.
 	RequiredGroups []string
 	// CredentialGroups, when non-empty, additionally gates the routes that
-	// return a stored device credential in plaintext (any-of): the caller
-	// must pass RequiredGroups AND carry one of these. Empty leaves those
-	// routes under RequiredGroups alone.
+	// return a stored device credential in plaintext, or mint a site-worker
+	// token that receives them (any-of): the caller must pass
+	// RequiredGroups AND carry one of these. Empty leaves those routes under
+	// RequiredGroups alone.
 	CredentialGroups []string
 	// Verifier, if non-nil, is used as-is (test injection). If nil and
 	// OIDCIssuer is set, NewServer builds the verifier via tokenverify.New.
@@ -491,8 +493,10 @@ func (s *Server) registerRoutes() {
 	read.GET("/machines/:id/netbox-diff", s.netboxDiffMachine)
 	// The one route that returns a stored device credential in plaintext;
 	// credentialAuth adds the optional credential-group check after
-	// oidcAuth. Routes that only use credentials server-side (power, boot,
-	// op creation) stay under the operator check alone.
+	// oidcAuth. Its other user is POST /site-workers below, whose token
+	// receives the credentials on the op stream. Routes that only use
+	// credentials server-side (power, boot, op creation) stay under the
+	// operator check alone.
 	read.GET("/devices/:ident/creds", s.getDeviceCreds, s.credentialAuth)
 	// PDU outlet resolve: non-mutating preflight that reverse-traces the
 	// outlet's cable and returns the downstream device identity, feed
@@ -553,7 +557,11 @@ func (s *Server) registerRoutes() {
 	admin.POST("/site-configs", s.createSiteConfig)
 	admin.PATCH("/site-configs/:slug", s.updateSiteConfig)
 	admin.DELETE("/site-configs/:slug", s.deleteSiteConfig)
-	admin.POST("/site-workers", s.registerSiteWorker)
+	// A site-worker token is credential-equivalent: the hub's op stream
+	// hands a connected worker every operation for its site with the
+	// credentials unredacted. Minting or rotating one therefore takes the
+	// same credential-group check as GET /devices/:ident/creds.
+	admin.POST("/site-workers", s.registerSiteWorker, s.credentialAuth)
 	admin.DELETE("/site-workers/:ident", s.deleteSiteWorker)
 	admin.POST("/admin/netbox/bootstrap", s.netboxBootstrap)
 	admin.POST("/admin/netbox/migrate-chassis-serial", s.netboxMigrateChassisSerial)

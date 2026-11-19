@@ -493,7 +493,10 @@ mechanisms below derive from (`model.SecretParamPaths`), and
 field (password/secret/key/token) anywhere under `OpParams` that lacks it.
 
 - **Workers get the real values.** The op stream (`op_delta`, `op_resync`,
-  the claim reply) carries params unredacted, scoped by slug as above.
+  the claim reply) carries params unredacted, scoped by slug as above. A
+  site-worker token is therefore credential-equivalent, so minting one
+  (`POST /site-workers`) takes the same optional credential-group check
+  as `GET /devices/:ident/creds` (`SLAGWORKS_OIDC_CREDENTIAL_GROUPS`).
 - **Operators never do.** The API server's echo JSON serializer
   (`internal/api/op_redaction.go`) is the one choke point for operator
   responses: every `Operation` it encodes (op-create responses from

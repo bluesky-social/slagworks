@@ -98,7 +98,13 @@ func workerRegisterCmd() *cobra.Command {
 		Short: "mint a bearer token for a site worker",
 		Long: `Mints (or rotates) a bearer token for a (site_slug, worker_id) pair.
 The plaintext token is returned once; hand it to the site worker via
-SLAGWORKS_TOKEN. Re-registering the same pair rotates the token.`,
+SLAGWORKS_TOKEN. Re-registering the same pair rotates the token.
+
+A worker connected with the token receives the site's device credentials
+with every operation it is sent, so a server that sets
+SLAGWORKS_OIDC_CREDENTIAL_GROUPS mints tokens only for operators who are
+also in one of those groups, as for "slagctl machine creds"; anyone else
+gets a 403 naming that setting.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			body := map[string]string{
 				"site_slug": slug,

@@ -78,6 +78,12 @@ func TestGetDeviceCreds_AuthRequired(t *testing.T) {
 // credentials; set, the caller needs an operator group AND a credential
 // group, and a refusal names the setting without echoing any group. Other
 // read routes ignore the setting.
+//
+// The gate covers two routes. GET /devices/:ident/creds returns a credential
+// directly. POST /site-workers mints a site-worker token, and a worker
+// connected with one receives every operation for its site with the
+// credentials unredacted (TestOperatorReadsRedactCredentials_WorkerStillReceivesThem),
+// so minting a token is the same as reading the credentials.
 func TestDeviceCreds_CredentialGroups(t *testing.T) {
 	st := store.New(testpg.DB(t, store.Migrate))
 	verifier := &fakeVerifier{claims: map[string]*tokenverify.Claims{
@@ -111,12 +117,30 @@ func TestDeviceCreds_CredentialGroups(t *testing.T) {
 		s.Echo().ServeHTTP(w, req)
 		return w.Code, w.Body.String()
 	}
+	registerWorker := func(t *testing.T, s *Server, workerID, token string) (int, string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/site-workers",
+			strings.NewReader(`{"site_slug":"pop1","worker_id":"`+workerID+`"}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.Echo().ServeHTTP(w, req)
+		return w.Code, w.Body.String()
+	}
 
 	t.Run("unset: an operator reads credentials", func(t *testing.T) {
 		s, _ := newServer(t, nil)
 		code, body := get(t, s, credsPath, "op-tok")
 		if code != http.StatusOK || !strings.Contains(body, password) {
 			t.Fatalf("got %d %s, want 200 with the credential", code, body)
+		}
+	})
+
+	t.Run("unset: an operator mints a site-worker token", func(t *testing.T) {
+		s, _ := newServer(t, nil)
+		code, body := registerWorker(t, s, "worker-unset", "op-tok")
+		if code != http.StatusCreated || !strings.Contains(body, `"token"`) {
+			t.Fatalf("got %d %s, want 201 with a token", code, body)
 		}
 	})
 
@@ -152,6 +176,26 @@ func TestDeviceCreds_CredentialGroups(t *testing.T) {
 			code, body := get(t, s, credsPath, "both-tok")
 			if code != http.StatusOK || !strings.Contains(body, password) {
 				t.Fatalf("got %d %s, want 200 with the credential", code, body)
+			}
+		})
+
+		t.Run("operator without a credential group cannot mint a site-worker token", func(t *testing.T) {
+			code, body := registerWorker(t, s, "worker-op-only", "op-tok")
+			if code != http.StatusForbidden {
+				t.Fatalf("got %d %s, want 403: a site-worker token receives device credentials on the op stream", code, body)
+			}
+			if !strings.Contains(body, "SLAGWORKS_OIDC_CREDENTIAL_GROUPS") {
+				t.Errorf("403 body does not name SLAGWORKS_OIDC_CREDENTIAL_GROUPS: %s", body)
+			}
+			if _, err := st.ResolveSiteWorker("worker-op-only"); !errors.Is(err, store.ErrSiteWorkerNotFound) {
+				t.Errorf("refused registration left a site_workers row behind (err=%v)", err)
+			}
+		})
+
+		t.Run("operator in a credential group mints a site-worker token", func(t *testing.T) {
+			code, body := registerWorker(t, s, "worker-op-cred", "both-tok")
+			if code != http.StatusCreated || !strings.Contains(body, `"token"`) {
+				t.Fatalf("got %d %s, want 201 with a token", code, body)
 			}
 		})
 
