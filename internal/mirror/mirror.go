@@ -102,6 +102,9 @@ type Store interface {
 	// given NetBox site. Used only by OnSiteUpdated's slug-immutability
 	// guard, which is a genuine netbox_site question (not a claim).
 	AnySiteConfigForNetBoxSite(netboxSite string) (bool, error)
+	// ListSiteConfigs lists every site_config. Used only by OnDeviceMoved,
+	// which cannot name the config a moved device left.
+	ListSiteConfigs() ([]model.SiteConfig, error)
 }
 
 // Mirror applies NetBox events (from webhook or reconcile) to the
@@ -200,6 +203,28 @@ func (m *Mirror) OnDeviceCreated(ctx context.Context, d Device) error {
 // d.ConfigSlug); an unclaimed device never reaches here.
 func (m *Mirror) OnDeviceUpdated(ctx context.Context, d Device) error {
 	m.inv.Invalidate(d.ConfigSlug)
+	return nil
+}
+
+// OnDeviceMoved handles a `device.updated` whose site or location changed.
+// OnDeviceUpdated invalidates the config that claims the device now, but
+// the device may also have left another config's scope, and that config's
+// snapshot keeps the machine until it is rebuilt. Until then the hub, which
+// routes a machine's op_delta by its cached per-slug snapshots, still sends
+// the machine's ops (and the credentials in their Params) to the old site's
+// worker. NetBox's prechange snapshot names the old site and location only
+// by id, so the config the device left cannot be resolved without more
+// NetBox lookups; every site_config is invalidated instead, the fan-out the
+// API uses when it has no slug to hand. The dispatcher's content-hash skip
+// keeps configs the move did not touch from pushing anything.
+func (m *Mirror) OnDeviceMoved(ctx context.Context, deviceID int) error {
+	cfgs, err := m.st.ListSiteConfigs()
+	if err != nil {
+		return fmt.Errorf("list site_configs to invalidate after device %d moved: %w", deviceID, err)
+	}
+	for _, cfg := range cfgs {
+		m.inv.Invalidate(cfg.Slug)
+	}
 	return nil
 }
 
