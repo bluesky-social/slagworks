@@ -746,7 +746,8 @@ Handler calls `store.AbortMachine(id)` (`server.go:1008`).
 
 `Store.AbortMachine` (`store.go:952`):
 
-1. Fetch the machine.
+1. Fetch the machine. An ID that names no machine returns
+   `ErrMachineNotFound` (HTTP 404) before anything is changed.
 2. List active ops (status in `{pending, claimed, running}`).
 3. For each, call `FailOperation(opID, {"error":"aborted by
    operator"})`.
