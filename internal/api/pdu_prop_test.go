@@ -448,8 +448,10 @@ func mustOps(t *rapid.T, env *propEnv, machine uuid.UUID) []model.Operation {
 // token minted with the server's key verifies.
 func FuzzVerifyPreflightToken(f *testing.F) {
 	key := []byte("fuzz-key")
+	// A fixed, far-future expiry (2100-01-01) keeps the one valid token the
+	// same across runs, so a saved corpus replays against the same oracle.
 	good, err := mintPreflightToken(key, preflightClaims{Operator: "op", Verb: "cycle", PDUDeviceID: 611, Outlet: 5,
-		DownstreamSerial: "SN", Classification: "sole", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+		DownstreamSerial: "SN", Classification: "sole", ExpiresAt: 4102444800})
 	if err != nil {
 		f.Fatal(err)
 	}

@@ -307,9 +307,15 @@ func patchAround(t interface{ Fatalf(string, ...any) }, env *propEnv, path, body
 	case <-time.After(10 * time.Second):
 		t.Fatalf("PATCH %s never read its body", path)
 	}
-	middle()
-	close(g.release)
-	<-done
+	// Release and join the handler even when middle fails the test, so a
+	// parked request never outlives its case.
+	func() {
+		defer func() {
+			close(g.release)
+			<-done
+		}()
+		middle()
+	}()
 	return propResp{code: w.Code, body: w.Body.Bytes()}
 }
 
