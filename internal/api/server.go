@@ -2122,6 +2122,12 @@ func (s *Server) createSSHKey(c *echo.Context) error {
 	if err := s.store.CreateSSHKey(&key); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
+	// SSH keys are global: every site's snapshot carries the list, and the
+	// agent writes the deployed host's authorized_keys from the worker's copy
+	// (/boot/ssh-keys). Nothing in a deploy rebuilds the snapshot before that
+	// fetch, so push a fresh one to all sites now or a deploy can come up
+	// without the key the operator just added.
+	s.invalidateAllSites()
 	return c.JSON(http.StatusCreated, key)
 }
 
@@ -2133,6 +2139,10 @@ func (s *Server) deleteSSHKey(c *echo.Context) error {
 	if err := s.store.DeleteSSHKey(id); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
+	// Removal is revocation: without a fresh snapshot on every site, deploys
+	// keep installing the removed key as root's authorized key until some
+	// unrelated rebuild. See createSSHKey.
+	s.invalidateAllSites()
 	return c.NoContent(http.StatusNoContent)
 }
 

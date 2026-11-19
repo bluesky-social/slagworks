@@ -187,7 +187,10 @@ snapshot build for each site.
 | POST | `/ssh-keys` | admin | Add a key. Body `{"public_key","comment"}`; the key must parse as an OpenSSH authorized-keys line. |
 | DELETE | `/ssh-keys/:id` | admin | Delete by UUID. 204. |
 
-Deploys are refused while no SSH key is registered.
+Adding or deleting a key pushes a fresh snapshot to every site, so the next
+deploy's agent fetch of `/boot/ssh-keys` reflects the change. Keys are written
+only at deploy time: deleting one does not remove it from hosts already
+deployed. Deploys are refused while no SSH key is registered.
 
 ## Site configs
 
