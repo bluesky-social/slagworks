@@ -16,6 +16,23 @@ const (
 	defaultPongTimeout  = 10 * time.Second
 )
 
+// MaxMessageBytes is the read limit both ends of the site-worker link
+// set, so it is the largest message either end may send: the hub's
+// snapshot (commission data for every machine at the site), each of the
+// worker's outbox observations and each of its log batches travel as one
+// message. A receiver closes the connection with StatusMessageTooBig on
+// anything larger, without reading or answering it, so a sender must
+// keep every message under this bound.
+const MaxMessageBytes = 16 << 20
+
+// MaxObservationDataBytes caps a request body that the site worker queues
+// for global as an observation's data (/api/v1/inventory and
+// /api/v1/report), measured as json.Marshal re-encodes it. It is the cap
+// /api/v1/inventory already put on its raw body, and it leaves the rest of
+// MaxMessageBytes for the observation message around the data, so a body
+// the worker accepts is one it can send.
+const MaxObservationDataBytes = 10 << 20
+
 // Conn wraps a coder/websocket connection with JSON envelope read/write.
 type Conn struct {
 	conn *websocket.Conn
@@ -73,15 +90,35 @@ func (c *Conn) WriteMessage(ctx context.Context, env Envelope) error {
 
 // WriteTyped marshals a typed message into an envelope and writes it.
 func (c *Conn) WriteTyped(ctx context.Context, msgType string, requestID string, payload any) error {
-	raw, err := json.Marshal(payload)
+	frame, err := EncodeTyped(msgType, requestID, payload)
 	if err != nil {
 		return err
 	}
-	return c.WriteMessage(ctx, Envelope{
+	return c.WriteFrame(ctx, frame)
+}
+
+// EncodeTyped marshals a typed message into the envelope bytes WriteTyped
+// sends. A caller that must know a message's size before sending it
+// encodes with EncodeTyped and sends with WriteFrame.
+func EncodeTyped(msgType string, requestID string, payload any) ([]byte, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := json.Marshal(Envelope{
 		Type:      msgType,
 		RequestID: requestID,
 		Data:      raw,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal envelope: %w", err)
+	}
+	return frame, nil
+}
+
+// WriteFrame writes envelope bytes produced by EncodeTyped.
+func (c *Conn) WriteFrame(ctx context.Context, frame []byte) error {
+	return c.conn.Write(ctx, websocket.MessageText, frame)
 }
 
 // Close closes the WebSocket connection with a normal closure.

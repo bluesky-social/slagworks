@@ -47,8 +47,8 @@ type globalConfig struct {
 	OIDCAudience string
 	OIDCGroups   []string
 	// OIDCCredentialGroups additionally gates the plaintext device-credential
-	// route (api.Config.CredentialGroups). Empty: every operator may read
-	// credentials.
+	// route and site-worker token minting (api.Config.CredentialGroups).
+	// Empty: every operator may call both.
 	OIDCCredentialGroups []string
 	ExternalURL          string
 	WebhookSecret        string
@@ -477,7 +477,7 @@ func globalCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.OIDCJWKSURL, "oidc-jwks-url", os.Getenv("SLAGWORKS_OIDC_JWKS_URL"), "JWKS URL to fetch signing keys from, when the server reaches the identity provider at a different address than the issuer; empty derives <issuer>/jwks/")
 	cmd.Flags().StringVar(&cfg.OIDCAudience, "oidc-audience", os.Getenv("SLAGWORKS_OIDC_AUDIENCE"), "OIDC audience to require on access tokens (the slagworks client ID)")
 	cmd.Flags().StringVar(&oidcGroupsRaw, "oidc-required-groups", os.Getenv("SLAGWORKS_OIDC_REQUIRED_GROUPS"), "identity-provider group(s) allowed operator access, comma-separated, any-of (required)")
-	cmd.Flags().StringVar(&oidcCredentialGroupsRaw, "oidc-credential-groups", os.Getenv("SLAGWORKS_OIDC_CREDENTIAL_GROUPS"), "identity-provider group(s) allowed to read stored device credentials in plaintext, comma-separated, any-of, in addition to an operator group; empty lets every operator read them")
+	cmd.Flags().StringVar(&oidcCredentialGroupsRaw, "oidc-credential-groups", os.Getenv("SLAGWORKS_OIDC_CREDENTIAL_GROUPS"), "identity-provider group(s) allowed to read stored device credentials in plaintext and to mint site-worker tokens (which receive them), comma-separated, any-of, in addition to an operator group; empty lets every operator do both")
 	cmd.Flags().StringVar(&cfg.ExternalURL, "external-url", os.Getenv("SLAGWORKS_EXTERNAL_URL"), "externally reachable URL for webhooks")
 	cmd.Flags().StringVar(&cfg.WebhookSecret, "webhook-secret", os.Getenv("SLAGWORKS_WEBHOOK_SECRET"), "HMAC secret for NetBox webhooks; empty rejects every webhook delivery")
 	cmd.Flags().StringVar(&cfg.TailscaleOAuthClientID, "tailscale-oauth-client-id", os.Getenv("TAILSCALE_OAUTH_CLIENT_ID"), "Tailscale OAuth client ID (auth_keys scope) for deploy-time tailnet enrollment; empty disables")

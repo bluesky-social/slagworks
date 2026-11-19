@@ -63,6 +63,8 @@ type fakeRedfishBMC struct {
 	failNTPEnable     bool // a PATCH enabling NTP answers 500
 	dropNTPEnable     bool // a PATCH enabling NTP answers 202 and never applies
 	dropNTPDisable    bool // a PATCH disabling NTP answers 202 and never applies
+	hangUpNTPDisable  bool // a PATCH disabling NTP applies, then the connection drops unanswered
+	lateNTPDisable    int  // with hangUpNTPDisable: the disable applies only after this many NetworkProtocol GETs
 	reportNTPOff      bool // NetworkProtocol GETs report ProtocolEnabled=false
 	taskEnd           string
 	taskRunning       int
@@ -75,6 +77,8 @@ type fakeRedfishBMC struct {
 	gen        map[string]int // per-resource ETag generation
 	pending    *ntpPatchBody  // an accepted async NTP PATCH not yet applied
 	pendingIn  int            // NetworkProtocol GETs until pending applies
+	late       *ntpPatchBody  // an unanswered disable not yet applied (lateNTPDisable)
+	lateIn     int            // NetworkProtocol GETs until late applies
 	echo       *ntpPatchBody  // what the next NetworkProtocol GET echoes
 	tasks      map[string]*fakeTask
 	patches    []fakePatch
@@ -166,6 +170,12 @@ func (f *fakeRedfishBMC) serve(w http.ResponseWriter, r *http.Request) {
 			"NetworkProtocol": map[string]string{"@odata.id": np},
 		})
 	case r.Method == http.MethodGet && r.URL.Path == np:
+		if f.late != nil {
+			if f.lateIn--; f.lateIn <= 0 {
+				f.applyNTP(*f.late)
+				f.late = nil
+			}
+		}
 		if f.pending != nil {
 			if f.pendingIn--; f.pendingIn <= 0 {
 				f.applyNTP(*f.pending)
@@ -255,10 +265,32 @@ func (f *fakeRedfishBMC) patch(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
+		if f.hangUpNTPDisable && !enable {
+			if f.lateNTPDisable > 0 {
+				f.late, f.lateIn = &p, f.lateNTPDisable
+			} else {
+				f.applyNTP(p)
+			}
+			f.gen[r.URL.Path]++
+			f.hangUp(w)
+			return
+		}
 		f.applyNTP(p)
 	}
 	f.gen[r.URL.Path]++
 	w.WriteHeader(http.StatusOK)
+}
+
+// hangUp closes the connection without answering: a write the BMC applied
+// whose response never arrives, as when its web server restarts, the
+// connection drops, or the client gives up first.
+func (f *fakeRedfishBMC) hangUp(w http.ResponseWriter) {
+	conn, _, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		f.t.Errorf("fake BMC hang-up: %v", err)
+		return
+	}
+	_ = conn.Close()
 }
 
 // startTask answers an NTP PATCH the way Supermicro does: 202, a
@@ -575,6 +607,85 @@ func TestReconcileTime_ReenableFailureIsLoud(t *testing.T) {
 	}
 	if !strings.Contains(res.Err.Error(), "re-run `slagctl machine bmc-reconcile`") {
 		t.Errorf("Err = %v, want the what-to-do", res.Err)
+	}
+}
+
+// TestReconcileTime_StepDisableWithNoResponseIsReenabled: the step's NTP
+// disable reaches the BMC and applies, but no response comes back (here the
+// connection drops; a client timeout or ctx ending mid-PATCH is the same).
+// NTP was compliant before, so only the step's re-enable can restore it:
+// the pass must treat the disable as possibly applied, re-enable NTP and
+// read it back, and not step a clock it cannot know is free of NTP.
+func TestReconcileTime_StepDisableWithNoResponseIsReenabled(t *testing.T) {
+	f := newFakeRedfishBMC(t, "1")
+	f.strictETag = true
+	f.hangUpNTPDisable = true
+	f.ntpEnabled, f.ntpServers = true, []string{testVIP, ""}
+	f.skew = time.Hour
+
+	res := f.runShortSettle(testVIP)
+
+	if enabled, servers, _, _, _ := f.state(); !enabled || !slices.Equal(servers, []string{testVIP, ""}) {
+		t.Errorf("BMC after = enabled %v servers %v, want NTP re-enabled on the VIP (Err = %v)", enabled, servers, res.Err)
+	}
+	ntp := f.patchesTo("/NetworkProtocol")
+	if len(ntp) != 2 || ntpEnabledIn(ntp[0]) != false || ntpEnabledIn(ntp[1]) != true {
+		t.Errorf("NetworkProtocol PATCHes = %+v, want the unanswered disable, then an enable", ntp)
+	}
+	if res.ClockStepped || len(f.setCalls) != 0 {
+		t.Errorf("stepped the clock (calls %v) after a disable with no response", f.setCalls)
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "disable NTP for the clock step: ") {
+		t.Fatalf("Err = %v, want the failed disable reported", res.Err)
+	}
+	if strings.Contains(res.Err.Error(), "DISABLED") {
+		t.Errorf("Err = %v, but NTP was re-enabled", res.Err)
+	}
+}
+
+// TestReconcileTime_StepWaitsForDisableWithNoResponse: the unanswered
+// disable is still applying when the pass gets to the re-enable (AMI
+// applies NTP PATCHes asynchronously). Re-enabling at once would let the
+// disable land after the re-enable was read back, leaving NTP off with no
+// alarm; the pass must wait for NTP to read disabled first, as it does
+// after an accepted disable.
+func TestReconcileTime_StepWaitsForDisableWithNoResponse(t *testing.T) {
+	f := newFakeRedfishBMC(t, "Self")
+	f.hangUpNTPDisable, f.lateNTPDisable = true, 10
+	f.ntpEnabled, f.ntpServers = true, []string{testVIP, ""}
+	f.skew = time.Hour
+
+	res := f.run(testVIP)
+
+	f.mu.Lock()
+	if f.late != nil { // the BMC applies what it accepted, eventually
+		f.applyNTP(*f.late)
+		f.late = nil
+	}
+	f.mu.Unlock()
+	if enabled, _, _, _, _ := f.state(); !enabled {
+		t.Errorf("the disable landed after the re-enable and left NTP off (Err = %v)", res.Err)
+	}
+}
+
+// TestReconcileTime_AMIStepDisableWithNoResponseReenableThatNeverAppliesIsLoud:
+// as above on AMI, where the re-enable is accepted but never applies. The
+// unanswered disable may be why NTP reads off, so, as after an accepted
+// disable, matching servers do not confirm the re-enable, and the error
+// says NTP is left disabled.
+func TestReconcileTime_AMIStepDisableWithNoResponseReenableThatNeverAppliesIsLoud(t *testing.T) {
+	f := newFakeRedfishBMC(t, "Self")
+	f.hangUpNTPDisable, f.dropNTPEnable = true, true
+	f.ntpEnabled, f.ntpServers = true, []string{testVIP, ""}
+	f.skew = time.Hour
+
+	res := f.runShortSettle(testVIP)
+
+	if enabled, _, _, _, _ := f.state(); enabled {
+		t.Fatal("fake BMC NTP enabled; the test does not exercise a dropped re-enable")
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "NTP is DISABLED") {
+		t.Fatalf("Err = %v, want it to say NTP was left disabled", res.Err)
 	}
 }
 

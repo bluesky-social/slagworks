@@ -126,6 +126,35 @@ func TestLogPane_Format(t *testing.T) {
 	goldenScreen(t, "logpane_format", strings.Join(lines, "\n"))
 }
 
+// TestLogPane_EscapesTerminalControls: every string on an envelope is text the
+// sending host chose (agent envelopes arrive through the site's
+// unauthenticated /logs/ingest). The formatted line must carry escape
+// sequences as visible text and fold line breaks to the visible marker, one
+// envelope per row, so they cannot repaint the frame, plant a hyperlink or
+// forge a log row.
+func TestLogPane_EscapesTerminalControls(t *testing.T) {
+	p := newLogPane(time.UTC)
+	e := env(slogkit.Source("agent\x1b[2J"), 0, "ok\x1b]8;;http://evil.example/\x07click\x1b]8;;\x07\nforged row")
+	e.Phase = "partitioning\x1b[1A"
+	p.Append(1, e)
+	ex := env(slogkit.SourceAgent, time.Second, "exec")
+	ex.Extra = map[string]any{"argv": "sgdisk \x1b_apc\x1b\\", "err": "boom\r\u009d52;c;cHduZWQ=\u009c"}
+	p.Append(2, ex)
+
+	for _, line := range p.Lines() {
+		assertNoTerminalControls(t, line)
+		if strings.Contains(line, "\n") {
+			t.Errorf("one envelope rendered as several rows: %q", line)
+		}
+	}
+	lines := strings.Join(p.Lines(), "\n")
+	for _, want := range []string{`ok\x1b]8;;http://evil.example/\x07click`, `click\x1b]8;;\x07 ⏎ forged row`, `phase=partitioning\x1b[1A`, `sgdisk \x1b_apc\x1b\`, `boom ⏎ \u009d52`} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("log pane missing the escaped text %q:\n%s", want, lines)
+		}
+	}
+}
+
 // TestLogPane_PhaseSurvivesExec is the regression for the exec-overwrites-phase
 // bug: an agent exec envelope that ALSO carries a phase field must keep the
 // phase prefix, not have it clobbered by the argv expansion. The mockup shows

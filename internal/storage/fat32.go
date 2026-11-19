@@ -1,11 +1,6 @@
 package storage
 
-import (
-	"fmt"
-	"math"
-	"strconv"
-	"strings"
-)
+import "fmt"
 
 // fat32MinClusters is the fewest clusters a FAT32 filesystem may have.
 // Readers that follow Microsoft's FAT specification, UEFI firmware among
@@ -97,25 +92,13 @@ func restPartitionBytes(dev Device, rest int, bd BlockDevice) (int64, error) {
 }
 
 // partitionBytes returns the size sgdisk gives a partition declared with a
-// fixed size: a whole number with a K, M, G, T, P or E suffix (binary units,
-// either case), or a bare whole number of logical sectors.
+// fixed size (see sizeBytes): the declared bytes rounded down to a whole
+// number of logical sectors.
 func partitionBytes(size string, sectorBytes int64) (int64, error) {
-	digits, unit := size, sectorBytes
-	if n := len(size); n > 0 {
-		if i := strings.Index("KMGTPE", strings.ToUpper(size[n-1:])); i >= 0 {
-			digits, unit = size[:n-1], int64(1)<<(10*(i+1))
-		}
+	b, err := sizeBytes(size)
+	if err != nil {
+		return 0, err
 	}
-	bad := fmt.Errorf("partition size %q is neither \"rest\" nor a whole number with an "+
-		"optional K, M, G, T, P or E suffix", size)
-	if digits == "" || strings.Trim(digits, "0123456789") != "" {
-		return 0, bad
-	}
-	n, err := strconv.ParseInt(digits, 10, 64)
-	if err != nil || n > math.MaxInt64/unit {
-		return 0, bad
-	}
-	b := n * unit
 	return b - b%sectorBytes, nil
 }
 

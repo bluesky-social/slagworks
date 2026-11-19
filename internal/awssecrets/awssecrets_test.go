@@ -3,7 +3,11 @@ package awssecrets
 import (
 	"context"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 )
 
 // TestParseAdminSecret_CarriesFields verifies that the parser extracts
@@ -237,5 +241,114 @@ func TestFakeReader_RoundTrip(t *testing.T) {
 	}
 	if _, err := fake.GetAdmin(context.Background(), "popX"); err == nil {
 		t.Error("expected error for unknown pop")
+	}
+}
+
+// gatedAdminSecrets serves pop/<pop>/bmc-creds-admin. Each GetSecretValue
+// captures the secret current when it is called, reports its 1-based call
+// number on started, then waits for that call's gate before returning: a
+// read that AWS answered before a rotation but whose response arrives later.
+type gatedAdminSecrets struct {
+	secretsAPI // only GetSecretValue is implemented
+
+	mu      sync.Mutex
+	body    string
+	calls   int
+	gates   map[int]chan struct{}
+	started chan int
+}
+
+func (g *gatedAdminSecrets) GetSecretValue(_ context.Context, _ *secretsmanager.GetSecretValueInput, _ ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+	g.mu.Lock()
+	g.calls++
+	n, body, gate := g.calls, g.body, g.gates[g.calls]
+	g.mu.Unlock()
+	g.started <- n
+	if gate != nil {
+		<-gate
+	}
+	return &secretsmanager.GetSecretValueOutput{SecretString: &body}, nil
+}
+
+func (g *gatedAdminSecrets) rotate(body string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.body = body
+}
+
+func (g *gatedAdminSecrets) callCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls
+}
+
+func adminSecretWithBMCPassword(pw string) string {
+	return `{"SN1":{"kind":"bmc","username":"ADMIN","password":"` + pw + `"}}`
+}
+
+// TestGetAdmin_CacheKeepsLaterIssuedRead: two callers miss the cache for
+// the same pop together (two snapshot rebuilds, or an op creation racing
+// `slagctl machine creds`, just after the TTL expired), and the admin
+// password is rotated between the two reads. Whichever response arrives
+// last, the cache must end up holding the rotated secret: an earlier-issued
+// read that returns late must not put the pre-rotation password back for a
+// fresh TTL.
+func TestGetAdmin_CacheKeepsLaterIssuedRead(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		releaseOrder [2]int // call numbers, in the order their responses arrive
+	}{
+		{name: "responses arrive in issue order", releaseOrder: [2]int{1, 2}},
+		{name: "pre-rotation read returns last", releaseOrder: [2]int{2, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gates := map[int]chan struct{}{1: make(chan struct{}), 2: make(chan struct{})}
+			api := &gatedAdminSecrets{
+				body:    adminSecretWithBMCPassword("old-pw"),
+				gates:   gates,
+				started: make(chan int, 2),
+			}
+			c := newClient(api, time.Hour)
+			ctx := context.Background()
+
+			results := map[int]chan string{1: make(chan string, 1), 2: make(chan string, 1)}
+			getAdmin := func(call int) {
+				go func() {
+					s, err := c.GetAdmin(ctx, "site-a")
+					if err != nil {
+						results[call] <- "error: " + err.Error()
+						return
+					}
+					results[call] <- s.Lookup("SN1").Password
+				}()
+				if n := <-api.started; n != call {
+					t.Fatalf("GetAdmin issued read %d, want read %d", n, call)
+				}
+			}
+
+			getAdmin(1) // reads old-pw, response held
+			api.rotate(adminSecretWithBMCPassword("new-pw"))
+			getAdmin(2) // reads new-pw, response held
+
+			want := map[int]string{1: "old-pw", 2: "new-pw"}
+			for _, call := range tc.releaseOrder {
+				close(gates[call])
+				if got := <-results[call]; got != want[call] {
+					t.Fatalf("read %d returned %q to its caller, want %q", call, got, want[call])
+				}
+			}
+
+			got, err := c.GetAdmin(ctx, "site-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := api.callCount(); n != 2 {
+				t.Fatalf("GetAdmin issued %d reads, want 2 (the last call should be a cache hit)", n)
+			}
+			if pw := got.Lookup("SN1").Password; pw != "new-pw" {
+				t.Errorf("cached password is %q after the rotated secret was read and cached; "+
+					"a read issued before the rotation replaced it (and restarted the TTL)", pw)
+			}
+		})
 	}
 }

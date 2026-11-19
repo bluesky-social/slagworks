@@ -30,6 +30,12 @@ import (
 // BMC without SOL all legitimately produce zero hits, in which case
 // the field stays empty and deploy preflight keeps refusing until the
 // operator sets a value or "none".
+//
+// The sweep rides the commission report, which the machine under
+// commission writes, so its candidates are untrusted input: only those
+// that pass model.ConsoleSweepCandidate.Validate are scanned for or can
+// win, which bounds the written value to console=<one of
+// model.ConsoleSweepTTYs>,<model.ConsoleSweepBaud>n8.
 
 // sweepResolveAttempts spaces the cast-table scans. First attempt is
 // immediate (the common case: nonces beat the report), the tail
@@ -37,8 +43,8 @@ import (
 var sweepResolveAttempts = []time.Duration{0, 5 * time.Second, 20 * time.Second}
 
 // sweepLookback bounds the cast scan window. Wide enough to cover the
-// whole commission boot; the nonces are 16 hex chars so a false
-// positive across windows is not a real concern.
+// whole commission boot; the nonces are 16 hex chars (enforced by
+// Validate) so a false positive across windows is not a real concern.
 const sweepLookback = 15 * time.Minute
 
 // resolveConsoleSweep scans the machine's cast stream for each
@@ -50,8 +56,20 @@ func (h *Handler) resolveConsoleSweep(ctx context.Context, machineID uuid.UUID, 
 	if sweep == nil || len(sweep.Candidates) == 0 {
 		return
 	}
+	cands := make([]model.ConsoleSweepCandidate, 0, len(sweep.Candidates))
+	for _, c := range sweep.Candidates {
+		if err := c.Validate(); err != nil {
+			h.log.Warn("console sweep: ignoring a reported candidate the agent's sweep cannot produce",
+				"machine_id", machineID, "err", err)
+			continue
+		}
+		cands = append(cands, c)
+	}
+	if len(cands) == 0 {
+		return
+	}
 
-	winner, err := h.scanSweepCandidates(ctx, machineID, sweep)
+	winner, err := h.scanSweepCandidates(ctx, machineID, cands)
 	if err != nil {
 		h.log.Error("console sweep: cast scan failed; slagworks_kernel_params stays unset",
 			"machine_id", machineID, "err", err)
@@ -60,7 +78,7 @@ func (h *Handler) resolveConsoleSweep(ctx context.Context, machineID uuid.UUID, 
 	if winner == nil {
 		h.log.Warn("console sweep: no candidate nonce reached the cast stream; "+
 			"slagworks_kernel_params stays unset (set it manually, or \"none\" if the device has no SOL)",
-			"machine_id", machineID, "candidates", len(sweep.Candidates))
+			"machine_id", machineID, "candidates", len(cands))
 		return
 	}
 	kp := fmt.Sprintf("console=%s,%dn8", winner.TTY, winner.Baud)
@@ -107,7 +125,7 @@ func (h *Handler) resolveConsoleSweep(ctx context.Context, machineID uuid.UUID, 
 // scanSweepCandidates polls the cast stream for the candidates'
 // nonces across sweepResolveAttempts. Returns the first candidate
 // whose nonce arrived, or nil after the last attempt.
-func (h *Handler) scanSweepCandidates(ctx context.Context, machineID uuid.UUID, sweep *model.ConsoleSweep) (*model.ConsoleSweepCandidate, error) {
+func (h *Handler) scanSweepCandidates(ctx context.Context, machineID uuid.UUID, cands []model.ConsoleSweepCandidate) (*model.ConsoleSweepCandidate, error) {
 	var lastErr error
 	for i, wait := range sweepResolveAttempts {
 		if wait > 0 {
@@ -117,8 +135,8 @@ func (h *Handler) scanSweepCandidates(ctx context.Context, machineID uuid.UUID, 
 				return nil, ctx.Err()
 			}
 		}
-		for i := range sweep.Candidates {
-			cand := &sweep.Candidates[i]
+		for i := range cands {
+			cand := &cands[i]
 			hit, err := h.casts.ScanCastEventsForNonce(ctx, machineID, cand.Nonce, sweepLookback)
 			if err != nil {
 				// No cast row yet (machine never SOL'd) or a query

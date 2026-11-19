@@ -200,6 +200,51 @@ func TestRunnerScrubsPasswordFromParseErrors(t *testing.T) {
 	}
 }
 
+func TestRunnerScrubsPasswordBeforeQuotingParseError(t *testing.T) {
+	// The power-status parse error renders the output it rejected: it trims
+	// the output and quotes it with %q. Both change the password's bytes (%q
+	// escapes `"`, `\` and control characters; the trim drops whitespace at
+	// the ends), so the password has to be scrubbed from the output before
+	// it is rendered. Scrubbing the finished message misses it.
+	//
+	// Each password ends in the same distinctive tail, which both renderings
+	// leave intact: if the tail is in the error, so is the password.
+	const (
+		tail   = "-7Kq"
+		prefix = "Usage: SMCIPMITool 10.0.0.5 ADMIN "
+	)
+	cases := []struct {
+		name   string
+		pass   string
+		suffix string // banner text after the echoed password
+	}{
+		{"double quote, escaped by %q", `pw"quote` + tail, " ipmi power status"},
+		{"backslash, escaped by %q", `pw\slash` + tail, " ipmi power status"},
+		{"tab, escaped by %q", "pw\ttab" + tail, " ipmi power status"},
+		{"trailing newline, trimmed", "pw-newline" + tail + "\n", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The fake tool exits 0 with a usage banner that echoes the
+			// connection arguments, password included, and that the
+			// power-state parser does not recognize.
+			r, _ := testRunner(t, prefix+tc.pass+tc.suffix, 0)
+			_, err := r.PowerStatus(context.Background(), Conn{Host: "10.0.0.5", User: "ADMIN", Pass: tc.pass})
+			if err == nil {
+				t.Fatal("an unrecognized banner must be an error")
+			}
+			if strings.Contains(err.Error(), tail) {
+				t.Fatalf("password leaked into parse error: %v", err)
+			}
+			// The error still quotes the output, with the password redacted,
+			// so the operator can see what the tool printed.
+			if !strings.Contains(err.Error(), prefix+redactedSecret) {
+				t.Fatalf("parse error should quote the scrubbed output: %v", err)
+			}
+		})
+	}
+}
+
 // Note: the "process succeeds, then ctx cancels in the race window" case
 // (runErr == nil && ctx.Err() != nil) from the runner's guard is not
 // directly unit-tested — a pre-cancelled context makes exec.Start() fail
