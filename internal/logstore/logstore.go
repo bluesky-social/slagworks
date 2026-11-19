@@ -193,10 +193,11 @@ func (s *Store) Query(ctx context.Context, filter QueryFilter) ([]Result, error)
 		q = q.Where("source IN ?", filter.Sources)
 	}
 	if filter.MinLevel != "" {
-		levels := levelsAtOrAbove(filter.MinLevel)
-		if len(levels) > 0 {
-			q = q.Where("level IN ?", levels)
+		levels, err := levelsAtOrAbove(filter.MinLevel)
+		if err != nil {
+			return nil, err
 		}
+		q = q.Where("level IN ?", levels)
 	}
 	if !filter.Since.IsZero() {
 		if filter.SinceOrReceived {
@@ -244,13 +245,28 @@ func (s *Store) DeleteOlderThan(ctx context.Context, cutoff time.Time, source st
 	return res.RowsAffected, res.Error
 }
 
-func levelsAtOrAbove(min string) []string {
-	min = strings.ToLower(min)
+// ValidateMinLevel checks a QueryFilter.MinLevel value: empty (no level
+// filter) or debug, info, warn or error in any case. Query applies the
+// same check; the log stream calls it to refuse a bad subscription before
+// it starts streaming.
+func ValidateMinLevel(level string) error {
+	if level == "" {
+		return nil
+	}
+	_, err := levelsAtOrAbove(level)
+	return err
+}
+
+// levelsAtOrAbove returns level and every more severe one. An unknown
+// level is an error rather than no filter, so a typo such as "warning"
+// cannot widen a query to every level.
+func levelsAtOrAbove(level string) ([]string, error) {
+	lower := strings.ToLower(level)
 	all := []string{"debug", "info", "warn", "error"}
 	for i, l := range all {
-		if l == min {
-			return all[i:]
+		if l == lower {
+			return all[i:], nil
 		}
 	}
-	return nil
+	return nil, fmt.Errorf("unknown min level %q: use debug, info, warn or error", level)
 }
