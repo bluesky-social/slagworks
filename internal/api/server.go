@@ -350,7 +350,12 @@ func NewServer(cfg Config) *Server {
 	if len(cfg.CredentialGroups) > 0 {
 		credAuthz = tokenverify.RequireAnyGroup(cfg.CredentialGroups...)
 	}
-	instanceID, _ := cfg.Store.GetInstanceID()
+	// Nothing gates on the instance ID; it is only reported by /healthz,
+	// /readyz and `slagctl version`, so a failed read is logged, not fatal.
+	instanceID, idErr := cfg.Store.GetInstanceID()
+	if idErr != nil {
+		slog.Warn("instance ID unavailable: /healthz and /readyz will report an empty instance_id", "err", idErr)
+	}
 
 	// preflightKey: derive from webhookSecret if available (same config
 	// surface, no extra knob); otherwise generate a random 32-byte key at
