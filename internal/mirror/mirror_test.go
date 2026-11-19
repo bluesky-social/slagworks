@@ -122,25 +122,6 @@ func (f *fakeStore) GetMachineByNetBoxSerial(serial string) (*model.Machine, err
 	return &cc, nil
 }
 
-func (f *fakeStore) UpdateMachine(m *model.Machine) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	existing, ok := f.machines[m.ID]
-	if !ok {
-		return errors.New("not found")
-	}
-	// Rebind the device-id index if it changed.
-	if existing.NetBoxDeviceID != nil {
-		delete(f.byDevice, *existing.NetBoxDeviceID)
-	}
-	cp := *m
-	f.machines[m.ID] = &cp
-	if cp.NetBoxDeviceID != nil {
-		f.byDevice[*cp.NetBoxDeviceID] = m.ID
-	}
-	return nil
-}
-
 // SetMachineNetBoxDeviceID updates ONLY netbox_device_id, leaving every other
 // column untouched — mirroring the real store's column-scoped Update.
 // This is what makes the rebind path safe against clobbering columns the
@@ -335,7 +316,7 @@ func TestOnDeviceCreatedRebindsBySerial(t *testing.T) {
 // TestOnDeviceCreatedRebindPreservesNonOwnedColumns: the reconciler
 // (webhook-loss safety net) re-feeds EVERY already-bound device through
 // OnDeviceCreated on each tick, so the rebind path must write ONLY
-// netbox_device_id. A full-row UpdateMachine(Save) of the loaded `existing`
+// netbox_device_id. A full-row gorm Save of the loaded `existing`
 // struct would race and revert concurrent writes to columns the mirror
 // doesn't own (it once reverted a freshly written BMC password this way).
 func TestOnDeviceCreatedRebindPreservesNonOwnedColumns(t *testing.T) {

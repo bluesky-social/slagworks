@@ -916,21 +916,18 @@ func (s *Server) getMachine(c *echo.Context) error {
 // updateMachine accepts only slagworks-owned runtime fields. Identity
 // (hostname, MACs, BMC IP, site) lives in NetBox; operators edit those
 // there. See docs/dev/api.md.
+//
+// It writes only the columns it accepts, never the whole row: state, lock
+// and the NetBox binding have their own writers, and a row read before the
+// body arrives would revert anything they committed in the meantime.
 func (s *Server) updateMachine(c *echo.Context) error {
 	id, err := s.resolveMachineParam(c)
 	if err != nil {
 		return err
 	}
-	existing, err := s.store.GetMachine(id)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusNotFound, "machine not found")
-	}
 	var body map[string]any
 	if err := c.Bind(&body); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
-	}
-	if v, ok := body["desired_os"].(string); ok {
-		existing.DesiredOS = v
 	}
 	if _, ok := body["state"]; ok {
 		// State is owned by the operation lifecycle (claim/complete/abort
@@ -939,11 +936,20 @@ func (s *Server) updateMachine(c *echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest,
 			"state is not directly settable; drive it via operations (commission/deploy/abort)")
 	}
-	if err := s.store.UpdateMachine(existing); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	if v, ok := body["desired_os"].(string); ok {
+		if err := s.store.SetMachineDesiredOS(id, v); err != nil {
+			if errors.Is(err, store.ErrMachineNotFound) {
+				return echo.NewHTTPError(http.StatusNotFound, "machine not found")
+			}
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		s.invalidateAllSites()
 	}
-	s.invalidateAllSites()
-	return c.JSON(http.StatusOK, existing)
+	m, err := s.store.GetMachine(id)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "machine not found")
+	}
+	return c.JSON(http.StatusOK, m)
 }
 
 // --- Machine action handlers ---
