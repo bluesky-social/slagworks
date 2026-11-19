@@ -123,10 +123,18 @@ variable shown, so a flag on the command line overrides the variable.
   (here `.example.net`) is used unchanged. When the template uses
   `{node}` or `{zone}` and a device name has no dot (or nothing on one
   side of its last dot), the machine gets no hostname from slagworks
-  and keeps the deployed image's default. Any other `{...}`, or a
-  template with no placeholder, is a configuration error: global
-  refuses to start. Changing the template changes the hostname every
-  machine gets on its next deploy.
+  and keeps the deployed image's default. The same happens when the
+  result is not a valid hostname: dot-separated labels of ASCII
+  letters, digits and hyphens, none empty or starting or ending with
+  a hyphen, at most 63 characters each and 253 in all (RFC 1123). A
+  device name containing a space, `/`, `_` or a newline, for example,
+  gives no hostname with or without a template. Any other `{...}`, a
+  template with no placeholder, or a template whose literal text no
+  device name could make a valid hostname (a character other than a
+  letter, digit, hyphen or dot, an empty label, or a label starting
+  or ending with a hyphen, as in `{node}.internal.{zone}.example_net`)
+  is a configuration error: global refuses to start. Changing the
+  template changes the hostname every machine gets on its next deploy.
 
 ### AWS
 

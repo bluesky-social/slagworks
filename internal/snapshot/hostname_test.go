@@ -95,6 +95,75 @@ func TestHostnameTemplate_NoTrailingLiteral(t *testing.T) {
 	})
 }
 
+// A NetBox device name that is not a hostname gives no hostname, under every
+// kind of template, instead of passing through to MachineSnapshot.FQDN: the
+// agent writes that value verbatim into /etc/hostname and the 127.0.1.1 line
+// of /etc/hosts. The first name would otherwise add a second /etc/hosts line
+// mapping 203.0.113.9 to a name of the NetBox editor's choosing.
+func TestHostnameTemplate_RejectsNamesThatAreNotHostnames(t *testing.T) {
+	names := []string{
+		"host-a\n203.0.113.9 mirror.example.org",
+		"host-a.site1\n203.0.113.9 mirror.example.org",
+		"spare server.site1",
+		// ends with the templates' trailing literal: the already-qualified
+		// passthrough must not skip the check.
+		"spare server.internal.site1.example.net",
+		"host\ta.site1",
+		"rack1/host-a.site1",
+		"host-a#2.site1",
+		"web_01.site1",
+		"host-a-.site1",
+		"host-a..site1",
+		"host-a.site1.",
+		strings.Repeat("a", 64) + ".site1",
+	}
+	for _, raw := range []string{"", "{name}", "{name}.example.net", internalZoneTemplate, "{zone}-{node}"} {
+		tmpl := mustParseHostnameTemplate(t, raw)
+		for _, name := range names {
+			if got := tmpl.Expand(name); got != "" {
+				t.Errorf("template %q: Expand(%q) = %q, want \"\" (not a valid hostname)", raw, name, got)
+			}
+		}
+	}
+	// The check is on the hostname produced, not on the device name: a
+	// leading hyphen that the template moves inside a label is fine.
+	assertExpansions(t, mustParseHostnameTemplate(t, "{zone}-{node}"), map[string]string{
+		"-host-a.site1": "site1--host-a",
+	})
+}
+
+// Template literal text that no device name could turn into a hostname is a
+// configuration error at startup, not a silent loss of every machine's
+// hostname.
+func TestParseHostnameTemplate_LiteralCannotFormHostname(t *testing.T) {
+	for _, raw := range []string{
+		"{node}.internal.{zone}.example_net",
+		"{node} {zone}",
+		"{name}.example.net.",
+		".{name}",
+		"{node}..{zone}",
+		"-{name}",
+		"{name}-",
+		"{node}.-{zone}",
+	} {
+		_, err := ParseHostnameTemplate(raw)
+		if err == nil {
+			t.Errorf("ParseHostnameTemplate(%q): expected an error", raw)
+			continue
+		}
+		if !strings.Contains(err.Error(), "valid hostname") {
+			t.Errorf("ParseHostnameTemplate(%q) error %q does not say the literal text cannot form a hostname", raw, err)
+		}
+	}
+	// A literal label too long on its own is not a startup error: a dot in
+	// {name} or {node} can split it. Expand judges each result instead.
+	x, y := strings.Repeat("x", 32), strings.Repeat("y", 32)
+	assertExpansions(t, mustParseHostnameTemplate(t, x+"{name}"+y), map[string]string{
+		"a.b": x + "a.b" + y,
+		"ab":  "",
+	})
+}
+
 func TestParseHostnameTemplate_Invalid(t *testing.T) {
 	cases := map[string]string{
 		"{host}.example.net":   `unknown placeholder "{host}"`,
