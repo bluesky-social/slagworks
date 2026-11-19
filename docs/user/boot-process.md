@@ -302,7 +302,11 @@ what stock `/init` calls; the slagworks version does exactly this:
    under normal deploy — the agent reboots on success.
 9. On agent success (`rc==0`) the hook runs `reboot -f`. On failure it
    POSTs a `phase=agent_crashed` envelope to `/api/v1/report` and drops
-   into recovery.
+   into recovery. Exit status 3 means the agent stopped because the
+   site worker told it the operation is over (an operator abort, a
+   timeout, a failure reported elsewhere); the envelope is refused for
+   the same reason and the host waits in recovery like any other
+   failure.
 
 The recovery path (`slagworks_recovery_drop`) is worth knowing: on any
 FATAL — no lease, squashfs download failure, agent nonzero exit,
