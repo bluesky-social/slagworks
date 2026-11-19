@@ -103,8 +103,21 @@ func (s *Store) ListMachinesByIDs(ids []uuid.UUID) ([]model.Machine, error) {
 	return out, err
 }
 
-func (s *Store) UpdateMachine(m *model.Machine) error {
-	return s.db.Save(m).Error
+// SetMachineDesiredOS writes ONLY the desired_os column, for
+// PATCH /machines/:id. Every other machine column has its own writer (state
+// and lock through the operation lifecycle, the NetBox binding through the
+// mirror), so a write-back of a row the caller read earlier would revert
+// whatever those writers committed in between. Returns ErrMachineNotFound
+// when no row matches, so a machine deleted mid-request stays deleted.
+func (s *Store) SetMachineDesiredOS(id uuid.UUID, desiredOS string) error {
+	res := s.db.Model(&model.Machine{}).Where("id = ?", id).Update("desired_os", desiredOS)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrMachineNotFound
+	}
+	return nil
 }
 
 // DeleteMachine hard-deletes a machine row and its child rows (operations
@@ -134,7 +147,7 @@ func (s *Store) SetMachineLocked(id uuid.UUID, locked bool) error {
 
 // SetMachineNetBoxDeviceID writes ONLY the netbox_device_id column. Used by the
 // mirror's rebind path (a NetBox device re-pointing at an existing serial's
-// row). A full-row UpdateMachine(Save) there would clobber columns the mirror
+// row). A full-row gorm Save there would clobber columns the mirror
 // does not own (state, lock, commission data) with whatever stale value the
 // mirror's in-memory struct was loaded with, racing a concurrent writer of
 // those columns. The mirror owns only the NetBox binding, so scope the write

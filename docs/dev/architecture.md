@@ -87,11 +87,14 @@ Modes (dispatched from `main.go` around line 165):
   (conditionally) `console_probe` back through `POST /api/v1/report`,
   then sends the full inventory as an operation-bound
   `commission_report` through that same endpoint and reboots.
-- `deploy` (default) — the long path in `main.go:249`. Verifies
-  identity, resolves the storage layout, plans and executes wipe /
-  partition / mkfs, extracts the image, installs a bootloader,
-  configures RAID, writes fstab, seeds cloud-init, applies the
-  network configuration, writes the hostname, installs SSH keys,
+- `deploy` (default) — the long path in `deploy.go` `runDeploy`.
+  Verifies identity, resolves the storage layout, renders the network
+  configuration (runs the network script; both scripts run before any
+  disk is touched, so a model gap fails the deploy with the host as
+  found), plans and executes wipe / partition / mkfs, extracts the
+  image, installs a bootloader, configures RAID, writes fstab, seeds
+  cloud-init, writes the rendered network configuration into the
+  target, writes the hostname, installs SSH keys,
   enrolls in Tailscale, writes the phone-home unit, reconciles the
   BMC, reports `deploy_complete`, and reboots.
 
@@ -417,8 +420,9 @@ Global to site:
 - `op_delta` / `op_resync` / `op_removed` (`OpDeltaMsg`, line 434 /
   `OpResyncMsg`, 450 / `OpRemovedMsg`, 462) — the op-event stream.
   Operations left `SiteSnapshot` (Tier 2 Phase 2); they flow as per-op
-  `op_delta`s, a full `op_resync` on every (re)connect, and
-  `op_removed` for terminal ops.
+  `op_delta`s (re-sent for the whole site after every pushed snapshot),
+  a full `op_resync` on every (re)connect, and `op_removed` for terminal
+  ops.
 - `power_status_request` / `boot_status_request` (`131`, `150`) —
   synchronous RPCs invoked by the API for operator reads.
 

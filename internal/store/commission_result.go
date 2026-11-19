@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -132,6 +134,12 @@ func (s *Store) CommitCommissionResult(opID, machineID uuid.UUID, data json.RawM
 	return outcome, alreadyCompleted, err
 }
 
+// jsonSemanticallyEqual reports whether a and b encode the same JSON value.
+// One side is usually read back from a jsonb column, which discards
+// whitespace, reorders object keys and re-spells numbers (1e3 becomes 1000, -0
+// becomes 0), so a byte-identical redelivery must still compare equal to it.
+// Numbers therefore compare by exact decimal value, never through float64,
+// which would also collapse distinct large integers.
 func jsonSemanticallyEqual(a, b []byte) bool {
 	var av, bv any
 	ad := json.NewDecoder(bytes.NewReader(a))
@@ -141,5 +149,63 @@ func jsonSemanticallyEqual(a, b []byte) bool {
 	if ad.Decode(&av) != nil || bd.Decode(&bv) != nil {
 		return false
 	}
-	return reflect.DeepEqual(av, bv)
+	return reflect.DeepEqual(decimalNumbers(av), decimalNumbers(bv))
+}
+
+// decimalNumbers replaces, in place, every json.Number in a decoded document
+// with its decimalValue and returns the document.
+func decimalNumbers(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, e := range x {
+			x[k] = decimalNumbers(e)
+		}
+	case []any:
+		for i, e := range x {
+			x[i] = decimalNumbers(e)
+		}
+	case json.Number:
+		if d, ok := parseDecimal(x); ok {
+			return d
+		}
+	}
+	return v
+}
+
+// decimalValue is the exact value of a JSON number: (-1 if neg) * digits *
+// 10^exp, where digits has no leading or trailing zeros. Every spelling of
+// the same value maps to the same decimalValue. Zero is the zero
+// decimalValue, so -0 equals 0, as it does in jsonb.
+type decimalValue struct {
+	neg    bool
+	digits string
+	exp    int64
+}
+
+// parseDecimal reduces n, a number the JSON decoder has already validated,
+// to its decimalValue. It works on the spelling, so the cost is linear in its
+// length however large the exponent is. ok is false when the exponent does
+// not fit in 32 bits; such a number cannot be stored in a Postgres numeric,
+// so the caller leaves it as a json.Number, which compares by spelling.
+func parseDecimal(n json.Number) (decimalValue, bool) {
+	s := string(n)
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(s, "-")
+	var exp int64
+	if i := strings.IndexAny(s, "eE"); i >= 0 {
+		e, err := strconv.ParseInt(s[i+1:], 10, 32)
+		if err != nil {
+			return decimalValue{}, false
+		}
+		exp, s = e, s[:i]
+	}
+	intPart, frac, _ := strings.Cut(s, ".")
+	// The value is the integer intPart+frac times 10^(exp-len(frac)).
+	digits := strings.TrimLeft(intPart+frac, "0")
+	if digits == "" {
+		return decimalValue{}, true
+	}
+	sig := strings.TrimRight(digits, "0")
+	exp += int64(len(digits)-len(sig)) - int64(len(frac))
+	return decimalValue{neg: neg, digits: sig, exp: exp}, true
 }

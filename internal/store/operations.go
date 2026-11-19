@@ -478,7 +478,16 @@ func (s *Store) SetOperationPhase(opID uuid.UUID, phase string) (PhaseTransition
 	var t PhaseTransition
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var op model.Operation
-		if err := tx.Select("id", "phase", "phase_entered_at", "machine_id", "trace_id").
+		// FOR UPDATE: the "did the phase change" decision and the
+		// PrevPhase/Duration below come from this read, so it must see the
+		// row the UPDATE writes. Under READ COMMITTED a plain SELECT lets
+		// two overlapping deliveries of one report (outbox redelivery on a
+		// new connection, an HA site-worker pair) both read the old phase
+		// and both write: two Changed=true results, two op_deltas, two
+		// envelopes, version +2. With the lock the second waits, then
+		// reads the first's phase and returns Changed=false.
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "phase", "phase_entered_at", "machine_id", "trace_id").
 			Where("id = ?", opID).First(&op).Error; err != nil {
 			return err
 		}
@@ -817,6 +826,9 @@ func (s *Store) ExpirePhoneHomeOperations(timeout time.Duration) ([]OpOutcome, e
 //
 // Returns the machine row after the abort AND the post-mutation
 // outcomes (one per op that transitioned) for the op-event publisher.
+// On error the outcomes still list every op failed before the error:
+// those ops are terminal in the database and a retried abort no longer
+// sees them, so the caller publishes them whatever the error.
 func (s *Store) AbortMachine(machineID uuid.UUID) (*model.Machine, []OpOutcome, error) {
 	var existing model.Machine
 	if err := s.db.Where("id = ?", machineID).First(&existing).Error; err != nil {
@@ -831,7 +843,7 @@ func (s *Store) AbortMachine(machineID uuid.UUID) (*model.Machine, []OpOutcome, 
 	for _, op := range activeOps {
 		out, err := s.failOperationGuarded(op.ID, []byte(`{"error":"aborted by operator"}`), nil)
 		if err != nil {
-			return nil, nil, fmt.Errorf("fail op %s during abort: %w", op.ID, err)
+			return nil, outcomes, fmt.Errorf("fail op %s during abort: %w", op.ID, err)
 		}
 		if out != nil {
 			outcomes = append(outcomes, *out)
@@ -839,7 +851,7 @@ func (s *Store) AbortMachine(machineID uuid.UUID) (*model.Machine, []OpOutcome, 
 	}
 	var out model.Machine
 	if err := s.db.Where("id = ?", machineID).First(&out).Error; err != nil {
-		return nil, nil, err
+		return nil, outcomes, err
 	}
 	return &out, outcomes, nil
 }

@@ -1035,133 +1035,66 @@ func TestSetOperationPhase_TransitionShape(t *testing.T) {
 	}
 }
 
-// TestSetOperationPhase_DoesNotRewriteTerminalOp: a phase report that
-// arrives after its op went terminal must not rewrite the row. The worker
-// does send these: a report already in flight when the operator aborts, or
-// the executor's power_cycle/pxe_booting updates after op_removed. The
-// phase the op ended in, phase_entered_at, and the version that workers
-// order the op stream by are all part of the terminal record, and a
-// reported change makes the hub publish an op_delta for a dead op.
-func TestSetOperationPhase_DoesNotRewriteTerminalOp(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		end  func(st *Store, m *model.Machine, op *model.Operation) error
-		want model.OperationStatus
-	}{
-		{"aborted", func(st *Store, m *model.Machine, _ *model.Operation) error {
-			_, _, err := st.AbortMachine(m.ID)
-			return err
-		}, model.OpFailed},
-		{"completed", func(st *Store, _ *model.Machine, op *model.Operation) error {
-			_, err := st.CompleteOperationWithState(op.ID, model.MachineStateRunning, nil)
-			return err
-		}, model.OpCompleted},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			st := testStore(t)
-			m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-late-phase", State: model.MachineStateCommissioned, PXEEligible: true}
-			if err := st.CreateMachine(m); err != nil {
-				t.Fatal(err)
-			}
-			op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if claimed, err := st.ClaimOperation(op.ID, "worker-1"); err != nil || claimed == nil {
-				t.Fatalf("claim: op=%v err=%v", claimed, err)
-			}
-			if _, err := st.SetOperationPhase(op.ID, "partitioning"); err != nil {
-				t.Fatal(err)
-			}
-			if err := tc.end(st, m, op); err != nil {
-				t.Fatal(err)
-			}
-			before, err := st.GetOperation(op.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if before.Status != tc.want || before.Phase != "partitioning" {
-				t.Fatalf("setup: op is %s in phase %q, want %s in partitioning", before.Status, before.Phase, tc.want)
-			}
-
-			// The report that was still in flight when the op ended.
-			tr, err := st.SetOperationPhase(op.ID, "rsyncing_os")
-			if err != nil {
-				t.Fatalf("late phase report: %v", err)
-			}
-
-			after, err := st.GetOperation(op.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if tr.Changed || tr.Op != nil {
-				t.Errorf("SetOperationPhase reported a phase change on a %s op (Changed=%v, Op set=%v); the hub publishes an op_delta for every reported change",
-					tc.want, tr.Changed, tr.Op != nil)
-			}
-			if after.Phase != "partitioning" {
-				t.Errorf("%s op's phase was rewritten: %q -> %q", tc.want, before.Phase, after.Phase)
-			}
-			if after.Version != before.Version {
-				t.Errorf("%s op's version moved after it went terminal: %d -> %d (workers accept any delta above their tombstone version)",
-					tc.want, before.Version, after.Version)
-			}
-			if !after.PhaseEnteredAt.Equal(before.PhaseEnteredAt) {
-				t.Errorf("%s op's phase_entered_at moved: %s -> %s", tc.want, before.PhaseEnteredAt, after.PhaseEnteredAt)
-			}
-		})
+// claimedDeployInPhase creates a claimed deploy op whose phase is already
+// set, for the overlapping-write tests below.
+func claimedDeployInPhase(t *testing.T, st *Store, serial, phase string) uuid.UUID {
+	t.Helper()
+	m := &model.Machine{
+		ID: uuid.New(), NetBoxSerial: serial,
+		State: model.MachineStateDeploying, PXEEligible: true,
 	}
-}
-
-// TestSetOperationPhase_AbortBetweenReadAndWrite: an abort that lands after
-// SetOperationPhase has read the op as active, and before it writes, must
-// still have the last word on the row. The abort starts in its own goroutine
-// right after the read, and the read's transaction waits until the abort has
-// either committed or blocked on a row lock before it goes on to write, so
-// the test is deterministic whether SetOperationPhase guards its write with
-// a status check or serializes against the abort with a lock.
-func TestSetOperationPhase_AbortBetweenReadAndWrite(t *testing.T) {
-	st := testStore(t)
-	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-abort-mid-phase", State: model.MachineStateCommissioned, PXEEligible: true}
 	if err := st.CreateMachine(m); err != nil {
 		t.Fatal(err)
 	}
-	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
-	if err != nil {
+	op := &model.Operation{MachineID: m.ID, Type: model.OpDeploy, Status: model.OpClaimed}
+	if err := st.CreateOperation(op); err != nil {
 		t.Fatal(err)
 	}
-	if claimed, err := st.ClaimOperation(op.ID, "worker-1"); err != nil || claimed == nil {
-		t.Fatalf("claim: op=%v err=%v", claimed, err)
-	}
-	if _, err := st.SetOperationPhase(op.ID, "partitioning"); err != nil {
+	if _, err := st.SetOperationPhase(op.ID, phase); err != nil {
 		t.Fatal(err)
 	}
+	return op.ID
+}
 
-	type abortResult struct {
-		outs []OpOutcome
-		err  error
+// overlapSetOperationPhase runs two SetOperationPhase calls on one op that
+// overlap the way two deliveries of a phase report can (the worker's outbox
+// resending an op_update on a new connection while the hub is still
+// handling the first copy, or one agent report reaching both site workers
+// of an HA pair): the second call starts after the first has read the op
+// row and before the first writes. It returns both transitions.
+//
+// The pause is a gorm query callback on the first call's phase read, the
+// only query that names phase_entered_at. The callback starts the second
+// call in a goroutine and returns once that call has either finished or is
+// waiting on a row lock, so the interleave is deterministic whether or not
+// SetOperationPhase locks the row it reads.
+func overlapSetOperationPhase(t *testing.T, st *Store, opID uuid.UUID, firstPhase, secondPhase string) (first, second PhaseTransition) {
+	t.Helper()
+	type result struct {
+		tr  PhaseTransition
+		err error
 	}
-	aborted := make(chan abortResult, 1)
+	secondDone := make(chan result, 1)
 	sqlDB, err := st.db.DB()
 	if err != nil {
 		t.Fatal(err)
 	}
-	name := "abort-mid-phase:" + uuid.NewString()
+	name := "overlap-set-phase:" + uuid.NewString()
 	fired := false
-	// SetOperationPhase's read is the only query that names phase_entered_at.
 	if err := st.db.Callback().Query().After("gorm:query").Register(name, func(tx *gorm.DB) {
 		if fired || !strings.Contains(tx.Statement.SQL.String(), `"phase_entered_at"`) {
 			return
 		}
 		fired = true
 		go func() {
-			_, outs, err := st.AbortMachine(m.ID)
-			aborted <- abortResult{outs, err}
+			tr, err := st.SetOperationPhase(opID, secondPhase)
+			secondDone <- result{tr, err}
 		}()
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
 			select {
-			case r := <-aborted:
-				aborted <- r
+			case r := <-secondDone:
+				secondDone <- r
 				return
 			case <-time.After(2 * time.Millisecond):
 			}
@@ -1171,40 +1104,91 @@ func TestSetOperationPhase_AbortBetweenReadAndWrite(t *testing.T) {
 				return
 			}
 		}
-		t.Error("abort neither finished nor blocked on a lock within 10s")
+		t.Error("second SetOperationPhase neither finished nor waited on a row lock within 10s")
 	}); err != nil {
 		t.Fatalf("register interleave callback: %v", err)
 	}
-	t.Cleanup(func() { _ = st.db.Callback().Query().Remove(name) })
+	defer func() { _ = st.db.Callback().Query().Remove(name) }()
 
-	tr, err := st.SetOperationPhase(op.ID, "rsyncing_os")
+	first, err = st.SetOperationPhase(opID, firstPhase)
 	if err != nil {
-		t.Fatalf("phase report: %v", err)
+		t.Fatalf("first SetOperationPhase: %v", err)
 	}
 	if !fired {
-		t.Fatal("setup: SetOperationPhase's read was not intercepted; the abort never ran between read and write")
+		t.Fatal("interleave callback never fired: SetOperationPhase's read no longer names phase_entered_at")
 	}
-	ab := <-aborted
-	if ab.err != nil {
-		t.Fatalf("abort: %v", ab.err)
+	select {
+	case r := <-secondDone:
+		if r.err != nil {
+			t.Fatalf("second SetOperationPhase: %v", r.err)
+		}
+		return first, r.tr
+	case <-time.After(10 * time.Second):
+		t.Fatal("second SetOperationPhase did not return within 10s")
 	}
-	if len(ab.outs) != 1 {
-		t.Fatalf("abort failed %d ops, want 1", len(ab.outs))
-	}
-	failed := ab.outs[0].Op
+	return first, second
+}
 
-	got, err := st.GetOperation(op.ID)
+// TestSetOperationPhase_OverlappingDuplicateChangesPhaseOnce: two
+// overlapping deliveries of the same phase report record one phase change.
+// The other is the idempotent repeat (Changed=false). Recording both would
+// publish two op_deltas and two "phase transition" envelopes, observe
+// PhaseDuration twice, write phase_entered_at (the phone-home deadline
+// anchor) twice, and bump the version by two.
+func TestSetOperationPhase_OverlappingDuplicateChangesPhaseOnce(t *testing.T) {
+	st := testStore(t)
+	opID := claimedDeployInPhase(t, st, "SN-dup-phase", "finalizing")
+	before, err := st.GetOperation(opID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Either order is legal (phase then fail, or fail and the phase report
-	// dropped), but in both the fail is the last write to the row.
-	if tr.Op != nil && tr.Op.Status == model.OpFailed {
-		t.Errorf("phase write landed on the failed row (version %d) and was reported for publication", tr.Op.Version)
+
+	first, second := overlapSetOperationPhase(t, st, opID, "awaiting_phone_home", "awaiting_phone_home")
+
+	if first.Changed == second.Changed {
+		t.Errorf("Changed: first=%v second=%v, want exactly one delivery to record the phase change",
+			first.Changed, second.Changed)
 	}
-	if got.Version != failed.Version || got.Phase != failed.Phase {
-		t.Errorf("row moved after the abort failed it: abort left phase %q version %d, row now has phase %q version %d",
-			failed.Phase, failed.Version, got.Phase, got.Version)
+	after, err := st.GetOperation(opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Version != before.Version+1 {
+		t.Errorf("version moved %d -> %d for one phase change, want +1", before.Version, after.Version)
+	}
+}
+
+// TestSetOperationPhase_OverlappingWritersChainPrevPhase: two overlapping
+// writes of different phases both change the phase, and the transitions
+// chain. The later write's PrevPhase is the phase the earlier write set
+// and its Duration runs from the earlier write, not from the phase both
+// started in. These feed the "phase transition" envelope and the
+// PhaseDuration metric.
+func TestSetOperationPhase_OverlappingWritersChainPrevPhase(t *testing.T) {
+	st := testStore(t)
+	opID := claimedDeployInPhase(t, st, "SN-overlap-phase", "finalizing")
+	// Age the starting phase so a Duration measured from it stands out.
+	if err := st.db.Model(&model.Operation{}).Where("id = ?", opID).
+		Update("phase_entered_at", time.Now().Add(-time.Hour)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	first, second := overlapSetOperationPhase(t, st, opID, "bmc_reconcile", "awaiting_phone_home")
+
+	if !first.Changed || !second.Changed {
+		t.Fatalf("Changed: first=%v second=%v, want both (the phases differ)", first.Changed, second.Changed)
+	}
+	earlier, later := first, second
+	if later.PrevPhase == "finalizing" {
+		earlier, later = second, first
+	}
+	if earlier.PrevPhase != "finalizing" || later.PrevPhase != earlier.NewPhase {
+		t.Errorf("transitions do not chain: %q -> %q and %q -> %q, want finalizing -> one -> the other",
+			first.PrevPhase, first.NewPhase, second.PrevPhase, second.NewPhase)
+	}
+	if later.Duration > time.Minute {
+		t.Errorf("later transition's Duration = %v, want it measured from the earlier write (milliseconds), not from finalizing (1h)",
+			later.Duration)
 	}
 }
 
@@ -1731,5 +1715,178 @@ func TestListActiveOperationsClaimedBy(t *testing.T) {
 	}
 	if len(none) != 0 {
 		t.Fatalf("worker-3: got %d ops, want 0", len(none))
+	}
+}
+
+// TestSetOperationPhase_DoesNotRewriteTerminalOp: a phase report that
+// arrives after its op went terminal must not rewrite the row. The worker
+// does send these: a report already in flight when the operator aborts, or
+// the executor's power_cycle/pxe_booting updates after op_removed. The
+// phase the op ended in, phase_entered_at, and the version that workers
+// order the op stream by are all part of the terminal record, and a
+// reported change makes the hub publish an op_delta for a dead op.
+func TestSetOperationPhase_DoesNotRewriteTerminalOp(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func(st *Store, m *model.Machine, op *model.Operation) error
+		want model.OperationStatus
+	}{
+		{"aborted", func(st *Store, m *model.Machine, _ *model.Operation) error {
+			_, _, err := st.AbortMachine(m.ID)
+			return err
+		}, model.OpFailed},
+		{"completed", func(st *Store, _ *model.Machine, op *model.Operation) error {
+			_, err := st.CompleteOperationWithState(op.ID, model.MachineStateRunning, nil)
+			return err
+		}, model.OpCompleted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-late-phase", State: model.MachineStateCommissioned, PXEEligible: true}
+			if err := st.CreateMachine(m); err != nil {
+				t.Fatal(err)
+			}
+			op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claimed, err := st.ClaimOperation(op.ID, "worker-1"); err != nil || claimed == nil {
+				t.Fatalf("claim: op=%v err=%v", claimed, err)
+			}
+			if _, err := st.SetOperationPhase(op.ID, "partitioning"); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.end(st, m, op); err != nil {
+				t.Fatal(err)
+			}
+			before, err := st.GetOperation(op.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if before.Status != tc.want || before.Phase != "partitioning" {
+				t.Fatalf("setup: op is %s in phase %q, want %s in partitioning", before.Status, before.Phase, tc.want)
+			}
+
+			// The report that was still in flight when the op ended.
+			tr, err := st.SetOperationPhase(op.ID, "rsyncing_os")
+			if err != nil {
+				t.Fatalf("late phase report: %v", err)
+			}
+
+			after, err := st.GetOperation(op.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tr.Changed || tr.Op != nil {
+				t.Errorf("SetOperationPhase reported a phase change on a %s op (Changed=%v, Op set=%v); the hub publishes an op_delta for every reported change",
+					tc.want, tr.Changed, tr.Op != nil)
+			}
+			if after.Phase != "partitioning" {
+				t.Errorf("%s op's phase was rewritten: %q -> %q", tc.want, before.Phase, after.Phase)
+			}
+			if after.Version != before.Version {
+				t.Errorf("%s op's version moved after it went terminal: %d -> %d (workers accept any delta above their tombstone version)",
+					tc.want, before.Version, after.Version)
+			}
+			if !after.PhaseEnteredAt.Equal(before.PhaseEnteredAt) {
+				t.Errorf("%s op's phase_entered_at moved: %s -> %s", tc.want, before.PhaseEnteredAt, after.PhaseEnteredAt)
+			}
+		})
+	}
+}
+
+// TestSetOperationPhase_AbortBetweenReadAndWrite: an abort that lands after
+// SetOperationPhase has read the op as active, and before it writes, must
+// still have the last word on the row. The abort starts in its own goroutine
+// right after the read, and the read's transaction waits until the abort has
+// either committed or blocked on a row lock before it goes on to write, so
+// the test is deterministic whether SetOperationPhase guards its write with
+// a status check or serializes against the abort with a lock.
+func TestSetOperationPhase_AbortBetweenReadAndWrite(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-abort-mid-phase", State: model.MachineStateCommissioned, PXEEligible: true}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := st.ClaimOperation(op.ID, "worker-1"); err != nil || claimed == nil {
+		t.Fatalf("claim: op=%v err=%v", claimed, err)
+	}
+	if _, err := st.SetOperationPhase(op.ID, "partitioning"); err != nil {
+		t.Fatal(err)
+	}
+
+	type abortResult struct {
+		outs []OpOutcome
+		err  error
+	}
+	aborted := make(chan abortResult, 1)
+	sqlDB, err := st.db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "abort-mid-phase:" + uuid.NewString()
+	fired := false
+	// SetOperationPhase's read is the only query that names phase_entered_at.
+	if err := st.db.Callback().Query().After("gorm:query").Register(name, func(tx *gorm.DB) {
+		if fired || !strings.Contains(tx.Statement.SQL.String(), `"phase_entered_at"`) {
+			return
+		}
+		fired = true
+		go func() {
+			_, outs, err := st.AbortMachine(m.ID)
+			aborted <- abortResult{outs, err}
+		}()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case r := <-aborted:
+				aborted <- r
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+			var waiters int
+			if err := sqlDB.QueryRow(`SELECT count(*) FROM pg_stat_activity
+				WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiters); err == nil && waiters > 0 {
+				return
+			}
+		}
+		t.Error("abort neither finished nor blocked on a lock within 10s")
+	}); err != nil {
+		t.Fatalf("register interleave callback: %v", err)
+	}
+	t.Cleanup(func() { _ = st.db.Callback().Query().Remove(name) })
+
+	tr, err := st.SetOperationPhase(op.ID, "rsyncing_os")
+	if err != nil {
+		t.Fatalf("phase report: %v", err)
+	}
+	if !fired {
+		t.Fatal("setup: SetOperationPhase's read was not intercepted; the abort never ran between read and write")
+	}
+	ab := <-aborted
+	if ab.err != nil {
+		t.Fatalf("abort: %v", ab.err)
+	}
+	if len(ab.outs) != 1 {
+		t.Fatalf("abort failed %d ops, want 1", len(ab.outs))
+	}
+	failed := ab.outs[0].Op
+
+	got, err := st.GetOperation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Either order is legal (phase then fail, or fail and the phase report
+	// dropped), but in both the fail is the last write to the row.
+	if tr.Op != nil && tr.Op.Status == model.OpFailed {
+		t.Errorf("phase write landed on the failed row (version %d) and was reported for publication", tr.Op.Version)
+	}
+	if got.Version != failed.Version || got.Phase != failed.Phase {
+		t.Errorf("row moved after the abort failed it: abort left phase %q version %d, row now has phase %q version %d",
+			failed.Phase, failed.Version, got.Phase, got.Version)
 	}
 }

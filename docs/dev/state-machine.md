@@ -175,7 +175,10 @@ decides:
   quarantine lock).
 - Any other target: state only, lock untouched.
 
-That helper has six call sites.
+That helper has five call sites. `PATCH /machines/:id` is not one: it
+rejects a body containing `state` and writes only the `desired_os`
+column, so it cannot revert a transition that commits while the request
+is in flight.
 
 | # | Function | File and line | Trigger | Preconditions | Effect on `machine.state` |
 |---|---|---|---|---|---|
@@ -184,7 +187,6 @@ That helper has six call sites.
 | 3 | `CompleteOperationWithState` | `internal/store/store.go:576` | hub receives `op_update{status=completed}` | op not already terminal | sets target state; deploy passes `MachineStateRunning`; empty target means no state change (power ops, per `internal/hubhandlers/hubhandlers.go:60`) |
 | 4 | `CommitCommissionResult` | `internal/store/commission_result.go` | commission observation handler | exact active commission op ID belongs to the reported machine | atomically stores inventory, completes that op, and moves its machine to `commissioned` |
 | 5 | `FailOperation` | `internal/store/store.go:772` | worker `op_update{status=failed}`, `AbortMachine`, or one of the three timeout sweeps | op not already terminal | per-rule branching, see below |
-| 6 | `updateMachine` (`PATCH /machines/:id`) | `internal/api/server.go:704` | operator PATCH | value passes `.Valid()` | direct write; mirrors auto-lock policy (`server.go:732`) but does not enforce `claimTransition` — see [rough edges](#open-questions-and-rough-edges) |
 
 ### `claimTransition` allowed sources
 
@@ -250,6 +252,9 @@ after the op ended (a report in flight when the operator aborts, or
 executor progress after `op_removed`), and that report changes
 nothing and publishes nothing. The op keeps the phase it ended in, and
 its version stays at the tombstone workers hold for it.
+It reads the op row `FOR
+UPDATE`, so two overlapping deliveries of the same report serialize:
+the second sees the phase the first wrote and returns `Changed=false`.
 
 The site worker maintains its own view of the phase in
 `Cache.UpdateOpPhase` (`internal/worker/cache.go:1321`). The write
@@ -443,6 +448,15 @@ op-event stream (`op_delta` / `op_resync` / `op_removed`, defined in
 - **(re)connect** sends an unconditional `op_resync` (the active set
   scoped to the conn's site + the transient overlay each claimed/running
   op implies).
+- **snapshot push** (`ws/hub.go` `Push`) follows each fan-out snapshot
+  with every active op of the site, re-sent as an `op_delta` scoped to the
+  new membership and carrying the transient state a claimed op implies.
+  The mirror commits a machine row and only schedules the identity
+  rebuild, so an op created on a new machine before that rebuild is
+  pushed has its `op_delta` dropped by the membership filter below; the
+  re-send is what delivers it. The worker drops the versions it already
+  holds, so op progress it recorded locally is untouched (an `op_resync`
+  here would full-replace it).
 
 Confidentiality scoping: `Operation.Params` carries per-site credentials
 (BMC/PDU passwords, tailnet auth keys), so `op_delta` and `op_resync` are
@@ -624,6 +638,14 @@ Phase failure is not timeout-driven. When the agent's `fatal` runs
 site worker marks the op failed immediately. The timeout sweeps
 exist only for the "agent died silently" case.
 
+Each sweep fails its ops one transaction at a time and keeps going past
+a per-op error, returning both the ops it failed and the joined error.
+The tick (`Server.expireOperations`) publishes `op_removed` for every op
+a sweep failed, and fires the identity rebuild, even when that sweep
+also returned an error: those ops are terminal and no later tick selects
+them again. The ops behind the error stay active and the next tick
+retries them.
+
 After the sweeps, each tick runs
 `Store.ScrubTerminalOperationCredentials` (also run once before the API
 starts serving); see [Credentials in operations](#credentials-in-operations).
@@ -646,6 +668,11 @@ Handler calls `store.AbortMachine(id)` (`server.go:1008`).
 3. For each, call `FailOperation(opID, {"error":"aborted by
    operator"})`.
 4. Return the fresh machine row.
+
+The handler publishes `op_removed` for each failed op (and fires the
+identity rebuild for a durable state write) before it checks the error,
+because `AbortMachine` also returns the ops it failed when a later step
+errors, and a retried abort no longer finds them.
 
 Effect on machine state follows the four `FailOperation` rules
 uniformly:
@@ -791,12 +818,6 @@ a reserved non-machine BMC, PDU, or unmanaged switch port).
 
 ## Open questions and rough edges
 
-- **`PATCH /machines/:id` bypasses `claimTransition`.**
-  `internal/api/server.go:726` allows setting `state` to any valid
-  value. The auto-lock policy is mirrored at line 732, but the
-  transition legality is not enforced. An operator can PATCH
-  `state = running` on a `new` machine. This is a documented soft
-  hole around the state machine.
 - **The commission branch of `hubhandlers.completionState`
   (`hubhandlers.go:50`) is effectively unused.** Commission
   completion runs through `commission.Handler` and

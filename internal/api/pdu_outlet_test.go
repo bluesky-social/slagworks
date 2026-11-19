@@ -738,6 +738,52 @@ func TestPowerPDUOutlet_INV1_OffOnServingWorker_RefusedAtCreation(t *testing.T) 
 	}
 }
 
+// TestPowerPDUOutlet_INV1_OffOnServingWorker_SerialCase_RefusedAtCreation: the
+// worker's row holds its SMBIOS spelling, the downstream serial is NetBox's.
+// The hello gate matched them case-insensitively, so a case-only difference
+// is still the same serving worker and the off is refused.
+func TestPowerPDUOutlet_INV1_OffOnServingWorker_SerialCase_RefusedAtCreation(t *testing.T) {
+	f := singleFeedFixture()
+	s, st := outletFixtureServer(t, f, pduSecret(), nil)
+	seedPDUMachine(t, st, pduNBID)
+	// NetBox has SN-KWORKER1; the worker's board reports it in lower case.
+	seedWorkerWithSerial(t, st, "pop1", "kworker-1", "sn-kworker1")
+
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	_, status := roundtrip(t, srv, "pdu-0102-left", 5, "off")
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (INV-1: off on serving worker whose serial differs only in case)", status)
+	}
+}
+
+// TestPowerPDUOutlet_SelfFeedCycle_SelfIsNotAPartnerAcrossSerialCase: the only
+// connected worker is the downstream device itself, reporting NetBox's serial
+// in a different case. It is not an eligible partner, so a non-AllowSelf
+// cycle is refused at creation.
+func TestPowerPDUOutlet_SelfFeedCycle_SelfIsNotAPartnerAcrossSerialCase(t *testing.T) {
+	f := singleFeedFixture()
+	s, st := outletFixtureServer(t, f, pduSecret(), nil)
+	seedPDUMachine(t, st, pduNBID)
+	seedWorkerWithSerial(t, st, "pop1", "kworker-1", "sn-kworker1")
+	if err := st.CreateSiteConfig(&model.SiteConfig{
+		Slug: "pop1", NetBoxSite: "pop1",
+		EphemeralPoolStart: "10.0.0.10", EphemeralPoolEnd: "10.0.0.250",
+	}); err != nil {
+		t.Fatalf("seed site_config: %v", err)
+	}
+	s.powerStatusRPC = fakeOutletRPC{serials: map[string][]string{"pop1": {"sn-kworker1"}}}
+
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	_, status := roundtrip(t, srv, "pdu-0102-left", 5, "cycle")
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (the only connected worker is the downstream itself)", status)
+	}
+}
+
 // TestPowerPDUOutlet_SelfFeedCycle_NoEligiblePartner_RefusedAtCreation: a
 // non-AllowSelf cycle whose downstream is a serving worker is refused at
 // creation when no eligible partner is connected (powerStatusRPC nil ⇒ no
