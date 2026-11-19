@@ -378,7 +378,7 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 	close(p.done)
 
 	// Reboot into the freshly-installed OS. The boot-action's
-	// "deploying + awaiting_phone_home → BootLocal" clause makes the
+	// "awaiting_phone_home → BootLocal" clause makes the
 	// post-deploy PXE iteration sanboot from disk, the OS comes up,
 	// the slagworks-phone-home.service unit POSTs to /api/v1/report,
 	// and the deploy op completes (machine → running). Without this
