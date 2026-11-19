@@ -15,7 +15,8 @@ func NormalizeHardwareIdentifier(value string) string {
 	switch lower {
 	case "00", "0", "default string", "n/a", "not specified", "none", "unknown",
 		"to be filled by o.e.m.", "to be filled by o.e.m", "no asset information",
-		"system serial number", "chassis serial number":
+		"system serial number", "chassis serial number",
+		"0123456789": // Supermicro's unprogrammed system and chassis serial
 		return ""
 	}
 	// Blank-fill identifiers occur at several lengths. WWNs commonly render

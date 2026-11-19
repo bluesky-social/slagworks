@@ -142,19 +142,24 @@ func (f *fakeStore) SetMachineNetBoxDeviceID(id uuid.UUID, netboxDeviceID int) e
 	return nil
 }
 
-func (f *fakeStore) DeleteMachine(id uuid.UUID) error {
+// DeleteMachineIfIdle mirrors the real store: a machine with in-flight ops
+// is left alone (false), an absent machine counts as deleted (true).
+func (f *fakeStore) DeleteMachineIfIdle(id uuid.UUID) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.machines[id]
 	if !ok {
-		return errors.New("not found")
+		return true, nil
+	}
+	if f.inFlightOps[id] > 0 {
+		return false, nil
 	}
 	delete(f.machines, id)
 	delete(f.bySerial, m.NetBoxSerial)
 	if m.NetBoxDeviceID != nil {
 		delete(f.byDevice, *m.NetBoxDeviceID)
 	}
-	return nil
+	return true, nil
 }
 
 // AnySiteConfigForNetBoxSite reports whether any config mirrors the given
@@ -345,6 +350,97 @@ func TestOnDeviceCreatedRebindPreservesNonOwnedColumns(t *testing.T) {
 	}
 }
 
+// TestOnDeviceUpdatedEnrollsUntrackedDevice: a device.updated for a claimed
+// device that has a serial but no machine row must enroll it, the rule the
+// reconciler already applies to untracked devices. Two ordinary operator
+// actions produce that event: filling in the serial of a device whose
+// device.created was skipped with ErrSerialRequired, and moving a serialled
+// device into a claimed site or location. The webhook handler routes both to
+// OnDeviceUpdated, which used to only invalidate, so the device stayed out of
+// the machine list and the site snapshot until the next reconcile tick.
+func TestOnDeviceUpdatedEnrollsUntrackedDevice(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("serial filled in after a skipped create", func(t *testing.T) {
+		st, inv, m := withSite(t)
+		if err := m.OnDeviceCreated(ctx, mkDevice(5, "host-5", "")); !errors.Is(err, ErrSerialRequired) {
+			t.Fatalf("setup: want ErrSerialRequired, got %v", err)
+		}
+		if err := m.OnDeviceUpdated(ctx, mkDevice(5, "host-5", "SN-5")); err != nil {
+			t.Fatal(err)
+		}
+		got, err := st.GetMachineByNetBoxDeviceID(5)
+		if err != nil {
+			t.Fatalf("device 5 now has a serial and is claimed, but device.updated did not enroll it: %v", err)
+		}
+		if got.NetBoxSerial != "SN-5" || got.State != model.MachineStateNew {
+			t.Fatalf("enrolled row = %+v; want serial SN-5 in state new", got)
+		}
+		if inv.count("pop3") != 1 {
+			t.Fatalf("pop3 invalidations = %d; want 1", inv.count("pop3"))
+		}
+	})
+
+	t.Run("serialled device moved into a claimed scope", func(t *testing.T) {
+		st, _, m := withSite(t)
+		// The mirror has never seen device 6: it lived in an unclaimed
+		// location until this update moved it into pop3's scope.
+		if err := m.OnDeviceUpdated(ctx, mkDevice(6, "host-6", "SN-6")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.GetMachineByNetBoxDeviceID(6); err != nil {
+			t.Fatalf("device 6 moved into a claimed scope with a serial, but device.updated did not enroll it: %v", err)
+		}
+	})
+}
+
+// TestOnDeviceUpdatedWithNothingToEnrollOnlyInvalidates pins the paths the
+// enrollment check leaves alone: an update to a tracked device keeps its row
+// as is, and an update to a device that still has no serial creates nothing.
+func TestOnDeviceUpdatedWithNothingToEnrollOnlyInvalidates(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("tracked device", func(t *testing.T) {
+		st, inv, m := withSite(t)
+		id := uuid.New()
+		nbID := 8
+		if err := st.CreateMachine(&model.Machine{
+			ID: id, NetBoxDeviceID: &nbID, NetBoxSerial: "SN-8", State: model.MachineStateRunning, Locked: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.OnDeviceUpdated(ctx, mkDevice(8, "host-8-renamed", "SN-8")); err != nil {
+			t.Fatal(err)
+		}
+		got, err := st.GetMachineByNetBoxDeviceID(8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != id || got.State != model.MachineStateRunning || !got.Locked {
+			t.Fatalf("update touched the tracked row: %+v", got)
+		}
+		if len(st.machines) != 1 {
+			t.Fatalf("machines = %d; want the one tracked row", len(st.machines))
+		}
+		if inv.count("pop3") != 1 {
+			t.Fatalf("pop3 invalidations = %d; want 1", inv.count("pop3"))
+		}
+	})
+
+	t.Run("still no serial", func(t *testing.T) {
+		st, inv, m := withSite(t)
+		if err := m.OnDeviceUpdated(ctx, mkDevice(9, "host-9", "")); err != nil {
+			t.Fatalf("an update to an unserialled device is not an error, got %v", err)
+		}
+		if _, err := st.GetMachineByNetBoxDeviceID(9); err == nil {
+			t.Fatal("a device without a serial must not be enrolled")
+		}
+		if inv.count("pop3") != 1 {
+			t.Fatalf("pop3 invalidations = %d; want 1", inv.count("pop3"))
+		}
+	})
+}
+
 // TestOnDeviceDeletedHardDeletes covers the new hard-delete semantics:
 // when a NetBox device is deleted, the Machine row is removed from the
 // store outright.
@@ -466,6 +562,44 @@ func TestOnDeviceDeletedMidOpFreezesInsteadOfDeleting(t *testing.T) {
 	}
 	if pub.states[0] != model.MachineStateFailed {
 		t.Fatalf("op_removed machine_state = %q, want failed", pub.states[0])
+	}
+}
+
+// refusingStore stands for a machine whose op appeared after the mirror's
+// in-flight check (so DeleteMachineIfIdle refuses) and then finished before
+// the mirror could fail it.
+type refusingStore struct{ *fakeStore }
+
+func (refusingStore) DeleteMachineIfIdle(uuid.UUID) (bool, error) { return false, nil }
+
+// TestOnDeviceDeletedRefusedDeleteStillInvalidates: when the delete is
+// refused but nothing is left to fail, the row stays for the next sweep
+// and no op_removed goes out, but the device is gone from NetBox, so the
+// snapshot is still invalidated.
+func TestOnDeviceDeletedRefusedDeleteStillInvalidates(t *testing.T) {
+	st, inv, _ := withSite(t)
+	m := New(refusingStore{st}, inv)
+	pub := &fakePublisher{}
+	m.SetPublisher(pub)
+	id := uuid.New()
+	nbID := 44
+	if err := st.CreateMachine(&model.Machine{
+		ID: id, NetBoxDeviceID: &nbID, NetBoxSerial: "SN-REFUSED", State: model.MachineStateCommissioned,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.OnDeviceDeleted(context.Background(), 44, "pop3"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetMachine(id); err != nil {
+		t.Fatalf("machine row must be retained when the delete is refused: %v", err)
+	}
+	if pub.removedCount() != 0 {
+		t.Fatalf("expected no op_removed publishes, got %d", pub.removedCount())
+	}
+	if inv.count("pop3") != 1 {
+		t.Fatalf("expected one pop3 invalidation, got %d", inv.count("pop3"))
 	}
 }
 

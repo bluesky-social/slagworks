@@ -9,8 +9,10 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/bluesky-social/slagworks/internal/model"
+	"github.com/bluesky-social/slagworks/internal/opstate"
 )
 
 // ErrMachineNotFound is returned when an operation targets a machine ID
@@ -120,15 +122,49 @@ func (s *Store) SetMachineDesiredOS(id uuid.UUID, desiredOS string) error {
 	return nil
 }
 
-// DeleteMachine hard-deletes a machine row and its child rows (operations
-// and log_envelopes). machine_interfaces cascades automatically; operations
-// and log_envelopes do not (no ON DELETE CASCADE on those FKs). The deletes
-// run in one transaction so a failure leaves no orphans.
+// DeleteMachineIfIdle hard-deletes a machine row and its child rows
+// (operations and log_envelopes) unless the machine has an active operation
+// (opstate.ActiveStatuses), in which case it changes nothing and returns
+// false. machine_interfaces cascades automatically; operations and
+// log_envelopes do not (no ON DELETE CASCADE on those FKs). A machine that
+// no longer exists returns true: the caller wanted it gone.
+//
+// The active-op check and the deletes run in one transaction that holds the
+// machine row FOR UPDATE. Inserting an operation takes FOR KEY SHARE on that
+// row through fk_operations_machine, and the two locks conflict, so a
+// concurrent op create is serialized against the delete: a create that
+// commits first is seen by the check (the machine is kept), and one that
+// reaches the row after the lock is taken waits, then is refused because the
+// machine is gone (CreateMachineOp reads the row FOR KEY SHARE and reports
+// it not found; CreatePowerOp's insert fails the foreign key). A check made
+// outside this transaction could not give that
+// guarantee: an op created between it and the delete would be removed along
+// with the machine after the operator had been handed its ID.
 //
 // Called by the mirror on NetBox device deletion. Per spec, hard-delete
 // is the only EOL path; soft-decommission is out of scope.
-func (s *Store) DeleteMachine(id uuid.UUID) error {
-	return s.db.Transaction(func(tx *gorm.DB) error {
+func (s *Store) DeleteMachineIfIdle(id uuid.UUID) (bool, error) {
+	deleted := false
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		var m model.Machine
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id").Where("id = ?", id).First(&m).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			deleted = true
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("lock machine: %w", err)
+		}
+		var active int64
+		if err := tx.Model(&model.Operation{}).
+			Where("machine_id = ? AND status IN ?", id, opstate.ActiveStatuses).
+			Count(&active).Error; err != nil {
+			return fmt.Errorf("count active operations: %w", err)
+		}
+		if active > 0 {
+			return nil
+		}
 		if err := tx.Where("machine_id = ?", id).Delete(&model.Operation{}).Error; err != nil {
 			return fmt.Errorf("delete operations: %w", err)
 		}
@@ -137,12 +173,29 @@ func (s *Store) DeleteMachine(id uuid.UUID) error {
 		if err := tx.Exec("DELETE FROM log_envelopes WHERE machine_id = ?", id).Error; err != nil {
 			return fmt.Errorf("delete log_envelopes: %w", err)
 		}
-		return tx.Delete(&model.Machine{}, "id = ?", id).Error
+		if err := tx.Delete(&model.Machine{}, "id = ?", id).Error; err != nil {
+			return err
+		}
+		deleted = true
+		return nil
 	})
+	if err != nil {
+		return false, err
+	}
+	return deleted, nil
 }
 
+// SetMachineLocked writes ONLY the locked column. Returns
+// ErrMachineNotFound when no row matches.
 func (s *Store) SetMachineLocked(id uuid.UUID, locked bool) error {
-	return s.db.Model(&model.Machine{}).Where("id = ?", id).Update("locked", locked).Error
+	res := s.db.Model(&model.Machine{}).Where("id = ?", id).Update("locked", locked)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrMachineNotFound
+	}
+	return nil
 }
 
 // SetMachineNetBoxDeviceID writes ONLY the netbox_device_id column. Used by the
@@ -190,14 +243,44 @@ func (s *Store) WithPopAdvisoryLock(ctx context.Context, popSlug string, fn func
 	})
 }
 
+// SetMachinePXEEligible writes ONLY the pxe_eligible column. Enabling a
+// locked machine is refused with ErrMachineLocked: the lock marks a machine
+// in service, and pxe_eligible is the gate that keeps it from PXE-booting
+// into a reimage. The lock test rides the UPDATE itself, so a concurrent
+// lock cannot land between a check and the write. Disabling is not
+// lock-gated: it only moves the machine toward booting from disk. Returns
+// ErrMachineNotFound when no row matches.
 func (s *Store) SetMachinePXEEligible(id uuid.UUID, eligible bool) error {
-	return s.db.Model(&model.Machine{}).Where("id = ?", id).Update("pxe_eligible", eligible).Error
+	q := s.db.Model(&model.Machine{}).Where("id = ?", id)
+	if eligible {
+		q = q.Where("locked = ?", false)
+	}
+	res := q.Update("pxe_eligible", eligible)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	if !eligible {
+		return ErrMachineNotFound
+	}
+	// The enable matched nothing: either there is no such machine or it was
+	// locked when the UPDATE ran.
+	var n int64
+	if err := s.db.Model(&model.Machine{}).Where("id = ?", id).Count(&n).Error; err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrMachineNotFound
+	}
+	return fmt.Errorf("%w (typically because it is in service); run `slagctl machine unlock %s` first", ErrMachineLocked, id)
 }
 
 func (s *Store) StoreCommissionData(id uuid.UUID, data json.RawMessage) error {
 	now := time.Now().UTC()
 	return s.db.Model(&model.Machine{}).Where("id = ?", id).Updates(map[string]any{
-		"commission_data": data,
+		"commission_data": jsonbSafe(data),
 		"commissioned_at": now,
 	}).Error
 }

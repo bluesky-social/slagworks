@@ -2,7 +2,9 @@ package storage
 
 import (
 	"fmt"
+	"path"
 	"strings"
+	"unicode"
 )
 
 // validate checks a layout for internal consistency before planning.
@@ -63,6 +65,9 @@ func validate(layout Layout) error {
 	// legitimately have no FS but are never mounted directly (the md
 	// device is), so they don't hit this path.
 	for path, m := range layout.Mounts {
+		if err := validateMountPoint(path); err != nil {
+			return err
+		}
 		if !deviceExists(m.Device, layout) {
 			return fmt.Errorf("mount %q references unknown device %q", path, m.Device)
 		}
@@ -107,6 +112,31 @@ func validate(layout Layout) error {
 		return fmt.Errorf("layout has no root (/) mount")
 	}
 
+	return nil
+}
+
+// validateMountPoint rejects a mount point that is not a clean absolute
+// path. Every consumer uses the key verbatim: planMounts mounts at
+// "/target"+mp and orders mounts by the number of "/" in each key, and the
+// agent writes the key into /etc/fstab. A relative key mounts beside
+// /target, a ".." segment escapes it, a doubled or trailing slash miscounts
+// the depth (so a parent can mount over its child) or names one point twice,
+// and whitespace, control characters or a backslash corrupt the fstab line
+// (fstab splits on blanks and decodes \040-style escapes). A clean absolute
+// key has none of these problems, and two distinct clean keys always name
+// distinct mount points.
+func validateMountPoint(mp string) error {
+	if !strings.HasPrefix(mp, "/") {
+		return fmt.Errorf("mount point %q is not absolute; mount points must start with \"/\" (for example \"/data\"): fix the storage script's mounts", mp)
+	}
+	for _, r := range mp {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || r == '\\' {
+			return fmt.Errorf("mount point %q contains whitespace, a control character or a backslash, which /etc/fstab cannot hold verbatim: rename it in the storage script's mounts", mp)
+		}
+	}
+	if clean := path.Clean(mp); clean != mp {
+		return fmt.Errorf("mount point %q is not a clean path (doubled or trailing slash, or a \".\" or \"..\" segment); write it as %q in the storage script's mounts", mp, clean)
+	}
 	return nil
 }
 
@@ -184,9 +214,20 @@ func memberReferencesDisk(member, disk string) bool {
 func validateDisk(name string, dev Device) error {
 	// Disks with no partitions are valid — they may be whole-disk RAID members.
 	restCount := 0
-	for _, p := range dev.Partitions {
+	for i, p := range dev.Partitions {
 		if p.Name == "" {
 			return fmt.Errorf("disk %q: partition missing name", name)
+		}
+		// planDisk creates and formats partition i+1 at the node the kernel
+		// gives that position, while mounts, RAID members, fstab and the
+		// bootloader reach the partition through "/dev/" + its name. Any
+		// other name sends those to a different device than the one just
+		// formatted. A "/dev/"-prefixed name is the same node: resolveDevPath
+		// passes it through unchanged.
+		if want := partName(name, i+1); stripDevPrefix(p.Name) != want {
+			return fmt.Errorf("disk %q partition %d is named %q, but the kernel names it %q; "+
+				"rename it %q, since mounts and RAID members find a partition by its name",
+				name, i+1, p.Name, want, want)
 		}
 		if p.Size == "" {
 			return fmt.Errorf("disk %q partition %q: missing size", name, p.Name)
@@ -205,14 +246,39 @@ func validateDisk(name string, dev Device) error {
 	return nil
 }
 
+// raidLevels is every md level a layout may request, with the minimum
+// member count validateRAID enforces and the kernel module that provides
+// the level's md personality. The kernel loads that module by running
+// modprobe in the deploy initramfs, not in the agent's chroot, so each one
+// must be baked into the deploy initrd by assets/initramfs/hooks/slagworks
+// (raid_modules_test.go holds the two lists together). Without it
+// `mdadm --create` fails "RUN_ARRAY failed: Invalid argument" after the
+// disks have already been repartitioned.
+var raidLevels = map[int]struct {
+	minMembers int
+	module     string
+}{
+	0:  {minMembers: 2, module: "raid0"},
+	1:  {minMembers: 2, module: "raid1"},
+	5:  {minMembers: 3, module: "raid456"},
+	6:  {minMembers: 4, module: "raid456"},
+	10: {minMembers: 4, module: "raid10"},
+}
+
+// RAIDModule returns the kernel module that provides the md personality
+// for a RAID level the planner accepts, and false for any other level.
+func RAIDModule(level int) (string, bool) {
+	l, ok := raidLevels[level]
+	return l.module, ok
+}
+
 func validateRAID(name string, dev Device, layout Layout) error {
-	minMembers := map[int]int{0: 2, 1: 2, 5: 3, 6: 4, 10: 4}
-	need, known := minMembers[dev.Level]
+	l, known := raidLevels[dev.Level]
 	if !known {
 		return fmt.Errorf("raid %q: unsupported RAID level %d", name, dev.Level)
 	}
-	if len(dev.Members) < need {
-		return fmt.Errorf("raid %q: RAID %d requires at least %d members, got %d", name, dev.Level, need, len(dev.Members))
+	if len(dev.Members) < l.minMembers {
+		return fmt.Errorf("raid %q: RAID %d requires at least %d members, got %d", name, dev.Level, l.minMembers, len(dev.Members))
 	}
 
 	// Verify all members reference partitions or disks in the layout.

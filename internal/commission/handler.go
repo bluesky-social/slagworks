@@ -34,8 +34,10 @@ type Store interface {
 	CommitCommissionResult(opID, machineID uuid.UUID, data json.RawMessage) (*store.OpOutcome, bool, error)
 
 	// CompleteOperationWithState / FailOperationOutcome finalize a
-	// bmc_reconcile op from its bmc_reconcile_report observation. Both
-	// are guarded against reviving a terminal op.
+	// bmc_reconcile op from its bmc_reconcile_report observation, and
+	// CompleteOperationWithState completes a deploy op from its
+	// phone_home observation. Both are guarded against reviving a
+	// terminal op.
 	CompleteOperationWithState(opID uuid.UUID, targetState model.MachineState, result []byte) (*store.OpOutcome, error)
 	FailOperationOutcome(opID uuid.UUID, result []byte) (*store.OpOutcome, error)
 
@@ -83,7 +85,9 @@ type MonitorWriter interface {
 
 // Invalidator is called after commission data lands so the site's
 // snapshot picks up the new SystemUUID / storage-script selection on
-// the next push. Nil disables that notification (tests).
+// the next push, and after a phone_home completes a deploy so the
+// site's baseline catches up to running. Nil disables that
+// notification (tests).
 type Invalidator interface {
 	Invalidate(slug string)
 }
@@ -103,8 +107,9 @@ type ClaimResolver interface {
 // state write → commissioned), so it publishes op_removed carrying that
 // state; the identity rebuild is fired separately via the Invalidator
 // below (unchanged). The bmc_reconcile_report handler publishes
-// op_removed for the bmc_reconcile op it finalizes (no machine state).
-// Nil disables the op-stream publish (tests).
+// op_removed for the bmc_reconcile op it finalizes (no machine state),
+// and the phone_home handler publishes op_removed carrying running for
+// the deploy op it completes. Nil disables the op-stream publish (tests).
 type OpPublisher interface {
 	PublishOpRemoved(op model.Operation, machineState model.MachineState)
 }
@@ -195,16 +200,69 @@ func (h *Handler) HandleObservation(ctx context.Context, obs model.Observation) 
 		return h.handleBMCReconcileReport(ctx, obs)
 	case "dhcp_lease":
 		return h.handleDHCPLease(ctx, obs)
-	case "phone_home", "inventory_import":
-		// Nothing NetBox-touching to do; ack so the worker drops the
-		// outbox row. State transitions for these events happen via
-		// the op_update path, not through observations.
+	case "phone_home":
+		return h.handlePhoneHome(obs)
+	case "inventory_import":
+		// Nothing to do; ack so the worker drops the outbox row.
 		return nil
 	default:
 		h.log.Debug("unknown observation event, acking anyway",
 			"event", obs.Event, "machine_id", obs.MachineID)
 		return nil
 	}
+}
+
+// handlePhoneHome completes the deploy op a phone_home observation names
+// and moves its machine to running. The installed OS phones home exactly
+// once after the site worker answers 2xx, and the worker's other signal,
+// an op_update{status=completed}, is memory-only on the worker and
+// unacknowledged on the wire, so this observation (persisted in the
+// worker's outbox until acked) is the record that survives a worker
+// restart, a dropped connection or a failed op_update handler. Without it
+// a healthy host would be failed at PhoneHomeTimeout.
+//
+// Whichever of the two reaches global first completes the op; the other
+// is a no-op (ValidateOperationBinding reports alreadyCompleted, or
+// CompleteOperationWithState finds the op terminal). A phone_home with no
+// OperationID is a late phone-home (the worker held no active deploy op
+// for the machine) and is acked without a state change. A phone_home for
+// an op that is failed, foreign, or not a deploy is dropped terminally:
+// it must never revive a failed op.
+//
+// A completion publishes op_removed carrying running and invalidates the
+// sending worker's site snapshot so its baseline catches up, as the
+// op_update path does.
+func (h *Handler) handlePhoneHome(obs model.Observation) error {
+	if obs.OperationID == uuid.Nil {
+		return nil
+	}
+	alreadyCompleted, err := h.store.ValidateOperationBinding(
+		obs.OperationID, obs.MachineID, model.OpDeploy, nil,
+	)
+	if err != nil {
+		return reportBindingError("validate phone_home operation binding", err)
+	}
+	if alreadyCompleted {
+		return nil
+	}
+	outcome, err := h.store.CompleteOperationWithState(obs.OperationID, model.MachineStateRunning, nil)
+	if err != nil {
+		return fmt.Errorf("complete deploy op %s on phone_home: %w", obs.OperationID, err)
+	}
+	if outcome == nil {
+		// The op went terminal between the binding check and the
+		// update (the op_update path, an abort, or the phone-home sweep).
+		return nil
+	}
+	h.log.Info("deploy completed by phone_home",
+		"op_id", obs.OperationID, "machine_id", obs.MachineID)
+	if h.publisher != nil {
+		h.publisher.PublishOpRemoved(outcome.Op, outcome.MachineState)
+	}
+	if h.inv != nil && obs.SiteSlug != "" {
+		h.inv.Invalidate(obs.SiteSlug)
+	}
+	return nil
 }
 
 // handleDHCPLease decodes a dhcp_lease observation and folds it into

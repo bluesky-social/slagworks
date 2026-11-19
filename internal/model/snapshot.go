@@ -138,7 +138,10 @@ type SnapshotInterface struct {
 	Name     string `json:"name"`
 	MAC      string `json:"mac"`
 	Type     string `json:"type"` // "physical" | "ipmi" | "lag"
-	IP       string `json:"ip,omitempty"`
+	// IP is the interface's one status=active NetBox address, in CIDR form.
+	// Build refuses the site when a bound machine's interface has more than
+	// one, rather than keeping whichever NetBox listed last.
+	IP string `json:"ip,omitempty"`
 
 	// The fields below carry the extra topology an L2 bond host needs and
 	// an L3 routed-NIC host derives from its addressing. All omitempty so

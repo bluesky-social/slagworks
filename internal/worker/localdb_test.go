@@ -199,6 +199,69 @@ func TestLocalDB_ReopenIdempotent(t *testing.T) {
 	}
 }
 
+// TestLocalDB_OpensInWALMode verifies OpenLocalDB leaves the file in WAL
+// journal mode, as LocalDB's doc comment promises. In the default
+// rollback-journal (delete) mode a reader and a writer block each other
+// and only the driver's 5s busy timeout absorbs the wait; past it,
+// AppendOutbox fails and the observation stays in memory only. The
+// glebarez/go-sqlite driver applies pragmas only from _pragma=... DSN
+// parameters, so a mattn-style _journal_mode=WAL is silently ignored.
+//
+// The existing-file case is the upgrade path: a worker.db created in
+// delete mode by an earlier binary must be switched to WAL on open.
+func TestLocalDB_OpensInWALMode(t *testing.T) {
+	t.Run("fresh file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "worker.db")
+		assertWALAfterOpen(t, path)
+	})
+
+	t.Run("existing delete-mode file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "worker.db")
+		raw, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatalf("open raw sqlite: %v", err)
+		}
+		var mode string
+		if err := raw.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+			t.Fatalf("read seed journal_mode: %v", err)
+		}
+		if mode != "delete" {
+			t.Fatalf("seed journal_mode = %q, want delete (test precondition)", mode)
+		}
+		if _, err := raw.Exec(preGooseSchema[0]); err != nil {
+			t.Fatalf("seed ddl: %v", err)
+		}
+		raw.Close()
+		assertWALAfterOpen(t, path)
+	})
+}
+
+// assertWALAfterOpen opens path with OpenLocalDB, closes it, and checks
+// journal_mode from an independent connection. WAL mode is recorded in
+// the database file, so a fresh connection (or a second process, such as
+// `slagworksd site worker-id`) sees it without any DSN parameters.
+func assertWALAfterOpen(t *testing.T, path string) {
+	t.Helper()
+	db, err := OpenLocalDB(path)
+	if err != nil {
+		t.Fatalf("OpenLocalDB: %v", err)
+	}
+	closeLocalDB(t, db)
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("reopen raw sqlite: %v", err)
+	}
+	defer raw.Close()
+	var mode string
+	if err := raw.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("read journal_mode: %v", err)
+	}
+	if mode != "wal" {
+		t.Fatalf("journal_mode = %q after OpenLocalDB, want wal", mode)
+	}
+}
+
 func gooseVersion(t *testing.T, path string) int64 {
 	t.Helper()
 	raw, err := sql.Open("sqlite", path)
@@ -487,6 +550,59 @@ func TestLocalDB_DHCPLeases_ExpiredFiltered(t *testing.T) {
 	leases := db.LoadDHCPLeases()
 	if len(leases) != 0 {
 		t.Fatalf("expected 0 (expired filtered), got %d", len(leases))
+	}
+}
+
+// TestLocalDB_DHCPLeases_ExpiryJudgedByInstant pins that a persisted
+// lease's expiry is compared as an instant, not as a wall-clock reading.
+// The SQLite driver stores expires_at as text carrying the writer's UTC
+// offset, so a row read under a different offset than the one it was
+// written with reads up to an hour off: a site-worker restart around a
+// DST fall-back (an expiry after the change carries the new offset, "now"
+// before it the old one), or a restart after the host's time zone
+// changes. Each case pairs the shifted row with a control row of the
+// opposite liveness written under the current offset, so the count, the
+// load and the load's purge of expired rows each have to tell them apart.
+func TestLocalDB_DHCPLeases_ExpiryJudgedByInstant(t *testing.T) {
+	_, offset := time.Now().Zone()
+	hourBehind := time.FixedZone("hour-behind", offset-3600)
+	hourAhead := time.FixedZone("hour-ahead", offset+3600)
+	shiftedMAC, _ := net.ParseMAC("52:54:00:aa:bb:01")
+	controlMAC, _ := net.ParseMAC("52:54:00:aa:bb:02")
+
+	cases := []struct {
+		name        string
+		shifted     time.Time
+		shiftedLive bool
+	}{
+		// 20 minutes left, but its wall-clock reading is 40 minutes ago.
+		{"live lease written an hour behind", time.Now().Add(20 * time.Minute).In(hourBehind), true},
+		// Expired 20 minutes ago, but its wall-clock reading is 40 minutes ahead.
+		{"expired lease written an hour ahead", time.Now().Add(-20 * time.Minute).In(hourAhead), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			control, liveMAC := time.Now().Add(-time.Hour), shiftedMAC
+			if !tc.shiftedLive {
+				control, liveMAC = time.Now().Add(time.Hour), controlMAC
+			}
+			db.SaveDHCPLease(DHCPLease{MAC: shiftedMAC, IP: net.ParseIP("10.0.0.50"), ExpiresAt: tc.shifted})
+			db.SaveDHCPLease(DHCPLease{MAC: controlMAC, IP: net.ParseIP("10.0.0.51"), ExpiresAt: control})
+
+			if n := db.CountActiveDHCPLeases(); n != 1 {
+				t.Errorf("CountActiveDHCPLeases = %d, want 1", n)
+			}
+			if got := db.LoadDHCPLeases(); len(got) != 1 || got[0].MAC.String() != liveMAC.String() {
+				t.Errorf("LoadDHCPLeases = %v, want only %s", got, liveMAC)
+			}
+			// LoadDHCPLeases deletes the rows it judges expired.
+			var onDisk []dhcpLeaseRow
+			db.db.Find(&onDisk)
+			if len(onDisk) != 1 || onDisk[0].MAC != liveMAC.String() {
+				t.Errorf("rows left after LoadDHCPLeases = %v, want only %s", onDisk, liveMAC)
+			}
+		})
 	}
 }
 

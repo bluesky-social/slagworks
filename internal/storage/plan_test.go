@@ -33,7 +33,7 @@ func TestPlan_SingleDisk_ESPAndRoot(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "vda", SizeBytes: 10737418240},
+		{Name: "vda", SizeBytes: 10737418240, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -75,7 +75,7 @@ func TestPlan_NVMe_PartitionDevPaths(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "nvme0n1", SizeBytes: 1920383410176},
+		{Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -118,8 +118,8 @@ func TestPlan_RAID1_Root(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "nvme0n1", SizeBytes: 1920383410176},
-		{Name: "nvme1n1", SizeBytes: 1920383410176},
+		{Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
+		{Name: "nvme1n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -186,10 +186,10 @@ func TestPlan_RAID1_Boot_RAID0_Data(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "nvme0n1", SizeBytes: 1920383410176},
-		{Name: "nvme1n1", SizeBytes: 1920383410176},
-		{Name: "nvme2n1", SizeBytes: 15360747397120},
-		{Name: "nvme3n1", SizeBytes: 15360747397120},
+		{Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
+		{Name: "nvme1n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
+		{Name: "nvme2n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
+		{Name: "nvme3n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -241,11 +241,11 @@ func TestPlan_RAID10(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "sda", SizeBytes: 500107862016},
-		{Name: "nvme0n1", SizeBytes: 15360747397120},
-		{Name: "nvme1n1", SizeBytes: 15360747397120},
-		{Name: "nvme2n1", SizeBytes: 15360747397120},
-		{Name: "nvme3n1", SizeBytes: 15360747397120},
+		{Name: "sda", SizeBytes: 500107862016, LogicalSectorBytes: 512},
+		{Name: "nvme0n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
+		{Name: "nvme1n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
+		{Name: "nvme2n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
+		{Name: "nvme3n1", SizeBytes: 15360747397120, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -279,7 +279,7 @@ func TestPlan_SwapPartition(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "vda", SizeBytes: 1099511627776},
+		{Name: "vda", SizeBytes: 1099511627776, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -316,7 +316,7 @@ func TestPlan_MountOrdering(t *testing.T) {
 	}`)
 
 	inventory := []BlockDevice{
-		{Name: "vda", SizeBytes: 1099511627776},
+		{Name: "vda", SizeBytes: 1099511627776, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -340,7 +340,7 @@ func TestPlan_MountOrdering(t *testing.T) {
 
 func TestDefaultLayout_VirtioDisk(t *testing.T) {
 	layout := DefaultLayout("vda")
-	inventory := []BlockDevice{{Name: "vda", SizeBytes: 10737418240}}
+	inventory := []BlockDevice{{Name: "vda", SizeBytes: 10737418240, LogicalSectorBytes: 512}}
 
 	cmds, err := Plan(layout, inventory)
 	if err != nil {
@@ -356,7 +356,7 @@ func TestDefaultLayout_VirtioDisk(t *testing.T) {
 
 func TestDefaultLayout_NVMeDisk(t *testing.T) {
 	layout := DefaultLayout("nvme0n1")
-	inventory := []BlockDevice{{Name: "nvme0n1", SizeBytes: 1920383410176}}
+	inventory := []BlockDevice{{Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512}}
 
 	cmds, err := Plan(layout, inventory)
 	if err != nil {
@@ -467,6 +467,148 @@ func TestPlan_RejectsUnsupportedFS(t *testing.T) {
 	}
 }
 
+// Plan creates and formats each partition at the node the kernel gives its
+// position (partition 2 of sda is /dev/sda2, of nvme0n1 /dev/nvme0n1p2),
+// but mounts and RAID members find a partition by its declared name
+// ("/dev/" + name). A name that is not the node for its disk and position
+// makes the plan format one device and then mount or assemble another,
+// after every disk has been wiped: a partition named for a retained disk's
+// partition puts the OS on the retained disk, swapped names on one disk
+// mount the ESP as /, and a name that is no node at all fails the mount.
+// Plan must refuse such a layout before emitting any command.
+func TestPlan_PartitionNameMustBeItsDeviceNode(t *testing.T) {
+	inventory := []BlockDevice{
+		{Name: "sda", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+		{Name: "sdb", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+		{Name: "nvme0n1", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+		{Name: "nvme1n1", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+	}
+	esp := func(name string) Partition {
+		return Partition{Name: name, Size: "512M", FS: "vfat", Bootable: true}
+	}
+	root := func(name string) Partition {
+		return Partition{Name: name, Size: "rest", FS: "ext4"}
+	}
+	disk := func(parts ...Partition) Device {
+		return Device{Type: "disk", PTable: "gpt", Partitions: parts}
+	}
+	mounts := func(rootDev, espDev string) map[string]Mount {
+		m := map[string]Mount{"/": {Device: rootDev}}
+		if espDev != "" {
+			m["/boot/efi"] = Mount{Device: espDev}
+		}
+		return m
+	}
+
+	cases := []struct {
+		name    string
+		layout  Layout
+		wantErr string // "" means the layout must be accepted
+	}{
+		{
+			name: "named for a partition of a retained disk",
+			layout: Layout{
+				Devices: map[string]Device{
+					"nvme0n1": disk(root("nvme1n1p1")),
+					"nvme1n1": {Type: "retain"},
+				},
+				Mounts: mounts("nvme1n1p1", ""),
+			},
+			wantErr: `disk "nvme0n1" partition 1 is named "nvme1n1p1", but the kernel names it "nvme0n1p1"`,
+		},
+		{
+			name: "names swapped on one disk",
+			layout: Layout{
+				Devices: map[string]Device{"sda": disk(esp("sda2"), root("sda1"))},
+				Mounts:  mounts("sda1", "sda2"),
+			},
+			wantErr: `disk "sda" partition 1 is named "sda2", but the kernel names it "sda1"`,
+		},
+		{
+			name: "same name twice on one disk",
+			layout: Layout{
+				Devices: map[string]Device{"sda": disk(esp("sda1"), root("sda1"))},
+				Mounts:  mounts("sda1", ""),
+			},
+			wantErr: `disk "sda" partition 2 is named "sda1", but the kernel names it "sda2"`,
+		},
+		{
+			name: "p separator dropped on an nvme disk",
+			layout: Layout{
+				Devices: map[string]Device{"nvme0n1": disk(root("nvme0n11"))},
+				Mounts:  mounts("nvme0n11", ""),
+			},
+			wantErr: `disk "nvme0n1" partition 1 is named "nvme0n11", but the kernel names it "nvme0n1p1"`,
+		},
+		{
+			name: "p separator added on a sata disk",
+			layout: Layout{
+				Devices: map[string]Device{"sda": disk(esp("sdap1"), root("sdap2"))},
+				Mounts:  mounts("sdap2", "sdap1"),
+			},
+			wantErr: `disk "sda" partition 1 is named "sdap1", but the kernel names it "sda1"`,
+		},
+		{
+			name: "label instead of a device node",
+			layout: Layout{
+				Devices: map[string]Device{"sda": disk(esp("esp"), root("root"))},
+				Mounts:  mounts("root", "esp"),
+			},
+			wantErr: `disk "sda" partition 1 is named "esp", but the kernel names it "sda1"`,
+		},
+		{
+			name: "raid member named for a disk outside the layout",
+			layout: Layout{
+				Devices: map[string]Device{
+					"sda": disk(esp("sda1"), Partition{Name: "sdc2", Size: "rest"}),
+					"sdb": disk(esp("sdb1"), Partition{Name: "sdb2", Size: "rest"}),
+					"md0": {Type: "raid", Level: 1, Members: []string{"sdc2", "sdb2"}, FS: "ext4"},
+				},
+				Mounts: mounts("md0", "sda1"),
+			},
+			wantErr: `disk "sda" partition 2 is named "sdc2", but the kernel names it "sda2"`,
+		},
+		{
+			name: "device nodes, bare or /dev/-prefixed",
+			layout: Layout{
+				Devices: map[string]Device{
+					"sda":     disk(esp("sda1"), root("/dev/sda2")),
+					"nvme0n1": disk(Partition{Name: "nvme0n1p1", Size: "100G", FS: "xfs"}),
+				},
+				Mounts: map[string]Mount{
+					"/":         {Device: "/dev/sda2"},
+					"/boot/efi": {Device: "sda1"},
+					"/data":     {Device: "nvme0n1p1"},
+				},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmds, err := Plan(tc.layout, inventory)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Plan rejected partitions named for their device nodes: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				var b strings.Builder
+				for _, c := range cmds {
+					b.WriteString("\n  " + c.String())
+				}
+				t.Fatalf("Plan accepted the layout, formatting partitions by position but "+
+					"mounting and assembling them by name; want error containing %q. Commands:%s",
+					tc.wantErr, b.String())
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Plan error = %q, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestResolveMountDevices_SATA verifies that ResolveMountDevices returns device
 // paths consistent with the mount commands Plan produces for a SATA disk.
 func TestResolveMountDevices_SATA(t *testing.T) {
@@ -481,7 +623,7 @@ func TestResolveMountDevices_SATA(t *testing.T) {
 	}
 
 	// Verify these match what Plan actually mounts.
-	cmds, err := Plan(layout, []BlockDevice{{Name: "sda", SizeBytes: 21474836480}})
+	cmds, err := Plan(layout, []BlockDevice{{Name: "sda", SizeBytes: 21474836480, LogicalSectorBytes: 512}})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -501,7 +643,7 @@ func TestResolveMountDevices_NVMe(t *testing.T) {
 		t.Errorf("expected /dev/nvme0n1p1 for /boot/efi, got %q", devs["/boot/efi"])
 	}
 
-	cmds, err := Plan(layout, []BlockDevice{{Name: "nvme0n1", SizeBytes: 21474836480}})
+	cmds, err := Plan(layout, []BlockDevice{{Name: "nvme0n1", SizeBytes: 21474836480, LogicalSectorBytes: 512}})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -640,7 +782,9 @@ func TestResolveMountDevices_NoESP(t *testing.T) {
 func TestPlan_BIOSGrub_HybridLayout(t *testing.T) {
 	// Hybrid layout (the matrix default): 1M bios_grub (EF02) + 512M
 	// ESP (EF00) + ext4 root. Asserts the EF02 type code and that the
-	// bios_grub partition gets NO mkfs (it's unformatted).
+	// bios_grub partition gets NO mkfs (it's unformatted), only the wipefs
+	// and boot-sector zeroing that clear whatever an earlier layout left at
+	// its offset.
 	layout := mustParseLayout(t, `{
 		"layout": {
 			"vda": {
@@ -658,7 +802,7 @@ func TestPlan_BIOSGrub_HybridLayout(t *testing.T) {
 		}
 	}`)
 
-	cmds, err := Plan(layout, []BlockDevice{{Name: "vda", SizeBytes: 10737418240}})
+	cmds, err := Plan(layout, []BlockDevice{{Name: "vda", SizeBytes: 10737418240, LogicalSectorBytes: 512}})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -669,6 +813,8 @@ func TestPlan_BIOSGrub_HybridLayout(t *testing.T) {
 		{"sgdisk", []string{"-n", "2:0:+512M", "-t", "2:EF00", "-c", "2:vda2", "/dev/vda"}},
 		{"sgdisk", []string{"-n", "3:0:0", "-t", "3:8300", "-c", "3:vda3", "/dev/vda"}},
 		{"blockdev", []string{"--rereadpt", "/dev/vda"}},
+		{"wipefs", []string{"-a", "/dev/vda1"}},
+		{"dd", []string{"if=/dev/zero", "of=/dev/vda1", "bs=4096", "count=1", "conv=fsync"}},
 		{"mkfs.fat", []string{"-F", "32", "/dev/vda2"}},
 		{"mkfs.ext4", []string{"-F", "/dev/vda3"}},
 		{"mkdir", []string{"-p", "/target"}},
@@ -879,8 +1025,8 @@ func TestPlan_RAIDCreate_WithArrayUUID_And_Preserve(t *testing.T) {
 	// keeps them out of the wipe/zap set. Only the boot disks need
 	// inventory entries (Plan checks disk-type devices against inventory).
 	inventory := []BlockDevice{
-		{Name: "nvme0n1", SizeBytes: 1920383410176},
-		{Name: "nvme1n1", SizeBytes: 1920383410176},
+		{Name: "nvme0n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
+		{Name: "nvme1n1", SizeBytes: 1920383410176, LogicalSectorBytes: 512},
 	}
 
 	cmds, err := Plan(layout, inventory)
@@ -1342,7 +1488,7 @@ func TestPlan_AcceptsValidPreserve(t *testing.T) {
 		}
 	}`)
 	cmds, err := Plan(layout, []BlockDevice{
-		{Name: "nvme0n1", SizeBytes: 10737418240},
+		{Name: "nvme0n1", SizeBytes: 10737418240, LogicalSectorBytes: 512},
 	})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
@@ -1368,5 +1514,76 @@ func TestPlan_RejectsMountingWholeDisk(t *testing.T) {
 	_, err := Plan(layout, []BlockDevice{{Name: "vda", SizeBytes: 10737418240}})
 	if err == nil {
 		t.Fatal("expected error for mounting a whole disk")
+	}
+}
+
+// A mount point is used verbatim: the planner mounts at "/target"+key and
+// orders mounts by counting the "/" in each key, and the agent writes the key
+// into the whitespace-separated /etc/fstab. A key that is not a clean
+// absolute path breaks one of those, so Plan must reject it.
+func TestPlan_RejectsMountPointThatIsNotACleanAbsolutePath(t *testing.T) {
+	layout := func(mounts map[string]Mount) Layout {
+		return Layout{
+			Devices: map[string]Device{"sda": {Type: "disk", PTable: "gpt", Partitions: []Partition{
+				{Name: "sda1", FS: "ext4", Size: "100G"},
+				{Name: "sda2", FS: "ext4", Size: "100G"},
+				{Name: "sda3", FS: "ext4", Size: "rest"},
+			}}},
+			Mounts: mounts,
+		}
+	}
+	inventory := []BlockDevice{{Name: "sda", SizeBytes: 1 << 40}}
+	mountTargets := func(cmds []Command) []string {
+		var targets []string
+		for _, c := range cmds {
+			if c.Name == "mount" {
+				targets = append(targets, c.Args[1])
+			}
+		}
+		return targets
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mounts map[string]Mount
+	}{
+		// Mounts at /targetdata, beside the target root rather than in it.
+		{"relative", map[string]Mount{"/": {Device: "sda1"}, "data": {Device: "sda2"}}},
+		// Mounts at /target/../srv, outside the target root.
+		{"dot-dot segment", map[string]Mount{"/": {Device: "sda1"}, "/../srv": {Device: "sda2"}}},
+		{"dot segment", map[string]Mount{"/": {Device: "sda1"}, "/./srv": {Device: "sda2"}}},
+		// "/var//" has more slashes than "/var/lib", so /var is mounted
+		// second and hides /var/lib.
+		{"doubled slash", map[string]Mount{"/": {Device: "sda1"}, "/var//": {Device: "sda2"}, "/var/lib": {Device: "sda3"}}},
+		// Both name /target/srv, so the second mount stacks on the first.
+		{"trailing slash", map[string]Mount{"/": {Device: "sda1"}, "/srv": {Device: "sda2"}, "/srv/": {Device: "sda3"}}},
+		// fstab separates fields with blanks and lines with newlines.
+		{"space", map[string]Mount{"/": {Device: "sda1"}, "/srv data": {Device: "sda2"}}},
+		{"tab", map[string]Mount{"/": {Device: "sda1"}, "/srv\tdata": {Device: "sda2"}}},
+		{"newline", map[string]Mount{"/": {Device: "sda1"}, "/srv\n/x": {Device: "sda2"}}},
+		// fstab decodes \040 as a space, so the fstab entry would name
+		// "/srv data" while the deploy mounted the literal path.
+		{"backslash", map[string]Mount{"/": {Device: "sda1"}, `/srv\040data`: {Device: "sda2"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmds, err := Plan(layout(tc.mounts), inventory)
+			if err == nil {
+				t.Fatalf("Plan accepted the layout; mount targets: %q", mountTargets(cmds))
+			}
+			if !strings.Contains(err.Error(), "mount point") {
+				t.Errorf("error should name the bad mount point, got: %v", err)
+			}
+		})
+	}
+
+	// Clean nested paths are still accepted, and the parent mounts first.
+	cmds, err := Plan(layout(map[string]Mount{
+		"/": {Device: "sda1"}, "/var": {Device: "sda2"}, "/var/lib": {Device: "sda3"},
+	}), inventory)
+	if err != nil {
+		t.Fatalf("Plan rejected clean mount points: %v", err)
+	}
+	if got, want := mountTargets(cmds), []string{"/target", "/target/var", "/target/var/lib"}; !sliceEqual(got, want) {
+		t.Errorf("mount targets = %q, want %q", got, want)
 	}
 }

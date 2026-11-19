@@ -753,6 +753,50 @@ func TestFailOperation_DeployFailureGoesToFailed(t *testing.T) {
 	}
 }
 
+// A worker-reported failure whose error text contains a NUL byte is valid
+// JSON (json.Marshal writes the NUL as \u0000), but a jsonb column refuses
+// that escape. The error text carries outside bytes verbatim: a config
+// script's stderr, a BMC's Redfish error body, ipmitool output. The fail
+// must still land, with the NUL replaced, instead of rolling back:
+// op_update is fire-and-forget, so a rolled-back fail leaves the op
+// claimed and the machine deploying until the 30-minute stuck sweep
+// replaces the cause with "operation timed out".
+func TestFailOperation_RecordsAFailureWhoseMessageContainsNUL(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-nul-result", State: model.MachineStateCommissioned, PXEEligible: true}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOperation(op.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	result := model.OpResult{Error: "storage script failed: exit status 1; script stderr:\nbad label \x00 on /dev/sda", Phase: "partitioning"}.Marshal()
+	out, err := st.FailOperationOutcome(op.ID, result)
+	if err != nil || out == nil {
+		t.Errorf("FailOperationOutcome: outcome set=%v err=%v; want the failure recorded", out != nil, err)
+	}
+	got, _ := st.GetOperation(op.ID)
+	gotM, _ := st.GetMachine(m.ID)
+	if got.Status != model.OpFailed {
+		t.Errorf("op is still %s after the worker reported it failed", got.Status)
+	}
+	if gotM.State != model.MachineStateFailed {
+		t.Errorf("machine is still %s; want failed", gotM.State)
+	}
+	res, err := got.DecodeResult()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "storage script failed: exit status 1; script stderr:\nbad label \uFFFD on /dev/sda"; res.Error != want {
+		t.Errorf("stored error = %q; want %q (the cause, with the NUL replaced)", res.Error, want)
+	}
+}
+
 // TestAbortMachine_RoutesViaFailOperation verifies AbortMachine's
 // per-op-status branching: an aborted pending op leaves machine
 // state alone; an aborted claimed op pulls state down per the
@@ -907,6 +951,185 @@ func TestExpirePhoneHomeOperations_FailsStuckDeploys(t *testing.T) {
 	gotM, _ := st.GetMachine(m.ID)
 	if gotM.State != model.MachineStateFailed {
 		t.Errorf("machine state: got %s, want failed", gotM.State)
+	}
+}
+
+// afterSweepSelect arranges for fn to run exactly once, immediately after
+// the next SELECT whose SQL contains match has returned on st's database
+// handle. The expiry sweeps read their candidates with a plain SELECT and
+// then fail each one in its own transaction; this puts fn in that gap
+// deterministically, with no sleeps and no goroutines.
+func afterSweepSelect(t *testing.T, st *Store, match string, fn func()) {
+	t.Helper()
+	name := "sweep-guard-test:" + uuid.NewString()
+	fired := false
+	err := st.db.Callback().Query().After("gorm:query").Register(name, func(tx *gorm.DB) {
+		if fired || !strings.Contains(tx.Statement.SQL.String(), match) {
+			return
+		}
+		fired = true
+		fn()
+	})
+	if err != nil {
+		t.Fatalf("register interleave callback: %v", err)
+	}
+	t.Cleanup(func() { _ = st.db.Callback().Query().Remove(name) })
+}
+
+// TestExpirePendingOperations_SparesAnOpClaimedMeanwhile pins the pending
+// sweep against a worker claim that commits between the sweep's candidate
+// read and its fail (a site worker reconnecting after a long outage claims
+// its backlog on the same tick). The claim told the worker the op is its to
+// drive, so the sweep must leave the op claimed and the machine deploying,
+// not fail it as "pending op timed out" and pull the machine to failed.
+func TestExpirePendingOperations_SparesAnOpClaimedMeanwhile(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{
+		ID: uuid.New(), NetBoxSerial: "SN-pending-vs-claim",
+		State: model.MachineStateCommissioned, PXEEligible: true,
+	}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil,
+		model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.Model(&model.Operation{}).Where("id = ?", op.ID).
+		Update("created_at", time.Now().Add(-25*time.Hour)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var claimed *model.Operation
+	var claimErr error
+	afterSweepSelect(t, st, "created_at <", func() {
+		claimed, claimErr = st.ClaimOperation(op.ID, "worker-1")
+	})
+	outs, err := st.ExpirePendingOperations(24 * time.Hour)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if claimErr != nil || claimed == nil {
+		t.Fatalf("setup: the interleaved claim did not succeed (op=%v err=%v)", claimed, claimErr)
+	}
+
+	if len(outs) != 0 {
+		t.Errorf("pending sweep reported %d expired ops; its only candidate had been claimed", len(outs))
+	}
+	gotOp, _ := st.GetOperation(op.ID)
+	if gotOp.Status != model.OpClaimed {
+		t.Errorf("op status: got %s (result %s), want claimed", gotOp.Status, gotOp.Result)
+	}
+	gotM, _ := st.GetMachine(m.ID)
+	if gotM.State != model.MachineStateDeploying {
+		t.Errorf("machine state: got %s, want deploying (the claimed op is driving it)", gotM.State)
+	}
+}
+
+// TestExpireStuckOperations_SparesAnOpThatEnteredAwaitingPhoneHome pins
+// the stuck sweep's awaiting_phone_home exclusion against a deploy_complete
+// phase report that commits between the sweep's candidate read and its
+// fail. Once the op is in awaiting_phone_home it is on the phone-home
+// budget, and the stuck sweep must not fail it.
+func TestExpireStuckOperations_SparesAnOpThatEnteredAwaitingPhoneHome(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{
+		ID: uuid.New(), NetBoxSerial: "SN-stuck-vs-phone-home",
+		State: model.MachineStateCommissioned, PXEEligible: true,
+	}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil,
+		model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOperation(op.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetOperationPhase(op.ID, "finalizing"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.Model(&model.Operation{}).Where("id = ?", op.ID).
+		Update("claimed_at", time.Now().Add(-31*time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	afterSweepSelect(t, st, "claimed_at <", func() {
+		if _, err := st.SetOperationPhase(op.ID, "awaiting_phone_home"); err != nil {
+			t.Errorf("interleaved phase report: %v", err)
+		}
+	})
+	outs, err := st.ExpireStuckOperations(30 * time.Minute)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	gotOp, _ := st.GetOperation(op.ID)
+	if gotOp.Phase != "awaiting_phone_home" {
+		t.Fatalf("setup: op phase is %q, want awaiting_phone_home", gotOp.Phase)
+	}
+	if len(outs) != 0 || gotOp.Status != model.OpClaimed {
+		t.Errorf("stuck sweep failed an op in awaiting_phone_home: status=%s result=%s outcomes=%d",
+			gotOp.Status, gotOp.Result, len(outs))
+	}
+	gotM, _ := st.GetMachine(m.ID)
+	if gotM.State != model.MachineStateDeploying {
+		t.Errorf("machine state: got %s, want deploying", gotM.State)
+	}
+}
+
+// TestExpirePhoneHomeOperations_SparesAnOpThatLeftAwaitingPhoneHome pins
+// the phone-home sweep against a phase change that commits between its
+// candidate read and its fail. The worker's failure path writes phase
+// `failed` ahead of the failed status; the op is then no longer awaiting
+// phone-home, so the sweep must leave it for the worker's own failure
+// report (which carries the real error) instead of failing it as
+// "phone-home timed out".
+func TestExpirePhoneHomeOperations_SparesAnOpThatLeftAwaitingPhoneHome(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{
+		ID: uuid.New(), NetBoxSerial: "SN-phone-home-vs-phase",
+		State: model.MachineStateCommissioned, PXEEligible: true,
+	}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil,
+		model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimOperation(op.ID, "worker-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetOperationPhase(op.ID, "awaiting_phone_home"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.Model(&model.Operation{}).Where("id = ?", op.ID).
+		Update("phase_entered_at", time.Now().Add(-31*time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	afterSweepSelect(t, st, "phase_entered_at <", func() {
+		if _, err := st.SetOperationPhase(op.ID, "failed"); err != nil {
+			t.Errorf("interleaved phase report: %v", err)
+		}
+	})
+	outs, err := st.ExpirePhoneHomeOperations(30 * time.Minute)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	gotOp, _ := st.GetOperation(op.ID)
+	if gotOp.Phase != "failed" {
+		t.Fatalf("setup: op phase is %q, want failed", gotOp.Phase)
+	}
+	if len(outs) != 0 || gotOp.Status != model.OpClaimed {
+		t.Errorf("phone-home sweep failed an op no longer awaiting phone-home: status=%s result=%s outcomes=%d",
+			gotOp.Status, gotOp.Result, len(outs))
 	}
 }
 
@@ -1715,5 +1938,178 @@ func TestListActiveOperationsClaimedBy(t *testing.T) {
 	}
 	if len(none) != 0 {
 		t.Fatalf("worker-3: got %d ops, want 0", len(none))
+	}
+}
+
+// TestSetOperationPhase_DoesNotRewriteTerminalOp: a phase report that
+// arrives after its op went terminal must not rewrite the row. The worker
+// does send these: a report already in flight when the operator aborts, or
+// the executor's power_cycle/pxe_booting updates after op_removed. The
+// phase the op ended in, phase_entered_at, and the version that workers
+// order the op stream by are all part of the terminal record, and a
+// reported change makes the hub publish an op_delta for a dead op.
+func TestSetOperationPhase_DoesNotRewriteTerminalOp(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func(st *Store, m *model.Machine, op *model.Operation) error
+		want model.OperationStatus
+	}{
+		{"aborted", func(st *Store, m *model.Machine, _ *model.Operation) error {
+			_, _, err := st.AbortMachine(m.ID)
+			return err
+		}, model.OpFailed},
+		{"completed", func(st *Store, _ *model.Machine, op *model.Operation) error {
+			_, err := st.CompleteOperationWithState(op.ID, model.MachineStateRunning, nil)
+			return err
+		}, model.OpCompleted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-late-phase", State: model.MachineStateCommissioned, PXEEligible: true}
+			if err := st.CreateMachine(m); err != nil {
+				t.Fatal(err)
+			}
+			op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claimed, err := st.ClaimOperation(op.ID, "worker-1"); err != nil || claimed == nil {
+				t.Fatalf("claim: op=%v err=%v", claimed, err)
+			}
+			if _, err := st.SetOperationPhase(op.ID, "partitioning"); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.end(st, m, op); err != nil {
+				t.Fatal(err)
+			}
+			before, err := st.GetOperation(op.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if before.Status != tc.want || before.Phase != "partitioning" {
+				t.Fatalf("setup: op is %s in phase %q, want %s in partitioning", before.Status, before.Phase, tc.want)
+			}
+
+			// The report that was still in flight when the op ended.
+			tr, err := st.SetOperationPhase(op.ID, "rsyncing_os")
+			if err != nil {
+				t.Fatalf("late phase report: %v", err)
+			}
+
+			after, err := st.GetOperation(op.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tr.Changed || tr.Op != nil {
+				t.Errorf("SetOperationPhase reported a phase change on a %s op (Changed=%v, Op set=%v); the hub publishes an op_delta for every reported change",
+					tc.want, tr.Changed, tr.Op != nil)
+			}
+			if after.Phase != "partitioning" {
+				t.Errorf("%s op's phase was rewritten: %q -> %q", tc.want, before.Phase, after.Phase)
+			}
+			if after.Version != before.Version {
+				t.Errorf("%s op's version moved after it went terminal: %d -> %d (workers accept any delta above their tombstone version)",
+					tc.want, before.Version, after.Version)
+			}
+			if !after.PhaseEnteredAt.Equal(before.PhaseEnteredAt) {
+				t.Errorf("%s op's phase_entered_at moved: %s -> %s", tc.want, before.PhaseEnteredAt, after.PhaseEnteredAt)
+			}
+		})
+	}
+}
+
+// TestSetOperationPhase_AbortBetweenReadAndWrite: an abort that lands after
+// SetOperationPhase has read the op as active, and before it writes, must
+// still have the last word on the row. The abort starts in its own goroutine
+// right after the read, and the read's transaction waits until the abort has
+// either committed or blocked on a row lock before it goes on to write, so
+// the test is deterministic whether SetOperationPhase guards its write with
+// a status check or serializes against the abort with a lock.
+func TestSetOperationPhase_AbortBetweenReadAndWrite(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-abort-mid-phase", State: model.MachineStateCommissioned, PXEEligible: true}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := st.ClaimOperation(op.ID, "worker-1"); err != nil || claimed == nil {
+		t.Fatalf("claim: op=%v err=%v", claimed, err)
+	}
+	if _, err := st.SetOperationPhase(op.ID, "partitioning"); err != nil {
+		t.Fatal(err)
+	}
+
+	type abortResult struct {
+		outs []OpOutcome
+		err  error
+	}
+	aborted := make(chan abortResult, 1)
+	sqlDB, err := st.db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "abort-mid-phase:" + uuid.NewString()
+	fired := false
+	// SetOperationPhase's read is the only query that names phase_entered_at.
+	if err := st.db.Callback().Query().After("gorm:query").Register(name, func(tx *gorm.DB) {
+		if fired || !strings.Contains(tx.Statement.SQL.String(), `"phase_entered_at"`) {
+			return
+		}
+		fired = true
+		go func() {
+			_, outs, err := st.AbortMachine(m.ID)
+			aborted <- abortResult{outs, err}
+		}()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case r := <-aborted:
+				aborted <- r
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+			var waiters int
+			if err := sqlDB.QueryRow(`SELECT count(*) FROM pg_stat_activity
+				WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiters); err == nil && waiters > 0 {
+				return
+			}
+		}
+		t.Error("abort neither finished nor blocked on a lock within 10s")
+	}); err != nil {
+		t.Fatalf("register interleave callback: %v", err)
+	}
+	t.Cleanup(func() { _ = st.db.Callback().Query().Remove(name) })
+
+	tr, err := st.SetOperationPhase(op.ID, "rsyncing_os")
+	if err != nil {
+		t.Fatalf("phase report: %v", err)
+	}
+	if !fired {
+		t.Fatal("setup: SetOperationPhase's read was not intercepted; the abort never ran between read and write")
+	}
+	ab := <-aborted
+	if ab.err != nil {
+		t.Fatalf("abort: %v", ab.err)
+	}
+	if len(ab.outs) != 1 {
+		t.Fatalf("abort failed %d ops, want 1", len(ab.outs))
+	}
+	failed := ab.outs[0].Op
+
+	got, err := st.GetOperation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Either order is legal (phase then fail, or fail and the phase report
+	// dropped), but in both the fail is the last write to the row.
+	if tr.Op != nil && tr.Op.Status == model.OpFailed {
+		t.Errorf("phase write landed on the failed row (version %d) and was reported for publication", tr.Op.Version)
+	}
+	if got.Version != failed.Version || got.Phase != failed.Phase {
+		t.Errorf("row moved after the abort failed it: abort left phase %q version %d, row now has phase %q version %d",
+			failed.Phase, failed.Version, got.Phase, got.Version)
 	}
 }

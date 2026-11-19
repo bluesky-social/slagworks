@@ -47,7 +47,9 @@ variable shown, so a flag on the command line overrides the variable.
 - **`LISTEN_ADDR`** / `--addr` — API and WebSocket listen address.
   Default `:8081`.
 - **`NETBOX_URL`** / `--netbox-url` and **`NETBOX_TOKEN`** /
-  `--netbox-token` — NetBox base URL and API token. Both must be set;
+  `--netbox-token` — NetBox base URL and API token. The URL may carry a
+  path, such as `https://netbox.example.com/netbox` for a NetBox served
+  under `BASE_PATH` or behind a proxy prefix. Both must be set;
   either alone logs a warning and leaves NetBox disabled. Without NetBox,
   global serves the REST API but builds no snapshots, does not register
   the site-worker WebSocket (so no site worker can connect), the NetBox
@@ -349,7 +351,10 @@ site config requires a prefix tagged `slagworks-production` scoped to the
 site (or location). The DNS servers and lease time handed out on the
 fabric leg come from that prefix's `dns_servers` and `dhcp_lease_seconds`
 custom fields, defaulting to `1.1.1.1` and 5 minutes; workers read them
-when their services start, so a change takes effect on restart.
+when their services start, so a change takes effect on restart. When
+child locations of a location-scoped config also carry
+`slagworks-production` prefixes, the prefix scoped to the config's own
+location still supplies the subnet, gateway, DNS servers and lease time.
 
 Manage site configs with
 `slagctl site-config {list,show,create,update,delete}`. Creating one also

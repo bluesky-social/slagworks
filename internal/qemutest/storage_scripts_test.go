@@ -94,3 +94,35 @@ layout = {
 }
 json.dump(layout, sys.stdout)
 `
+
+// raid1XFSThreeDiskStorageScript is a BIOS-only layout: an xfs root on a
+// three-way mdraid mirror, each member disk carrying its own 1M bios_grub
+// (EF02) partition, so the agent runs grub-install three times over the
+// same xfs /boot/grub.
+const raid1XFSThreeDiskStorageScript = `#!/usr/bin/env python3
+import json, os, sys
+
+with open(os.environ["SLAGWORKS_INVENTORY"]) as f:
+    inv = json.load(f)
+
+disks = sorted(d["name"] for d in inv["disks"])
+if len(disks) != 3:
+    print(f"expected 3 disks, got {len(disks)}: {disks}", file=sys.stderr)
+    sys.exit(1)
+
+layout = {"layout": {}, "mounts": {"/": {"device": "mdroot"}}}
+for d in disks:
+    layout["layout"][d] = {
+        "type": "disk", "ptable": "gpt",
+        "partitions": [
+            {"name": f"{d}1", "size": "1M", "bios_grub": True},
+            {"name": f"{d}2", "size": "rest"},
+        ],
+    }
+layout["layout"]["mdroot"] = {
+    "type": "raid", "level": 1,
+    "members": [f"{d}2" for d in disks],
+    "fs": "xfs",
+}
+json.dump(layout, sys.stdout)
+`

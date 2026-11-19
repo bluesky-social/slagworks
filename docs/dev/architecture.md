@@ -95,7 +95,8 @@ Modes (dispatched from `main.go` around line 165):
   image, installs a bootloader, configures RAID, writes fstab, seeds
   cloud-init, writes the rendered network configuration into the
   target, writes the hostname, installs SSH keys,
-  enrolls in Tailscale, writes the phone-home unit, reconciles the
+  enrolls in Tailscale, writes the phone-home unit, unmounts the target
+  (a filesystem that will not unmount fails the deploy), reconciles the
   BMC, reports `deploy_complete`, and reboots.
 
 All agent-to-site traffic is plain HTTP against the site worker's
@@ -216,7 +217,11 @@ distinct concepts share the word "reconcile":
   net). `mirror.OnDeviceCreated`, `OnDeviceUpdated`, `OnDeviceDeleted`.
   Enforces `ErrSerialRequired` (`mirror.go:53`) and `ErrSlugImmutable`
   (`mirror.go:58`), and on a re-create with the same serial rebinds
-  the existing row via `SetMachineNetBoxDeviceID`.
+  the existing row via `SetMachineNetBoxDeviceID`. `OnDeviceUpdated`
+  only invalidates for a tracked device; for a serialled device with no
+  machine row (its serial was just filled in, or it just moved into a
+  claimed scope) it enrolls through `OnDeviceCreated`, the rule the
+  reconciler applies to untracked devices.
 - **`internal/snapshot.Reconciler`** — a 5-minute ticker
   (`reconcile.go:39`) that walks every `site_config`, lists its NetBox
   devices, and calls `mirror.OnDevice*` for each. This is the safety
@@ -250,7 +255,10 @@ the fields it discovered:
 
 - Top-level: `serial`, `asset_tag`, `name` (hostname), `status`
   (`active` on deploy), `device_type`.
-- Tags: adds `slagworks-managed`.
+- Tags: adds `slagworks-managed` and keeps every operator tag. NetBox
+  replaces the whole tag set on PATCH, so the sync reads the device's
+  tags first and writes them back with `slagworks-managed` added; once
+  the tag is present it leaves `tags` out of the PATCH.
 - Custom fields: `slagworks_id`, `board_vendor`, `board_product`,
   `chassis_type`, `board_serial`.
 
@@ -294,7 +302,8 @@ Types are in `internal/model/snapshot.go`:
 - `SnapshotInterface` (`snapshot.go:126`) — `Type` is one of
   `physical`, `ipmi`, `lag`; only physical NICs are matched by DHCP.
   A `mgmt_only` interface is `ipmi` only when the device has a canonical
-  NetBox `oob_ip`; on a BMC-less device it remains a physical host/PXE NIC.
+  NetBox `oob_ip`; on a BMC-less device the flag is ignored, so a NIC
+  remains a physical host/PXE NIC and a bond remains `lag`.
 - `ContentHash()` (`snapshot.go:280`) — SeqNum stripped, slices sorted
   in copy, sha256. This is the dispatcher's push-decision key.
 
@@ -302,7 +311,9 @@ Types are in `internal/model/snapshot.go`:
 
 `internal/snapshot/builder.go:66` is `Build(in Inputs) (SiteSnapshot,
 error)`. It is pure — no I/O — and fails loudly if `Prefixes` is
-empty (`builder.go:68`). Its inputs (`Inputs`, `builder.go:31`) are
+empty (`builder.go:68`) or if an interface of a bound machine carries
+more than one active IP address (a machine's interface facts hold one).
+Its inputs (`Inputs`, `builder.go:31`) are
 NetBox reads (site, config, prefixes, OOB prefixes and ranges,
 devices, device-types, interfaces, IPs), Postgres reads (machines,
 images, storage scripts, network scripts, SSH keys), and
@@ -555,9 +566,12 @@ service POSTs `/api/v1/phone-home`):
   `awaiting_phone_home` clobber guard (documented in the
   state-machine doc).
 
-Outbox handling: every observation and op update the cache accepts
-is appended to a durable outbox row on the local SQLite (via
-`LocalDB.AppendOutbox`) and queued for the WebSocket drain
+Outbox handling: every observation the cache accepts is appended to
+a durable outbox row on the local SQLite (via `LocalDB.AppendOutbox`)
+and deleted only when global acks it; op updates are queued in
+memory only and are never acknowledged, so anything that must not be
+lost (commission reports, the phone-home that completes a deploy)
+rides an observation. Both are queued for the WebSocket drain
 (`cache.go:334 appendObservation`, `685 DrainOutbox`, `805 RequeueOutbox`,
 `824 AckObservation`, `843 ReloadOutboxFromDisk`). Retry backoff is in
 `armRetryTimerLocked` (724) and `RequeueRejected` (772). This is why
@@ -979,13 +993,13 @@ passive carrier.
 
 `internal/configscript`:
 
-- `Script` (`configscript.go:19`) — `Path`, `Priority`, `Rules
+- `Script` (`configscript.go:20`) — `Path`, `Priority`, `Rules
   []MatchRule`, `Content`.
-- `Parse(path, content, validFields)` (line 38) — reads header
-  directives `# slagworks:match <field> <regex>` and
+- `Parse(path, content, validFields)` (line 45) — reads header
+  directives `# slagworks:match <field>=<value>` and
   `# slagworks:priority <int>` from the leading comment block.
-  Rejects unknown fields.
-- `Match(scripts, resolve)` (line 106) — resolves each field via a
+  Rejects unknown fields and any other `slagworks:` directive.
+- `Match(scripts, resolve)` (line 123) — resolves each field via a
   callback and picks the highest-priority script whose rules all
   match.
 

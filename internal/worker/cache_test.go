@@ -3,6 +3,7 @@ package worker
 import (
 	"encoding/json"
 	"net"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/uuid"
@@ -209,14 +210,105 @@ func TestUpdateOpPhase_AwaitingPhoneHomeNotClobbered(t *testing.T) {
 			t.Fatalf("after UpdateOpPhase(%q): BootAction = %d, want BootLocal (phase must stay awaiting_phone_home)", p, got)
 		}
 	}
+}
 
-	// And a non-boot-prefix terminal phase (phone_home / completed-ish)
-	// must still be allowed through — the guard is scoped to boot-prefix
-	// phases only.
-	c.UpdateOpPhase(opID.String(), "phone_home")
-	if op := c.ActiveBootingOpForMachine(mid); op != nil && op.Phase != "phone_home" {
-		t.Fatalf("non-boot-prefix phase must update: got %q, want phone_home", op.Phase)
+// TestUpdateOpPhase_AwaitingPhoneHomeOnlyLeftByFailure covers the phase
+// writers other than the post-install PXE. Once deploy_complete has latched
+// the op at awaiting_phone_home, no phase write may move it except failure:
+// completion goes through RecordPhoneHome, not a phase. Two writers used to
+// get through because the guard listed only the four boot-prefix phases:
+//
+//   - Executor.runLifecycleOp writes power_cycle then pxe_booting after it
+//     claims and power-cycles a deploy op. It reaches a latched op when the
+//     install finished while the op was still pending on this worker.
+//   - An agent phase report (agent_starting ... bmc_reconcile) that the
+//     worker's HTTP server processes after deploy_complete.
+//
+// Either one set op.Phase, so the next PXE got BootDeploy and the host
+// reinstalled over the disk it had just written, and queued the phase for
+// global, taking the op off the phone-home timeout.
+func TestUpdateOpPhase_AwaitingPhoneHomeOnlyLeftByFailure(t *testing.T) {
+	latched := func(t *testing.T) (*Cache, uuid.UUID, uuid.UUID, string) {
+		t.Helper()
+		c := NewCache(nil)
+		mid, opID := uuid.New(), uuid.New()
+		mac := "52:54:00:b1:00:01"
+		c.ApplySnapshot(snapMachine(mid, mac, model.MachineStateDeploying))
+		seedOpsResync(c, model.Operation{
+			ID: opID, MachineID: mid, Type: model.OpDeploy,
+			Status: model.OpClaimed, Phase: "finalizing", Version: 5,
+		})
+		if err := c.HandleProgressReport(&model.ProgressReport{
+			MachineID: mid.String(), OperationID: opID.String(), Event: "deploy_complete",
+		}); err != nil {
+			t.Fatalf("deploy_complete: %v", err)
+		}
+		if got := c.BootActionForMAC(mac); got != model.BootLocal {
+			t.Fatalf("precondition: latched op got %d, want BootLocal", got)
+		}
+		c.DrainOutbox()
+		return c, mid, opID, mac
 	}
+	stillLatched := func(t *testing.T, c *Cache, opID uuid.UUID, mac, after string) {
+		t.Helper()
+		if op := c.GetOperation(opID.String()); op == nil || op.Phase != "awaiting_phone_home" {
+			t.Errorf("after %s: op = %+v, want phase awaiting_phone_home", after, op)
+		}
+		if got := c.BootActionForMAC(mac); got != model.BootLocal {
+			t.Errorf("after %s: post-install PXE got %d, want BootLocal (%d)", after, got, model.BootLocal)
+		}
+		_, updates := c.DrainOutbox()
+		for _, u := range updates {
+			if u.Phase != "" {
+				t.Errorf("after %s: queued phase update %+v for global, want none", after, u)
+			}
+		}
+	}
+
+	t.Run("executor claims and drives the latched op", func(t *testing.T) {
+		c, _, opID, mac := latched(t)
+		// The phase writes runLifecycleOp makes after power-cycling.
+		c.UpdateOpPhase(opID.String(), "power_cycle")
+		c.UpdateOpPhase(opID.String(), "pxe_booting")
+		c.MarkOpStatus(opID.String(), model.OpRunning)
+		stillLatched(t, c, opID, mac, "the executor's power_cycle, pxe_booting")
+	})
+	for _, phase := range []string{"agent_starting", "partitioning", "finalizing", "bmc_reconcile"} {
+		t.Run("late agent report "+phase, func(t *testing.T) {
+			c, mid, opID, mac := latched(t)
+			if err := c.HandleProgressReport(&model.ProgressReport{
+				MachineID: mid.String(), OperationID: opID.String(), Phase: phase,
+			}); err != nil {
+				t.Fatalf("report: %v", err)
+			}
+			stillLatched(t, c, opID, mac, "a late "+phase+" report")
+		})
+	}
+	// Failure is the one phase write that still leaves the latch: the
+	// agent's failure report writes phase "failed" and then marks the op
+	// failed.
+	t.Run("failure report leaves the latch", func(t *testing.T) {
+		c, mid, opID, _ := latched(t)
+		if err := c.HandleProgressReport(&model.ProgressReport{
+			MachineID: mid.String(), OperationID: opID.String(),
+			Phase: "bmc_reconcile", Failed: true, Error: "boom",
+		}); err != nil {
+			t.Fatalf("failure report: %v", err)
+		}
+		if op := c.GetOperation(opID.String()); op == nil || op.Status != model.OpFailed {
+			t.Fatalf("op = %+v, want status failed", op)
+		}
+		_, updates := c.DrainOutbox()
+		var sawFailedPhase bool
+		for _, u := range updates {
+			if u.Phase == "failed" && u.Status == "" {
+				sawFailedPhase = true
+			}
+		}
+		if !sawFailedPhase {
+			t.Errorf("updates = %+v, want the failed phase update queued for global", updates)
+		}
+	})
 }
 
 // TestUpdateOpPhase_BootPrefixAllowedWhenNotAwaiting confirms the guard is
@@ -476,6 +568,53 @@ func TestCacheRecordPhoneHome_NoActiveOpStillEmitsObs(t *testing.T) {
 	if len(updates) != 0 {
 		t.Errorf("no active op → no op_update expected, got: %+v", updates)
 	}
+}
+
+// TestRecordPhoneHome_CompletionSurvivesRestart pins that the deploy's
+// completion is durable once the worker has answered the phone-home. The
+// installed OS stops phoning home after its first 2xx, so if the only
+// record of the completion is the memory-only op_update, a worker restart
+// before the drain loop sends it loses the completion for good: global
+// keeps the op at awaiting_phone_home and fails the healthy host at
+// PhoneHomeTimeout. The phone_home observation is persisted in the SQLite
+// outbox, so it must name the deploy op for global to complete it from.
+func TestRecordPhoneHome_CompletionSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.db")
+	db, err := OpenLocalDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, opID := uuid.New(), uuid.New()
+	c := NewCache(db)
+	c.ApplySnapshot(snapMachine(id, "52:54:00:e1:00:01", model.MachineStateDeploying))
+	seedOpsResync(c, model.Operation{
+		ID: opID, MachineID: id, Type: model.OpDeploy,
+		Status: model.OpClaimed, Phase: "awaiting_phone_home",
+	})
+
+	// The installed OS phones home; a nil return is what gives it its 200.
+	if err := c.HandleProgressReport(&model.ProgressReport{
+		MachineID: id.String(), OperationID: opID.String(), Event: "phone_home",
+	}); err != nil {
+		t.Fatalf("phone_home: %v", err)
+	}
+
+	// The worker restarts before the drain loop sends anything.
+	closeLocalDB(t, db)
+	db2, err := OpenLocalDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeLocalDB(t, db2) })
+	obs, updates := NewCache(db2).DrainOutbox()
+
+	for _, p := range obs {
+		if p.Obs.Event == "phone_home" && p.Obs.OperationID == opID && p.Obs.MachineID == id {
+			return
+		}
+	}
+	t.Fatalf("after a restart no durable phone_home observation names deploy op %s (observations %+v, op updates %+v): "+
+		"global never learns the host phoned home and fails the deploy at PhoneHomeTimeout", opID, obs, updates)
 }
 
 // TestHandleProgressReport_DeployComplete_WithBMCCreds verifies the
