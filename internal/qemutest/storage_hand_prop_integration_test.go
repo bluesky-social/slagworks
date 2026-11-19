@@ -173,6 +173,21 @@ func propPatternCases() []propCase {
 			},
 		},
 		{
+			// Both members of a whole-disk mirror become bystanders of a
+			// --wipe-all-disks deploy.
+			Name: "uefi-wipeall-whole-disk-members", Firmware: "uefi",
+			Disks: []propDisk{
+				propD("d0", "virtio", 8, 0, 512, ""), propD("d1", "virtio", 4, 1, 512, ""), propD("d2", "virtio", 4, 2, 512, ""),
+			},
+			Steps: []propStep{
+				{Attach: all("d0", "d1", "d2"), Layout: propDataLayout("d0", "raid", 1, "d1", "d2"),
+					Expect: "ok", Why: "blank disks"},
+				{Attach: all("d0", "d1", "d2"), Layout: propSingleLayout("d0", "ext4"),
+					Destructive: true, WipeAll: true, Reboot: true, Expect: "ok",
+					Why: "destructive redeploy with --wipe-all-disks; d1 and d2 must end up without signatures"},
+			},
+		},
+		{
 			// A destructive deploy over a disk with signatures outside
 			// where the new partition table and filesystems will land.
 			Name: "destructive-over-zfs", Firmware: "uefi",

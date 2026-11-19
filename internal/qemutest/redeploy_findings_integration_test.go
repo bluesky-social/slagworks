@@ -231,17 +231,25 @@ func TestDeploy_StaleMemberWithPinnedArrayUUID(t *testing.T) {
 	vmB := r.deploy(ctx, "b", pinnedDataScript(1, 2), model.OpParams{Destructive: true, DataMarker: token})
 
 	// The data-marker unit reports, on every boot, where /data is mounted
-	// from.
+	// from. A boot that loses the array either reports NOT-MOUNTED or never
+	// gets that far: it times out on the /data device and stops in
+	// emergency mode.
 	cursor := 0
 	for boot := 1; boot <= 3; boot++ {
-		if err := vmB.Serial.WaitForAfter(ctx, cursor, "PRESERVE_MARKER install="+token, 5*time.Minute); err != nil {
-			t.Fatalf("boot %d: no data-marker line: %v", boot, err)
-		}
 		var line string
-		for _, l := range vmB.Serial.Lines()[cursor:] {
-			if strings.Contains(l, "PRESERVE_MARKER install="+token) {
-				line = l
+		for deadline := time.Now().Add(6 * time.Minute); line == "" && time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
+			for _, l := range vmB.Serial.Lines()[cursor:] {
+				if strings.Contains(l, "PRESERVE_MARKER install="+token) {
+					line = l
+				}
+				if strings.Contains(l, "Dependency failed for") && strings.Contains(l, "data.mount") {
+					t.Fatalf("boot %d of the redeployed machine: the /data array did not assemble and the boot fell to emergency mode: %s\n%s",
+						boot, strings.TrimSpace(l), grepSerial(vmB, "md0 : "))
+				}
 			}
+		}
+		if line == "" {
+			t.Fatalf("boot %d: no data-marker line within 6m\n%s", boot, serialDump(vmB))
 		}
 		if src := markerField(line, "source"); !strings.HasPrefix(src, "/dev/md") {
 			t.Fatalf("boot %d of the redeployed machine: /data is not mounted from the array (source=%s).\n"+

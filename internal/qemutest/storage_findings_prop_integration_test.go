@@ -108,6 +108,32 @@ func propFindingCases() []propCase {
 		propTopMountsCase("bios-topmounts-ext4", "bios", "ext4"),
 		propTopMountsCase("uefi-topmounts-ext4", "uefi", "ext4"),
 
+		// 8. A data array lives on disks the redeploy leaves out of its
+		// layout (no --wipe-all-disks). The agent created it as /dev/md0, so
+		// its superblock asks for md0; the new root mirror is also
+		// /dev/md0 in the mdadm.conf the agent writes. When the initramfs
+		// assembles the old array first, the root array is refused
+		// ("/dev/md0 is already in use") and the machine stops in the
+		// initramfs. Generated cases g0027 (BIOS) and g0013 (UEFI).
+		{
+			Name: "uefi-bystander-array-takes-md0", Firmware: "uefi",
+			Disks: []propDisk{
+				propD("d0", "virtio", 8, 0, 512, ""), propD("d1", "virtio", 8, 1, 512, ""),
+				propD("d2", "virtio", 4, 2, 512, ""), propD("d3", "virtio", 4, 3, 512, ""),
+			},
+			Steps: []propStep{
+				{Attach: all("d0", "d1", "d2", "d3"), Expect: "ok", Why: "blank disks",
+					Layout: func() propLayout {
+						l := propDataLayout("d0", "raid", 1, "d2", "d3")
+						l.Arrays[0].UUID = "" // an ordinary array, no pinned UUID
+						return l
+					}()},
+				{Attach: all("d0", "d1", "d2", "d3"), Layout: propRAID1Layout("d0", "d1", "ext4"),
+					Destructive: true, Reboot: true, Expect: "ok",
+					Why: "destructive redeploy of the root as a mirror; the data disks are left alone"},
+			},
+		},
+
 		// 6. A root partition with a fixed size and free space after it is
 		// grown to the end of the disk by cloud-init on first boot.
 		{

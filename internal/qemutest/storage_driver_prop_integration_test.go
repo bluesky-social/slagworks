@@ -583,7 +583,9 @@ wait:
 		}
 		lines := vm.Serial.Lines()
 		for ; cursor < len(lines); cursor++ {
-			for _, marker := range []string{"grub rescue>", "PXE boot failed after", "No bootable device.", "Dropping to a shell!"} {
+			// ("grub rescue>" is a prompt with no newline and never becomes a
+			// line; the line before it does.)
+			for _, marker := range []string{"Entering rescue mode", "PXE boot failed after", "No bootable device.", "Dropping to a shell!"} {
 				if strings.Contains(lines[cursor], marker) {
 					dead = marker
 				}

@@ -50,7 +50,10 @@ type propGen struct {
 	// member superblock of any generation of that array and has not been
 	// wiped since.
 	holders map[string]map[string]bool
-	next    int
+	// memberOf records, per disk, that it carries a member superblock of
+	// some array and has not been wiped since.
+	memberOf map[string]bool
+	next     int
 }
 
 func (g *propGen) pick(weights ...int) int {
@@ -448,6 +451,23 @@ func (g *propGen) hazard(st propStep) string {
 			}
 		}
 	}
+	// bystander-array: the layout has an array of its own while a disk it
+	// neither wipes nor names as a member carries an array member. Both
+	// arrays want /dev/md0 at boot and the wrong one can win
+	// (TestStoragePropFindings/uefi-bystander-array-takes-md0).
+	if len(st.Layout.Arrays) > 0 {
+		member := map[string]bool{}
+		for _, a := range st.Layout.Arrays {
+			for _, m := range a.Members {
+				member[m.Disk] = true
+			}
+		}
+		for _, id := range st.Attach {
+			if g.memberOf[id] && !member[id] && !wiped[id] {
+				return "bystander-array"
+			}
+		}
+	}
 	return ""
 }
 
@@ -498,6 +518,16 @@ func (g *propGen) apply(st propStep) {
 	for _, h := range g.holders {
 		for id := range touched {
 			delete(h, id)
+		}
+	}
+	for id := range touched {
+		delete(g.memberOf, id)
+	}
+	for _, a := range st.Layout.Arrays {
+		if a.Type == "raid" {
+			for _, m := range a.Members {
+				g.memberOf[m.Disk] = true
+			}
 		}
 	}
 	for _, a := range st.Layout.Arrays {
@@ -552,7 +582,7 @@ func propGenCase(seed int64) propCase {
 	g := &propGen{
 		rng: rand.New(rand.NewSource(seed)), c: &c,
 		big: map[string]bool{}, sig: map[string]string{}, arrs: map[string]*propArrState{},
-		holders: map[string]map[string]bool{},
+		holders: map[string]map[string]bool{}, memberOf: map[string]bool{},
 	}
 	c.Firmware = "uefi"
 	if g.chance(40) {
@@ -773,6 +803,11 @@ func propGenCase(seed int64) propCase {
 		// (TestStoragePropFindings/bios-topmounts-*). On BIOS, GRUB then
 		// reads a filesystem whose journal was never replayed and may not
 		// find its own modules, so the outcome is open.
+		if st.Expect == "ok" && st.Hazard != "" {
+			// Either hazard can leave the machine in the initramfs.
+			st.Expect = "ok|noboot"
+			st.Why = "valid layout, but hazard " + st.Hazard + " (known finding)"
+		}
 		if bios && st.Expect == "ok" && propHasTopLevelMount(st.Layout) {
 			st.Expect = "ok|noboot"
 			st.Why = "valid layout, but the root may be left mounted at reboot (known finding)"

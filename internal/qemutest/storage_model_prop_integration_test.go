@@ -177,6 +177,15 @@ for d in inv["disks"]:
     by_size.setdefault(d["size_bytes"], []).append(d["name"])
 sys.stderr.write("PROPINV " + json.dumps(
     [[d["name"], d["size_bytes"], d.get("serial", ""), d.get("transport", "")] for d in inv["disks"]]) + "\n")
+# What the deploy environment looks like before the agent touches anything:
+# the same listing the agent's bystander selection reads, and the md state.
+import subprocess
+for cmd in (["lsblk", "-dnlo", "NAME,TYPE"], ["cat", "/proc/mdstat"]):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True).stdout
+    except Exception as e:
+        out = "error: %s" % e
+    sys.stderr.write("PROPENV %s: %s\n" % (" ".join(cmd), " | ".join(out.split("\n"))))
 
 def dname(i):
     names = by_size.get(SPEC["sizes"][i], [])
@@ -290,6 +299,7 @@ echo "@@@ df"; df -B1 --output=source,size,used,target /
 echo "@@@ efi"; efibootmgr 2>&1 | head -40
 echo "@@@ growth"
 grep -h -i -E "growpart|resizefs|resize2fs|xfs_growfs" /var/log/cloud-init.log /var/log/cloud-init-output.log 2>/dev/null | tail -12
+echo "@@@ lsblkd"; lsblk -dnlo NAME,TYPE
 echo "@@@ kmsg"
 dmesg | grep -i -E "recovery|unclean|not clean|has not been unmounted" | head -20
 echo "@@@ unitlogs"
