@@ -562,11 +562,15 @@ requesting MAC, asks the `MachineProvider` for the current
   early-boot / one-shot cases (`kernelBootScript`,
   `chainloadCompleteScript`).
 
-Console params come from `consoleParams` (`handler.go:290-302`),
+Console params come from `consoleParams`,
 which reads the per-machine value the provider sourced from
-`NetBox.device_type.custom_fields.slagworks_kernel_params`. A literal
-`"none"` opts the host out of any `console=`; an unset value falls
-back to the historical `tty0 + ttyS1@115200`.
+`NetBox.device_type.custom_fields.slagworks_kernel_params`, trimmed of
+surrounding whitespace as the agent trims it. A literal
+`"none"` opts the host out of any `console=`; an unset value refuses a
+deploy and broadcasts to every candidate console for a commission. A
+value iPXE would read as more than kernel arguments (`checkKernelParams`)
+refuses the boot, and so does any other value on the deploy line that
+can't ride as one `key=value` argument (`checkKernelArgValue`).
 
 ### The image row and mode split
 

