@@ -18,10 +18,11 @@ const (
 
 // MaxMessageBytes is the read limit both ends of the site-worker link
 // set, so it is the largest message either end may send: the hub's
-// snapshot (commission data for every machine at the site) and each of
-// the worker's outbox observations travel as one message. A receiver
-// closes the connection with StatusMessageTooBig on anything larger,
-// without reading or answering it.
+// snapshot (commission data for every machine at the site), each of the
+// worker's outbox observations and each of its log batches travel as one
+// message. A receiver closes the connection with StatusMessageTooBig on
+// anything larger, without reading or answering it, so a sender must
+// keep every message under this bound.
 const MaxMessageBytes = 16 << 20
 
 // MaxObservationDataBytes caps a request body that the site worker queues

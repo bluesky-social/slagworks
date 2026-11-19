@@ -776,25 +776,36 @@ func (w *WSConn) drainLoop(ctx context.Context, conn *ws.Conn) {
 	}
 }
 
+// Bounds on one log_batch message. logBatchMaxBytes keeps a batch far
+// below ws.MaxMessageBytes whatever the envelope sizes (Ring.Drain drops
+// an envelope larger than the whole budget), with ample room for the
+// message wrapper. A quarter of the limit rather than all of it bounds
+// what one failed write loses and how long the hub's synchronous
+// log_batch dispatch holds up the connection, and still fits about 250
+// envelopes carrying a full 16 KiB exec capture each.
+const (
+	logBatchMaxEnvelopes       = 256
+	logBatchMaxBytes     int64 = ws.MaxMessageBytes / 4
+)
+
 // logRingDrainLoop is a per-connection goroutine that pumps log
 // envelopes from w.logRing to global as TypeLogBatch messages.
-// Drains in batches of up to logRingBatchMax envelopes per WS write;
-// blocks on Ring.Wait between batches. On send failure the batch is
-// dropped (the ring is the operator-facing buffer; we don't double-
-// buffer).
+// Drains up to logBatchMaxEnvelopes envelopes and logBatchMaxBytes
+// bytes per WS write; blocks on Ring.Wait between batches. On send
+// failure the batch is dropped (the ring is the operator-facing
+// buffer; we don't double-buffer).
 func (w *WSConn) logRingDrainLoop(ctx context.Context, conn *ws.Conn) {
-	const batchMax = 256
 	for {
 		if !w.logRing.Wait(ctx) {
 			// SIGTERM-flush: drain whatever's left so a routine
 			// restart doesn't unnecessarily lose buffered envelopes.
-			batch := w.logRing.Drain(batchMax)
+			batch := w.logRing.Drain(logBatchMaxEnvelopes, logBatchMaxBytes)
 			if len(batch) > 0 {
 				_ = w.sendLogBatch(ctx, conn, batch)
 			}
 			return
 		}
-		batch := w.logRing.Drain(batchMax)
+		batch := w.logRing.Drain(logBatchMaxEnvelopes, logBatchMaxBytes)
 		if len(batch) == 0 {
 			continue
 		}

@@ -611,7 +611,8 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Worker messages exceed Accept's 1 MiB default: an outbox
 	// observation carries an inventory report httpboot admits up to
-	// 10 MiB. Read up to the bound the worker reads the snapshot with.
+	// 10 MiB, and a log batch of exec output reaches several MiB. Read
+	// up to the bound the worker reads the snapshot with.
 	conn.SetReadLimit(MaxMessageBytes)
 
 	ctx := r.Context()

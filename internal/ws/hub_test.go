@@ -1454,6 +1454,59 @@ func TestHub_LogBatchDispatchedToHandler(t *testing.T) {
 	}
 }
 
+// A worker message larger than 1 MiB is legitimate: the worker ships its
+// log ring in log_batch messages of up to 256 envelopes, and one agent
+// exec envelope carries up to 16 KiB of stdout. The hub must read such a
+// message and keep serving the connection, not close it with
+// StatusMessageTooBig.
+func TestHub_AcceptsMultiMiBLogBatch(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop3", "worker-1")
+	logHandler := &fakeLogBatchHandler{}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, LogBatchHandler: logHandler})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	// 256 exec envelopes, each with a full 16 KiB stdout capture: about
+	// 4.3 MiB on the wire.
+	stdout := strings.Repeat("rsync: copied another file\n", (16<<10)/27)
+	batch := LogBatchMsg{}
+	for range 256 {
+		batch.Envelopes = append(batch.Envelopes, slogkit.Envelope{
+			TS: time.Unix(1_700_000_000, 0), Level: slogkit.LevelInfo, Source: slogkit.SourceAgent,
+			Msg: "exec", Extra: map[string]any{"argv": "rsync -a /mnt/image/ /target/", "stdout": stdout},
+		})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeLogBatch, "", batch); err != nil {
+		t.Fatalf("write log_batch: %v", err)
+	}
+	// The worker's next message on the same connection: an RPC whose
+	// reply proves the hub read past the batch and kept the connection.
+	if err := conn.WriteTyped(ctx, TypeClaimOp, "req-after-logs", ClaimOpMsg{OperationID: uuid.NewString()}); err != nil {
+		t.Fatalf("write claim_op after the log batch: %v", err)
+	}
+	env, err := conn.ReadMessage(ctx)
+	if err != nil {
+		t.Fatalf("hub dropped the connection on a multi-MiB log batch instead of processing it: %v", err)
+	}
+	if env.Type != TypeClaimOpResp || env.RequestID != "req-after-logs" {
+		t.Fatalf("got %q/%q, want the claim_op_response", env.Type, env.RequestID)
+	}
+	logHandler.mu.Lock()
+	defer logHandler.mu.Unlock()
+	if len(logHandler.received) != 1 || len(logHandler.received[0].Envelopes) != 256 {
+		t.Fatalf("log handler received %d batches, want one batch of 256 envelopes", len(logHandler.received))
+	}
+}
+
 func TestHub_OpUpdateHandlerErrorLoggedButNotPropagated(t *testing.T) {
 	auth := newFakeAuth()
 	auth.register("tok-1", "pop3", "worker-1")
