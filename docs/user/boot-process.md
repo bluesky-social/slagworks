@@ -68,7 +68,13 @@ a machine ever gets booted:
   allocation (`internal/dhcp/handler.go:944`). A pool with a nil
   `RangeStart` (reservations-only segment) still serves the full reservation
   set; a non-reserved MAC on such a segment gets no offer, which is what
-  lets a slice-owning peer answer in an active/active split-pool cage.
+  lets a slice-owning peer answer in an active/active split-pool cage. A
+  reservation also wins over another MAC's live lease on the same address
+  (the address moved to a new MAC in NetBox, or the reservation sits inside
+  the dynamic pool and a dynamic client drew it first): the handler revokes
+  that lease with a warning, and the other MAC is NAKed at its next renew
+  and re-DISCOVERs onto a different address. Until that renew, both devices
+  answer for the address on the wire.
 - **Known-MAC filter.** When a segment is non-promiscuous and `KnownMACs` is
   set, an unregistered MAC's DHCP is silently dropped at debug level
   (`handler.go:424-428`). A promiscuous segment (typical for OOB where you
