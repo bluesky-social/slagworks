@@ -468,10 +468,22 @@ func (h *Handler) deployBootScript(mac string) string {
 				// are emitted only when the auth key is present so a
 				// half-populated block can't produce a hostname-only
 				// cmdline the agent would misread.
+				//
+				// The hostname derives from the NetBox device name, which
+				// is free text. Spliced raw, a newline in it would add an
+				// iPXE command and a space would add kernel parameters, so
+				// a hostname that isn't valid drops both tokens (the agent
+				// skips enrollment). Global declines to mint for such a
+				// name; this keeps the script safe whatever the op holds.
 				if ts := p.TailscaleRuntime; ts != nil && ts.AuthKey != "" {
-					extra += " slagworks.tailscale_authkey=" + ts.AuthKey
-					if ts.Hostname != "" {
-						extra += " slagworks.tailscale_hostname=" + ts.Hostname
+					if ts.Hostname != "" && !model.ValidHostname(ts.Hostname) {
+						h.log.Warn("tailscale enrollment skipped: the op's tailnet hostname is not a valid hostname",
+							"machine_id", machineID, "op_id", opID, "hostname", ts.Hostname)
+					} else {
+						extra += " slagworks.tailscale_authkey=" + ts.AuthKey
+						if ts.Hostname != "" {
+							extra += " slagworks.tailscale_hostname=" + ts.Hostname
+						}
 					}
 				}
 				extra += bmcAdminUserKernelArg(machine, p)

