@@ -293,7 +293,8 @@ watch view. Registered only with the log store.
 
 1. The client sends one `log_stream_subscribe` envelope with any of
    `trace_id`, `machine_id`, `machine_name`, `op_id`, `sources` (`agent`,
-   `site`, `global`), `min_level`, `since` (RFC 3339) and `last_seen_id`.
+   `site`, `global`), `min_level` (`debug`, `info`, `warn` or `error`),
+   `since` (RFC 3339) and `last_seen_id`.
    It must arrive within 5 seconds.
 2. The server replies `subscribed`, sends matching rows from
    `log_envelopes` as `log_stream_envelope` (`{"id","envelope"}`), then

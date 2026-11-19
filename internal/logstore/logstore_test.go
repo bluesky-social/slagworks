@@ -97,6 +97,13 @@ func TestInsertBatchAndQuery(t *testing.T) {
 		}
 	})
 
+	t.Run("unknown min level is an error, not every level", func(t *testing.T) {
+		got, err := st.Query(ctx, logstore.QueryFilter{TraceID: trace, MinLevel: "warning"})
+		if err == nil {
+			t.Fatalf("min_level=warning: got %d envelopes and no error, want an error", len(got))
+		}
+	})
+
 	t.Run("last_seen_id resumes past prior id", func(t *testing.T) {
 		all, err := st.Query(ctx, logstore.QueryFilter{TraceID: trace})
 		if err != nil {
