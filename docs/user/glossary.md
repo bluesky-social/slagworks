@@ -264,9 +264,10 @@ Prevents stuck operations from blocking the machine indefinitely.
 
 Post-boot callback from the installed OS to the worker. A first-boot systemd
 oneshot service POSTs `{"machine_id":"...","op_id":"...","event":"phone_home"}`
-to `/api/v1/report`. The worker accepts it only for that machine's active
-deploy operation, completes the operation, and moves the machine from
-`deploying` to `running`.
+to `/api/v1/report`, retrying until it succeeds. The worker accepts it only for
+that machine's active deploy operation and only after the agent has reported
+the install finished (phase `awaiting_phone_home`), then completes the
+operation and moves the machine from `deploying` to `running`.
 
 ---
 

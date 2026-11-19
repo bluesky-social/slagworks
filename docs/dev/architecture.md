@@ -566,9 +566,9 @@ handler, and the executor):
 - `ReservedIPForMAC`, `IsOOBManagedNonMachine`, `MachineIDForMAC`.
 - `GetDHCPConfig`, `GetOOBConfig`, `GetSSHKeys`, `GetSiteInfo`.
 
-Observation intake (reached from the HTTP-boot handler when the agent
-POSTs `/api/v1/report` or `/api/v1/inventory`, or the installed OS's
-phone-home service POSTs its `phone_home` report to `/api/v1/report`):
+Observation intake (called from the HTTP-boot handler when the agent
+or the installed OS's phone-home service POSTs `/api/v1/report`, or
+the agent POSTs `/api/v1/inventory`):
 
 - `RecordDeployComplete` (382), `RecordPhoneHome` (404),
   `RecordCommissionReport` (434), `RecordInventoryReport` (446).

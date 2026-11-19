@@ -154,9 +154,9 @@ type MachineProvider interface {
 	BootActionForMAC(mac string) BootAction
 	MachineIDForMAC(mac string) (uuid.UUID, bool)
 	// MachineByMAC returns the machine snapshot for a MAC, or nil for an
-	// unknown MAC. The .State field reflects any local override
-	// (RecordPhoneHome). Callers read the per-machine field they need
-	// (SystemUUID, StorageScript, KernelParams, NetworkScript,
+	// unknown MAC. The .State field reflects any local override (an
+	// accepted phone_home report). Callers read the per-machine field
+	// they need (SystemUUID, StorageScript, KernelParams, NetworkScript,
 	// Interfaces, FQDN) directly off the returned snapshot — treating the
 	// zero value of each as "unset" with the same semantics the old
 	// per-field accessors documented: empty SystemUUID == never
