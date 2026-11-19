@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/bluesky-social/slagworks/internal/agent"
@@ -224,7 +225,7 @@ func parseTransceiver(output string) *TransceiverInfo {
 //  4. Supported ports fallback (for switch ASICs where port type is "other")
 func classifyInterfaceType(driver, speed, portType, supportedPorts string, xcvr *TransceiverInfo) string {
 	driver = strings.ToLower(strings.TrimSpace(driver))
-	speed = strings.ToLower(strings.TrimSpace(speed))
+	mbps := speedMbps(speed)
 	portType = strings.ToLower(strings.TrimSpace(portType))
 	supportedPorts = strings.ToLower(strings.TrimSpace(supportedPorts))
 
@@ -241,7 +242,7 @@ func classifyInterfaceType(driver, speed, portType, supportedPorts string, xcvr 
 		connector := strings.ToLower(xcvr.Connector)
 		wavelength := strings.ToLower(strings.TrimSpace(xcvr.Wavelength))
 		xcvrType := strings.ToLower(xcvr.TransceiverType)
-		if t := classifyFromTransceiver(speed, connector, wavelength, xcvrType); t != "" {
+		if t := classifyFromTransceiver(mbps, connector, wavelength, xcvrType); t != "" {
 			return t
 		}
 	}
@@ -254,36 +255,58 @@ func classifyInterfaceType(driver, speed, portType, supportedPorts string, xcvr 
 		isFibre = strings.Contains(supportedPorts, "fibre")
 	}
 
-	// 3. Speed-based classification (descending prefix length to avoid overlap)
-	switch {
-	case strings.HasPrefix(speed, "100000"):
+	// 3. Speed-based classification on the exact rate. String prefixes
+	// overlap across tiers ("400000Mb/s" begins with "40000"), so a rate
+	// with no case here is left unclassified rather than matched by prefix.
+	switch mbps {
+	case 400000:
+		// ethtool cannot tell QSFP-DD from OSFP or QSFP112; QSFP-DD is the
+		// common 400G cage.
+		return "400gbase-x-qsfpdd"
+	case 100000:
 		if isFibre {
 			return "100gbase-x-qsfp28"
 		}
 		return "100gbase-x-cxp"
-	case strings.HasPrefix(speed, "50000"):
+	case 50000:
 		return "50gbase-x-sfp28"
-	case strings.HasPrefix(speed, "40000"):
+	case 40000:
 		return "40gbase-x-qsfpp"
-	case strings.HasPrefix(speed, "25000"):
+	case 25000:
 		if isFibre {
 			return "25gbase-x-sfp28"
 		}
 		return "25gbase-kr"
-	case strings.HasPrefix(speed, "10000"):
+	case 10000:
 		if isFibre {
 			return "10gbase-x-sfpp"
 		}
 		return "10gbase-t"
-	case strings.HasPrefix(speed, "1000"):
+	case 1000:
 		if isFibre {
 			return "1000base-x-sfp"
 		}
 		return "1000base-t"
-	case strings.HasPrefix(speed, "100m"), strings.HasPrefix(speed, "100 "):
+	case 100:
 		return "100base-tx"
 	}
 	return ""
+}
+
+// speedMbps returns the leading decimal rate in Mb/s of an ethtool speed
+// ("400000Mb/s") or link mode ("25000baseSR/Full"), or 0 when there is
+// none ("Unknown!").
+func speedMbps(s string) int {
+	s = strings.TrimSpace(s)
+	end := strings.IndexFunc(s, func(r rune) bool { return r < '0' || r > '9' })
+	if end < 0 {
+		end = len(s)
+	}
+	n, err := strconv.Atoi(s[:end])
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // maxSupportedSpeed extracts the highest speed from ethtool "Supported link modes" lines.
@@ -291,15 +314,7 @@ func classifyInterfaceType(driver, speed, portType, supportedPorts string, xcvr 
 func maxSupportedSpeed(modes []string) string {
 	var maxMbps int
 	for _, mode := range modes {
-		var mbps int
-		for _, c := range mode {
-			if c >= '0' && c <= '9' {
-				mbps = mbps*10 + int(c-'0')
-			} else {
-				break
-			}
-		}
-		if mbps > maxMbps {
+		if mbps := speedMbps(mode); mbps > maxMbps {
 			maxMbps = mbps
 		}
 	}
@@ -317,14 +332,14 @@ func maxSupportedSpeed(modes []string) string {
 // The xcvrType string (e.g., "100G Base-LR4", "40G Active Cable") resolves
 // ambiguity when connector alone isn't enough (AOC cables use "no separable"
 // like DACs but are active optical).
-func classifyFromTransceiver(speed, connector, wavelength, xcvrType string) string {
+func classifyFromTransceiver(mbps int, connector, wavelength, xcvrType string) string {
 	isLC := strings.Contains(connector, "lc")
 	isDAC := strings.Contains(connector, "no separable")
 	isShortReach := strings.Contains(wavelength, "850")
 	isLR := strings.Contains(xcvrType, "lr") || strings.Contains(xcvrType, "long reach")
 
-	switch {
-	case strings.HasPrefix(speed, "100000"):
+	switch mbps {
+	case 100000:
 		switch {
 		case isDAC:
 			return "100gbase-cr4"
@@ -335,7 +350,7 @@ func classifyFromTransceiver(speed, connector, wavelength, xcvrType string) stri
 		default:
 			return "100gbase-x-qsfp28"
 		}
-	case strings.HasPrefix(speed, "25000"):
+	case 25000:
 		switch {
 		case isLC && isShortReach:
 			return "25gbase-x-sfp28" // SR
@@ -344,7 +359,7 @@ func classifyFromTransceiver(speed, connector, wavelength, xcvrType string) stri
 		default:
 			return "25gbase-x-sfp28"
 		}
-	case strings.HasPrefix(speed, "10000"):
+	case 10000:
 		switch {
 		case isLC && isShortReach:
 			return "10gbase-x-sfpp" // SR
@@ -353,7 +368,7 @@ func classifyFromTransceiver(speed, connector, wavelength, xcvrType string) stri
 		default:
 			return "10gbase-x-sfpp"
 		}
-	case strings.HasPrefix(speed, "1000"):
+	case 1000:
 		switch {
 		case isLC && isShortReach:
 			return "1000base-x-sfp" // SX

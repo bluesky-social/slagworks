@@ -142,11 +142,12 @@ just before deploy (see `cmd/slagworks-agent/script_exec.go:9-72`).
   (`validateMountPoint` in `storage/validate.go`), because the
   planner and the fstab writer use them verbatim.
 
-Partitions declare `name`, `size` (`"512M"`, `"100G"`, `"rest"`),
-optional `fs` (`vfat`, `ext4`, `xfs`, `swap`), and two boolean
-partition-type flags: `bootable` (EFI System Partition, GPT type
-EF00) and `bios_grub` (BIOS boot partition, GPT type EF02, mutually
-exclusive with `fs`/`bootable`) (`storage/layout.go:22-33`,
+Partitions declare `name`, `size` (`"512M"`, `"100G"`: a whole
+number with a `K`/`M`/`G`/`T` suffix, at least `4K`; or `"rest"`,
+last partition only), optional `fs` (`vfat`, `ext4`, `xfs`, `swap`), and
+two boolean partition-type flags: `bootable` (EFI System Partition,
+GPT type EF00) and `bios_grub` (BIOS boot partition, GPT type EF02,
+mutually exclusive with `fs`/`bootable`) (`storage/layout.go:22-33`,
 `storage/plan.go:294-307`).
 
 Header directives on the script:
@@ -163,7 +164,8 @@ Header directives on the script:
 ### The executor
 
 `storage.Plan(layout, inventory)` is pure: it validates the layout
-against a `[]BlockDevice` inventory (referenced disks must exist),
+against a `[]BlockDevice` inventory (referenced disks must exist and
+their partitions must fit them, `storage/size.go`),
 assigns `/dev/mdN` names to RAID arrays in sorted order, and returns
 an ordered `[]Command` (`storage/plan.go:28-95`). Phases: partition,
 create RAID, format, mount (deepest last).

@@ -452,14 +452,35 @@ func NewHub(cfg HubConfig) *Hub {
 // op_deltas scoped to the new membership (see workerConn.send). The cache
 // is updated before the fan-out starts, which the opReady handoff in send
 // relies on.
+//
+// A snapshot whose SeqNum is lower than the cached one is not fanned out:
+// the slug's connections are closed instead (see below).
 func (h *Hub) Push(slug string, snap model.SiteSnapshot) {
 	h.mu.Lock()
+	prev, cached := h.snapshots[slug]
 	h.snapshots[slug] = snap
 	conns := make([]*workerConn, 0, len(h.connections[slug]))
 	for c := range h.connections[slug] {
 		conns = append(conns, c)
 	}
 	h.mu.Unlock()
+
+	// The slug's counter went backwards: its site config was deleted and
+	// recreated (the new row counts from 0 again) or global's database was
+	// restored. A connected worker holds the higher SeqNum and drops a
+	// lower one on a live connection, where fan-outs can arrive out of
+	// order, so it would stay on the stale site. Close its connection
+	// instead: the worker reconnects, and the hello reply carrying snap is
+	// the first snapshot on the new connection, which it adopts whatever
+	// its SeqNum (worker.Cache.AdoptSnapshot).
+	if cached && snap.SeqNum < prev.SeqNum {
+		h.log.Warn("site snapshot sequence went backwards; closing the site's worker connections so they reconnect and adopt the new snapshot",
+			"slug", slug, "cached_seq", prev.SeqNum, "new_seq", snap.SeqNum, "workers", len(conns))
+		for _, c := range conns {
+			_ = c.conn.CloseNow()
+		}
+		return
+	}
 
 	for _, c := range conns {
 		go c.send(snap)
@@ -1223,10 +1244,19 @@ func (c *workerConn) handleHello(ctx context.Context, hello HelloMsg) error {
 		// skipped_no_change and never Pushes, leaving this slug absent
 		// from the cache. machineInSlug reads that cache as the op-stream
 		// confidentiality gate, so an uncached slug would silently drop
-		// every op_delta for this worker until an unrelated Push. Guard
-		// against clobbering a newer concurrently-Pushed snapshot.
+		// every op_delta for this worker until an unrelated Push.
+		//
+		// A snapshot cached while the rebuild was pending (by a Push, or by
+		// another cold hello) is never older than built: the dispatcher
+		// pushes every content change before returning it, and a cold
+		// hello only fills an empty slot. Keep it and answer the hello
+		// from it.
+		// Comparing SeqNums instead would put a pre-reset snapshot back
+		// when the slug's counter went backwards in the meantime.
 		c.hub.mu.Lock()
-		if cur, ok := c.hub.snapshots[c.slug]; !ok || cur.SeqNum < built.SeqNum {
+		if cur, ok := c.hub.snapshots[c.slug]; ok {
+			snap = cur
+		} else {
 			c.hub.snapshots[c.slug] = built
 		}
 		c.hub.mu.Unlock()

@@ -31,7 +31,7 @@ type Device struct {
 // Partition describes a GPT partition on a disk.
 type Partition struct {
 	Name     string `json:"name"`
-	Size     string `json:"size"`               // "512M", "100G", "rest"
+	Size     string `json:"size"`               // "512M", "100G" (K/M/G/T suffix), or "rest" (last partition only)
 	FS       string `json:"fs,omitempty"`       // "vfat", "ext4", "xfs", "swap"
 	Bootable bool   `json:"bootable,omitempty"` // true for ESP partitions (GPT type EF00)
 	// BIOSGrub marks a GPT BIOS boot partition (type EF02): a tiny

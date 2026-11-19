@@ -280,7 +280,11 @@ Interfaces and cables are more permissive: `ReconcileInterfaces` will
 create, patch (including rename), and delete NetBox interfaces to match
 the NICs the agent reports, but with a protected-set
 (`isProtectedInterface`) that leaves management, LAG, and virtual
-interfaces alone. On switches (device role `leaf`, `spine`,
+interfaces alone. Setting a NIC's MAC is two writes (assign a MAC
+object, then mark it primary); a run that finds the MAC object already
+assigned but not primary marks it primary instead of creating another.
+That includes the protected `ipmi` row matching the BMC MAC, the one
+write reconcile makes to a protected row. On switches (device role `leaf`, `spine`,
 `oob-switch`) interface names and the row set are operator-owned: the
 commission initrd's kernel names (`enp3s0npN`, `eno1`) are not the
 operational `swpN`/`eth0`, so reconcile only patches non-name fields of
@@ -467,7 +471,9 @@ cast pipeline, and the `SourceSOL` constant no longer exists.
   token (`register`, 373).
 - Fans snapshot pushes out to every connected worker for the slug
   (`Push`, 301) — one goroutine per worker, per-connection write
-  order preserved via `workerConn.writeMu`.
+  order preserved via `workerConn.writeMu`. A push whose SeqNum is
+  below the cached one closes the slug's connections instead, so each
+  worker reconnects and adopts the new snapshot from its hello reply.
 - On hello, sends a snapshot or `no_change`. Coalesces concurrent
   hello-triggered rebuilds through a
   `singleflight.Group` (`helloRebuild`, 226).
@@ -551,7 +557,11 @@ under the cache lock:
   snapshot (see [WebSocket transport](#websocket-transport)).
 
 The cache rejects an out-of-order snapshot (SeqNum equal or less than
-the current). It runs `imagepull.SyncImages` synchronously under
+the current), except the first snapshot on each connection, which
+`WSConn` applies with `AdoptSnapshot` whatever its SeqNum: it is
+global's current view, and global's per-site counter can go backwards
+(site config deleted and recreated, database restored, worker pointed
+at another global). It runs `imagepull.SyncImages` synchronously under
 `imageSyncMu` on every apply (`cache.go:578`) — that is what pulls
 images to disk if the snapshot points at a new SHA. `OnSnapshotApplied`
 callbacks fire outside the lock; today the cast manager and DHCP

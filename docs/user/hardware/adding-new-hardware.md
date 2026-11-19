@@ -183,6 +183,11 @@ the shape; the interesting bits:
   (marks the ESP, GPT type EF00) or `bios_grub: true` (marks a legacy BIOS
   boot partition, GPT type EF02, for the legacy-GRUB install path). The
   latter two are mutually exclusive with `fs`.
+- A fixed `size` needs a `K`, `M`, `G` or `T` suffix (a bare number is a
+  sector count to `sgdisk`), only the last partition may be `"rest"`, and
+  the partitions must fit the disk; the agent refuses a layout that breaks
+  any of these before touching a disk (see
+  [Storage scripts](../storage-scripts.md)).
 - Mounts are keyed by mount point and reference a device or partition name
   from the layout. The planner sorts by depth so `/` mounts before
   `/boot/efi`. A mount point must be a clean absolute path (`/var/lib`, not

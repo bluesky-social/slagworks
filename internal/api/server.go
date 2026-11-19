@@ -729,8 +729,9 @@ func (s *Server) scrubTerminalCredentials() {
 // machine row by netbox_device_id.
 //
 // Returns 400 for malformed input, 404 when the hostname doesn't resolve
-// or there's no slagworks row for the resolved device, 503 when NetBox
-// integration isn't configured but a hostname was supplied.
+// or there's no slagworks row for the resolved device, 409 when several
+// NetBox devices carry the hostname, 503 when NetBox integration isn't
+// configured but a hostname was supplied.
 func (s *Server) resolveMachineParam(c *echo.Context) (uuid.UUID, error) {
 	raw := c.Param("id")
 	if id, err := uuid.Parse(raw); err == nil {
@@ -744,10 +745,15 @@ func (s *Server) resolveMachineParam(c *echo.Context) (uuid.UUID, error) {
 		return uuid.Nil, echo.NewHTTPError(http.StatusServiceUnavailable,
 			"hostname resolution requires NetBox integration; pass a machine UUID instead")
 	}
-	// siteID 0 means "any site" — NetBox names like `kworker-l34-1.pop1`
-	// already encode the site in the hostname, so cross-site uniqueness
-	// is enforced by the name itself.
+	// siteID 0 means "any site". Names like `kworker-l34-1.pop1` usually
+	// encode the site, but NetBox only enforces uniqueness within a site,
+	// so a name two sites share is refused rather than guessed.
 	dev, err := s.netbox.FindDeviceByName(c.Request().Context(), raw, 0)
+	var ambig *netbox.AmbiguousNameError
+	if errors.As(err, &ambig) {
+		return uuid.Nil, echo.NewHTTPError(http.StatusConflict,
+			ambig.Error()+"; pass the machine UUID instead")
+	}
 	if err != nil {
 		return uuid.Nil, echo.NewHTTPError(http.StatusInternalServerError,
 			fmt.Sprintf("netbox lookup: %v", err))

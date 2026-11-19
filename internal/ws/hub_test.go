@@ -452,6 +452,124 @@ func TestHub_PushFansOutToAllWorkers(t *testing.T) {
 	}
 }
 
+// TestHub_PushWithLowerSeqClosesWorkerConns: a pushed snapshot whose SeqNum
+// is below the cached one (site config deleted and recreated, database
+// restored) would be dropped as stale by a connected worker. The hub closes
+// the slug's connections instead of fanning it out, and the reconnect's
+// hello reply carries the new snapshot.
+func TestHub_PushWithLowerSeqClosesWorkerConns(t *testing.T) {
+	h, auth, _ := newTestHub(t)
+	auth.register("tok-1", "pop3", "worker-1")
+	h.Push("pop3", model.SiteSnapshot{SeqNum: 57, Site: model.SiteInfo{Slug: "pop3"}})
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	hello := HelloMsg{WorkerID: "worker-1", LastSeqNum: 57, Proto: OpStreamProto}
+	if err := conn.WriteTyped(ctx, TypeHello, "", hello); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // no_change, op_resync
+		if _, err := conn.ReadMessage(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h.Push("pop3", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"}})
+
+	env, err := conn.ReadMessage(ctx)
+	if err == nil {
+		t.Fatalf("got %s after a push with a lower SeqNum, want the connection closed", env.Type)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("connection still open after a push with a lower SeqNum")
+	}
+
+	conn2 := dialHub(t, srv, "tok-1")
+	if conn2 == nil {
+		t.Fatal("redial failed")
+	}
+	defer conn2.CloseNow()
+	if err := conn2.WriteTyped(ctx, TypeHello, "", hello); err != nil {
+		t.Fatal(err)
+	}
+	env, err = conn2.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg SnapshotMsg
+	if env.Type != TypeSnapshot || json.Unmarshal(env.Data, &msg) != nil || msg.Snapshot.SeqNum != 1 {
+		t.Fatalf("hello reply after reconnect = %s %s, want snapshot seq 1", env.Type, env.Data)
+	}
+}
+
+// pushDuringRebuild stands in for the rebuild actor when the slug's counter
+// resets while a cold hello waits: the hello's rebuild produced old, and
+// before the hello goroutine resumed, the actor went on to push the
+// recreated site's first snapshot.
+type pushDuringRebuild struct {
+	hub      *Hub
+	old, new model.SiteSnapshot
+}
+
+func (r *pushDuringRebuild) RebuildAndWait(context.Context, string) (model.SiteSnapshot, error) {
+	r.hub.Push("pop3", r.new)
+	return r.old, nil
+}
+
+// TestHub_ColdHelloKeepsSnapshotPushedDuringRebuild: a cold hello's rebuild
+// result must not replace a snapshot Push cached while the rebuild was
+// pending, even one with a lower SeqNum (the slug's counter reset). The
+// hub would otherwise answer this and every later hello with the
+// pre-reset site.
+func TestHub_ColdHelloKeepsSnapshotPushedDuringRebuild(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop3", "worker-1")
+	reb := &pushDuringRebuild{
+		old: model.SiteSnapshot{SeqNum: 57, Site: model.SiteInfo{Slug: "pop3"}},
+		new: model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"}},
+	}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: reb, RebuildTimeout: 2 * time.Second})
+	reb.hub = h
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeHello, "", HelloMsg{WorkerID: "worker-1", Proto: OpStreamProto}); err != nil {
+		t.Fatal(err)
+	}
+	// The hello reply precedes the op_resync; the pushed snapshot's
+	// fan-out may land on either side of it.
+	for {
+		env, err := conn.ReadMessage(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if env.Type == TypeOpResync {
+			break
+		}
+		var msg SnapshotMsg
+		if env.Type == TypeSnapshot && json.Unmarshal(env.Data, &msg) == nil && msg.Snapshot.SeqNum != 1 {
+			t.Errorf("worker was sent snapshot seq %d, want only the pushed seq 1", msg.Snapshot.SeqNum)
+		}
+	}
+	if snap, _ := h.snapshotFor("pop3"); snap.SeqNum != 1 {
+		t.Errorf("hub caches snapshot seq %d after the cold hello, want the pushed seq 1", snap.SeqNum)
+	}
+}
+
 func TestHub_UnregisterOnDisconnect(t *testing.T) {
 	h, auth, _ := newTestHub(t)
 	auth.register("tok-1", "pop3", "worker-1")
