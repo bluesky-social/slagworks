@@ -65,7 +65,7 @@ This is the same format the old MAAS commissioning scripts produced. It has prov
 }
 ```
 
-Partition `size` is `"512M"`, `"100G"`, or `"rest"` (fill remaining). `fs` is optional — omit it for raw partitions (e.g., RAID members). `bootable` marks the ESP partition.
+Partition `name` is the device node the kernel gives the partition at that position on that disk: the disk name plus the partition number, with a `p` between them when the disk name ends in a digit (`sda2`, `nvme0n1p2`, `mmcblk0p1`). Mounts and RAID members find a partition by this name, so the agent refuses, before touching any disk, a layout where a name is anything else (a label such as `root`, `nvme0n11`, `sdap1`, or the names of two partitions swapped). Partition `size` is `"512M"`, `"100G"`, or `"rest"` (fill remaining). `fs` is optional — omit it for raw partitions (e.g., RAID members). `bootable` marks the ESP partition.
 
 A `vfat` partition is formatted FAT32, which needs at least 65525 clusters, so its minimum size depends on the disk's logical sector size: `33M` on a disk with 512-byte sectors, `257M` on a 4Kn disk (4096-byte sectors). Below that, `mkfs.fat` would format the partition anyway and UEFI firmware could not read it, so the agent refuses the layout before touching any disk, naming the minimum ("make the partition at least 257M"). The inventory a script reads does not carry the sector size, so size an ESP that may land on a 4Kn disk for 4Kn; the `512M` ESPs on this page fit both.
 
@@ -269,6 +269,7 @@ Implementation notes:
 
 - The layout JSON uses map keys for device names. `Plan()` must sort or toposort explicitly — Go map iteration is nondeterministic.
 - Only one partition per disk may use `"rest"`. `Plan()` rejects layouts with multiple `"rest"` partitions on the same disk.
+- `Plan()` creates and formats partition N of a disk at the kernel's node for that position, but mounts, RAID members, fstab and the bootloader reach a partition through its declared name, so it rejects a partition whose name is not that node.
 - `Plan()` rejects a `vfat` partition smaller than the FAT32 minimum for its disk's logical sector size (`BlockDevice.LogicalSectorBytes`, from `lsblk`'s `LOG-SEC` column), since `mkfs.fat -F 32` formats an undersized partition with only a warning.
 
 ### Execution
