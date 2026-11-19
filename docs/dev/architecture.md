@@ -295,7 +295,8 @@ Types are in `internal/model/snapshot.go`:
 - `SnapshotInterface` (`snapshot.go:126`) — `Type` is one of
   `physical`, `ipmi`, `lag`; only physical NICs are matched by DHCP.
   A `mgmt_only` interface is `ipmi` only when the device has a canonical
-  NetBox `oob_ip`; on a BMC-less device it remains a physical host/PXE NIC.
+  NetBox `oob_ip`; on a BMC-less device the flag is ignored, so a NIC
+  remains a physical host/PXE NIC and a bond remains `lag`.
 - `ContentHash()` (`snapshot.go:280`) — SeqNum stripped, slices sorted
   in copy, sha256. This is the dispatcher's push-decision key.
 
@@ -556,9 +557,12 @@ service POSTs `/api/v1/phone-home`):
   `awaiting_phone_home` clobber guard (documented in the
   state-machine doc).
 
-Outbox handling: every observation and op update the cache accepts
-is appended to a durable outbox row on the local SQLite (via
-`LocalDB.AppendOutbox`) and queued for the WebSocket drain
+Outbox handling: every observation the cache accepts is appended to
+a durable outbox row on the local SQLite (via `LocalDB.AppendOutbox`)
+and deleted only when global acks it; op updates are queued in
+memory only and are never acknowledged, so anything that must not be
+lost (commission reports, the phone-home that completes a deploy)
+rides an observation. Both are queued for the WebSocket drain
 (`cache.go:334 appendObservation`, `685 DrainOutbox`, `805 RequeueOutbox`,
 `824 AckObservation`, `843 ReloadOutboxFromDisk`). Retry backoff is in
 `armRetryTimerLocked` (724) and `RequeueRejected` (772). This is why

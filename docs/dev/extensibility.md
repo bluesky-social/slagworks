@@ -128,7 +128,10 @@ just before deploy (see `cmd/slagworks-agent/script_exec.go:9-72`).
   Disks carry `partitions[]`; raids carry `level`, `members[]`, and
   an optional filesystem for the array itself.
 - `mounts` — a map from mount point (`/`, `/boot/efi`, ...) to a
-  `Device` reference by name.
+  `Device` reference by name. Mount points must be clean absolute
+  paths with no whitespace, control characters or backslashes
+  (`validateMountPoint` in `storage/validate.go`), because the
+  planner and the fstab writer use them verbatim.
 
 Partitions declare `name`, `size` (`"512M"`, `"100G"`, `"rest"`),
 optional `fs` (`vfat`, `ext4`, `xfs`, `swap`), and two boolean

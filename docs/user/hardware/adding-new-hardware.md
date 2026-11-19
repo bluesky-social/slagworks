@@ -104,9 +104,10 @@ and set the device's `oob_ip` to the IP assigned to that interface. Slagworks
 uses `oob_ip` as the canonical BMC-presence signal; names vary too much across
 vendors and operator habit (`ipmi`, `ipmi0`, `bmc`, `mgmt`, `lom`,
 `dedicated`) to key on. A `mgmt_only` interface on a device with `oob_ip`
-becomes type `ipmi`. On a BMC-less device, such as an SN2700 switch, a
-`mgmt_only` host management/PXE NIC remains type `physical` and participates
-in DHCP machine identity.
+becomes type `ipmi`. On a BMC-less device, such as an SN2700 switch,
+`mgmt_only` does not change the type: a `mgmt_only` host management/PXE NIC
+remains type `physical` and participates in DHCP machine identity, and a
+`mgmt_only` bond (NetBox type `lag`) remains type `lag`.
 
 A BMC-less device gets console capture (`slagctl machine logs --sol`) only
 through its serial console: model a console port on the device and cable it
@@ -163,14 +164,18 @@ the shape; the interesting bits:
   `partitions: […]`) or a RAID array (`type: "raid"`, `level`, `members`).
   Set `boot: true` on a disk that carries the ESP so the layout is
   self-describing (the flag itself is advisory today).
-- Partitions carry `name`, `size` (`"512M"`, `"100G"`, or `"rest"`), an
+- Partitions carry `name` (the kernel's device node for that position on
+  the disk: `sda2`, `nvme0n1p2`), `size` (`"512M"`, `"100G"`, or `"rest"`), an
   optional `fs` (`vfat`, `ext4`, `xfs`, `swap`), and one of `bootable: true`
   (marks the ESP, GPT type EF00) or `bios_grub: true` (marks a legacy BIOS
   boot partition, GPT type EF02, for the legacy-GRUB install path). The
   latter two are mutually exclusive with `fs`.
 - Mounts are keyed by mount point and reference a device or partition name
   from the layout. The planner sorts by depth so `/` mounts before
-  `/boot/efi`.
+  `/boot/efi`. A mount point must be a clean absolute path (`/var/lib`, not
+  `var/lib`, `/var/lib/` or `/var//lib`) with no whitespace, control
+  characters or backslashes; the planner rejects anything else (see
+  [Storage Templates](../storage-scripts.md)).
 
 The planner (`internal/storage/plan.go`) translates the JSON into an ordered
 list of `sgdisk`, `mdadm`, `mkfs.*`, `wipefs` and `dd` (which clear every

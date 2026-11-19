@@ -660,15 +660,15 @@ func classifyInterface(i netbox.Interface) string {
 // NetBox's mgmt_only flag describes traffic purpose, not hardware ownership: on
 // a BMC-less switch it marks the host OS management/PXE NIC. device.oob_ip is
 // the canonical BMC-presence signal, so only a machine that actually has a BMC
-// may classify its mgmt_only interfaces as ipmi. This keeps the BMC-less NIC in
-// the worker's machine MAC index and prevents the OOB DHCP safety gate from
-// suppressing its PXE bootfile.
+// may classify its mgmt_only interfaces as ipmi. On a BMC-less device the flag
+// is ignored and the interface classifies by its NetBox type alone: a NIC is
+// physical (staying in the worker's machine MAC index, so the OOB DHCP safety
+// gate does not suppress its PXE bootfile) and a bond is lag.
 func classifyMachineInterface(i netbox.Interface, hasBMC bool) string {
-	kind := classifyInterface(i)
-	if kind == "ipmi" && !hasBMC {
-		return "physical"
+	if !hasBMC {
+		i.MgmtOnly = false
 	}
-	return kind
+	return classifyInterface(i)
 }
 
 // newPrefixGatewayResolver returns a function mapping an interface CIDR to
