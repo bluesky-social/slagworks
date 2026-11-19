@@ -57,6 +57,13 @@ func acceptOperatorStream(c *echo.Context) (*websocket.Conn, error) {
 // resume past disconnect with last_seen_id. Every query, backfill
 // included, holds back rows received in the last liveTailWatermark, so
 // those arrive on a later poll rather than in the first page.
+//
+// The filter is built once and every query uses it unchanged apart from
+// the cursor. The cursor moves past every id a query did not return, so
+// a row is delivered only if the first query to reach its id admits it:
+// a filter that admitted more rows later in the stream (as the since
+// bound once did, ts-only until the first empty page) would lose the
+// rows it had already stepped over.
 func (s *Server) handleLogsStream(c *echo.Context) error {
 	if s.logStore == nil {
 		return echo.NewHTTPError(http.StatusServiceUnavailable, "log stream not available")
@@ -127,12 +134,7 @@ func (s *Server) handleLogsStream(c *echo.Context) error {
 			return nil
 		}
 		if len(results) == 0 {
-			// The backlog is consumed: switch to the live tail and sleep
-			// before the next poll. The live tail stops bounding since
-			// on the emitter's ts alone: the cursor already bounds what
-			// is new, and a line from an emitter whose clock runs behind
-			// must stream once global has received it.
-			filter.SinceOrReceived = true
+			// The backlog is consumed: sleep before the next poll.
 			select {
 			case <-ctx.Done():
 				return nil
@@ -158,9 +160,6 @@ func buildFilter(sub ws.LogStreamSubscribeMsg) (logstore.QueryFilter, error) {
 		Sources:     normalizeSources(sub.Sources),
 		MinLevel:    strings.ToLower(sub.MinLevel),
 		LastSeenID:  sub.LastSeenID,
-		// A resume continues the live tail past the client's cursor, so
-		// it bounds since the way the live tail does.
-		SinceOrReceived: sub.LastSeenID > 0,
 	}
 	if err := logstore.ValidateMinLevel(sub.MinLevel); err != nil {
 		return f, err
