@@ -31,7 +31,7 @@ func TestRegisterSiteWorker_MintsToken(t *testing.T) {
 func TestRegisterSiteWorker_RotatesOnReregister(t *testing.T) {
 	st := testStore(t)
 
-	_, token1, err := st.RegisterSiteWorker("pop3", "worker-1", "worker-1.pop3")
+	first, token1, err := st.RegisterSiteWorker("pop3", "worker-1", "worker-1.pop3")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,10 +43,16 @@ func TestRegisterSiteWorker_RotatesOnReregister(t *testing.T) {
 	if token1 == token2 {
 		t.Fatal("re-registration should mint a new token")
 	}
-	// Row identity (first.ID vs second.ID) is GORM-decided; the
-	// (slug, worker_id) upsert handles dedupe. We verify the rotation
-	// by confirming the new FQDN landed and the old token no longer
-	// authenticates.
+	// Rotation updates the existing row, so the returned struct is that
+	// row: same id and first_seen_at, new fqdn, and the old token no
+	// longer authenticates.
+	if second.ID != first.ID {
+		t.Fatalf("re-registration returned id %s; the registration's id is %s", second.ID, first.ID)
+	}
+	if !second.FirstSeenAt.Equal(first.FirstSeenAt) {
+		t.Fatalf("re-registration returned first_seen_at %s; the registration's is %s",
+			second.FirstSeenAt, first.FirstSeenAt)
+	}
 	if second.FQDN != "worker-1.pop3-renamed" {
 		t.Fatalf("fqdn not refreshed: %q", second.FQDN)
 	}
