@@ -693,7 +693,8 @@ func checkAdminUser(users []User, adminUser string) error {
 }
 
 // ListUsers parses `ipmitool user list 1` output into User records.
-// ipmitool's list format is space-separated columns:
+// ipmitool's list format is fixed-width columns (parseUserList has the
+// byte-level detail):
 //
 //	ID  Name              Callin   Link Auth  IPMI Msg  Channel Priv Limit
 //	1                     true     false      false     ADMINISTRATOR
@@ -724,9 +725,19 @@ func ListUsers(ctx context.Context, opt Options) ([]User, error) {
 // blank, and `Fields` collapses runs of whitespace, so the columns
 // shift when name is empty.
 //
-// The header looks like:
+// In a terminal the header looks like:
 //
 //	ID  Name             Callin  Link Auth  IPMI Msg   Channel Priv Limit
+//
+// but that is a rendering: ipmitool prints it as a C literal holding two
+// TABs ("ID  Name\t     Callin  Link Auth\tIPMI Msg   Channel Priv Limit",
+// lib/ipmi_user.c dump_user_access), while each data row is
+// printf("%-4d%-17s%-8s%-11s%-11s%-s") and holds only spaces. The header's
+// offsets match the rows' columns (Name 4, Callin 21, Channel 51) only once
+// the TABs are expanded to 8-column stops, so the header is expanded before
+// its offsets are taken; on the raw bytes Callin lands at 14 and Channel at
+// 43, which truncates names and misses every privilege. The rows are sliced
+// as printed.
 //
 // We capture the start of "Name" and the start of "Callin" — those
 // bracket the Name field. The privilege string is everything from
@@ -751,6 +762,7 @@ func parseUserList(s string) ([]User, error) {
 	if headerLine == "" {
 		return nil, errors.New("no header row in user list output")
 	}
+	headerLine = expandTabs(headerLine)
 
 	nameStart := strings.Index(headerLine, "Name")
 	callinStart := strings.Index(headerLine, "Callin")
@@ -790,6 +802,20 @@ func parseUserList(s string) ([]User, error) {
 		return nil, errors.New("no user rows parsed (output format unexpected)")
 	}
 	return users, nil
+}
+
+// expandTabs replaces each TAB in s with the spaces that reach the next
+// 8-column tab stop, as a terminal renders it.
+func expandTabs(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\t' {
+			b.WriteByte(s[i])
+			continue
+		}
+		b.WriteString(strings.Repeat(" ", 8-b.Len()%8))
+	}
+	return b.String()
 }
 
 // safeSlice clamps start/end to the string's bounds so callers
