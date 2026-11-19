@@ -88,19 +88,6 @@ func TestMACKeyedEndpoints_UpperCaseMACResolvesSameMachine(t *testing.T) {
 		}
 	})
 
-	t.Run("phone-home", func(t *testing.T) {
-		c, mux := newCaseTestServer(t)
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/phone-home?mac="+upper, nil))
-		if w.Code != http.StatusOK {
-			t.Fatalf("POST /api/v1/phone-home?mac=%s: got %d, want 200", upper, w.Code)
-		}
-		if got := c.MachineState(caseTestMachineID); got != string(model.MachineStateRunning) {
-			t.Errorf("machine state after phone-home = %q, want %q (phone-home was dropped as an unknown MAC)",
-				got, model.MachineStateRunning)
-		}
-	})
-
 	t.Run("inventory", func(t *testing.T) {
 		c, mux := newCaseTestServer(t)
 		body := `{"nics":[{"mac":"` + upper + `"}]}`

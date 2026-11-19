@@ -564,10 +564,21 @@ Path depends on the op type.
 
 - **Deploy** completes via the phone-home service on the deployed
   host, not via the agent. The agent writes a systemd unit
-  (`generatePhoneHomeUnit`, `main.go:1484`) that POSTs
-  `/api/v1/phone-home?mac=...`; the httpboot handler at
-  `handler.go:941` calls `provider.RecordPhoneHome`, which is
-  `Cache.RecordPhoneHome` (`internal/worker/cache.go:404`).
+  (`target.GeneratePhoneHomeUnit`, `internal/agent/target/target.go`)
+  that POSTs `/api/v1/report` with the deploy's `machine_id`, `op_id`
+  and `event: "phone_home"`, retrying until it gets a 2xx.
+  `Cache.HandleProgressReport` accepts it only when
+  `opState.validateReportBinding` finds that op active, of type
+  deploy, owned by that machine, and at phase `awaiting_phone_home`
+  (the agent's `deploy_complete` has latched it); anything else is a
+  409, and the unit keeps retrying. A phone-home earlier than that
+  would record a deploy as successful over a disk the agent has not
+  finished writing. Once the machine is `running` a retried
+  phone-home is acknowledged without side effects. There is no
+  MAC-only phone-home route: a request that names no op cannot
+  complete one (`TestPhoneHome_CompletesOnlyTheBoundDeployAwaitingIt`,
+  `internal/httpboot/phone_home_test.go`). An accepted report
+  calls `Cache.RecordPhoneHome` (`internal/worker/cache.go`).
   That sets the machine's local state to `running`, emits a
   `phone_home` observation carrying the deploy op's ID, and calls
   `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. Both reach
@@ -772,8 +783,9 @@ keeps failing installs with the machine still `commissioned` or
 `failed`: only the claim's op_delta moves it to `deploying`, and
 `HandleProgressReport` accepts reports for a pending op
 (`TestBootAction_AwaitingPhoneHomeOnUnclaimedDeploy`, `cache_test.go`).
-The target boots off disk, its phone-home
-service POSTs `/api/v1/phone-home`, `RecordPhoneHome` fires the
+The target boots off disk and its phone-home service POSTs its
+`phone_home` report to `/api/v1/report`; the worker accepts that
+report only at this phase. `RecordPhoneHome` then fires the
 completion path described earlier, and the op transitions to
 `completed` with `machine.state = running`.
 

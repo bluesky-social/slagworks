@@ -562,8 +562,8 @@ handler, and the executor):
 - `GetDHCPConfig`, `GetOOBConfig`, `GetSSHKeys`, `GetSiteInfo`.
 
 Observation intake (called from the HTTP-boot handler when the agent
-POSTs `/api/v1/report` or `/api/v1/inventory` or the phone-home
-service POSTs `/api/v1/phone-home`):
+or the installed OS's phone-home service POSTs `/api/v1/report`, or
+the agent POSTs `/api/v1/inventory`):
 
 - `RecordDeployComplete` (382), `RecordPhoneHome` (404),
   `RecordCommissionReport` (434), `RecordInventoryReport` (446).
@@ -670,10 +670,10 @@ matter to contributors:
   `internal/httpboot/handler.go`):
 
   ```text
-  POST /api/v1/report                            (progress, phase, failure, deploy_complete, commission_report)
+  POST /api/v1/report                            (progress, phase, failure, deploy_complete, commission_report;
+                                                  phone_home from the installed OS)
   POST /api/v1/inventory
   POST /logs/ingest                              (log envelopes)
-  POST /api/v1/phone-home?mac=...                (from the installed OS)
   GET  /boot/ipxe?mac=...
   GET  /boot/ssh-keys
   GET  /files/bin/slagworks-agent

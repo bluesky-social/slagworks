@@ -593,8 +593,8 @@ and the mode is a cmdline, not a separate image (`handler.go:467-475`).
 table for the site worker's PXE / boot HTTP endpoint:
 
 - `/boot/ipxe` — the entry the DHCP OFFER points at.
-- `/api/v1/report`, `/api/v1/inventory`, `/api/v1/phone-home` — the
-  agent's callbacks.
+- `/api/v1/report`, `/api/v1/inventory` — the agent's callbacks, and
+  the installed OS's phone-home (a `phone_home` report).
 - `/api/v1/machines/:id/network-script`, `network-facts`,
   `kernel-params`, `hostname`, `storage-script` — per-machine config
   served to the agent in the deploy initrd.
