@@ -76,6 +76,14 @@ func (s *Server) handleLogsStream(c *echo.Context) error {
 	if err != nil {
 		return nil
 	}
+	// The subscribe is the only message a client sends. CloseRead drains
+	// the connection from here on and cancels ctx when the client closes
+	// or drops it. Nothing else would: the request context of a hijacked
+	// connection outlives the client, and a poll loop whose filter
+	// matches no new rows never writes, so it would never see the closed
+	// connection and would query the store every pollInterval for the
+	// life of the process.
+	ctx = conn.CloseRead(ctx)
 	var env ws.Envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		writeErr(ctx, conn, "protocol_error", "malformed subscribe envelope: "+err.Error())

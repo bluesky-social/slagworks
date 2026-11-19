@@ -79,7 +79,11 @@ func TestLogsStreamDeliversRowCommittedBehindHigherID(t *testing.T) {
 	}
 
 	s := &Server{echo: echo.New(), logStore: gap}
-	s.echo.GET("/api/v1/logs/stream", s.handleLogsStream)
+	handlerDone := make(chan struct{})
+	s.echo.GET("/api/v1/logs/stream", func(c *echo.Context) error {
+		defer close(handlerDone)
+		return s.handleLogsStream(c)
+	})
 	srv := httptest.NewServer(s.echo)
 	defer srv.Close()
 
@@ -87,7 +91,18 @@ func TestLogsStreamDeliversRowCommittedBehindHigherID(t *testing.T) {
 	if conn == nil {
 		t.Fatalf("dial logs stream: status %d, want 101 upgrade", status)
 	}
-	defer conn.CloseNow() //nolint:errcheck
+	// srv.Close does not wait for the handler of a hijacked (WebSocket)
+	// connection, and the handler queries the shared testpg handle, so the
+	// test waits for it here: a handler still polling when a later test
+	// registers gorm callbacks on that handle is a data race.
+	defer func() {
+		_ = conn.CloseNow()
+		select {
+		case <-handlerDone:
+		case <-time.After(5 * time.Second):
+			t.Errorf("handleLogsStream still running 5s after the client closed the connection; a gone subscriber must stop polling the log store")
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	sub, err := ws.MarshalEnvelope(ws.TypeLogStreamSubscribe, "", ws.LogStreamSubscribeMsg{MachineID: machineID.String()})
