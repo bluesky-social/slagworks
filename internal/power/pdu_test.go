@@ -3,6 +3,9 @@ package power
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -224,6 +227,63 @@ func TestPDU_PowerStatus_NoLiveFeedPlusErrorIsUnknown(t *testing.T) {
 	}
 	if err == nil {
 		t.Error("expected error surfaced with Unknown")
+	}
+}
+
+// TestPDU_PowerStatus_UnrecognizedPlusOffIsUnknown: one feed answers with a
+// state that is neither On nor Off, the other reads Off. The unrecognized
+// feed may be the one powering the box, so the aggregate must be Unknown,
+// not Off (Off would make the executor PowerOn instead of PowerCycle a box
+// that is already running).
+func TestPDU_PowerStatus_UnrecognizedPlusOffIsUnknown(t *testing.T) {
+	fa := newFakePDUConn("pdu-left")
+	fb := newFakePDUConn("pdu-right")
+	fa.states[4] = StateUnknown
+	fb.states[4] = StateOff
+	specs := []PDUOutletSpec{{Host: "pdu-left", Outlet: 4}, {Host: "pdu-right", Outlet: 4}}
+	p := newTestPDUController(t, specs, map[string]*fakePDUConn{"pdu-left": fa, "pdu-right": fb})
+
+	st, err := p.PowerStatus(context.Background())
+	if st != StateUnknown || err != nil {
+		t.Errorf("PowerStatus = (%s, %v), want (unknown, nil): the unrecognized feed may be live", st, err)
+	}
+}
+
+// TestPDU_PowerStatus_UnrecognizedRedfishPlusOffIsUnknown drives the same
+// case through the production Redfish reader: two TLS servers stand in for
+// the two NMCs. Feed A answers HTTP 200 with a SwitchedState the reader does
+// not recognize (or none at all), which it reports as (Unknown, nil); feed B
+// answers Off.
+func TestPDU_PowerStatus_UnrecognizedRedfishPlusOffIsUnknown(t *testing.T) {
+	serve := func(t *testing.T, body string) string {
+		t.Helper()
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(srv.Close)
+		return strings.TrimPrefix(srv.URL, "https://")
+	}
+	for _, bodyA := range []string{
+		`{"Oem":{"SwitchedState":"Rebooting"}}`,
+		`{"Oem":{}}`,
+		`{}`,
+	} {
+		t.Run(bodyA, func(t *testing.T) {
+			hostA := serve(t, bodyA)
+			hostB := serve(t, `{"Oem":{"SwitchedState":"Off"}}`)
+			p, err := NewPDUController(context.Background(),
+				[]PDUOutletSpec{{Host: hostA, Outlet: 1}, {Host: hostB, Outlet: 1}}, nil)
+			if err != nil {
+				t.Fatalf("NewPDUController: %v", err)
+			}
+			t.Cleanup(func() { _ = p.Close(context.Background()) })
+
+			st, err := p.PowerStatus(context.Background())
+			if st != StateUnknown || err != nil {
+				t.Errorf("PowerStatus = (%s, %v), want (unknown, nil): feed A's state is unreadable and may be live", st, err)
+			}
+		})
 	}
 }
 

@@ -265,10 +265,11 @@ func (p *PDUController) waitAllOn(ctx context.Context) error {
 // PowerStatus aggregates per-outlet Redfish state. Any confirmed-On feed
 // pins StateOn (a dual-fed box is powered as long as one feed is live;
 // reporting Off while a feed is confirmed up would be a dangerous lie).
-// StateUnknown only when no On is confirmed AND at least one read errored.
-// See doc §D.
+// StateOff only when every outlet read Off. With no On confirmed, a read
+// error gives StateUnknown plus that error, and an unrecognized outlet
+// state gives StateUnknown. See doc §D.
 func (p *PDUController) PowerStatus(ctx context.Context) (State, error) {
-	anyOn, anyOff, anyErr := false, false, false
+	anyOn, anyOff, anyErr, anyUnknown := false, false, false, false
 	var lastErr error
 	for _, oc := range p.outlets {
 		st, err := oc.conn.outletState(ctx, oc.outlet)
@@ -283,10 +284,11 @@ func (p *PDUController) PowerStatus(ctx context.Context) (State, error) {
 		case StateOff:
 			anyOff = true
 		case StateUnknown:
-			// An outlet that read successfully but returned an
-			// unrecognized SwitchedState; treat like a non-vote (neither
-			// confirms On nor Off). The aggregate falls through to the
-			// anyErr/default rules below.
+			// The outlet answered, but with a SwitchedState that is
+			// neither On nor Off. It does not confirm On, and like an
+			// unreachable feed it may be the one powering the box, so it
+			// also rules out an aggregate Off.
+			anyUnknown = true
 		}
 	}
 	switch {
@@ -299,9 +301,11 @@ func (p *PDUController) PowerStatus(ctx context.Context) (State, error) {
 		// No live feed confirmed and a read failed: we cannot rule out
 		// that a feed we couldn't reach is powering the box.
 		return StateUnknown, fmt.Errorf("pdu power status: no live feed confirmed and a read failed: %w", lastErr)
-	case anyOff:
+	case anyOff && !anyUnknown:
 		return StateOff, nil
 	default:
+		// No live feed confirmed, and at least one outlet reported a
+		// state that is neither On nor Off.
 		return StateUnknown, nil
 	}
 }
