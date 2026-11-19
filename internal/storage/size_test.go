@@ -52,6 +52,9 @@ func TestPlan_RejectsMalformedPartitionSizes(t *testing.T) {
 		// sgdisk rounds a size down to whole sectors, so on this 4Kn disk
 		// 2K is zero too.
 		{"under one sector", sizeLayout("2K", "rest"), `"2K"`},
+		// Not a whole number of 4096-byte sectors: sgdisk rounds it down,
+		// so 6K is 6 KiB on a 512-byte-sector disk and 4 KiB on this one.
+		{"not a multiple of 4K", sizeLayout("6K", "rest"), `"6K"`},
 		// What (disk_bytes - 600 MiB) // MiB, the root size most shipped
 		// scripts compute, gives on a disk under 600 MiB. sgdisk exits 4.
 		{"negative", sizeLayout("512M", "-536M"), `"-536M"`},
@@ -127,5 +130,34 @@ func TestPlan_RejectsPartitionsThatDoNotFit(t *testing.T) {
 				t.Errorf("error %q does not say the partitions do not fit", err)
 			}
 		})
+	}
+}
+
+// TestPlan_PartitionSizeMeansTheSameAtEverySectorSize: sgdisk rounds a size
+// down to whole logical sectors, so a size that is not a multiple of 4096
+// bytes gives a smaller partition on a 4Kn disk than on a disk with 512-byte
+// sectors ("6K" is 6 KiB on one and 4 KiB on the other), with sgdisk exiting
+// 0 either way. A layout must not change meaning with the sector size, so
+// Plan refuses such a size whatever the disk under it, and accepts every
+// multiple of 4K on both.
+func TestPlan_PartitionSizeMeansTheSameAtEverySectorSize(t *testing.T) {
+	for _, sector := range []int64{512, 4096} {
+		inv := []BlockDevice{{Name: "sda", SizeBytes: 480103981056, LogicalSectorBytes: sector}}
+		for _, size := range []string{"5K", "6K", "7K", "1023K", "4097K"} {
+			cmds, err := Plan(sizeLayout(size, "rest"), inv)
+			if err == nil {
+				t.Errorf("%d-byte sectors: Plan accepted size %q, which sgdisk realizes differently on 512-byte and 4096-byte sectors:%s",
+					sector, size, commandLines(cmds))
+				continue
+			}
+			if !strings.Contains(err.Error(), `"`+size+`"`) || !strings.Contains(err.Error(), "multiple of 4K") {
+				t.Errorf("%d-byte sectors: error for %q should name the size and the multiple-of-4K rule: %v", sector, size, err)
+			}
+		}
+		for _, size := range []string{"4K", "8K", "1024K", "4100K", "1M", "1G"} {
+			if _, err := Plan(sizeLayout(size, "rest"), inv); err != nil {
+				t.Errorf("%d-byte sectors: Plan refused size %q, a multiple of 4K: %v", sector, size, err)
+			}
+		}
 	}
 }

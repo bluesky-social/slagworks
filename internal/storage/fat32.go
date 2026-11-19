@@ -56,7 +56,7 @@ func checkVFATSizes(name string, dev Device, bd BlockDevice) error {
 			what = fmt.Sprintf("the rest of the disk (about %dM)", size/mib)
 		} else {
 			var err error
-			size, err = partitionBytes(p.Size, sector)
+			size, err = sizeBytes(p.Size)
 			if err != nil {
 				return fmt.Errorf("disk %s partition %s: %w", name, p.Name, err)
 			}
@@ -82,24 +82,13 @@ func restPartitionBytes(dev Device, rest int, bd BlockDevice) (int64, error) {
 		if i == rest {
 			continue
 		}
-		b, err := partitionBytes(p.Size, bd.LogicalSectorBytes)
+		b, err := sizeBytes(p.Size)
 		if err != nil {
 			return 0, fmt.Errorf("partition %s: %w", p.Name, err)
 		}
 		left -= ceilDiv(b, mib) * mib
 	}
 	return left, nil
-}
-
-// partitionBytes returns the size sgdisk gives a partition declared with a
-// fixed size (see sizeBytes): the declared bytes rounded down to a whole
-// number of logical sectors.
-func partitionBytes(size string, sectorBytes int64) (int64, error) {
-	b, err := sizeBytes(size)
-	if err != nil {
-		return 0, err
-	}
-	return b - b%sectorBytes, nil
 }
 
 func ceilDiv(a, b int64) int64 {

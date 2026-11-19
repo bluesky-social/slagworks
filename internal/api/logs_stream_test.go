@@ -237,10 +237,18 @@ type logsStreamFixture struct {
 
 func newLogsStreamFixture(t *testing.T) *logsStreamFixture {
 	t.Helper()
+	return newLogsStreamFixtureAround(t, func(_ *logsStreamFixture, ls LogStreamStore) LogStreamStore { return ls })
+}
+
+// newLogsStreamFixtureAround is newLogsStreamFixture with the handler
+// reading the log store through wrap's result, so a test can act between
+// the handler's queries.
+func newLogsStreamFixtureAround(t *testing.T, wrap func(*logsStreamFixture, LogStreamStore) LogStreamStore) *logsStreamFixture {
+	t.Helper()
 	st := store.New(testpg.DB(t, store.Migrate))
 	ls := logstore.New(st.DB())
 	f := &logsStreamFixture{st: st, ls: ls}
-	s := &Server{echo: echo.New(), logStore: ls}
+	s := &Server{echo: echo.New(), logStore: wrap(f, ls)}
 	s.echo.GET("/api/v1/logs/stream", func(c *echo.Context) error {
 		f.handlers.Add(1)
 		defer f.handlers.Done()
@@ -332,9 +340,9 @@ func (f *logsStreamFixture) subscribe(t *testing.T, sub ws.LogStreamSubscribeMsg
 	}
 }
 
-// An agent whose clock is behind global stamps ts in the past. since bounds
-// only the ts-ordered backfill; once the stream is past its cursor, a line
-// global received after since must still stream (`machine logs -f` shape).
+// An agent whose clock is behind global stamps ts in the past. A line
+// global received after since must still stream on the live tail
+// (`machine logs -f` shape).
 func TestLogsStream_LiveTailDeliversLineFromSlowClockedEmitter(t *testing.T) {
 	f := newLogsStreamFixture(t)
 	machine := uuid.New()
@@ -352,9 +360,9 @@ func TestLogsStream_LiveTailDeliversLineFromSlowClockedEmitter(t *testing.T) {
 	}
 }
 
-// A reconnect sends last_seen_id with the same since. The resume continues
-// the live tail past the cursor, so a slow-clocked line global received
-// while the client was away must stream (deploy TUI shape: machine OR op).
+// A reconnect sends last_seen_id with the same since. A slow-clocked line
+// global received while the client was away is past the cursor and must
+// stream (deploy TUI shape: machine OR op).
 func TestLogsStream_ResumeDeliversLineFromSlowClockedEmitter(t *testing.T) {
 	f := newLogsStreamFixture(t)
 	machine, op := uuid.New(), uuid.New()
@@ -369,5 +377,101 @@ func TestLogsStream_ResumeDeliversLineFromSlowClockedEmitter(t *testing.T) {
 	})
 	if msg, ok := next(5 * time.Second); !ok || msg != "slow-clock-missed" {
 		t.Fatalf("resume: got %q ok=%v, want slow-clock-missed (past last_seen_id, received after since; ancient must never stream)", msg, ok)
+	}
+}
+
+// received sets when global received the row with the given id. A row
+// received more than liveTailWatermark ago is readable by the next query.
+func (f *logsStreamFixture) received(t *testing.T, id int64, at time.Time) {
+	t.Helper()
+	if err := f.st.DB().Exec("UPDATE log_envelopes SET global_received_at = ? WHERE id = ?", at, id).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A line from an emitter whose clock runs behind must stream whenever
+// global receives it inside the subscription's window, including while the
+// backfill is still paging. The stream used to bound since on the emitter's
+// ts alone until its first empty page and only then admit a row by
+// global_received_at as well. Until then each query filtered the
+// slow-clocked line out and moved the cursor past its id with the next
+// in-window row, so the later, wider queries could never return it: whether
+// the line showed up depended on whether another emitter logged after it
+// before the stream first ran dry. On a machine being deployed, something
+// always does.
+//
+// The backfill here is two pages. Between the handler's first and second
+// query, global receives a slow-clocked agent line and then an in-sync
+// site line; both are past the watermark by the second query.
+func TestLogsStream_SlowClockedLineReceivedDuringBackfillStreams(t *testing.T) {
+	const backlog = 600 // more than one 500-row page
+	machine := uuid.New()
+	since := time.Now().Add(-10 * time.Minute)
+
+	f := newLogsStreamFixtureAround(t, func(f *logsStreamFixture, ls LogStreamStore) LogStreamStore {
+		return &firstQueryGap{
+			LogStreamStore: ls,
+			before:         func(context.Context) {},
+			after: func() {
+				// Read by the second query: received a second ago, which
+				// is past the watermark and inside the window.
+				at := time.Now().Add(-time.Second)
+				f.received(t, f.insert(t, slogkit.Envelope{TS: time.Now().Add(-70 * time.Minute), Level: slogkit.LevelInfo, Source: slogkit.SourceAgent, Msg: "slow-clock-during-backfill", MachineID: machine}), at)
+				f.ancient(t, slogkit.Envelope{TS: since.Add(-time.Hour), Level: slogkit.LevelInfo, Source: slogkit.SourceSite, Msg: "ancient", MachineID: machine})
+				f.received(t, f.insert(t, slogkit.Envelope{TS: time.Now(), Level: slogkit.LevelInfo, Source: slogkit.SourceSite, Msg: "in-sync-after", MachineID: machine}), at)
+			},
+		}
+	})
+
+	rows := make([]slogkit.Envelope, backlog)
+	for i := range rows {
+		rows[i] = slogkit.Envelope{TS: since.Add(time.Minute), Level: slogkit.LevelInfo, Source: slogkit.SourceSite, Msg: "backlog-" + strconv.Itoa(i), MachineID: machine}
+	}
+	if err := f.ls.InsertBatch(context.Background(), rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.DB().Exec("UPDATE log_envelopes SET global_received_at = ? WHERE machine_id = ?", since.Add(time.Minute), machine).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	next := f.subscribe(t, ws.LogStreamSubscribeMsg{MachineID: machine.String(), SinceTimestamp: since.UTC().Format(time.RFC3339Nano)})
+	for i := range backlog {
+		if msg, ok := next(5 * time.Second); !ok || msg != "backlog-"+strconv.Itoa(i) {
+			t.Fatalf("backfill row %d: got %q ok=%v, want backlog-%d", i, msg, ok, i)
+		}
+	}
+	if msg, ok := next(5 * time.Second); !ok || msg != "slow-clock-during-backfill" {
+		t.Fatalf("after the backlog: got %q ok=%v, want slow-clock-during-backfill (received inside the window while the backfill was paging, ts an hour behind); "+
+			"the stream moved its cursor past the line without delivering it", msg, ok)
+	}
+	if msg, ok := next(5 * time.Second); !ok || msg != "in-sync-after" {
+		t.Fatalf("after the slow-clocked line: got %q ok=%v, want in-sync-after (ancient must never stream)", msg, ok)
+	}
+	if msg, ok := next(time.Second); ok {
+		t.Fatalf("stream delivered %q after its last row; ancient must never stream and nothing may repeat", msg)
+	}
+}
+
+// The same line already stored when the client subscribes: global received
+// it inside the window, between two in-window lines. The backfill must
+// deliver it in id order instead of stepping over it.
+func TestLogsStream_BackfillDeliversSlowClockedLineReceivedInWindow(t *testing.T) {
+	f := newLogsStreamFixture(t)
+	machine := uuid.New()
+	since := time.Now().Add(-10 * time.Minute)
+	at := time.Now().Add(-time.Minute)
+	f.received(t, f.insert(t, slogkit.Envelope{TS: since.Add(time.Minute), Level: slogkit.LevelInfo, Source: slogkit.SourceSite, Msg: "in-window-1", MachineID: machine}), at)
+	f.received(t, f.insert(t, slogkit.Envelope{TS: time.Now().Add(-70 * time.Minute), Level: slogkit.LevelInfo, Source: slogkit.SourceAgent, Msg: "slow-clock-stored", MachineID: machine}), at)
+	f.ancient(t, slogkit.Envelope{TS: since.Add(-time.Hour), Level: slogkit.LevelInfo, Source: slogkit.SourceSite, Msg: "ancient", MachineID: machine})
+	f.received(t, f.insert(t, slogkit.Envelope{TS: since.Add(2 * time.Minute), Level: slogkit.LevelInfo, Source: slogkit.SourceSite, Msg: "in-window-2", MachineID: machine}), at)
+
+	next := f.subscribe(t, ws.LogStreamSubscribeMsg{MachineID: machine.String(), SinceTimestamp: since.UTC().Format(time.RFC3339Nano)})
+	for _, want := range []string{"in-window-1", "slow-clock-stored", "in-window-2"} {
+		if msg, ok := next(5 * time.Second); !ok || msg != want {
+			t.Fatalf("backfill: got %q ok=%v, want %s", msg, ok, want)
+		}
+	}
+	if msg, ok := next(time.Second); ok {
+		t.Fatalf("stream delivered %q after its last row; ancient must never stream", msg)
 	}
 }

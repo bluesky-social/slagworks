@@ -169,7 +169,7 @@ the real values over the WebSocket op stream. See
 | GET | `/images` | read | List image rows. |
 | POST | `/images` | admin | Create a row. Body `{"name","version","sha256","url","arch"}`; all but `arch` (default `amd64`) are required. The name must match `^[a-z0-9][a-z0-9._-]*$` (`model.ValidateImageName`), since it becomes a directory on every site worker; 400 otherwise. 409 on conflict. Pushes a fresh snapshot to every site. |
 | PUT | `/images/:name` | admin | Create or replace the row named in the path (the path name wins over the body). Same name rule as POST. Used by `slagctl image follow-latest`. Pushes a fresh snapshot to every site. |
-| DELETE | `/images/:name` | admin | Delete by name or UUID. 204. Does not push a snapshot. |
+| DELETE | `/images/:name` | admin | Delete by name or row id. A row id match wins; an identifier that is no row's id is tried as a name, even when it parses as a UUID. 204. Does not push a snapshot. |
 
 ## Storage and network scripts
 
@@ -226,7 +226,7 @@ in [`configuration.md`](../user/configuration.md#site-config-model).
 |---|---|---|---|
 | GET | `/workers` | read | List registered workers: `id`, `site_slug`, `worker_id`, `fqdn`, `serial`, `first_seen_at`, `last_seen_at`, plus for connected workers `smcipmitool` (`installed`, `missing`, `missing-required`, `disabled`) and `supermicro_machines`. |
 | POST | `/site-workers` | creds | Register a worker, or rotate its token. Body `{"site_slug","worker_id","fqdn"}`; `site_slug` and `worker_id` are required. Returns `{"id","site_slug","worker_id","fqdn","first_seen_at","token"}`; the plaintext token appears only in this response. `creds` because the token receives the site's device credentials on the op stream. |
-| DELETE | `/site-workers/:ident` | admin | Delete a registration. `:ident` is the row id, `worker_id` or FQDN. 409 when ambiguous, when the worker is connected, or when it has claimed operations in flight. 204. |
+| DELETE | `/site-workers/:ident` | admin | Delete a registration. `:ident` is the row id, `worker_id` or FQDN. A row id match wins; an identifier that is no row's id is tried as a `worker_id` or FQDN, even when it parses as a UUID (the default `worker_id` is one). 409 when ambiguous, when the worker is connected, or when it has claimed operations in flight. 204. |
 
 ## NetBox
 
@@ -319,15 +319,16 @@ watch view. Registered only with the log store.
 2. The server replies `subscribed`, sends matching rows from
    `log_envelopes` as `log_stream_envelope` (`{"id","envelope"}`), then
    polls for new rows every 250 ms, holding back the newest 500 ms.
-   `since` bounds the backfill on the emitter's `ts`; the live tail
-   admits a row when its `ts` or `global_received_at` is at or after
-   `since`, so a line from an emitter whose clock runs behind still
-   streams.
+   `since` admits a row when its `ts` or `global_received_at` is at or
+   after it, so a line from an emitter whose clock runs behind still
+   streams. The rule is the same for the backfill and the live tail:
+   the stream pages by id, so a row that one query's bound hid and a
+   later one admitted would be stepped over and never sent.
 3. A bad subscription or query failure sends one `error`
    (`{"code","message"}`) and closes the connection.
 
-Clients resume after a disconnect with `last_seen_id`, which skips the
-backfill and continues the live tail past that id. The
+Clients resume after a disconnect with `last_seen_id`, which continues
+the stream past that id. The
 `log_stream_meta` type is defined and rendered by `slagctl` but not sent by
 the server.
 
