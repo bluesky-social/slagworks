@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/bluesky-social/slagworks/internal/agent/execkit"
 )
 
 // Runner abstracts command execution. The production implementation is
@@ -37,6 +39,11 @@ type Context struct {
 	Log    *slog.Logger
 	Exec   Runner
 	Server string // site worker host:port
+	// Procs is the group every process the agent starts outside Exec runs
+	// in (config scripts, the tailscale daemon and client), the same group
+	// the production Exec uses, so that stopping the agent ends all of
+	// them. nil, as in tests, leaves those processes untracked.
+	Procs *execkit.Group
 }
 
 // HTTPGet fetches a URL from the site worker and returns the response
@@ -80,7 +87,21 @@ type PostOptions struct {
 	// nil, any 2xx is accepted. Callers requiring an exact status pass
 	// their own predicate (e.g. func(s int) bool { return s == 200 }).
 	AcceptFn func(status int) bool
+	// FinalFn names statuses that are the server's final answer: PostJSON
+	// returns the StatusError at once instead of spending the remaining
+	// attempts on a request that cannot succeed. Checked before AcceptFn.
+	// nil means no status is final.
+	FinalFn func(status int) bool
 }
+
+// StatusError is the error PostJSON returns for a response whose status was
+// not accepted. Callers that act on a particular status find it with
+// errors.As.
+type StatusError struct {
+	Status int
+}
+
+func (e *StatusError) Error() string { return fmt.Sprintf("HTTP %d", e.Status) }
 
 // PostJSON POSTs a pre-marshaled JSON body to url, retrying per opts, and
 // returns nil once a response with an accepted status arrives. It is the
@@ -121,10 +142,13 @@ func PostJSON(log *slog.Logger, url string, body []byte, opts PostOptions) error
 		} else {
 			status := resp.StatusCode
 			resp.Body.Close()
+			if opts.FinalFn != nil && opts.FinalFn(status) {
+				return fmt.Errorf("%s refused: %w", opts.Name, &StatusError{Status: status})
+			}
 			if accept(status) {
 				return nil
 			}
-			lastErr = fmt.Errorf("HTTP %d", status)
+			lastErr = &StatusError{Status: status}
 			if log != nil {
 				log.Warn(opts.Name+" attempt returned unaccepted status", "attempt", attempt, "max", attempts, "status", status)
 			}

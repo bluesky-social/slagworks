@@ -135,6 +135,27 @@ func TestLifecycle_Fail(t *testing.T) {
 	goldenScreen(t, "lifecycle_deploy_failed", got)
 }
 
+// TestLifecycle_ObserveAfterFailIsIgnored: Fail ends the spine. A phase
+// observed afterwards must not start spinning, and must not skip-mark the
+// pending runway between it and the failed phase, which Fail leaves pending.
+func TestLifecycle_ObserveAfterFailIsIgnored(t *testing.T) {
+	l := newLifecyclePane(model.OpDeploy)
+	l.now = fixedClock(at(time.Minute))
+	l.Observe("agent_starting", at(0))
+	l.Observe("partitioning", at(10*time.Second))
+	l.Fail(at(30 * time.Second))
+	before := plain(l.Render(lifecycleWidth, "⠙"))
+
+	l.Observe("installing_bootloader", at(40*time.Second))
+
+	if got := l.CurrentPhase(); got != "" {
+		t.Errorf("CurrentPhase() = %q after Fail, want none", got)
+	}
+	if got := plain(l.Render(lifecycleWidth, "⠙")); got != before {
+		t.Errorf("spine changed after Fail:\nbefore:\n%s\nafter:\n%s", before, got)
+	}
+}
+
 // TestLifecycle_Completed renders the success terminal: every phase done with a
 // duration, completed marked ✓ with no trailing duration, nothing spinning.
 func TestLifecycle_Completed(t *testing.T) {

@@ -158,7 +158,11 @@ func enrollTailscale(ctx *agent.Context, target string) error {
 	tsdTee := io.MultiWriter(os.Stderr, &tsdBuf)
 	tailscaled.Stdout = tsdTee
 	tailscaled.Stderr = tsdTee
-	if err := tailscaled.Start(); err != nil {
+	// Started in the agent's process group set, like every command the
+	// agent runs: an agent told to stop mid-enrollment exits without running
+	// the deferred kill below, and an untracked daemon would stay up in the
+	// recovery environment, enrolled and serving tailscale SSH.
+	if err := ctx.Procs.Start(tailscaled); err != nil {
 		return fmt.Errorf("tailscale: start tailscaled in chroot: %w", err)
 	}
 	defer tsdBuf.flushTo(ctx.Log, "tailscaled")
@@ -175,7 +179,7 @@ func enrollTailscale(ctx *agent.Context, target string) error {
 	// Cmd.Wait blocks until the copier is done, so the subsequent flush is safe.
 	defer func() {
 		_ = tailscaled.Process.Kill()
-		_ = tailscaled.Wait()
+		_ = ctx.Procs.Wait(tailscaled)
 	}()
 
 	// Give tailscaled a moment to create its socket before `up` connects.
@@ -266,7 +270,7 @@ func runTailscaleUp(ctx *agent.Context, target, authKey, hostname string) error 
 	cmd := exec.Command("chroot", args...)
 	cmd.Stdout = tee
 	cmd.Stderr = tee
-	err := cmd.Run()
+	err := ctx.Procs.Run(cmd)
 	upBuf.flushTo(ctx.Log, "tailscale up")
 	return err
 }

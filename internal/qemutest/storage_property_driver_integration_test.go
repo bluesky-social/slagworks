@@ -195,7 +195,7 @@ func propRangesString(r [][2]int64) string {
 }
 
 // propDiskArgs builds the QEMU arguments for the disks of one step. The disks
-// get bootindex 2.. in Attach order, after the NIC at 1.
+// get bootindex 2.. in Attach order, after the NIC.
 func propDiskArgs(c propCase, st propStep, images map[string]string) []string {
 	var args []string
 	scsi := false
@@ -381,8 +381,9 @@ func (r *propRun) runStep(ctx context.Context, i int, st propStep) string {
 		Memory:        "4096",
 		SMBIOSUUID:    systemUUID,
 		NoPrimaryDisk: true,
-		NetBootIndex:  1,
-		ExtraArgs:     propDiskArgs(r.c, st, images),
+		// The NIC boots ahead of disks that already carry a bootloader.
+		NetworkBootFirst: true,
+		ExtraArgs:        propDiskArgs(r.c, st, images),
 	})
 	started := time.Now()
 	vm.Start(ctx)
