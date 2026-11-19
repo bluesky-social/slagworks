@@ -19,6 +19,10 @@ import (
 //   - RAID members are never formatted directly
 //   - mdadm creates an array before its md device is formatted
 //   - mkdir -p creates every mount target before mount uses it
+//   - every partition and RAID array the plan creates and does not format
+//     is cleared with wipefs -a (a partition also has its first 4 KiB
+//     zeroed) once it exists and before mdadm uses it, and nothing else (a
+//     preserve array or member, a retained disk) is
 //
 // The generator must only produce valid layouts. Each predicate derives its
 // expectation from the generated Layout rather than echoing Plan's output.
@@ -93,7 +97,9 @@ func genParts(t *rapid.T, disk string, forceMountable bool) []Partition {
 // Layout plus the matching physical inventory. It covers 1-8 SATA/NVMe
 // disks, sequentially named partitions with real filesystems, ESP and
 // BIOS-grub partitions, RAID-member partitions, optional RAID0/1/10 arrays
-// with valid member counts, and nested mount paths.
+// with valid member counts (formatted, or unformatted and unmounted), an
+// optional retained disk, an optional preserve array on disks outside the
+// layout, and nested mount paths.
 func genScenario() *rapid.Generator[scenario] {
 	return rapid.Custom(func(t *rapid.T) scenario {
 		nDisks := rapid.IntRange(1, 8).Draw(t, "numDisks")
@@ -125,6 +131,7 @@ func genScenario() *rapid.Generator[scenario] {
 			devices[d.name] = Device{Type: "disk", PTable: "gpt", Partitions: d.parts}
 			inventory = append(inventory, BlockDevice{
 				Name: d.name, SizeBytes: 107374182400, Transport: d.transport,
+				LogicalSectorBytes: rapid.SampledFrom([]int64{512, 4096}).Draw(t, "logicalSector"),
 			})
 			if len(d.parts) == 0 {
 				raidCandidates = append(raidCandidates, d.name) // whole-disk RAID member
@@ -157,9 +164,25 @@ func genScenario() *rapid.Generator[scenario] {
 			members := append([]string{}, memberOrder[:k]...)
 			memberOrder = memberOrder[k:]
 			raidName := fmt.Sprintf("md%d", r)
-			fs := rapid.SampledFrom([]string{"ext4", "xfs"}).Draw(t, "raidFS")
+			fs := rapid.SampledFrom([]string{"ext4", "xfs", ""}).Draw(t, "raidFS")
 			devices[raidName] = Device{Type: "raid", Level: level, Members: members, FS: fs}
-			raidFS = append(raidFS, raidName)
+			if fs != "" {
+				raidFS = append(raidFS, raidName)
+			}
+		}
+
+		// Data the plan must leave alone. The generated disks are at most
+		// sda..sdh and nvme0n1..nvme7n1, so sdy and sdz never collide.
+		if rapid.Bool().Draw(t, "retainDisk") {
+			devices["sdz"] = Device{Type: "retain"}
+			inventory = append(inventory, BlockDevice{Name: "sdz", SizeBytes: 107374182400, Transport: "sata"})
+		}
+		if rapid.Bool().Draw(t, "preserveArray") {
+			devices["mdkeep"] = Device{
+				Type: "preserve", Level: 1, Members: []string{"sdy1", "/dev/sdy2"},
+				FS:        rapid.SampledFrom([]string{"xfs", ""}).Draw(t, "preserveFS"),
+				ArrayUUID: "22222222-2222-2222-2222-222222222222",
+			}
 		}
 
 		mountable := append([]string{}, mountableParts...)
@@ -396,6 +419,102 @@ func checkMDAdmBeforeMkfs(layout Layout, cmds []Command) error {
 	return nil
 }
 
+// checkUnformattedCleared derives from the layout every block device the plan
+// creates and leaves unformatted: each FS-less partition of a managed disk
+// and each FS-less raid array. Each must get exactly one wipefs -a, and each
+// such partition also exactly one dd zeroing its first 4 KiB: a partition's
+// after its disk's blockdev --rereadpt and before any mdadm, an array's after
+// its mdadm --create. No other device may be written by wipefs or dd, which
+// keeps them off preserve arrays, their members, and retained disks.
+func checkUnformattedCleared(layout Layout, cmds []Command) error {
+	firstMdadm := len(cmds)
+	for i, c := range cmds {
+		if c.Name == "mdadm" {
+			firstMdadm = i
+			break
+		}
+	}
+	indexOf := func(pred func(Command) bool) int {
+		for i, c := range cmds {
+			if pred(c) {
+				return i
+			}
+		}
+		return -1
+	}
+
+	// expected maps each device to clear to the window its clearing must
+	// fall in and whether its boot sector is zeroed too.
+	type target struct {
+		after, before int
+		zero          bool
+	}
+	expected := map[string]target{}
+	for _, d := range diskNames(layout) {
+		path := "/dev/" + d
+		reread := indexOf(func(c Command) bool {
+			return c.Name == "blockdev" && len(c.Args) == 2 && c.Args[0] == "--rereadpt" && c.Args[1] == path
+		})
+		for i, p := range layout.Devices[d].Partitions {
+			if p.FS == "" {
+				expected["/dev/"+partNameLocal(d, i+1)] = target{reread, firstMdadm, true}
+			}
+		}
+	}
+	for name, dev := range layout.Devices {
+		if dev.Type != "raid" || dev.FS != "" {
+			continue
+		}
+		md := propMDDevPath(layout, name)
+		create := indexOf(func(c Command) bool {
+			return c.Name == "mdadm" && len(c.Args) >= 2 && c.Args[0] == "--create" && c.Args[1] == md
+		})
+		expected[md] = target{create, len(cmds), false}
+	}
+
+	wiped, zeroed := map[string]int{}, map[string]int{}
+	for i, c := range cmds {
+		var dev string
+		switch c.Name {
+		case "wipefs":
+			if len(c.Args) != 2 || c.Args[0] != "-a" {
+				return fmt.Errorf("cmd[%d] %s: want wipefs -a <device>", i, c)
+			}
+			dev = c.Args[1]
+			wiped[dev]++
+		case "dd":
+			if len(c.Args) != 5 || c.Args[0] != "if=/dev/zero" || !strings.HasPrefix(c.Args[1], "of=") ||
+				c.Args[2] != "bs=4096" || c.Args[3] != "count=1" || c.Args[4] != "conv=fsync" {
+				return fmt.Errorf("cmd[%d] %s: want dd if=/dev/zero of=<device> bs=4096 count=1 conv=fsync", i, c)
+			}
+			dev = strings.TrimPrefix(c.Args[1], "of=")
+			zeroed[dev]++
+		default:
+			continue
+		}
+		w, ok := expected[dev]
+		if !ok {
+			return fmt.Errorf("cmd[%d] %s clears a device the plan does not create unformatted", i, c)
+		}
+		if w.after < 0 || i <= w.after || i >= w.before {
+			return fmt.Errorf("cmd[%d] %s outside its window (after %d, before %d)", i, c, w.after, w.before)
+		}
+	}
+	for dev, w := range expected {
+		if wiped[dev] != 1 {
+			return fmt.Errorf("%s: wipefs ran %d times, want once", dev, wiped[dev])
+		}
+		want := 0
+		if w.zero {
+			want = 1
+		}
+		if zeroed[dev] != want {
+			return fmt.Errorf("%s: boot sector zeroed %d times, want %d", dev, zeroed[dev], want)
+		}
+	}
+	return nil
+}
+
 func checkMkdirBeforeMount(layout Layout, cmds []Command) error {
 	for path := range layout.Mounts {
 		tgt := "/target" + path
@@ -466,7 +585,7 @@ func replayLog(rt *rapid.T, layout Layout, inventory []BlockDevice, cmds []Comma
 }
 
 // TestPlan_Property_StructuralContracts runs one rapid.Check asserting the
-// eight structural contracts below.
+// structural contracts below.
 func TestPlan_Property_StructuralContracts(t *testing.T) {
 	checks := []struct {
 		name string
@@ -480,6 +599,7 @@ func TestPlan_Property_StructuralContracts(t *testing.T) {
 		{"RAID members are never formatted directly", checkRAIDMembersNotFormatted},
 		{"mdadm creation precedes mkfs of its md device", checkMDAdmBeforeMkfs},
 		{"mkdir -p for a target precedes its mount", checkMkdirBeforeMount},
+		{"exactly the unformatted devices the plan creates are cleared, in order", checkUnformattedCleared},
 	}
 
 	rapid.Check(t, func(rt *rapid.T) {

@@ -44,7 +44,11 @@ func isOutletOp(raw json.RawMessage) bool {
 //
 // verifiedSerial is the claiming worker's hardware serial (P4a, "" =
 // unverified). registered is the persisted registered-worker-serial set for
-// the slug (connected OR not), used only for INV-1.
+// the slug (connected OR not), used only for INV-1. Both carry the workers'
+// SMBIOS spelling while DownstreamSerial carries NetBox's, and the hello gate
+// matched them case-insensitively, so every comparison here uses
+// model.SameHardwareSerial: exact equality would leave the interlock inert for
+// a worker whose board and NetBox record differ only in case.
 //
 // Returns (eligible, reason). reason is a log-only diagnostic string when
 // eligible is false. A declined claim is NOT an error: the caller returns the
@@ -86,7 +90,7 @@ func outletClaimEligibility(op *model.Operation, verifiedSerial string, register
 	// site worker (connected or not) is refused for EVERY claimant, never
 	// overridable. This keys on the DOWNSTREAM device being a serving worker,
 	// not on who claims.
-	if op.Type == model.OpPowerOff && registered[rt.DownstreamSerial] {
+	if op.Type == model.OpPowerOff && containsSerial(registered, rt.DownstreamSerial) {
 		return false, fmt.Sprintf("refusing outlet off: downstream serial %q is a registered site worker (INV-1: no serving-worker-off path)", rt.DownstreamSerial)
 	}
 
@@ -94,12 +98,23 @@ func outletClaimEligibility(op *model.Operation, verifiedSerial string, register
 	// ineligible to serve (cutting its own feed), EXCEPT cycle/on carrying the
 	// explicit AllowSelf override (never off, which INV-1 already refused when
 	// the downstream is a registered worker).
-	if rt.DownstreamSerial == verifiedSerial {
+	if model.SameHardwareSerial(rt.DownstreamSerial, verifiedSerial) {
 		if rt.AllowSelf && (op.Type == model.OpPowerCycle || op.Type == model.OpPowerOn) {
 			return true, ""
 		}
-		return false, fmt.Sprintf("self-feed: claiming worker serial %q == downstream (INV-2 decline; a partner claims it)", verifiedSerial)
+		return false, fmt.Sprintf("self-feed: claiming worker serial %q is downstream %q (INV-2 decline; a partner claims it)", verifiedSerial, rt.DownstreamSerial)
 	}
 
 	return true, ""
+}
+
+// containsSerial reports whether set holds a serial that names the same
+// device as serial (model.SameHardwareSerial).
+func containsSerial(set map[string]bool, serial string) bool {
+	for s := range set {
+		if model.SameHardwareSerial(s, serial) {
+			return true
+		}
+	}
+	return false
 }

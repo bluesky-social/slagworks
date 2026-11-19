@@ -142,7 +142,8 @@ Key rules and shapes:
   literals in call sites — bump the table and note why.
 - **TestMatrix.** `matrix_integration_test.go` is a table-driven
   full-stack deploy lifecycle test crossed over firmware (UEFI /
-  BIOS), storage layout (single / RAID1), and failure mode
+  BIOS), storage layout (single / RAID1 / xfs RAID1 with GRUB on three
+  disks), and failure mode
   (none / dirty-disk hard-fail / missing-efivarfs recoverable). It
   subsumed the older per-firmware `TestDeploy_*` and
   `TestDeployFullLifecycle_*` tests. Clean cells drive through

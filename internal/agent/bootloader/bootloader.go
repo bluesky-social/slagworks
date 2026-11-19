@@ -210,16 +210,8 @@ func InstallGRUBBIOS(ctx *agent.Context, disks []string, machineID string) error
 		mounted = append(mounted, m.dst)
 	}
 
-	for _, disk := range disks {
-		// --target=i386-pc forces legacy BIOS GRUB even though the disk
-		// is GPT (grub-install would otherwise guess from the running
-		// firmware, which inside the deploy initrd is itself BIOS here,
-		// but being explicit is the contract). --no-floppy skips the
-		// slow nonexistent-floppy probe on these headless boxes.
-		if err := ctx.Exec.Run("chroot", "/target", "grub-install",
-			"--target=i386-pc", "--no-floppy", "--recheck", disk); err != nil {
-			return fmt.Errorf("grub-install on %s: %w", disk, err)
-		}
+	if err := grubInstallOnDisks(ctx, "/target", disks); err != nil {
+		return err
 	}
 
 	// Generate the menu (discovers the installed kernel + initrd, emits
@@ -229,6 +221,44 @@ func InstallGRUBBIOS(ctx *agent.Context, disks []string, machineID string) error
 	}
 
 	ctx.Log.Info("legacy GRUB installed")
+	return nil
+}
+
+// grubBIOSModuleDir is where grub-install --target=i386-pc puts GRUB's
+// modules, core.img and boot.img, relative to the target root.
+const grubBIOSModuleDir = "boot/grub/i386-pc"
+
+// grubInstallOnDisks runs the target's grub-install once per disk, with
+// target as the chroot, and removes the module directory before each run.
+//
+// grub-install copies the same modules into /boot/grub/i386-pc every time.
+// When it finds modules already there it renames each one to a "~" backup,
+// copies the set again and deletes the backups. On an XFS root those
+// deletions can empty a block in the middle of the directory; XFS frees the
+// block and the directory keeps a hole there. GRUB 2.12 as packaged for
+// Ubuntu 24.04 reads a hole as a block of entries for inode 0 and fails the
+// lookup with "not a correct XFS inode", so every module listed after the
+// hole is out of reach and the machine stops at "grub rescue>". With that
+// package's modules the hole is there after three runs and after five. A
+// directory that has only ever been filled has no holes, so every run gets
+// one.
+func grubInstallOnDisks(ctx *agent.Context, target string, disks []string) error {
+	moduleDir := filepath.Join(target, grubBIOSModuleDir)
+	for _, disk := range disks {
+		if err := os.RemoveAll(moduleDir); err != nil {
+			return fmt.Errorf("remove %s before grub-install on %s: %w; "+
+				"check that the target root is mounted read-write and redeploy", moduleDir, disk, err)
+		}
+		// --target=i386-pc forces legacy BIOS GRUB even though the disk
+		// is GPT (grub-install would otherwise guess from the running
+		// firmware, which inside the deploy initrd is itself BIOS here,
+		// but being explicit is the contract). --no-floppy skips the
+		// slow nonexistent-floppy probe on these headless boxes.
+		if err := ctx.Exec.Run("chroot", target, "grub-install",
+			"--target=i386-pc", "--no-floppy", "--recheck", disk); err != nil {
+			return fmt.Errorf("grub-install on %s: %w", disk, err)
+		}
+	}
 	return nil
 }
 

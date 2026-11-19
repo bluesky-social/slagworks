@@ -3,6 +3,8 @@ package storageapply
 import (
 	"errors"
 	"fmt"
+	"os/exec"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -352,26 +354,83 @@ func listPartitions(ctx *agent.Context, disk string) ([]string, error) {
 	return parts, nil
 }
 
-// CheckDisksClean verifies that none of the disks in the layout contain
-// existing filesystem or partition table signatures. This prevents
-// accidentally wiping a machine that already has an OS installed.
+// CheckDisksClean is the safety check of a deploy without --destructive:
+// it refuses every layout disk that carries any signature (partition
+// table, filesystem, RAID/LVM/ZFS member, LUKS header), so a deploy never
+// partitions a machine that already holds an OS or data. A disk passes only
+// when it is known to be blank; a probe that cannot run fails the check.
+//
+// The probe is wipefs, not `blkid -p`. In its safe-probe mode blkid prints
+// nothing on stdout for a disk carrying two signatures it will not choose
+// between (an ext4 disk later given to ZFS without a wipe), just as for a
+// blank disk, and it exits 2 ("nothing found") for a blank disk and for one
+// it could not open or read alike; a check that read any blkid failure as
+// clean passed all of them. wipefs lists every signature libblkid
+// recognizes, partition tables included (it also finds a GPT whose
+// protective MBR is gone), prints nothing and exits 0 on a blank disk, and
+// exits non-zero only when it cannot probe.
+//
+// Only the whole-disk node is probed. Any partition the kernel sees comes
+// from a partition table, which wipefs reports on the whole disk; a
+// filesystem left inside a partition whose table was erased has no device
+// node at all, so no probe could reach it.
 func CheckDisksClean(ctx *agent.Context, layout storage.Layout) error {
 	for name, dev := range layout.Devices {
 		if dev.Type != "disk" {
 			continue
 		}
 		diskPath := "/dev/" + name
-		// blkid exits 2 on a signature-less (clean) disk, so err != nil
-		// is the clean case and err == nil with output is the dirty one.
-		out, err := ctx.Exec.Output("blkid", "-p", diskPath)
-		if err == nil && out != "" {
-			return fmt.Errorf("disk %s has existing data (%s); refusing to partition -- this machine may have an active OS",
-				diskPath, out)
+		out, err := ctx.Exec.Output("wipefs", "--noheadings", "--output", "TYPE,OFFSET", diskPath)
+		if err != nil {
+			return fmt.Errorf("cannot tell whether disk %s holds data: listing its signatures failed: %s; "+
+				"refusing to partition it. Check that the disk is present and readable (lsblk, dmesg) and that "+
+				"wipefs is in the deploy image, then redeploy; --destructive skips this check and overwrites the disk",
+				diskPath, probeError(err))
 		}
-		// blkid exit code 2 = no signatures found (clean disk)
+		if sigs := wipefsSignatures(out); len(sigs) > 0 {
+			return fmt.Errorf("disk %s already holds data (%s); refusing to partition it -- this machine may have an active OS. "+
+				"Redeploy with --destructive to overwrite it",
+				diskPath, strings.Join(sigs, ", "))
+		}
 		ctx.Log.Info("disk is clean", "disk", diskPath)
 	}
 	return nil
+}
+
+// wipefsSignatures summarizes `wipefs --noheadings --output TYPE,OFFSET`
+// as one entry per signature type, in the order wipefs lists them: "ext4 at
+// 0x438", or "zfs_member at 0x23c00 and 28 more" for a type that recurs
+// (wipefs lists every ZFS uberblock it finds). Every non-blank line counts:
+// a line without the expected two columns is kept verbatim, so an
+// unexpected format can only make the safety check refuse, never pass.
+func wipefsSignatures(out string) []string {
+	var types []string
+	first := map[string]string{}
+	count := map[string]int{}
+	for line := range strings.SplitSeq(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		typ, desc := strings.TrimSpace(line), strings.TrimSpace(line)
+		if len(fields) == 2 {
+			typ, desc = fields[0], fields[0]+" at "+fields[1]
+		}
+		if count[typ] == 0 {
+			types = append(types, typ)
+			first[typ] = desc
+		}
+		count[typ]++
+	}
+	sigs := make([]string, 0, len(types))
+	for _, typ := range types {
+		sig := first[typ]
+		if more := count[typ] - 1; more > 0 {
+			sig += fmt.Sprintf(" and %d more", more)
+		}
+		sigs = append(sigs, sig)
+	}
+	return sigs
 }
 
 // CheckStaleArrayMembers refuses the deploy, before any disk is touched,
@@ -504,23 +563,49 @@ func parseExamineArrayUUIDs(examine string) []string {
 	return uuids
 }
 
-// CleanupMounts unmounts every layout mount under /target, deepest
-// first, before reboot.
-func CleanupMounts(ctx *agent.Context, layout storage.Layout) {
-	ctx.Log.Info("unmounting")
+// probeError describes a failed probe, preferring the tool's own stderr
+// (which names the cause, e.g. an I/O error) over a bare exit status.
+func probeError(err error) string {
+	if ee, ok := errors.AsType[*exec.ExitError](err); ok {
+		if msg := strings.TrimSpace(string(ee.Stderr)); msg != "" {
+			return fmt.Sprintf("%v: %s", err, msg)
+		}
+	}
+	return err.Error()
+}
 
-	// Build mount list sorted deepest-first for clean unmount
-	var paths []string
-	for path := range layout.Mounts {
-		paths = append(paths, "/target"+path)
+// CleanupMounts unmounts every layout mount under /target before reboot,
+// deepest first, so no mount is attempted while another still sits beneath
+// it; the root, /target itself, goes last. Depth ties are broken lexically
+// so the order never depends on map iteration.
+//
+// A mount that will not unmount is an error the caller must fail the deploy
+// on: rebooting with a filesystem still mounted leaves it dirty, and a
+// bootloader that does not replay a journal (GRUB reading an xfs root) then
+// cannot find its own files. umount refuses a mount with anything still
+// mounted beneath it, so a successful unmount of /target also proves no
+// helper left a mount (a chroot bind, a tmpfs) behind.
+func CleanupMounts(ctx *agent.Context, layout storage.Layout) error {
+	ctx.Log.Info("unmounting target filesystems")
+
+	paths := make([]string, 0, len(layout.Mounts))
+	for mp := range layout.Mounts {
+		paths = append(paths, path.Join("/target", mp))
 	}
 	sort.Slice(paths, func(i, j int) bool {
-		return strings.Count(paths[i], "/") > strings.Count(paths[j], "/")
+		di, dj := strings.Count(paths[i], "/"), strings.Count(paths[j], "/")
+		if di != dj {
+			return di > dj
+		}
+		return paths[i] < paths[j]
 	})
 
 	for _, mp := range paths {
 		if err := ctx.Exec.Run("umount", mp); err != nil {
-			ctx.Log.Warn("umount failed", "path", mp, "err", err)
+			return fmt.Errorf("umount %s: %w; rebooting with it mounted would leave the filesystem dirty, "+
+				"so the deploy stops here. Something beneath %s is still mounted or in use: "+
+				"inspect it from the recovery shell (findmnt -R %s) and redeploy", mp, err, mp, mp)
 		}
 	}
+	return nil
 }

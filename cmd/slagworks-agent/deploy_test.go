@@ -42,7 +42,7 @@ func (r *noDiskRunner) Run(name string, args ...string) error {
 
 func (r *noDiskRunner) Output(name string, _ ...string) (string, error) {
 	if name == "lsblk" {
-		return `{"blockdevices":[{"name":"sda","size":107374182400,"tran":"sata","model":"TestDisk"}]}`, nil
+		return `{"blockdevices":[{"name":"sda","size":107374182400,"tran":"sata","model":"TestDisk","log-sec":512}]}`, nil
 	}
 	return "", errors.New(name + " not available in test")
 }
@@ -181,12 +181,12 @@ func (r *mdHostRunner) Run(name string, args ...string) error {
 func (r *mdHostRunner) Output(name string, args ...string) (string, error) {
 	argv := strings.Join(append([]string{name}, args...), " ")
 	switch {
-	case argv == "lsblk -Jb -d -o NAME,SIZE,TRAN,MODEL":
+	case argv == "lsblk -Jb -d -o NAME,SIZE,TRAN,MODEL,LOG-SEC":
 		return `{"blockdevices":[` +
-			`{"name":"vda","size":10737418240,"tran":"virtio","model":"QEMU"},` +
-			`{"name":"vdb","size":4294967296,"tran":"virtio","model":"QEMU"},` +
-			`{"name":"vdc","size":4294967296,"tran":"virtio","model":"QEMU"},` +
-			`{"name":"vdd","size":4294967296,"tran":"virtio","model":"QEMU"}]}`, nil
+			`{"name":"vda","size":10737418240,"tran":"virtio","model":"QEMU","log-sec":512},` +
+			`{"name":"vdb","size":4294967296,"tran":"virtio","model":"QEMU","log-sec":512},` +
+			`{"name":"vdc","size":4294967296,"tran":"virtio","model":"QEMU","log-sec":512},` +
+			`{"name":"vdd","size":4294967296,"tran":"virtio","model":"QEMU","log-sec":512}]}`, nil
 	case argv == "lsblk -dnlo NAME,TYPE":
 		return "vda disk\nvdb disk\nvdc disk\nvdd disk", nil
 	case strings.HasPrefix(argv, "lsblk -nlo NAME /dev/"):
@@ -198,8 +198,8 @@ func (r *mdHostRunner) Output(name string, args ...string) (string, error) {
 		return "", errors.New("exit status 1: mdadm: No md superblock detected")
 	case argv == "cat /proc/mdstat":
 		return "Personalities : [raid1]\nunused devices: <none>", nil
-	case strings.HasPrefix(argv, "blkid -p "):
-		return "", errors.New("exit status 2") // no signatures: a clean disk
+	case strings.HasPrefix(argv, "wipefs --noheadings --output TYPE,OFFSET "):
+		return "", nil // no signatures: a clean disk
 	}
 	return "", errors.New(name + " not available in test")
 }

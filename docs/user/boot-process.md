@@ -153,11 +153,22 @@ policy lives. `Handler.ServeHTTP`
     NOT use `sanboot --drive 0x80` here: on AMI Aptio firmware
     (documented in `handler.go:227-244`) `sanboot` prints "Booting from
     SAN device 0x80" and hangs.
-  - `platform=efi` or absent: the script runs
-    `sanboot --no-describe --drive 0x80 || sanboot --no-describe --drive 0x81 || exit 1`.
+  - `platform=efi` or absent: the script loops
+    `sanboot --no-describe --drive ${drive}` over drives `0x80` through
+    `0x9f` and boots the first whose ESP holds `\EFI\BOOT\BOOTX64.EFI`.
     `sanboot` under UEFI recursively `ConnectController`s the disk's FAT
-    driver and directly `LoadImage`s `\EFI\BOOT\BOOTX64.EFI`, which is the
-    iPXE-maintainer-recommended UEFI local-boot idiom.
+    driver and directly `LoadImage`s that file, which is the
+    iPXE-maintainer-recommended UEFI local-boot idiom. iPXE numbers whole
+    local disks from `0x80` in the firmware's block-device order, and a
+    storage script may put the ESP on any disk, so the script walks 32
+    of them rather than the first two. When none boots it ends with a
+    plain `exit`: status 0 makes `embed.ipxe`'s chain succeed and iPXE
+    exits to the firmware with `EFI_SUCCESS`. Firmware that continues its
+    boot order then reaches the `Slagworks` Boot#### entry the agent
+    registered; EDK2-based firmware with a boot menu (OVMF) shows that
+    menu instead, which the UEFI spec allows after a successful return. A
+    nonzero status would fail the chain, which `embed.ipxe` retries 20
+    times before dropping to an iPXE shell.
 - **`BootCommission`.** Emits `commissionBootScript` — kernel + initrd from
   the configured image, with `slagworks.mode=commission` on the cmdline.
 - **`BootDeploy`.** Emits `deployBootScript` — same image, with
@@ -329,11 +340,22 @@ What the agent actually does, in order:
   - **Legacy BIOS**: `installGRUBBIOS` — install GRUB i386-pc onto each
     disk with a `bios_grub` (EF02) partition. No BIOS-grub partition on
     any disk is a hard fail — we refuse to leave the host unbootable.
+    `grub-install` runs once per disk, and `/boot/grub/i386-pc` is
+    removed before each run so every run writes a fresh module
+    directory. A run that finds the previous run's modules backs them up
+    and deletes the backups, which on an XFS root can leave a hole in
+    that directory; GRUB 2.12 cannot read past one and stops at
+    `error: not a correct XFS inode.`
 - `finalizing`: write `/etc/fstab`, seed cloud-init, apply the network
   config script (with NetBox facts injected), write the hostname, disable
   first-boot apt timers, write operator SSH keys, enroll on tailscale (if
   an auth key rode the cmdline), and write the
-  `slagworks-phone-home.service` unit.
+  `slagworks-phone-home.service` unit. Then unmount every target
+  filesystem, deepest first and the root last. A filesystem that will not
+  unmount fails the deploy here, before BMC reconcile and
+  `deploy_complete`: rebooting with it mounted would leave it dirty, and
+  GRUB does not replay a journal, so a dirty xfs root stops a BIOS host's
+  next boot at the `grub rescue>` prompt.
 - `bmc_reconcile`: reconcile BMC users and persistent boot order —
   this is what gets the `slagworks` and `monitor` accounts onto the BMC
   and keeps them in sync on every redeploy. Failure is a soft error on
@@ -350,8 +372,8 @@ of rebooting, for ad-hoc debugging without losing `/target`.
 After the reboot, the machine PXE-broadcasts again. The MAC's op is now
 `deploying, phase=awaiting_phone_home` — the site worker maps this to
 `BootLocal`, and the HTTP handler emits the platform-appropriate local-boot
-script (BIOS `exit`, UEFI `sanboot 0x80`). The firmware boots the freshly
-installed OS off disk.
+script (BIOS `exit`, UEFI `sanboot` over drives `0x80`-`0x9f`). The
+firmware boots the freshly installed OS off disk.
 
 The generated `slagworks-phone-home.service`
 (`internal/agent/target/target.go` `GeneratePhoneHomeUnit`) fires after
@@ -376,7 +398,7 @@ machine `running` with no active op and continues serving `BootLocal`.
 | DHCP option 93 client arch | `INTEL_X86PC` | `EFI_X86_64` / `EFI_BC` / `EFI_IA32` |
 | iPXE binary served | `undionly.kpxe` | `snponly.efi` |
 | iPXE served over | TFTP | HTTP (option 60 `HTTPClient`) or TFTP fallback |
-| Local-boot iPXE idiom | `exit` (return to firmware) | `sanboot --drive 0x80 \|\| 0x81` |
+| Local-boot iPXE idiom | `exit` (return to firmware) | `sanboot` drives `0x80`-`0x9f`, then `exit` |
 | Bootloader installed | GRUB i386-pc, per bios_grub disk | systemd-boot on the ESP, registered via `efibootmgr` |
 | Requires `bios_grub` (EF02) partition | Yes; deploy fails without one | No |
 | Requires ESP mount | No | Yes; deploy fails without `/boot/efi` |

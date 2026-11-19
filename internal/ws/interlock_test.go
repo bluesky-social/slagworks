@@ -198,6 +198,94 @@ func TestInterlock_SelfFeedingOff_DeclinedForEveryone(t *testing.T) {
 	}
 }
 
+// TestInterlock_SerialCaseMismatchDoesNotDisarm: the hello gate verifies a
+// worker's SMBIOS serial by asking NetBox for devices with that serial, and
+// NetBox's device serial filter is case-insensitive (iexact). A worker whose
+// board reports "abc123" is therefore verified as the NetBox device whose
+// serial is "ABC123", and site_workers.serial holds the reported spelling.
+// The op's downstream_serial is NetBox's spelling. The interlock must treat
+// the two spellings as the same device, or it is silently inert for that
+// worker.
+func TestInterlock_SerialCaseMismatchDoesNotDisarm(t *testing.T) {
+	const netboxSerial = "ABC123"   // dcim.device.serial, stamped into the op as downstream_serial
+	const reportedSerial = "abc123" // what the worker's dmidecode prints
+
+	cases := []struct {
+		name       string
+		opType     model.OperationType
+		registered []model.SiteWorker
+		claimant   string
+	}{
+		{
+			// Both INV-1 and INV-2 apply: the worker would cut its own feed.
+			name:       "self off",
+			opType:     model.OpPowerOff,
+			registered: []model.SiteWorker{{SiteSlug: "pop3", WorkerID: "worker-1", Serial: reportedSerial}},
+			claimant:   reportedSerial,
+		},
+		{
+			// INV-2 only: no registered row, a non-AllowSelf cycle by the
+			// downstream device itself.
+			name:     "self cycle",
+			opType:   model.OpPowerCycle,
+			claimant: reportedSerial,
+		},
+		{
+			// INV-1 only: a partner worker (a hot spare at a multi-worker
+			// site) must not power off the outlet feeding a registered worker.
+			name:       "partner off",
+			opType:     model.OpPowerOff,
+			registered: []model.SiteWorker{{SiteSlug: "pop3", WorkerID: "w-down", Serial: reportedSerial}},
+			claimant:   "SN-PARTNER",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := newFakeAuth()
+			auth.register("tok-1", "pop3", "worker-1")
+			if tc.registered != nil {
+				auth.setSiteWorkers("pop3", tc.registered...)
+			}
+
+			op := outletOp(t, tc.opType, netboxSerial, false)
+			claimed := *op
+			claimed.Status = model.OpClaimed
+			claimed.ClaimedBy = "worker-1"
+			claimed.Version = 1
+			claimer := &fakeOpClaimer{pendingOp: op, op: &claimed}
+
+			// The production resolver accepts any serial NetBox returns exactly
+			// one in-scope device for; with an iexact filter that includes a
+			// case-only variant.
+			resolver := newFakeSerialResolver()
+			hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, OpClaimer: claimer, SerialResolver: resolver})
+			hub.Push("pop3", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"},
+				Machines: []model.MachineSnapshot{{ID: op.MachineID}}})
+			srv := httptest.NewServer(hub)
+			defer srv.Close()
+			conn := dialHub(t, srv, "tok-1")
+			if conn == nil {
+				t.Fatal("dial failed")
+			}
+			defer conn.CloseNow()
+			helloAndDrainSerial(t, conn, "worker-1", tc.claimant)
+
+			resp, errStr := claimAndRead(t, conn, op.ID)
+			if errStr != "" {
+				t.Fatalf("unexpected rpc error: %s", errStr)
+			}
+			if resp.Operation != nil || len(claimer.calls()) != 0 {
+				t.Fatalf("claimant %q was granted an outlet %s whose downstream is NetBox device %q, "+
+					"the worker whose board reports %q (store claims attempted: %d)",
+					tc.claimant, tc.opType, netboxSerial, reportedSerial, len(claimer.calls()))
+			}
+			if !resp.AlreadyClaimed {
+				t.Fatal("an interlock decline must be reported as already_claimed")
+			}
+		})
+	}
+}
+
 // TestInterlock_EmptySerialClaimant_Declined: an outlet op claimed by a worker
 // whose verified serial is "" (unverified) is declined fail-closed.
 func TestInterlock_EmptySerialClaimant_Declined(t *testing.T) {
@@ -341,8 +429,11 @@ func TestInterlock_NonOutletOpMalformedParams_Unaffected(t *testing.T) {
 }
 
 // TestInterlock_StoreErrorResolvingRegistered_FailClosed: a store error
-// resolving the registered-serial set for an outlet op declines the claim
-// fail-closed (never falls through to ClaimOperation).
+// resolving the registered-serial set for an outlet op fails closed (never
+// falls through to ClaimOperation, never grants) and is answered as a
+// retryable rpc error, not a decline: every worker on the slug would hit the
+// same failing read, so a decline would leave the op pending with no worker
+// left to claim it.
 func TestInterlock_StoreErrorResolvingRegistered_FailClosed(t *testing.T) {
 	op := outletOp(t, model.OpPowerCycle, "SN-SOMEWHERE", false)
 	auth := newFakeAuth()
@@ -363,14 +454,63 @@ func TestInterlock_StoreErrorResolvingRegistered_FailClosed(t *testing.T) {
 	helloAndDrainSerial(t, conn, "worker-1", "SN-PARTNER")
 
 	resp, errStr := claimAndRead(t, conn, op.ID)
-	if errStr != "" {
-		t.Fatalf("fail-closed decline must not be an rpc error, got %q", errStr)
+	if resp.Operation != nil {
+		t.Fatal("store error resolving registered serials must not grant the claim")
 	}
-	if !resp.AlreadyClaimed {
-		t.Error("store error resolving registered serials must fail closed (decline)")
+	if errStr == "" || resp.AlreadyClaimed {
+		t.Errorf("store error resolving registered serials was answered already_claimed=%v error=%q; "+
+			"want a retryable rpc error", resp.AlreadyClaimed, errStr)
 	}
 	if n := len(claimer.calls()); n != 0 {
-		t.Errorf("fail-closed decline must not reach ClaimOperation, got %d", n)
+		t.Errorf("fail-closed claim must not reach ClaimOperation, got %d", n)
+	}
+}
+
+// TestInterlock_StoreErrorReadingOp_Retryable: the interlock reads the op row
+// before it can tell whether the op is an outlet op, so that read runs for
+// every claim, deploys included. A store failure on it must be answered as an
+// rpc error: the worker treats that as retryable (it rolls its local claimed
+// mark back to pending and claims again on its next tick). Answering
+// already_claimed instead tells the worker another worker owns the op, so it
+// stops asking and the op sits pending with nothing driving it. No claim is
+// granted either way, and the retry claims normally once the store recovers.
+func TestInterlock_StoreErrorReadingOp_Retryable(t *testing.T) {
+	params, err := json.Marshal(model.OpParams{BMCRuntime: &model.BMCRuntime{Username: "admin", Password: "x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := &model.Operation{
+		ID: uuid.New(), MachineID: uuid.New(), Type: model.OpDeploy,
+		Status: model.OpPending, Params: params,
+	}
+	_, claimer, srv := interlockHub(t, op, nil)
+	claimer.setGetErr(errors.New("driver: bad connection"))
+
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrainSerial(t, conn, "worker-1", "SN-PARTNER")
+
+	resp, errStr := claimAndRead(t, conn, op.ID)
+	if resp.Operation != nil {
+		t.Fatal("a failed pre-claim read must not grant the claim")
+	}
+	if errStr == "" || resp.AlreadyClaimed {
+		t.Fatalf("store read failure on a pending deploy op was answered already_claimed=%v error=%q; "+
+			"want an rpc error so the worker retries instead of abandoning a still-pending op",
+			resp.AlreadyClaimed, errStr)
+	}
+	if n := len(claimer.calls()); n != 0 {
+		t.Errorf("a failed pre-claim read must not reach ClaimOperation, got %d", n)
+	}
+
+	// The store recovers; the worker's next claim attempt wins the op.
+	claimer.setGetErr(nil)
+	resp, errStr = claimAndRead(t, conn, op.ID)
+	if errStr != "" || resp.Operation == nil {
+		t.Fatalf("retry after the store recovered: error=%q granted=%v, want the op granted", errStr, resp.Operation != nil)
 	}
 }
 

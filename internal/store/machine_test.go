@@ -53,26 +53,184 @@ func TestGetMachineByNetBoxDeviceID(t *testing.T) {
 	}
 }
 
-func TestDeleteMachine(t *testing.T) {
+func TestDeleteMachineIfIdle(t *testing.T) {
 	st := testStore(t)
 	nb := 42
 	m := &model.Machine{ID: uuid.New(), NetBoxDeviceID: &nb, NetBoxSerial: "SN-D", State: model.MachineStateRunning}
 	if err := st.CreateMachine(m); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.DeleteMachine(m.ID); err != nil {
-		t.Fatal(err)
+	deleted, err := st.DeleteMachineIfIdle(m.ID)
+	if err != nil || !deleted {
+		t.Fatalf("DeleteMachineIfIdle = (%v, %v), want (true, nil)", deleted, err)
 	}
 	if _, err := st.GetMachine(m.ID); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("expected gorm.ErrRecordNotFound after delete, got %v", err)
 	}
+	// Already gone is what the caller asked for.
+	deleted, err = st.DeleteMachineIfIdle(m.ID)
+	if err != nil || !deleted {
+		t.Fatalf("DeleteMachineIfIdle on a deleted machine = (%v, %v), want (true, nil)", deleted, err)
+	}
 }
 
-// TestDeleteMachine_CascadesOperationsAndLogs verifies DeleteMachine
+// TestDeleteMachineIfIdle_KeepsMachineWithActiveOp: a machine with a
+// pending, claimed or running op is left alone, op included.
+func TestDeleteMachineIfIdle_KeepsMachineWithActiveOp(t *testing.T) {
+	for _, status := range []model.OperationStatus{model.OpPending, model.OpClaimed, model.OpRunning} {
+		t.Run(string(status), func(t *testing.T) {
+			st := testStore(t)
+			m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-BUSY", State: model.MachineStateCommissioned}
+			if err := st.CreateMachine(m); err != nil {
+				t.Fatal(err)
+			}
+			op := &model.Operation{ID: uuid.New(), MachineID: m.ID, Type: model.OpDeploy, Status: status}
+			if err := st.CreateOperation(op); err != nil {
+				t.Fatal(err)
+			}
+			deleted, err := st.DeleteMachineIfIdle(m.ID)
+			if err != nil || deleted {
+				t.Fatalf("DeleteMachineIfIdle = (%v, %v), want (false, nil)", deleted, err)
+			}
+			if _, err := st.GetMachine(m.ID); err != nil {
+				t.Errorf("machine deleted despite its %s op: %v", status, err)
+			}
+			got, err := st.GetOperation(op.ID)
+			if err != nil {
+				t.Fatalf("%s op deleted: %v", status, err)
+			}
+			if got.Status != status {
+				t.Errorf("op status = %s, want %s untouched", got.Status, status)
+			}
+		})
+	}
+}
+
+// TestDeleteMachineIfIdle_WaitsForConcurrentOpCreate pins the locking the
+// idle check relies on: an op insert that is in progress when the delete
+// starts holds FOR KEY SHARE on the machine row (through the operations
+// foreign key), so DeleteMachineIfIdle's FOR UPDATE waits for it and, once
+// it commits, sees the op and keeps the machine. Checking before taking
+// the lock would miss the uncommitted op and then fail on the foreign key.
+func TestDeleteMachineIfIdle_WaitsForConcurrentOpCreate(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-RACE", State: model.MachineStateCommissioned}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+
+	create := st.db.Begin()
+	t.Cleanup(func() { create.Rollback() })
+	op := &model.Operation{ID: uuid.New(), MachineID: m.ID, Type: model.OpDeploy, Status: model.OpPending}
+	if err := create.Create(op).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var deleted bool
+	var delErr error
+	returned := make(chan struct{})
+	go func() {
+		deleted, delErr = st.DeleteMachineIfIdle(m.ID)
+		close(returned)
+	}()
+	waitForLockWait(t, st, returned, "DeleteMachineIfIdle")
+
+	if err := create.Commit().Error; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("DeleteMachineIfIdle still blocked after the op insert committed")
+	}
+	if delErr != nil || deleted {
+		t.Fatalf("DeleteMachineIfIdle = (%v, %v), want (false, nil): the op committed while it waited", deleted, delErr)
+	}
+	if _, err := st.GetOperation(op.ID); err != nil {
+		t.Errorf("op deleted: %v", err)
+	}
+	if _, err := st.GetMachine(m.ID); err != nil {
+		t.Errorf("machine deleted: %v", err)
+	}
+}
+
+// TestCreateMachineOp_DeleteCommittedFirstIsMachineNotFound is the other
+// order: the machine delete is in progress when the op create starts. The
+// create must wait for it and then refuse the way it refuses a machine
+// that is already gone ("machine not found"), not read the doomed row,
+// pass its checks against it and fail later on the operations foreign key
+// with an error that tells the operator nothing.
+func TestCreateMachineOp_DeleteCommittedFirstIsMachineNotFound(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-GONE", State: model.MachineStateCommissioned, PXEEligible: true}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+
+	del := st.db.Begin()
+	t.Cleanup(func() { del.Rollback() })
+	if err := del.Delete(&model.Machine{}, "id = ?", m.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var op *model.Operation
+	var createErr error
+	returned := make(chan struct{})
+	go func() {
+		op, createErr = st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
+		close(returned)
+	}()
+	waitForLockWait(t, st, returned, "CreateMachineOp")
+
+	if err := del.Commit().Error; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CreateMachineOp still blocked after the delete committed")
+	}
+	if op != nil {
+		t.Fatalf("CreateMachineOp created op %s on a deleted machine", op.ID)
+	}
+	if !errors.Is(createErr, gorm.ErrRecordNotFound) {
+		t.Fatalf("CreateMachineOp error = %v, want machine not found", createErr)
+	}
+}
+
+// waitForLockWait polls until a session in the test database is waiting on
+// a lock, which here can only be the call under test blocking on the
+// test's open transaction. It fails if the call returns first.
+func waitForLockWait(t *testing.T, st *Store, returned <-chan struct{}, call string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting int64
+		if err := st.db.Raw(`SELECT count(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND datname = current_database()`).
+			Scan(&waiting).Error; err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			return
+		}
+		select {
+		case <-returned:
+			t.Fatalf("%s returned without waiting for the open transaction", call)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never blocked on the open transaction", call)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestDeleteMachineIfIdle_CascadesOperationsAndLogs verifies the delete
 // cleans up child rows that don't have ON DELETE CASCADE on their
 // FK. Without this cleanup, the FK constraint on operations.machine_id
 // would block the delete entirely.
-func TestDeleteMachine_CascadesOperationsAndLogs(t *testing.T) {
+func TestDeleteMachineIfIdle_CascadesOperationsAndLogs(t *testing.T) {
 	st := testStore(t)
 	nb := 99
 	m := &model.Machine{
@@ -93,8 +251,8 @@ func TestDeleteMachine_CascadesOperationsAndLogs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.DeleteMachine(m.ID); err != nil {
-		t.Fatalf("delete with child op should cascade, got: %v", err)
+	if deleted, err := st.DeleteMachineIfIdle(m.ID); err != nil || !deleted {
+		t.Fatalf("delete with a terminal child op should cascade, got (%v, %v)", deleted, err)
 	}
 	if _, err := st.GetMachine(m.ID); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Errorf("machine should be deleted, got: %v", err)
@@ -171,6 +329,37 @@ func TestGetMachineNotFound(t *testing.T) {
 	_, err := st.GetMachine(uuid.New())
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("expected gorm.ErrRecordNotFound, got %v", err)
+	}
+}
+
+// SetMachineDesiredOS writes desired_os and nothing else, reports a missing
+// machine as ErrMachineNotFound (instead of inserting it), and treats
+// re-setting the current value as success.
+func TestSetMachineDesiredOS(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-OS", State: model.MachineStateRunning, Locked: true, DesiredOS: "jammy"}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // the second pass re-sets the value it already holds
+		if err := st.SetMachineDesiredOS(m.ID, "noble"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.GetMachine(m.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DesiredOS != "noble" || got.State != model.MachineStateRunning || !got.Locked {
+		t.Errorf("after SetMachineDesiredOS: desired_os=%q state=%q locked=%v, want noble/running/true", got.DesiredOS, got.State, got.Locked)
+	}
+
+	missing := uuid.New()
+	if err := st.SetMachineDesiredOS(missing, "noble"); !errors.Is(err, ErrMachineNotFound) {
+		t.Errorf("unknown machine: got %v, want ErrMachineNotFound", err)
+	}
+	if _, err := st.GetMachine(missing); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Errorf("SetMachineDesiredOS created a row for an unknown machine (GetMachine err=%v)", err)
 	}
 }
 

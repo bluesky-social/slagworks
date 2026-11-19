@@ -142,6 +142,22 @@ func TestMatrix(t *testing.T) {
 			failure:         failureNone,
 			expectPhoneHome: true,
 		},
+		{
+			// xfs root on a three-way mirror, GRUB on all three
+			// disks: three grub-install runs over one xfs
+			// /boot/grub. When the second and third runs found the
+			// previous run's modules, backed them up and deleted the
+			// backups, /boot/grub/i386-pc ended up with a hole in its
+			// directory blocks, which the installed GRUB cannot read
+			// past: the first boot stopped at "error: not a correct
+			// XFS inode." and "grub rescue>". Two disks (the cell
+			// above) and ext4 never showed it.
+			name:            "bios-raid1-xfs-three-disks",
+			firmware:        qemutest.BIOS,
+			storage:         storageRAID1XFSThreeDisks,
+			failure:         failureNone,
+			expectPhoneHome: true,
+		},
 	}
 
 	// Concurrency cap removed (was maxParallel=2). Background:
@@ -196,6 +212,9 @@ type storageShape int
 const (
 	storageSingle storageShape = iota
 	storageRAID1
+	// storageRAID1XFSThreeDisks is an xfs root on a three-way mirror
+	// with a bios_grub partition on every member disk (BIOS only).
+	storageRAID1XFSThreeDisks
 	// storageNone means the site worker serves NO storage script for
 	// the machine (204). Used to assert the agent hard-fails at layout
 	// resolution instead of guessing an install target.
@@ -288,6 +307,13 @@ func runMatrixCell(t *testing.T, c matrixCell) {
 		// each so total VM disk usage matches the RAID1 lifecycle test.
 		vmCfg.DiskSize = "6G"
 		vmCfg.ExtraDisks = []qemutest.ExtraDisk{
+			{Type: qemutest.DiskVirtio, Size: "6G"},
+		}
+	}
+	if c.storage == storageRAID1XFSThreeDisks {
+		vmCfg.DiskSize = "6G"
+		vmCfg.ExtraDisks = []qemutest.ExtraDisk{
+			{Type: qemutest.DiskVirtio, Size: "6G"},
 			{Type: qemutest.DiskVirtio, Size: "6G"},
 		}
 	}
@@ -424,6 +450,8 @@ func storageScriptFor(s storageShape) matrixStorage {
 		return matrixStorage{name: "default", content: defaultStorageScript}
 	case storageRAID1:
 		return matrixStorage{name: "raid1", content: raid1StorageScript}
+	case storageRAID1XFSThreeDisks:
+		return matrixStorage{name: "raid1-xfs-three-disks", content: raid1XFSThreeDiskStorageScript}
 	default:
 		panic(fmt.Sprintf("unknown storage shape %d", int(s)))
 	}
