@@ -7,19 +7,26 @@ import (
 	"strings"
 )
 
-// minPartitionBytes is the smallest fixed partition size: 4096, the largest
-// logical sector size. sgdisk rounds a size down to whole sectors, so on a
-// 4Kn disk anything smaller is a zero-length partition.
-const minPartitionBytes = 4096
+// partitionSizeUnitBytes is what every fixed partition size must be a whole
+// multiple of: 4096, the largest logical sector size. sgdisk rounds a size
+// down to whole sectors, so on a 4Kn disk a size under 4096 bytes is a
+// zero-length partition and any other size that is not a multiple of it is a
+// smaller partition than the same size gives on a disk with 512-byte sectors
+// ("6K" is 6 KiB there and 4 KiB on 4Kn), with sgdisk exiting 0.
+const partitionSizeUnitBytes = 4096
 
 // sizeBytes returns the bytes a fixed partition size declares: a whole
 // number with a K, M, G or T suffix, in binary units and either case ("512M"
-// is 512 MiB), of at least minPartitionBytes. planDisk passes the size to
-// sgdisk unchanged, as the end of "-n N:0:+<size>", so anything sgdisk would
-// read differently is refused here: a bare number (sgdisk reads it as
-// sectors, a size that changes with the disk's sector size), a fraction
-// (sgdisk drops it), and zero, a negative number or a size under one sector
-// (sgdisk fails, after --zap-all has run).
+// is 512 MiB), that is a positive multiple of partitionSizeUnitBytes. planDisk
+// passes the size to sgdisk unchanged, as the end of "-n N:0:+<size>", so
+// anything sgdisk would read differently is refused here: a bare number
+// (sgdisk reads it as sectors, a size that changes with the disk's sector
+// size), a fraction (sgdisk drops it), zero, a negative number or a size
+// under one sector (sgdisk fails, after --zap-all has run), and a size that
+// is not a whole number of 4096-byte sectors (sgdisk rounds it down on a 4Kn
+// disk only). The last rule does not depend on the sector size of the disk
+// in hand: a layout must mean the same on every disk it may land on. Only a
+// K size can break it; every M, G and T size is a multiple of 4K.
 func sizeBytes(size string) (int64, error) {
 	bad := fmt.Errorf("partition size %q is neither \"rest\" nor a positive whole number "+
 		"with a K, M, G or T suffix (as in \"512M\" or \"100G\")", size)
@@ -39,9 +46,15 @@ func sizeBytes(size string) (int64, error) {
 	if err != nil || v == 0 || v > math.MaxInt64/unit {
 		return 0, bad
 	}
-	if v*unit < minPartitionBytes {
+	if v*unit < partitionSizeUnitBytes {
 		return 0, fmt.Errorf("partition size %q is under 4K: sgdisk rounds sizes down to whole "+
 			"logical sectors, which are 4K on a 4Kn disk; make it at least 1M", size)
+	}
+	if rem := v * unit % partitionSizeUnitBytes; rem != 0 {
+		down := (v*unit - rem) / 1024
+		return 0, fmt.Errorf("partition size %q is not a multiple of 4K: sgdisk rounds sizes down to "+
+			"whole logical sectors, so on a 4Kn disk (4K sectors) it would create %dK instead; "+
+			"use %dK or %dK, or a size in M", size, down, down, down+partitionSizeUnitBytes/1024)
 	}
 	return v * unit, nil
 }
