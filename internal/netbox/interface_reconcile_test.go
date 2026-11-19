@@ -454,6 +454,66 @@ func TestReconcileInterfaces_DuplicateMACRerunIsIdempotent(t *testing.T) {
 	}
 }
 
+// assignedMACRow returns an interface row in the state a half-finished
+// MAC write leaves in NetBox 4.2+: one MAC object assigned to the
+// interface, none marked primary, so the interface's own mac_address
+// (derived from the primary) is null.
+func assignedMACRow(id int, name, typ string, macID int, mac string) map[string]any {
+	r := ifaceRow(id, name, typ, "", nil)
+	r["mac_addresses"] = []map[string]any{{"id": macID, "mac_address": mac}}
+	r["primary_mac_address"] = nil
+	return r
+}
+
+// primaryMACPatches returns the primary_mac_address values PATCHed onto
+// interface id, in order.
+func primaryMACPatches(f *reconcileFixture, id int) []any {
+	var out []any
+	for _, p := range f.patches[id] {
+		if v, ok := p["primary_mac_address"]; ok {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// TestReconcileInterfaces_AssignedMACWithoutPrimaryIsMarkedPrimary pins
+// the repair of a half-finished MAC write. Setting an interface's MAC
+// takes two NetBox writes: create a MAC object assigned to the interface,
+// then mark it primary. When the second fails after the first committed
+// (a 5xx, a timeout, a lost create response), the row is left with
+// mac_addresses=[M] and no primary, and SyncCommissionData relies on the
+// next run to finish the job. Interface.GetMAC falls back to
+// mac_addresses[0], so reconcile read that row as already carrying M and
+// skipped it on every later run, leaving the primary null for good. The
+// rerun must mark the existing object primary without creating a
+// duplicate.
+func TestReconcileInterfaces_AssignedMACWithoutPrimaryIsMarkedPrimary(t *testing.T) {
+	f := newReconcileFixture([]map[string]any{
+		assignedMACRow(50, "eth0", "25gbase-x-sfp28", 900, "AA:00:00:00:00:01"),
+	})
+	srv := f.server(t)
+	defer srv.Close()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+	err := c.ReconcileInterfaces(context.Background(), 1, []NICData{
+		{Name: "eth0", MAC: "aa:00:00:00:00:01", IntfType: "25gbase-x-sfp28"},
+	}, false)
+	if err != nil {
+		t.Fatalf("ReconcileInterfaces: %v", err)
+	}
+	if len(f.macs) != 0 {
+		t.Errorf("expected no MAC-object creations (object 900 already holds the MAC), got %v", f.macs)
+	}
+	got := primaryMACPatches(f, 50)
+	if len(got) != 1 || got[0] != float64(900) {
+		t.Errorf("row 50: primary_mac_address PATCHes = %v, want [900] (the already-assigned object)", got)
+	}
+	if len(f.posts) != 0 || len(f.deletes) != 0 {
+		t.Errorf("expected pure update; posts=%v deletes=%v", f.posts, f.deletes)
+	}
+}
+
 // TestReconcileInterfaces_StaleSweepKeepsProtected pins the deletion
 // guard: unclaimed data NICs are deleted, while bonds, mgmt_only rows,
 // and BMC-named rows survive.
@@ -607,6 +667,40 @@ func TestReconcileInterfaces_MgmtOnlyRowIsIdempotent(t *testing.T) {
 	}
 	if len(f.deletes) != 0 {
 		t.Errorf("expected no deletions, got %v", f.deletes)
+	}
+}
+
+// TestReconcileInterfaces_MgmtOnlyRerunMarksAssignedMACPrimary is the
+// half-finished MAC write of
+// TestReconcileInterfaces_AssignedMACWithoutPrimaryIsMarkedPrimary on the
+// synthetic "ipmi" row. Reconcile created that row on an earlier run, so
+// it is protected and the rerun takes the mgmt-only idempotency skip,
+// which recognises the row by GetMAC and therefore also matched on the
+// mac_addresses[0] fallback. The skip must still mark the assigned MAC
+// object primary, and must write nothing else to the protected row.
+func TestReconcileInterfaces_MgmtOnlyRerunMarksAssignedMACPrimary(t *testing.T) {
+	bmc := assignedMACRow(91, "ipmi", "1000base-t", 901, "AA:BB:CC:DD:EE:91")
+	bmc["mgmt_only"] = true
+	f := newReconcileFixture([]map[string]any{bmc})
+	srv := f.server(t)
+	defer srv.Close()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+	err := c.ReconcileInterfaces(context.Background(), 1, []NICData{
+		{Name: "ipmi", MAC: "aa:bb:cc:dd:ee:91", IntfType: "1000base-t", MgmtOnly: true},
+	}, false)
+	if err != nil {
+		t.Fatalf("ReconcileInterfaces: %v", err)
+	}
+	if len(f.macs) != 0 {
+		t.Errorf("expected no MAC-object creations (object 901 already holds the MAC), got %v", f.macs)
+	}
+	ps := f.patches[91]
+	if len(ps) != 1 || len(ps[0]) != 1 || ps[0]["primary_mac_address"] != float64(901) {
+		t.Errorf("row 91 (protected mgmt_only): PATCHes = %v, want exactly [{primary_mac_address: 901}]", ps)
+	}
+	if len(f.posts) != 0 || len(f.deletes) != 0 {
+		t.Errorf("expected no creations or deletions; posts=%v deletes=%v", f.posts, f.deletes)
 	}
 }
 
