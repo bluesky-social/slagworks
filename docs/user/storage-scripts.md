@@ -96,6 +96,14 @@ redeploy with `--destructive`.
 }
 ```
 
+A mount point must be a clean absolute path: `/var/lib`, not `var/lib`,
+`/var/lib/`, `/var//lib` or `/srv/../var`, and with no whitespace, control
+characters or backslashes. The planner mounts each one at `/target` plus the
+key, orders mounts by depth, and writes the key into `/etc/fstab`, so anything
+else could mount outside `/target`, mount a parent over its child, or break
+the fstab line. The agent refuses such a layout before touching any disk and
+names the offending mount point.
+
 ## Storage scripts
 
 Scripts that produce layout JSON on stdout. They must be executable and carry
