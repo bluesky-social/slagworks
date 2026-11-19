@@ -103,7 +103,9 @@ distinct locations).
 The ephemeral pool is the range from which the DHCP/TFTP boot server
 hands leases to hosts booting via `pxe_eligible=true`. It must sit
 inside the OOB subnet the site worker is bound to but should not
-overlap production reservations. Relay pools (`--relay-pool`) are added
+overlap production reservations: a reserved host takes its address back
+from any dynamic client holding it, and that client is NAKed at its next
+renew and moves to another address. Relay pools (`--relay-pool`) are added
 via `site-config update` for hosts that PXE across an L3 relay.
 
 Source: `cmd/slagctl/cmd/site.go`, `internal/model/site_config.go`.

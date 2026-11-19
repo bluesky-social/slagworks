@@ -92,6 +92,15 @@ func preserveLayout() storage.Layout {
 	}
 }
 
+// preserveRunner is a scriptRunner that answers the kernel's view of
+// preserveLayout's members: both are whole disks.
+func preserveRunner() *scriptRunner {
+	r := newScriptRunner()
+	r.output["lsblk -snlo NAME,TYPE /dev/nvme1n1"] = "nvme1n1 disk"
+	r.output["lsblk -snlo NAME,TYPE /dev/nvme2n1"] = "nvme2n1 disk"
+	return r
+}
+
 func TestPreflightPreserve_NoPreserveDevices_NoOp(t *testing.T) {
 	layout := storage.Layout{Devices: map[string]storage.Device{
 		"nvme0n1": {Type: "disk"},
@@ -108,7 +117,7 @@ func TestPreflightPreserve_NoPreserveDevices_NoOp(t *testing.T) {
 func TestPreflightPreserve_Success(t *testing.T) {
 	layout := preserveLayout()
 	md := storage.MDDevMap(layout)["mddata"]
-	r := newScriptRunner()
+	r := preserveRunner()
 	// mdadm --detail returns the matching UUID (mdadm's colon-grouped form).
 	r.output["mdadm --detail "+md] = "        Version : 1.2\n           UUID : e8c9aa81:11112222:33334444:55556666\n"
 	// blkid on the array returns the fs UUID (not declared here -> not checked).
@@ -162,7 +171,7 @@ func TestPreflightPreserve_Success(t *testing.T) {
 func TestPreflightPreserve_PostVerifyStopFails_FATAL(t *testing.T) {
 	layout := preserveLayout()
 	md := storage.MDDevMap(layout)["mddata"]
-	r := newScriptRunner()
+	r := preserveRunner()
 	r.output["mdadm --detail "+md] = "           UUID : e8c9aa81:11112222:33334444:55556666\n"
 	// The targeted post-verify stop fails. (--stop --scan and the pre-assemble
 	// path succeed by default; only the exact-argv targeted stop errors.)
@@ -174,33 +183,78 @@ func TestPreflightPreserve_PostVerifyStopFails_FATAL(t *testing.T) {
 	}
 }
 
+// TestPreflightPreserve_MemberOnDiskTarget_FATAL: a preserve member on an
+// UNDECLARED partition of a disk the layout partitions (finding #3). Static
+// validate() misses it (it compares full partition names); the guard must
+// catch it before any zap, whatever the member is called. The kernel, not
+// the member's spelling, says which disk holds it: a /dev/disk/by-id path or
+// a partition of a pmem disk does not parse back to its disk's name.
 func TestPreflightPreserve_MemberOnDiskTarget_FATAL(t *testing.T) {
-	// finding #3: a preserve member on an UNDECLARED partition of a managed
-	// disk. Static validate() misses it (it compares full partition names);
-	// the parent-disk match here catches it before any zap.
-	layout := preserveLayout()
-	dev := layout.Devices["mddata"]
-	dev.Members = []string{"nvme0n1p9", "nvme2n1"} // nvme0n1 IS a disk target
-	layout.Devices["mddata"] = dev
+	cases := []struct {
+		name   string
+		disk   string // the disk-type layout target that holds the member
+		member string
+		lsblk  string // lsblk -snlo NAME,TYPE <member>
+	}{
+		{"kernel partition name", "nvme0n1", "nvme0n1p9", "nvme0n1p9 part\nnvme0n1   disk"},
+		{"/dev/disk/by-id path to the partition", "nvme0n1",
+			"/dev/disk/by-id/nvme-EXAMPLE_SERIAL_S1-part9", "nvme0n1p9 part\nnvme0n1   disk"},
+		{"partition of a pmem disk", "pmem0", "pmem0p2", "pmem0p2 part\npmem0   disk"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			layout := preserveLayout()
+			layout.Devices[tc.disk] = storage.Device{Type: "disk", Partitions: []storage.Partition{
+				{Name: tc.disk + "p1", FS: "ext4", Size: "rest"},
+			}}
+			dev := layout.Devices["mddata"]
+			dev.Members = []string{tc.member, "nvme2n1"}
+			layout.Devices["mddata"] = dev
+			md := storage.MDDevMap(layout)["mddata"]
 
+			r := preserveRunner()
+			r.output["lsblk -snlo NAME,TYPE "+resolveMemberPath(tc.member)] = tc.lsblk
+			// The named members would assemble and verify, so only the guard
+			// stands between this layout and sgdisk --zap-all on the member.
+			r.output["mdadm --detail "+md] = "           UUID : e8c9aa81:11112222:33334444:55556666\n"
+
+			err := PreflightPreserve(scriptCtx(r), layout)
+			if err == nil {
+				t.Fatalf("expected FATAL: preserve member %q is on disk target %s", tc.member, tc.disk)
+			}
+			if !strings.Contains(err.Error(), tc.disk) {
+				t.Errorf("error should name the offending disk %s, got: %v", tc.disk, err)
+			}
+			// The host must be untouched: no mdadm call at all, not even a stop.
+			if r.ran("mdadm") {
+				t.Errorf("must FATAL before any mdadm call when a member is on a disk target, calls: %v", r.calls)
+			}
+		})
+	}
+}
+
+// TestPreflightPreserve_MemberNotOnHost_FATAL: a member the kernel does not
+// know cannot be checked against the disk targets, so the guard fails with
+// the host untouched instead of proceeding.
+func TestPreflightPreserve_MemberNotOnHost_FATAL(t *testing.T) {
+	layout := preserveLayout()
 	r := newScriptRunner()
+	r.output["lsblk -snlo NAME,TYPE /dev/nvme1n1"] = "nvme1n1 disk"
+	r.outputErr["lsblk -snlo NAME,TYPE /dev/nvme2n1"] = fmt.Errorf("exit status 32")
+
 	err := PreflightPreserve(scriptCtx(r), layout)
-	if err == nil {
-		t.Fatal("expected FATAL: preserve member on a disk-type layout target")
+	if err == nil || !strings.Contains(err.Error(), "nvme2n1") {
+		t.Fatalf("expected FATAL naming the missing member nvme2n1, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "nvme0n1") {
-		t.Errorf("error should name the offending parent disk, got: %v", err)
-	}
-	// Crucially, NO assemble may have run -- we must fail before touching mdadm.
-	if r.ran("--assemble") {
-		t.Errorf("must FATAL before assembling when a member is on a disk target, calls: %v", r.calls)
+	if r.ran("mdadm") {
+		t.Errorf("must FATAL before any mdadm call, calls: %v", r.calls)
 	}
 }
 
 func TestPreflightPreserve_AssembleFails_FATAL(t *testing.T) {
 	layout := preserveLayout()
 	md := storage.MDDevMap(layout)["mddata"]
-	r := newScriptRunner()
+	r := preserveRunner()
 	r.runErr["mdadm --assemble "+md+" --uuid "+testArrayUUID+" /dev/nvme1n1 /dev/nvme2n1"] =
 		fmt.Errorf("mdadm: no recogniseable superblock")
 
@@ -213,7 +267,7 @@ func TestPreflightPreserve_AssembleFails_FATAL(t *testing.T) {
 func TestPreflightPreserve_UUIDMismatch_FATAL(t *testing.T) {
 	layout := preserveLayout()
 	md := storage.MDDevMap(layout)["mddata"]
-	r := newScriptRunner()
+	r := preserveRunner()
 	// Assembled array reports a DIFFERENT UUID than expected.
 	r.output["mdadm --detail "+md] = "           UUID : deadbeef:00000000:11111111:22222222\n"
 
@@ -240,7 +294,7 @@ func TestPreflightPreserve_FSUUIDMismatch_FATAL(t *testing.T) {
 	layout.Devices["mddata"] = dev
 	md := storage.MDDevMap(layout)["mddata"]
 
-	r := newScriptRunner()
+	r := preserveRunner()
 	r.output["mdadm --detail "+md] = "           UUID : e8c9aa81:11112222:33334444:55556666\n"
 	r.output["blkid -s UUID -o value "+md] = "ffffffff-0000-1111-2222-333333333333" // != declared FSUUID
 

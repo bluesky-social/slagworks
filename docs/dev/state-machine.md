@@ -60,7 +60,9 @@ the state machine:
 - `PXEEligible` (`machine.go:55`) — the operator-owned gate that
   keeps a live host from PXE-booting into an accidental reimage.
   Must be true for the boot-action decision to return anything
-  other than `BootLocal`.
+  other than `BootLocal`. Enabling it is refused while `Locked`
+  (`SetMachinePXEEligible` returns `ErrMachineLocked`, HTTP 409);
+  disabling it is always allowed.
 - `CommissionData` (`machine.go:51`) — raw JSON of the last
   commission report. Empty means the machine has never been
   commissioned; this is the signal used by `FailOperation` to
@@ -184,7 +186,7 @@ is in flight.
 |---|---|---|---|---|---|
 | 1 | `CreateMachine` | `internal/store/store.go:60` | new machine row (from `mirror.OnDeviceCreated`) | `NetBoxSerial != ""` | initial `state = new` if empty (line 67) |
 | 2 | `ClaimOperation` | `internal/store/store.go:369` | worker WS RPC `claim_op` | op status is `pending` (CAS at line 430); machine not locked; state is in `claimTransition` allowed set | commission -> `commissioning`; deploy -> `deploying`; power ops leave state untouched |
-| 3 | `CompleteOperationWithState` | `internal/store/store.go:576` | hub receives `op_update{status=completed}` | op not already terminal | sets target state; deploy passes `MachineStateRunning`; empty target means no state change (power ops, per `internal/hubhandlers/hubhandlers.go:60`) |
+| 3 | `CompleteOperationWithState` | `internal/store/store.go:576` | hub receives `op_update{status=completed}`, or a `phone_home` observation naming the deploy op | op not already terminal | sets target state; deploy passes `MachineStateRunning`; empty target means no state change (power ops, per `internal/hubhandlers/hubhandlers.go:60`) |
 | 4 | `CommitCommissionResult` | `internal/store/commission_result.go` | commission observation handler | exact active commission op ID belongs to the reported machine | atomically stores inventory, completes that op, and moves its machine to `commissioned` |
 | 5 | `FailOperation` | `internal/store/store.go:772` | worker `op_update{status=failed}`, `AbortMachine`, or one of the three timeout sweeps | op not already terminal | per-rule branching, see below |
 
@@ -344,15 +346,15 @@ it. The authoritative implementation is `Cache.BootActionForMAC`
 |---|---|---|---|
 | Unknown MAC (not in the snapshot) | — | — | `BootLocal` (`cache.go:254`) |
 | Any state with `!PXEEligible` | — | — | `BootLocal` (`cache.go:257`) |
+| Any state | deploy op | `awaiting_phone_home` | `BootLocal` (`opState.bootActionLocked`) |
 | `commissioning` | commission op already claimed | — | `BootCommission` (`cache.go:278`) |
 | `deploying` | deploy op | anything except `awaiting_phone_home` | `BootDeploy` (`cache.go:285`) |
-| `deploying` | deploy op | `awaiting_phone_home` | `BootLocal` (`cache.go:280`) |
 | `new` | commission op | — | `BootCommission` |
 | `new` | — | — | `BootLocal` |
 | `failed` | pending commission op | — | `BootCommission` (`cache.go:300`) |
-| `failed` | pending deploy op | — | `BootDeploy` (`cache.go:303`) |
+| `failed` | pending deploy op | anything except `awaiting_phone_home` | `BootDeploy` (`cache.go:303`) |
 | `failed` | no operation | — | `BootLocal` (`cache.go:307`) |
-| `commissioned` | pending deploy op | — | `BootDeploy` (`cache.go:309`) |
+| `commissioned` | pending deploy op | anything except `awaiting_phone_home` | `BootDeploy` (`cache.go:309`) |
 | `commissioned` | no deploy op | — | `BootLocal` (`cache.go:312`) |
 | `running` | any | — | `BootLocal` (`cache.go:313`) |
 | default | — | — | `BootLocal` (`cache.go:317`) |
@@ -366,9 +368,11 @@ Notes:
 - Commission and deploy both require an exact active operation. The boot
   script derives `machine_id`, `op_id`, and `trace_id` from that single
   binding; inventory can validate identity but cannot select another machine.
-- The `awaiting_phone_home` branch (`cache.go:280`) is the reason
-  the post-deploy reboot does not loop-wipe the disk; see [The
-  `awaiting_phone_home` latch](#the-awaiting_phone_home-latch).
+- The `awaiting_phone_home` row is the reason the post-deploy reboot
+  does not loop-wipe the disk; see [The `awaiting_phone_home`
+  latch](#the-awaiting_phone_home-latch). It is checked before the
+  machine state because the pending-op rows let an install finish
+  while the machine is still `commissioned` or `failed`.
 
 ### How the boot action reaches the target
 
@@ -511,7 +515,10 @@ resurrect a zombie op, and — the re-wipe-window fix — clears its op-driven
 machine-state overlay on an identity apply ONLY where the applied baseline
 equals the overlay value. A rehydrated-from-LocalDB op set is UNTRUSTED
 until the first `op_resync`: it may force `BootLocal` but never actuate.
-Fail-closed rule: an effective transient state (deploying/commissioning)
+The worker persists its op layer (`worker.db`, kv key `op_state`) after
+every stream apply and after the two local writes that protect an
+installed host, a deploy op reaching `awaiting_phone_home` and a
+phone-home; see [the latch](#the-awaiting_phone_home-latch). Fail-closed rule: an effective transient state (deploying/commissioning)
 with NO matching active op in the op layer serves `BootLocal`, never
 `BootDeploy`/`BootCommission`. Protocol skew is loud: `HelloMsg.Proto` and
 every hello reply carry `ws.OpStreamProto`; either side refuses an
@@ -562,12 +569,22 @@ Path depends on the op type.
   `handler.go:941` calls `provider.RecordPhoneHome`, which is
   `Cache.RecordPhoneHome` (`internal/worker/cache.go:404`).
   That sets the machine's local state to `running`, emits a
-  `phone_home` observation, and calls
-  `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. The op
-  update flows through the outbox to the hub, and
-  `hubhandlers.OpUpdate.HandleOpUpdate` calls
+  `phone_home` observation carrying the deploy op's ID, and calls
+  `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. Both reach
   `Store.CompleteOperationWithState(opID, Running, ...)`, which
-  auto-locks the machine.
+  auto-locks the machine: the op update through
+  `hubhandlers.OpUpdate.HandleOpUpdate`, the observation through
+  the observation handler (`internal/commission/handler.go`,
+  `handlePhoneHome`). Whichever lands first completes the op; the
+  other is a no-op. The observation is the one that must arrive:
+  the installed OS phones home only until its first 2xx, op updates
+  live only in the worker's memory and are never acknowledged, and
+  the observation stays in the worker's SQLite outbox until global
+  acks it. Without it, a worker restart, a dropped connection or a
+  failed op-update handler between the 2xx and delivery would leave
+  the op at `awaiting_phone_home` until `PhoneHomeTimeout` fails a
+  healthy host. A `phone_home` with no op ID (the worker held no
+  active deploy op) changes nothing.
 - **Commission** completes via the commission report path, not the
   op-update path. The observation handler calls
   `Store.CommitCommissionResult(opID, machineID, data)`, which revalidates
@@ -647,6 +664,17 @@ Phase failure is not timeout-driven. When the agent's `fatal` runs
 site worker marks the op failed immediately. The timeout sweeps
 exist only for the "agent died silently" case.
 
+The worker's local failure holds until global's `op_removed` for the op.
+Global applies the failure as separate writes, and each phase write
+publishes an `op_delta` whose row is still `claimed` before the failure
+publishes `op_removed`; a reconnect's `op_resync` can also still show the
+op claimed when the best-effort `op_update` never reached global. The
+worker keeps such an op failed (`keepLocalFailure` in
+`internal/worker/opstate_cache.go`): the host is not booted into the agent
+again and reports for the op are refused as terminal. When the failure
+never reached global, the op stays active there until a timeout sweep
+fails it.
+
 Each sweep fails its ops one transaction at a time and keeps going past
 a per-op error, returning both the ops it failed and the joined error.
 The tick (`Server.expireOperations`) publishes `op_removed` for every op
@@ -711,30 +739,55 @@ latch, that PXE would land back in `Cache.BootActionForMAC` while
 the machine was still `deploying`, get `BootDeploy` again, and the
 agent would wipe the disk it just wrote.
 
-The fix is a per-phase clobber guard.
+The fix is a clobber guard on the op's phase.
 
-`Cache.HandleProgressReport` (`internal/worker/cache.go:1517`)
+`Cache.HandleProgressReport` (`internal/worker/cache.go`)
 recognizes the `deploy_complete` event and calls
-`UpdateOpPhase(opID, "awaiting_phone_home")` (line 1525).
+`UpdateOpPhase(opID, "awaiting_phone_home")`.
 
-`Cache.UpdateOpPhase` (`cache.go:1321`) then refuses to overwrite
-`awaiting_phone_home` with a phase from the `bootPrefixPhases` set
-(`cache.go:1314`):
-
-```text
-pxe_booting, dhcp_ack, ipxe_dhcp, ipxe_loaded
-```
-
-The reasoning is documented in the block comment at `cache.go:1301`.
-Test: `TestUpdateOpPhase_AwaitingPhoneHomeNotClobbered`
-(`cache_test.go:190`).
+`Cache.UpdateOpPhase` then refuses every phase write that would move
+the op off `awaiting_phone_home`, except `failed`, which
+`HandleProgressReport` writes just before `MarkOpFailed` on an agent
+failure report. The guard lives in `opState.updatePhase`
+(`internal/worker/opstate_cache.go`). The writers it stops are the
+post-install firmware PXE (`pxe_booting`, `dhcp_ack`, `ipxe_dhcp`,
+`ipxe_loaded`), the executor's `power_cycle` and `pxe_booting` when it
+claims an op whose install finished while the op was still pending,
+and an agent phase report the worker processes after
+`deploy_complete`. Completion never needs a phase write: it goes
+through `RecordPhoneHome`. A dropped write is not queued for global
+either, so the op stays on the phone-home timeout. Tests:
+`TestUpdateOpPhase_AwaitingPhoneHomeNotClobbered` and
+`TestUpdateOpPhase_AwaitingPhoneHomeOnlyLeftByFailure`
+(`cache_test.go`). `keepTerminalWait` holds the phase the same way
+against a pending, claimed or running deploy row in an op_delta or
+op_resync from global (`TestStaleEchoKeepsAwaitingPhoneHome`,
+`TestStalePendingRowKeepsAwaitingPhoneHome`, `opstream_test.go`).
 
 `Cache.BootActionForMAC` reads the phase and returns `BootLocal`
-whenever `state = deploying` and `phase = awaiting_phone_home`
-(`cache.go:280`). The target boots off disk, its phone-home
+whenever the machine's active deploy op is at `awaiting_phone_home`,
+whatever the machine state. The state is usually `deploying`, but a
+host that PXEs on the pending-op clause while the executor's claim
+keeps failing installs with the machine still `commissioned` or
+`failed`: only the claim's op_delta moves it to `deploying`, and
+`HandleProgressReport` accepts reports for a pending op
+(`TestBootAction_AwaitingPhoneHomeOnUnclaimedDeploy`, `cache_test.go`).
+The target boots off disk, its phone-home
 service POSTs `/api/v1/phone-home`, `RecordPhoneHome` fires the
 completion path described earlier, and the op transitions to
 `completed` with `machine.state = running`.
+
+The latch has to survive a worker restart. The phase and the completion
+reach global only as op_updates, which the outbox keeps in memory, so
+global can still hold the op claimed at a pre-install phase when the
+install finishes during a WAN outage. `Cache.UpdateOpPhase` therefore
+writes the op layer to LocalDB when it sets `awaiting_phone_home`, and
+`Cache.RecordPhoneHome` writes it with the running overlay and the
+`phoneHomed` pin. After a restart the first `op_resync` (built from
+global's stale row) then finds the latched phase to keep
+(`keepTerminalWait`) and the pin to apply, and the host's next PXE still
+boots its disk. Test: `TestAwaitingPhoneHomeSurvivesRestart`
+(`opstream_test.go`).
 
 Timeout: `PhoneHomeTimeout` (30 minutes by default) anchored on
 `phase_entered_at`.

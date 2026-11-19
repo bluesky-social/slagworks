@@ -23,13 +23,18 @@ import (
 //     critical section that enqueues it, closing the "row in SQLite but
 //     not in memory" window that reloadFromDisk would otherwise mistake
 //     for a stranded row.
-//   - opUpdates are best-effort and NOT persisted — they carry phase
-//     progress that's cheap to lose on crash.
+//   - opUpdates are best-effort and NOT persisted. A lost phase update
+//     is cheap; a lost terminal status leaves the op to global's timeout
+//     sweeps. A completion that must not be lost rides a durable
+//     observation as well: the deploy's phone_home carries the op ID
+//     (see Cache.RecordPhoneHome).
 //   - ackObservation deletes the SQLite row only after global confirms
 //     receipt via rpc_response{ok:true}.
 //   - reloadFromDisk re-enqueues rows that were sent but not yet acked
 //     when a connection drops, so a disconnect mid-ack-window doesn't
 //     strand the observation until the next worker restart.
+//   - newOutbox rehydrates unacked rows on restart and wakes the drain
+//     loop, so they are re-sent on the first connection.
 type outbox struct {
 	mu        sync.Mutex
 	pending   []PendingOutbox
@@ -37,9 +42,9 @@ type outbox struct {
 
 	// retryTimer wakes the drain loop when the earliest backed-off row
 	// becomes due. The drain loop is otherwise purely wake-driven (wakeCh
-	// fires on append/requeue), so when drain holds back not-due rows and
-	// nothing else writes to the queue, no wake would ever fire and the
-	// rows would strand until the next WS reconnect. drain (re)arms this
+	// fires on rehydrate/append/requeue), so when drain holds back not-due
+	// rows and nothing else writes to the queue, no wake would ever fire and
+	// the rows would strand until the next WS reconnect. drain (re)arms this
 	// for the earliest NextAttempt whenever it holds rows back. Guarded by
 	// mu. The callback is wake(), which is idempotent and non-blocking, so
 	// a stale timer firing after a re-arm only costs one spurious drain.
@@ -65,6 +70,13 @@ type outbox struct {
 
 // newOutbox builds an outbox, rehydrating any persisted pending rows from
 // localDB (nil disables persistence). The wake channel is buffered(1).
+//
+// Rehydrated rows get a wake like any other enqueue: the drain loop is
+// wake-driven, and reloadFromDisk on the first connection adds nothing
+// (the rows are already in memory), so without this token a row left
+// unacked by the previous process would wait for an unrelated append.
+// The token sits in the buffered channel until the first connection's
+// drain loop takes it.
 func newOutbox(localDB *LocalDB) *outbox {
 	o := &outbox{
 		wakeCh:  make(chan struct{}, 1),
@@ -73,6 +85,7 @@ func newOutbox(localDB *LocalDB) *outbox {
 	if localDB != nil {
 		if pending := localDB.ListPendingOutbox(); len(pending) > 0 {
 			o.pending = pending
+			o.wake()
 		}
 	}
 	return o

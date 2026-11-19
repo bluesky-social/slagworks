@@ -37,6 +37,16 @@ type CastManager struct {
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
 
+	// reconcileMu serializes whole Reconcile passes. The site worker
+	// calls Reconcile from the snapshot-applied callback and directly at
+	// startup, on different goroutines. A pass reads the active set
+	// before taking mu and drains dropped pumps after releasing it, so
+	// without this an older read could commit after a newer one, and a
+	// re-add could spawn while the dropped pump still holds the SOL
+	// session. Shutdown does not take it, so it never waits behind a
+	// drain.
+	reconcileMu sync.Mutex
+
 	mu    sync.Mutex
 	pumps map[uuid.UUID]*castPumpHandle
 
@@ -118,8 +128,10 @@ func (m *CastManager) Start(parent context.Context) {
 }
 
 // Reconcile aligns the pump set with the cache's active machines.
-// Idempotent. Safe to call from a single goroutine (the worker's
-// snapshot-apply path). No-op before Start or after Shutdown.
+// Idempotent. Safe to call from several goroutines: passes run one at a
+// time, from the active-set read through the dropped-pump drain, so the
+// pump set ends at the set the last pass read and a re-add waits out an
+// earlier pass's drain. No-op before Start or after Shutdown.
 func (m *CastManager) Reconcile() {
 	if m.rootCtx == nil {
 		return
@@ -127,6 +139,8 @@ func (m *CastManager) Reconcile() {
 	if err := m.rootCtx.Err(); err != nil {
 		return
 	}
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
 	want := make(map[uuid.UUID]struct{})
 	for _, id := range m.cache.ListActiveMachineIDs() {
 		want[id] = struct{}{}

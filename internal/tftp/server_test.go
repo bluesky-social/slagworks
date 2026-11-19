@@ -59,6 +59,66 @@ func TestReadHandler_ServesFile(t *testing.T) {
 	}
 }
 
+// The serve directory comes from SLAGWORKS_TFTP_DIR (or qemutest-tftpd's
+// -dir) verbatim. Every spelling of the same directory must serve the same
+// files and reject the same escapes; a trailing slash, a "./" prefix or a
+// relative path must not turn every request into "rejected path traversal".
+func TestReadHandler_ServeDirSpelling(t *testing.T) {
+	parent := t.TempDir()
+	serve := filepath.Join(parent, "ipxe")
+	if err := os.Mkdir(serve, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serve, "snponly.efi"), []byte("EFI"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "outside"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		cwd  string
+		dir  string
+	}{
+		{"absolute", parent, serve},
+		{"absolute trailing slash", parent, serve + "/"},
+		{"absolute double slash", parent, serve + "//"},
+		{"absolute trailing dot", parent, serve + "/."},
+		{"relative", parent, "ipxe"},
+		{"relative dot-slash prefix", parent, "./ipxe"},
+		{"relative trailing slash", parent, "ipxe/"},
+		{"current directory", serve, "."},
+		{"current directory trailing slash", serve, "./"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(tc.cwd)
+			h := NewReadHandler(tc.dir)
+
+			rc, err := h.Open("snponly.efi")
+			if err != nil {
+				t.Fatalf("serve dir %q: Open(snponly.efi) = %v, want the file", tc.dir, err)
+			}
+			b, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != "EFI" {
+				t.Errorf("serve dir %q: got %q, want %q", tc.dir, b, "EFI")
+			}
+
+			for _, name := range []string{"../outside", ".", "./"} {
+				if rc, err := h.Open(name); err == nil {
+					rc.Close()
+					t.Errorf("serve dir %q: Open(%q) succeeded, want rejection", tc.dir, name)
+				}
+			}
+		})
+	}
+}
+
 func TestReadHandler_FileNotFound(t *testing.T) {
 	dir := setupServeDir(t)
 	h := NewReadHandler(dir)

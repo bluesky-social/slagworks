@@ -142,6 +142,76 @@ func TestParse_InvalidPriority(t *testing.T) {
 	}
 }
 
+func TestParse_TabAfterDirectiveApplies(t *testing.T) {
+	// The grammar tolerates whitespace around the "#" and around "=", so a tab
+	// (or several spaces) between the directive and its argument is the same
+	// directive, not prose. Before the fix a tab made Parse skip the line, so
+	// the AND-constraint vanished and the priority fell back to 0.
+	s := mustParse(t, "#!/usr/bin/env python3\n"+
+		"# slagworks:match system_manufacturer=/ASUSTeK.*/\n"+
+		"# slagworks:match\tsystem_product=RS501A-E12-RS4U\n"+
+		"# slagworks:priority\t150\n"+
+		"import sys\n")
+	if len(s.Rules) != 2 {
+		t.Fatalf("expected 2 rules, got %d: %+v", len(s.Rules), s.Rules)
+	}
+	if s.Rules[1].Field != "system_product" || s.Rules[1].Value != "RS501A-E12-RS4U" {
+		t.Errorf("tab-separated rule: got %s=%s, want system_product=RS501A-E12-RS4U", s.Rules[1].Field, s.Rules[1].Value)
+	}
+	if s.Priority != 150 {
+		t.Errorf("tab-separated priority: got %d, want 150", s.Priority)
+	}
+}
+
+func TestParse_UnrecognizedDirectiveRejected(t *testing.T) {
+	// A header line that starts with "slagworks:" is a directive. One Parse
+	// does not recognize is an operator typo. Before the fix such lines were
+	// treated as prose, so the upload succeeded and the snapshot build later
+	// matched hosts with that constraint (or priority) missing. Each must fail
+	// the parse and name the offending text.
+	for _, tc := range []struct {
+		header string
+		want   string
+	}{
+		{"# slagworks:match: system_product=RS501A-E12-RS4U", "slagworks:match:"},
+		{"# slagworks:mtach system_product=RS501A-E12-RS4U", "slagworks:mtach"},
+		{"# slagworks: match system_product=RS501A-E12-RS4U", "slagworks:"},
+		{"# slagworks:match=system_product=RS501A-E12-RS4U", "slagworks:match=system_product"},
+		{"# Slagworks:match system_product=RS501A-E12-RS4U", "Slagworks:match"},
+		{"# SLAGWORKS:PRIORITY 150", "SLAGWORKS:PRIORITY"},
+		{"# slagworks:prio 150", "slagworks:prio"},
+		{"# slagworks:match", "invalid match rule"},
+		{"# slagworks:priority", "invalid priority"},
+	} {
+		content := "#!/usr/bin/env python3\n# slagworks:match system_manufacturer=/ASUSTeK.*/\n" + tc.header + "\nimport sys\n"
+		s, err := Parse("typo-script", []byte(content), testFields)
+		if err == nil {
+			t.Errorf("header %q: expected a parse error, got rules=%+v priority=%d", tc.header, s.Rules, s.Priority)
+			continue
+		}
+		for _, want := range []string{"typo-script", tc.want} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("header %q: error should mention %q, got: %v", tc.header, want, err)
+			}
+		}
+	}
+}
+
+func TestParse_ProseMentioningSlagworksIsNotADirective(t *testing.T) {
+	// Only a line whose first word starts with "slagworks:" is a directive.
+	// Header prose that mentions slagworks (these shapes appear in shipped
+	// scripts) must keep parsing.
+	s := mustParse(t, "#!/usr/bin/env python3\n"+
+		"# slagworks deploy agent - storage layout for the RS501A.\n"+
+		"# slagworks_netlib does the parsing; SLAGWORKS_INVENTORY is set by\n"+
+		"# slagworks; it narrows this script off of any RS501A elsewhere.\n"+
+		"# slagworks:match system_product=RS501A-E12-RS4U\n"+
+		"import sys\n")
+	if len(s.Rules) != 1 {
+		t.Errorf("expected 1 rule, got %d: %+v", len(s.Rules), s.Rules)
+	}
+}
+
 // --- Match ---
 
 func TestMatch_NoScripts(t *testing.T) {

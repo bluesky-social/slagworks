@@ -6,6 +6,7 @@ func TestNormalizeHardwareSerial(t *testing.T) {
 	for _, value := range []string{
 		"", "Default string", "To Be Filled By O.E.M.", "N/A",
 		"System Serial Number", "Chassis Serial Number", "0000000000",
+		"0123456789",
 	} {
 		if got := NormalizeHardwareSerial(value); got != "" {
 			t.Errorf("NormalizeHardwareSerial(%q) = %q, want empty", value, got)
