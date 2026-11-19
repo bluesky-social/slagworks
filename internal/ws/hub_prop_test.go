@@ -444,6 +444,17 @@ func (w *propWorld) checkRegistry() {
 					w.violate("registry:count", "slug %s: hub lists %d connections, %d are open", slug, got, exp[slug])
 				}
 			}
+			for _, wk := range propWorkers {
+				live := false
+				for _, c := range w.liveClients() {
+					if _, closed := c.snapshotLog(); !closed && c.worker.id == wk.id {
+						live = true
+					}
+				}
+				if got := w.hub.IsWorkerConnected(wk.slug, wk.id); got != live {
+					w.violate("registry:identity", "worker %s of slug %s: hub says connected=%v, the test holds an open connection=%v", wk.id, wk.slug, got, live)
+				}
+			}
 			w.mu.Unlock()
 			return
 		}

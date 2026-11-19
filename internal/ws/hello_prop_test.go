@@ -217,6 +217,8 @@ func TestProp_HelloGate(t *testing.T) {
 			// The hub must hang up, never register, never persist a serial.
 			if _, err := conn.ReadMessage(ctx); err == nil {
 				rt.Fatalf("connection stayed open and sent more after refusing with %q\n  %s", wantCode, desc)
+			} else if ctx.Err() != nil {
+				rt.Fatalf("the hub did not close the connection after refusing with %q (the read ended on the test's deadline: %v)\n  %s", wantCode, err, desc)
 			}
 			if hub.IsWorkerConnected("site-a", "worker-1") {
 				rt.Fatalf("refused worker is registered as connected\n  %s", desc)
