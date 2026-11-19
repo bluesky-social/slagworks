@@ -234,7 +234,9 @@ the persistent WebSocket.
 
 - **Push down**: global pushes a full `SiteSnapshot` to the worker whenever
   site state changes (debounced). Snapshots carry a per-site `SeqNum`;
-  workers apply strictly by SeqNum to prevent stale overwrites.
+  within a connection workers apply strictly by SeqNum to prevent stale
+  overwrites. The first snapshot on each connection is global's current
+  view and replaces whatever the worker held, even at a lower SeqNum.
 - **Push up**: the worker sends observations, operation updates, and log
   envelopes upstream on the same socket, draining its durable local outbox.
 

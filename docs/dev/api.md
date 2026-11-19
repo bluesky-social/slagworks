@@ -239,8 +239,10 @@ Connection setup:
    the current op-stream protocol (`OpStreamProto`, 1), or, when NetBox is
    configured, when `serial` is empty or does not resolve to exactly one
    NetBox device inside the worker's site-config scope.
-3. Global replies with `snapshot` (worker is behind) or `no_change`, then
-   sends `op_resync`.
+3. Global replies with `snapshot` (the worker's `last_seq_num` differs from
+   global's) or `no_change`, then sends `op_resync`. The worker adopts the
+   first snapshot on a connection even when its SeqNum is lower than the
+   one it holds, and drops a later one that is older than what it holds.
 
 Worker to global:
 
@@ -262,7 +264,7 @@ Global to worker:
 
 | Type | Purpose |
 |---|---|
-| `snapshot` | `{"snapshot","version","proto"}`: the full site snapshot plus global's build SHA. Sent on hello when the worker is behind and whenever the site's snapshot content changes. A worker with `SLAGWORKS_AUTO_UPGRADE=1` upgrades itself when `version` differs from its own. |
+| `snapshot` | `{"snapshot","version","proto"}`: the full site snapshot plus global's build SHA. Sent on hello when the worker's `last_seq_num` differs from global's and whenever the site's snapshot content changes; when the site's SeqNum went backwards (site config recreated, database restored) global closes the site's worker connections instead, and the snapshot arrives as each reconnect's hello reply. A worker with `SLAGWORKS_AUTO_UPGRADE=1` upgrades itself when `version` differs from its own. |
 | `no_change` | `{"version","proto"}`. Hello reply when the worker's `last_seq_num` is current. |
 | `op_resync` | `{"ops","machine_states"}`: every active operation for the site, sent after every hello reply. |
 | `op_delta` | `{"operation","machine_state"}`: one operation after a mutation (create, claim, phase change). Every active operation for the site is also re-sent as an `op_delta` after each `snapshot` pushed on a content change; the worker keeps the higher `version`. |
