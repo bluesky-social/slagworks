@@ -35,10 +35,12 @@ func (r ResolvedMachine) Slot() string { return r.ID.String() }
 //
 //  1. UUID         → returned as-is, no API call.
 //  2. exact serial → GET /api/v1/machines?serial=<arg> with one hit.
-//  3. exact host   → GET /api/v1/machines?hostname=<arg> with one hit
-//     whose name equals arg (NetBox `name__ic` is substring, so the
-//     equality check happens client-side).
-//  4. unique substring → same call, exactly one match.
+//  3. exact host   → GET /api/v1/machines?hostname=<arg> with exactly
+//     one hit whose name equals arg (NetBox `name__ic` is substring, so
+//     the equality check happens client-side). Two or more such hits
+//     (NetBox names are unique only per site) are ambiguous and error
+//     with their UUIDs.
+//  4. unique substring → same call, no exact hit, exactly one match.
 //  5. ambiguous → error listing the candidate hostnames.
 //  6. miss → "no machine matches".
 //
@@ -96,15 +98,33 @@ func resolveMachine(ctx context.Context, c *slclient.Client, arg string) (Resolv
 	if len(hits) == 0 {
 		return ResolvedMachine{}, fmt.Errorf("no machine matches %q", arg)
 	}
-	// Exact-name win: any row whose Hostname equals arg (case-
+	// Exact-name win: a row whose Hostname equals arg (case-
 	// insensitive — NetBox device names are case-insensitive at the
 	// API layer via `name__ic`, so a typed `CPU1.pop1` should match a
 	// stored `cpu1.pop1` exactly even when other substring hits would
-	// otherwise force an ambiguous error).
+	// otherwise force an ambiguous error). NetBox names are unique only
+	// within a site (and tenant), so two machines can share one; that
+	// is ambiguous too, never a pick of whichever row came first.
+	var exact []model.Machine
 	for _, m := range hits {
 		if strings.EqualFold(m.Hostname, arg) {
-			return ResolvedMachine{ID: m.ID, Label: hostLabel(m)}, nil
+			exact = append(exact, m)
 		}
+	}
+	if len(exact) == 1 {
+		return ResolvedMachine{ID: exact[0].ID, Label: hostLabel(exact[0])}, nil
+	}
+	if len(exact) > 1 {
+		// The hostnames collide, so list full UUIDs: the one shape
+		// that still tells the candidates apart and resolves as-is.
+		cands := make([]string, len(exact))
+		for i, m := range exact {
+			cands[i] = fmt.Sprintf("%s (%s)", m.Hostname, m.ID)
+		}
+		sort.Strings(cands)
+		return ResolvedMachine{}, fmt.Errorf(
+			"ambiguous: %q is the hostname of %d machines: %s; pass the machine UUID instead",
+			arg, len(exact), strings.Join(cands, ", "))
 	}
 	if len(hits) == 1 {
 		return ResolvedMachine{ID: hits[0].ID, Label: hostLabel(hits[0])}, nil

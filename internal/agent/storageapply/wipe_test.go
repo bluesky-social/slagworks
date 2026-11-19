@@ -34,7 +34,7 @@ md0 raid1
 loop0 loop
 sr0 rom
 `
-	got := parseBystanderDisks(lsblkOut, layout)
+	got := parseBystanderDisks(lsblkOut, layoutClaimedDisks(layout))
 	want := []string{"nvme2n1", "nvme3n1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("bystanders = %v, want %v", got, want)
@@ -45,7 +45,7 @@ func TestParseBystanderDisks_AllClaimed(t *testing.T) {
 	layout := storage.Layout{Devices: map[string]storage.Device{
 		"sda": {Type: "disk"},
 	}}
-	if got := parseBystanderDisks("sda disk\n", layout); got != nil {
+	if got := parseBystanderDisks("sda disk\n", layoutClaimedDisks(layout)); got != nil {
 		t.Errorf("expected no bystanders, got %v", got)
 	}
 }
@@ -56,7 +56,7 @@ func TestParseBystanderDisks_RetainedDiskIsProtected(t *testing.T) {
 		"nvme1n1": {Type: "retain"},
 	}}
 	lsblkOut := "nvme0n1 disk\nnvme1n1 disk\nnvme2n1 disk\n"
-	got := parseBystanderDisks(lsblkOut, layout)
+	got := parseBystanderDisks(lsblkOut, layoutClaimedDisks(layout))
 	want := []string{"nvme2n1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("bystanders = %v, want %v", got, want)
@@ -66,43 +66,10 @@ func TestParseBystanderDisks_RetainedDiskIsProtected(t *testing.T) {
 func TestParseBystanderDisks_MalformedLinesIgnored(t *testing.T) {
 	layout := storage.Layout{Devices: map[string]storage.Device{}}
 	out := "\n  \nnvme0n1\nnvme1n1 disk extra-field\nsda disk\n"
-	got := parseBystanderDisks(out, layout)
+	got := parseBystanderDisks(out, layoutClaimedDisks(layout))
 	want := []string{"sda"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("bystanders = %v, want %v", got, want)
-	}
-}
-
-// TestParseBystanderDisks_PreserveWholeDiskMember is the regression case for
-// the preserve-member wipe bug: a preserve device's member is a whole disk,
-// not a disk-type layout entry, so the old dev.Type == "disk" check missed
-// it entirely and would have signature-wiped the protected data disk.
-func TestParseBystanderDisks_PreserveWholeDiskMember(t *testing.T) {
-	layout := storage.Layout{Devices: map[string]storage.Device{
-		"nvme0n1": {Type: "disk"},
-		"data":    {Type: "preserve", Members: []string{"nvme2n1"}},
-	}}
-	lsblkOut := "nvme0n1 disk\nnvme2n1 disk\nnvme3n1 disk\n"
-	got := parseBystanderDisks(lsblkOut, layout)
-	want := []string{"nvme3n1"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("bystanders = %v, want %v (nvme2n1 is a preserve member and must be excluded)", got, want)
-	}
-}
-
-// TestParseBystanderDisks_PreservePartitionMember covers a preserve member
-// that names a PARTITION of a disk that is not itself a layout device at
-// all (not disk, raid, or preserve) -- the parent disk must still be
-// excluded via parentDisk, not just the partition name.
-func TestParseBystanderDisks_PreservePartitionMember(t *testing.T) {
-	layout := storage.Layout{Devices: map[string]storage.Device{
-		"data": {Type: "preserve", Members: []string{"nvme0n1p2"}},
-	}}
-	lsblkOut := "nvme0n1 disk\nnvme1n1 disk\n"
-	got := parseBystanderDisks(lsblkOut, layout)
-	want := []string{"nvme1n1"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("bystanders = %v, want %v (nvme0n1 is the parent of preserve member nvme0n1p2)", got, want)
 	}
 }
 
@@ -114,41 +81,135 @@ func TestParseBystanderDisks_RaidMembersExcluded(t *testing.T) {
 		"md0": {Type: "raid", Members: []string{"nvme4n1", "nvme5n1"}},
 	}}
 	lsblkOut := "nvme4n1 disk\nnvme5n1 disk\nnvme6n1 disk\n"
-	got := parseBystanderDisks(lsblkOut, layout)
+	got := parseBystanderDisks(lsblkOut, layoutClaimedDisks(layout))
 	want := []string{"nvme6n1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("bystanders = %v, want %v (raid members nvme4n1/nvme5n1 must be excluded)", got, want)
 	}
 }
 
-// TestParseBystanderDisks_GenuineBystanderStillSelected confirms the fix
-// doesn't over-exclude: a disk in neither the layout's disk entries nor any
-// raid/preserve member set is still a genuine bystander.
-func TestParseBystanderDisks_GenuineBystanderStillSelected(t *testing.T) {
+// TestParseBystanderDisks_DevPrefixedRaidMemberNormalizes confirms a "/dev/"-
+// prefixed raid member excludes the same disk as its bare form.
+func TestParseBystanderDisks_DevPrefixedRaidMemberNormalizes(t *testing.T) {
 	layout := storage.Layout{Devices: map[string]storage.Device{
-		"nvme0n1": {Type: "disk"},
-		"data":    {Type: "preserve", Members: []string{"nvme2n1"}},
-	}}
-	lsblkOut := "nvme0n1 disk\nnvme2n1 disk\nnvme9n1 disk\n"
-	got := parseBystanderDisks(lsblkOut, layout)
-	want := []string{"nvme9n1"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("bystanders = %v, want %v", got, want)
-	}
-}
-
-// TestParseBystanderDisks_DevPrefixedMemberNormalizes confirms a "/dev/"-
-// prefixed member excludes the same disk as its bare form.
-func TestParseBystanderDisks_DevPrefixedMemberNormalizes(t *testing.T) {
-	layout := storage.Layout{Devices: map[string]storage.Device{
-		"data": {Type: "preserve", Members: []string{"/dev/nvme2n1"}},
-		"raid": {Type: "raid", Members: []string{"/dev/nvme0n1p2"}},
+		"raid": {Type: "raid", Members: []string{"/dev/nvme0n1p2", "/dev/nvme2n1"}},
 	}}
 	lsblkOut := "nvme0n1 disk\nnvme2n1 disk\nnvme3n1 disk\n"
-	got := parseBystanderDisks(lsblkOut, layout)
+	got := parseBystanderDisks(lsblkOut, layoutClaimedDisks(layout))
 	want := []string{"nvme3n1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("bystanders = %v, want %v (/dev/-prefixed members must normalize like bare names)", got, want)
+	}
+}
+
+// wipeCallsOn returns the recorded commands that write signatures or md
+// metadata (mdadm --zero-superblock, wipefs, sgdisk) on disk or on one of its
+// partitions.
+func wipeCallsOn(calls []string, disk string) []string {
+	var out []string
+	for _, c := range calls {
+		f := strings.Fields(c)
+		if len(f) < 2 {
+			continue
+		}
+		if f[0] != "wipefs" && f[0] != "sgdisk" && (f[0] != "mdadm" || f[1] != "--zero-superblock") {
+			continue
+		}
+		for _, a := range f[1:] {
+			if a == disk || strings.HasPrefix(a, disk+"p") {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// TestWipeBystanderDisks_PreserveMemberDiskIsNeverWiped: --wipe-all-disks
+// must leave alone every disk that holds a preserve member, however the
+// storage script spells the member. Each case gives the host's whole disks
+// (`lsblk -dnlo NAME,TYPE`) and what the kernel reports for each member
+// (`lsblk -snlo NAME,TYPE <member>`: the member, then the devices beneath
+// it). A /dev/disk/by-id path and a pmem disk are spellings mdadm accepts
+// but whose text does not name the lsblk disk, so the disk holding the data
+// must come from the kernel, not from parsing the member name.
+func TestWipeBystanderDisks_PreserveMemberDiskIsNeverWiped(t *testing.T) {
+	cases := []struct {
+		name      string
+		disks     string
+		members   map[string]string // member as written -> lsblk -snlo output
+		protected []string          // disks holding preserve data
+		bystander string            // a disk nothing claims, which must be wiped
+	}{
+		{
+			name:      "kernel name of a whole disk",
+			disks:     "nvme0n1 disk\nnvme2n1 disk\nnvme3n1 disk",
+			members:   map[string]string{"nvme2n1": "nvme2n1 disk"},
+			protected: []string{"/dev/nvme2n1"},
+			bystander: "/dev/nvme3n1",
+		},
+		{
+			name:      "kernel name of a partition on a disk the layout does not declare",
+			disks:     "nvme0n1 disk\nnvme1n1 disk\nnvme4n1 disk",
+			members:   map[string]string{"nvme1n1p2": "nvme1n1p2 part\nnvme1n1   disk"},
+			protected: []string{"/dev/nvme1n1"},
+			bystander: "/dev/nvme4n1",
+		},
+		{
+			name:      "/dev/-prefixed kernel name",
+			disks:     "nvme0n1 disk\nnvme2n1 disk\nnvme3n1 disk",
+			members:   map[string]string{"/dev/nvme2n1": "nvme2n1 disk"},
+			protected: []string{"/dev/nvme2n1"},
+			bystander: "/dev/nvme3n1",
+		},
+		{
+			name:      "/dev/disk/by-id path to a whole disk",
+			disks:     "nvme0n1 disk\nnvme1n1 disk\nnvme2n1 disk",
+			members:   map[string]string{"/dev/disk/by-id/nvme-EXAMPLE_SERIAL_X1": "nvme1n1 disk"},
+			protected: []string{"/dev/nvme1n1"},
+			bystander: "/dev/nvme2n1",
+		},
+		{
+			name:      "/dev/disk/by-id path to a partition",
+			disks:     "nvme0n1 disk\nsdb disk\nsdc disk",
+			members:   map[string]string{"/dev/disk/by-id/wwn-0x5000c500a1b2c3d4-part3": "sdb3 part\nsdb  disk"},
+			protected: []string{"/dev/sdb"},
+			bystander: "/dev/sdc",
+		},
+		{
+			name:      "pmem whole disks (digit-ending name outside nvme/mmcblk/loop/dm/md)",
+			disks:     "nvme0n1 disk\npmem0 disk\npmem1 disk\nnvme1n1 disk",
+			members:   map[string]string{"pmem0": "pmem0 disk", "pmem1": "pmem1 disk"},
+			protected: []string{"/dev/pmem0", "/dev/pmem1"},
+			bystander: "/dev/nvme1n1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			members := make([]string, 0, len(tc.members))
+			r := newScriptRunner()
+			r.output["lsblk -dnlo NAME,TYPE"] = tc.disks
+			for m, out := range tc.members {
+				members = append(members, m)
+				r.output["lsblk -snlo NAME,TYPE "+resolveMemberPath(m)] = out
+			}
+			layout := storage.Layout{Devices: map[string]storage.Device{
+				"nvme0n1": {Type: "disk", Partitions: []storage.Partition{{Name: "nvme0n1p1", Size: "rest", FS: "ext4"}}},
+				"mddata":  {Type: "preserve", Members: members, FS: "xfs", ArrayUUID: testArrayUUID},
+			}}
+
+			if err := WipeBystanderDisks(scriptCtx(r), layout); err != nil {
+				t.Fatalf("WipeBystanderDisks: %v", err)
+			}
+			for _, d := range tc.protected {
+				if got := wipeCallsOn(r.calls, d); len(got) > 0 {
+					t.Errorf("preserve member disk %s was wiped: %v", d, got)
+				}
+			}
+			if !r.ran("wipefs -a " + tc.bystander) {
+				t.Errorf("bystander %s was not wiped; calls: %v", tc.bystander, r.calls)
+			}
+		})
 	}
 }
 
@@ -195,6 +256,30 @@ func TestParseExamineArrayUUIDs(t *testing.T) {
 	}
 }
 
+// TestWipeBystanderDisks_UnresolvablePreserveMemberWipesNothing: when the
+// kernel cannot say which disk holds a preserve member, --wipe-all-disks
+// must refuse to wipe anything rather than guess.
+func TestWipeBystanderDisks_UnresolvablePreserveMemberWipesNothing(t *testing.T) {
+	r := newScriptRunner()
+	r.output["lsblk -dnlo NAME,TYPE"] = "nvme0n1 disk\nnvme1n1 disk\nnvme2n1 disk"
+	r.outputErr["lsblk -snlo NAME,TYPE /dev/disk/by-id/nvme-EXAMPLE_SERIAL_X1"] = fmt.Errorf("exit status 32")
+	layout := storage.Layout{Devices: map[string]storage.Device{
+		"nvme0n1": {Type: "disk"},
+		"mddata": {Type: "preserve", Members: []string{"/dev/disk/by-id/nvme-EXAMPLE_SERIAL_X1"},
+			FS: "xfs", ArrayUUID: testArrayUUID},
+	}}
+
+	err := WipeBystanderDisks(scriptCtx(r), layout)
+	if err == nil || !strings.Contains(err.Error(), "/dev/disk/by-id/nvme-EXAMPLE_SERIAL_X1") {
+		t.Fatalf("expected an error naming the unresolvable member, got: %v", err)
+	}
+	for _, d := range []string{"/dev/nvme1n1", "/dev/nvme2n1"} {
+		if got := wipeCallsOn(r.calls, d); len(got) > 0 {
+			t.Errorf("%s was wiped although a preserve member could not be located: %v", d, got)
+		}
+	}
+}
+
 // pinnedRAIDLayout is a root disk vda plus a raid that pins its array UUID.
 func pinnedRAIDLayout() storage.Layout {
 	return storage.Layout{Devices: map[string]storage.Device{
@@ -231,6 +316,49 @@ func TestCheckStaleArrayMembers_PartitionListingFails(t *testing.T) {
 	err := CheckStaleArrayMembers(scriptCtx(r), pinnedRAIDLayout(), false)
 	if err == nil || !strings.Contains(err.Error(), "/dev/vdb") {
 		t.Fatalf("want an error naming /dev/vdb, got %v", err)
+	}
+}
+
+// TestCheckStaleArrayMembers_WipeAllDisksExaminesPreserveMemberDisk: under
+// --wipe-all-disks the bystander wipe leaves a disk holding a preserve member
+// alone however the member is spelled, so the stale-member check must examine
+// that disk rather than assume the wipe zeroes it. The member is a by-id path,
+// whose text does not name the disk; only the kernel can place it.
+func TestCheckStaleArrayMembers_WipeAllDisksExaminesPreserveMemberDisk(t *testing.T) {
+	const member = "/dev/disk/by-id/nvme-EXAMPLE_SERIAL_X1"
+	r := newScriptRunner()
+	r.output["lsblk -dnlo NAME,TYPE"] = "vda disk\nvdb disk\nvdc disk"
+	r.output["lsblk -snlo NAME,TYPE "+member] = "vdc disk"
+	r.output["lsblk -nlo NAME /dev/vdc"] = "vdc"
+	r.output["mdadm --examine /dev/vdc"] = "/dev/vdc:\n     Array UUID : e8c9aa81:11112222:33334444:55556666"
+	layout := pinnedRAIDLayout()
+	layout.Devices["mdkeep"] = storage.Device{Type: "preserve", Members: []string{member}, FS: "xfs",
+		ArrayUUID: "0f0f0f0f-1111-2222-3333-444455556666"}
+
+	err := CheckStaleArrayMembers(scriptCtx(r), layout, true)
+	if err == nil || !strings.Contains(err.Error(), "/dev/vdc") || !strings.Contains(err.Error(), "leaves retained and preserve-member disks alone") {
+		t.Fatalf("want a refusal naming /dev/vdc as a disk --wipe-all-disks leaves alone, got %v", err)
+	}
+	if r.ran("lsblk -nlo NAME /dev/vdb") {
+		t.Errorf("bystander vdb is zeroed by --wipe-all-disks and must not be examined; calls: %v", r.calls)
+	}
+}
+
+// TestCheckStaleArrayMembers_UnresolvablePreserveMemberFails: when the kernel
+// cannot place a preserve member, the check cannot tell which disks the
+// bystander wipe leaves alone, so it must refuse rather than skip them.
+func TestCheckStaleArrayMembers_UnresolvablePreserveMemberFails(t *testing.T) {
+	const member = "/dev/disk/by-id/nvme-EXAMPLE_SERIAL_X1"
+	r := newScriptRunner()
+	r.output["lsblk -dnlo NAME,TYPE"] = "vda disk\nvdb disk"
+	r.outputErr["lsblk -snlo NAME,TYPE "+member] = errors.New("exit status 32")
+	layout := pinnedRAIDLayout()
+	layout.Devices["mdkeep"] = storage.Device{Type: "preserve", Members: []string{member}, FS: "xfs",
+		ArrayUUID: "0f0f0f0f-1111-2222-3333-444455556666"}
+
+	err := CheckStaleArrayMembers(scriptCtx(r), layout, true)
+	if err == nil || !strings.Contains(err.Error(), member) {
+		t.Fatalf("want an error naming %s, got %v", member, err)
 	}
 }
 

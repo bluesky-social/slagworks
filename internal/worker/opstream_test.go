@@ -473,6 +473,131 @@ func TestStaleResyncKeepsAwaitingPhoneHome(t *testing.T) {
 	}
 }
 
+// TestStalePendingRowKeepsAwaitingPhoneHome: the install finished on a deploy
+// op global still holds pending (the host PXEd on the pending-op clause while
+// the executor's claim kept failing), so global's echo of an earlier phase
+// update, or a reconnect resync built before the awaiting_phone_home update
+// reached it, carries a pending row at an older phase. It must not knock the
+// op off awaiting_phone_home any more than a claimed row may: the machine is
+// still commissioned, so the post-install PXE would get BootDeploy.
+func TestStalePendingRowKeepsAwaitingPhoneHome(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		apply func(c *Cache, row model.Operation)
+	}{
+		{"op_delta", func(c *Cache, row model.Operation) { c.ApplyOpDelta(row, "") }},
+		{"op_resync", func(c *Cache, row model.Operation) { seedOpsResync(c, row) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const mac = "52:54:00:15:10:58"
+			c := NewCache(nil)
+			id, opID := uuid.New(), uuid.New()
+			c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 1, Machines: []model.MachineSnapshot{{
+				ID: id, State: model.MachineStateCommissioned, PXEEligible: true,
+				Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}},
+			}}})
+			row := model.Operation{
+				ID: opID, MachineID: id, Type: model.OpDeploy,
+				Status: model.OpPending, Phase: "rsyncing_os", Version: 5,
+			}
+			seedOpsResync(c, row)
+			if err := c.HandleProgressReport(&model.ProgressReport{
+				MachineID: id.String(), OperationID: opID.String(), Event: "deploy_complete",
+			}); err != nil {
+				t.Fatalf("deploy_complete: %v", err)
+			}
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("precondition: got %d, want BootLocal", got)
+			}
+
+			row.Phase, row.Version = "finalizing", 6
+			tc.apply(c, row)
+			if op := c.GetOperation(opID.String()); op == nil || op.Version != 6 || op.Phase != "awaiting_phone_home" {
+				t.Fatalf("op = %+v, want version 6 phase awaiting_phone_home", op)
+			}
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("after a stale pending %s: got %d, want BootLocal (%d)", tc.name, got, model.BootLocal)
+			}
+		})
+	}
+}
+
+// TestAwaitingPhoneHomeSurvivesRestart: the install finishes while global is
+// unreachable, so the awaiting_phone_home phase update (and, once the host
+// phones home, the completion) sit in the in-memory op_update queue and
+// never reach global. The worker restarts before it reconnects, losing that
+// queue. On reconnect the hub's hello sends the snapshot and then an
+// op_resync built from global's row, which is still claimed at the
+// pre-install phase. The installed host's next PXE must still boot its disk:
+// the local latch has to come back from LocalDB, or BootDeploy re-images it.
+func TestAwaitingPhoneHomeSurvivesRestart(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		phoneHome bool
+	}{
+		{"restart after deploy_complete", false},
+		{"restart after phone-home", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const mac = "52:54:00:15:10:57"
+			dbPath := t.TempDir() + "/worker.db"
+			id, opID := uuid.New(), uuid.New()
+			// Global's row never moves past this: it gets neither the phase
+			// nor the completion.
+			globalRow := model.Operation{
+				ID: opID, MachineID: id, Type: model.OpDeploy,
+				Status: model.OpClaimed, Phase: "finalizing", Version: 5,
+			}
+
+			db, err := OpenLocalDB(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := NewCache(db)
+			deployingMachine(c, id, mac)
+			seedOpsResync(c, globalRow)
+			// Global becomes unreachable. Agent and phone-home traffic is
+			// site-local, so the install still finishes.
+			if err := c.HandleProgressReport(&model.ProgressReport{
+				MachineID: id.String(), OperationID: opID.String(), Event: "deploy_complete",
+			}); err != nil {
+				t.Fatalf("deploy_complete: %v", err)
+			}
+			if tc.phoneHome {
+				c.RecordPhoneHome(id)
+			}
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("precondition: installed host got %d, want BootLocal", got)
+			}
+
+			// Restart: a new process over the same worker.db.
+			db2, err := OpenLocalDB(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c = NewCache(db2)
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("precondition: rehydrated, untrusted set got %d, want BootLocal", got)
+			}
+
+			// Reconnect: hello snapshot, then op_resync from global's row.
+			deployingMachine(c, id, mac)
+			seedOpsResync(c, globalRow)
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("installed host's next PXE after restart and op_resync: got %d, want BootLocal (%d); BootDeploy re-images it", got, model.BootLocal)
+			}
+			// The phone-home pin (applyOpResync keeps a phoned-home machine
+			// running while global still shows the op claimed) must come
+			// back too, not only the phase latch.
+			if tc.phoneHome {
+				if got := c.MachineState(id); got != string(model.MachineStateRunning) {
+					t.Fatalf("phoned-home machine after restart and op_resync: state %q, want running", got)
+				}
+			}
+		})
+	}
+}
+
 // TestFailedDeltaLeavesAwaitingPhoneHome: the phone-home timeout's failure
 // still applies; keepTerminalWait only blocks phase regressions on an op
 // global still shows active.
@@ -486,6 +611,64 @@ func TestFailedDeltaLeavesAwaitingPhoneHome(t *testing.T) {
 	}, "")
 	if op := c.GetOperation(opID.String()); op == nil || op.Status != model.OpFailed {
 		t.Fatalf("op = %+v, want status failed", op)
+	}
+}
+
+// TestAwaitingPhoneHomeHoldsBeforeClaimDelta: the executor has claimed a
+// deploy op and driven the host into the installer, but the claim's op_delta,
+// the only thing that moves the machine to deploying on this worker, has not
+// been applied when the agent reports deploy_complete. The op is claimed and
+// running locally while the machine still reads commissioned.
+// TestBootAction_AwaitingPhoneHomeOnUnclaimedDeploy (cache_test.go) covers the
+// same latch for an op that is still pending; this is the claimed half. The
+// post-install PXE must boot the disk, before the late claim delta and after
+// it: BootDeploy re-wipes the disk just installed.
+func TestAwaitingPhoneHomeHoldsBeforeClaimDelta(t *testing.T) {
+	c := NewCache(nil)
+	id, opID := uuid.New(), uuid.New()
+	mac := "52:54:00:a1:00:01"
+	c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 1, Machines: []model.MachineSnapshot{{
+		ID: id, State: model.MachineStateCommissioned, PXEEligible: true,
+		Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}},
+	}}})
+	c.ApplyOpResync(nil, nil)
+	c.ApplyOpDelta(model.Operation{ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpPending}, "")
+	// The cache side of Executor.executeOp + runLifecycleOp.
+	c.MarkOpClaimed(opID.String())
+	c.UpdateOpPhase(opID.String(), "power_cycle")
+	c.UpdateOpPhase(opID.String(), "pxe_booting")
+	c.MarkOpStatus(opID.String(), model.OpRunning)
+	if got := c.BootActionForMAC(mac); got != model.BootDeploy {
+		t.Fatalf("precondition: the install boot got %d, want BootDeploy (%d)", got, model.BootDeploy)
+	}
+
+	// The agent finishes the install.
+	if err := c.HandleProgressReport(&model.ProgressReport{
+		MachineID: id.String(), OperationID: opID.String(), Event: "deploy_complete",
+	}); err != nil {
+		t.Fatalf("deploy_complete: %v", err)
+	}
+	if op := c.GetOperation(opID.String()); op == nil || op.Status != model.OpRunning || op.Phase != "awaiting_phone_home" {
+		t.Fatalf("precondition: op = %+v, want running at awaiting_phone_home", op)
+	}
+	if got := c.MachineState(id); got != string(model.MachineStateCommissioned) {
+		t.Fatalf("precondition: machine state %q, want commissioned (no claim delta yet)", got)
+	}
+
+	// The post-install reboot PXEs first (PXE is boot order #1).
+	if got := c.BootActionForMAC(mac); got != model.BootLocal {
+		t.Fatalf("post-install PXE before the claim delta: got %d, want BootLocal (%d)", got, model.BootLocal)
+	}
+
+	// The late claim delta lands: global's claimed row, machine deploying.
+	c.ApplyOpDelta(model.Operation{
+		ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Version: 1,
+	}, model.MachineStateDeploying)
+	if got := c.MachineState(id); got != string(model.MachineStateDeploying) {
+		t.Fatalf("after the claim delta: machine state %q, want deploying", got)
+	}
+	if got := c.BootActionForMAC(mac); got != model.BootLocal {
+		t.Fatalf("post-install PXE after the late claim delta: got %d, want BootLocal (%d)", got, model.BootLocal)
 	}
 }
 

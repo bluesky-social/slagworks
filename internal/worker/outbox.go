@@ -23,8 +23,11 @@ import (
 //     critical section that enqueues it, closing the "row in SQLite but
 //     not in memory" window that reloadFromDisk would otherwise mistake
 //     for a stranded row.
-//   - opUpdates are best-effort and NOT persisted — they carry phase
-//     progress that's cheap to lose on crash.
+//   - opUpdates are best-effort and NOT persisted. A lost phase update
+//     is cheap; a lost terminal status leaves the op to global's timeout
+//     sweeps. A completion that must not be lost rides a durable
+//     observation as well: the deploy's phone_home carries the op ID
+//     (see Cache.RecordPhoneHome).
 //   - ackObservation deletes the SQLite row only after global confirms
 //     receipt via rpc_response{ok:true}.
 //   - reloadFromDisk re-enqueues rows that were sent but not yet acked

@@ -17,6 +17,17 @@ func feedANSI(seq []byte) string {
 	return e.String()
 }
 
+// renderCastScreenANSI writes chunks, in order, into a castScreen and returns
+// its snapshot: the whole-cast form of what castSnapshot does a page at a time.
+func renderCastScreenANSI(chunks [][]byte, width, height int) []byte {
+	s := newCastScreen(width, height)
+	defer s.Close()
+	for _, c := range chunks {
+		s.Write(c)
+	}
+	return s.ANSI()
+}
+
 // TestRenderCastScreenANSI_ReproducesScreen is the core guarantee: replaying
 // the cast chunks server-side and shipping renderCastScreenANSI's output must
 // make a fresh client emulator render the SAME screen as feeding the raw cast

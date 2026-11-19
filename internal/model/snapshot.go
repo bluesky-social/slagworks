@@ -138,7 +138,10 @@ type SnapshotInterface struct {
 	Name     string `json:"name"`
 	MAC      string `json:"mac"`
 	Type     string `json:"type"` // "physical" | "ipmi" | "lag"
-	IP       string `json:"ip,omitempty"`
+	// IP is the interface's one status=active NetBox address, in CIDR form.
+	// Build refuses the site when a bound machine's interface has more than
+	// one, rather than keeping whichever NetBox listed last.
+	IP string `json:"ip,omitempty"`
 
 	// The fields below carry the extra topology an L2 bond host needs and
 	// an L3 routed-NIC host derives from its addressing. All omitempty so
@@ -352,7 +355,10 @@ func (s SiteSnapshot) ContentHash() (string, error) {
 	// hash stability (NetBox/API order isn't guaranteed). Copy the slice so
 	// we don't mutate the caller's backing array. DNS/NTP order is
 	// authored (CSV order in NetBox) and deterministic, so they're not
-	// re-sorted — that order is intentional and stable.
+	// re-sorted — that order is intentional and stable. DHCP.RelayPools
+	// isn't re-sorted either: configured pools keep their authored order
+	// (the worker serves from the first pool containing giaddr), and the
+	// builder emits the generated /31 pools sorted by subnet.
 	copied.OOB.DynamicSlices = append([]OOBDynamicSlice(nil), s.OOB.DynamicSlices...)
 
 	// Machine.ID is a UUID and guaranteed unique, so a simple comparator

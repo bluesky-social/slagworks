@@ -195,10 +195,31 @@ func (m *Mirror) OnDeviceCreated(ctx context.Context, d Device) error {
 
 // OnDeviceUpdated handles `device.updated`. Slagworks doesn't mirror
 // Device fields into Postgres — the snapshot builder joins NetBox live
-// at rebuild time. Just invalidate so the next rebuild picks up the
-// new state. Claim membership is the caller's responsibility (it stamps
-// d.ConfigSlug); an unclaimed device never reaches here.
+// at rebuild time — so for a tracked device this only invalidates, and
+// the next rebuild picks up the new state. Claim membership is the
+// caller's responsibility (it stamps d.ConfigSlug); an unclaimed device
+// never reaches here.
+//
+// An update can also make a device enrollable: the operator fills in the
+// serial of a device whose create was skipped with ErrSerialRequired, or
+// moves a serialled device into a claimed site or location. A claimed
+// device with a serial and no machine row therefore goes through
+// OnDeviceCreated, the same rule the reconciler applies to untracked
+// devices, so enrollment does not wait for the next reconcile tick.
 func (m *Mirror) OnDeviceUpdated(ctx context.Context, d Device) error {
+	if d.Serial != "" {
+		_, err := m.st.GetMachineByNetBoxDeviceID(d.ID)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return m.OnDeviceCreated(ctx, d)
+		}
+		if err != nil {
+			// The NetBox change is real whether or not the enrollment
+			// check could run: refresh the snapshot anyway, and leave
+			// enrollment to the reconcile tick.
+			m.inv.Invalidate(d.ConfigSlug)
+			return fmt.Errorf("lookup machine by device id %d: %w", d.ID, err)
+		}
+	}
 	m.inv.Invalidate(d.ConfigSlug)
 	return nil
 }

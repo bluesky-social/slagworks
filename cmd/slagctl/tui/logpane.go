@@ -94,6 +94,12 @@ func (p *logPane) MaxID() int64 { return p.maxID }
 // rather than the useless bare "exec". The phase prefix is applied
 // after the exec expansion so it survives on exec lines. Timestamps format
 // through the injected location (D9).
+//
+// The result never contains a line break. renderLogBody gives each entry one
+// row, but a message can carry several lines (a subprocess's multi-line
+// output, or the bare CRs of progress output), so they are joined with a
+// visible " ⏎ " and a trailing break is dropped. The unjoined text is in
+// `slagctl machine logs`.
 func (p *logPane) format(env slogkit.Envelope) string {
 	ts := env.TS.In(p.loc).Format("15:04:05")
 	// Build the message body first, then prepend the phase prefix once. The
@@ -119,5 +125,6 @@ func (p *logPane) format(env slogkit.Envelope) string {
 	if env.Phase != "" {
 		body = fmt.Sprintf("phase=%s %s", env.Phase, body)
 	}
-	return fmt.Sprintf("%s [%-6s] %s", ts, env.Source, strings.TrimRight(body, "\n"))
+	line := fmt.Sprintf("%s [%-6s] %s", ts, env.Source, body)
+	return strings.ReplaceAll(strings.TrimRight(lineBreaks.Replace(line), "\n"), "\n", " ⏎ ")
 }

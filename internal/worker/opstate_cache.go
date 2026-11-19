@@ -48,6 +48,7 @@ import (
 //   - phoneHomed: deploy op IDs that phone-homed LOCALLY (RecordPhoneHome).
 //     A resync that brings the op back as claimed-deploying must not
 //     downgrade the running overlay this op earned — see applyOpResync.
+//     Persisted with the op set, so it survives a restart.
 //   - tombstones: opID -> terminal version; a late lower-version delta for
 //     a removed op is discarded so a concurrent-publisher race can't
 //     resurrect a zombie active op (which the fail-closed boot rule would
@@ -102,23 +103,6 @@ type phaseState struct {
 	started time.Time
 }
 
-// bootPrefixPhases are the phases the boot spine reports as a host powers
-// on and PXE/iPXE-boots (toward the agent). They must NOT clobber
-// awaiting_phone_home: once a deploy install is done and the op is awaiting
-// phone-home, the host's reboots are booting its freshly installed DISK,
-// and its firmware-PXE DHCP/iPXE traffic (PXE is boot order #1) would
-// otherwise reset the phase off awaiting_phone_home. That reset makes
-// BootActionForMAC return BootDeploy again and the host re-deploys in a
-// loop, re-wiping the disk it just installed. Only phone_home (op
-// completes) or the phone-home timeout (op fails) may leave
-// awaiting_phone_home.
-var bootPrefixPhases = map[string]bool{
-	"pxe_booting": true,
-	"dhcp_ack":    true,
-	"ipxe_dhcp":   true,
-	"ipxe_loaded": true,
-}
-
 // keepTerminalWait holds a locally reached awaiting_phone_home on a deploy
 // op that global's incoming row still shows active at an earlier phase.
 // Local phase writes don't bump Version, so global's echo of an EARLIER
@@ -128,7 +112,10 @@ var bootPrefixPhases = map[string]bool{
 // post-install PXE gets BootDeploy, and the host re-deploys over the disk it
 // just installed (leaf-5.pop1 2026-10-24). Only completion
 // (op_removed) or failure may leave awaiting_phone_home — the same rule
-// updatePhase enforces against boot-prefix phases.
+// updatePhase enforces against local phase writes. A pending row is held
+// too: the host can install on the pending-op boot clause while the claim
+// keeps failing, and global never moves an op back to pending, so a pending
+// row for a latched op is always older than the latch.
 func keepTerminalWait(existing, incoming *model.Operation) {
 	if existing == nil || existing.Phase != "awaiting_phone_home" {
 		return
@@ -136,7 +123,8 @@ func keepTerminalWait(existing, incoming *model.Operation) {
 	if incoming.Type != model.OpDeploy {
 		return
 	}
-	if incoming.Status != model.OpClaimed && incoming.Status != model.OpRunning {
+	if incoming.Status != model.OpPending && incoming.Status != model.OpClaimed &&
+		incoming.Status != model.OpRunning {
 		return
 	}
 	if incoming.Phase == "failed" {
@@ -336,9 +324,9 @@ func (o *opState) putTombstone(opID string, version int) {
 	o.tombstoneOrder = append(o.tombstoneOrder, opID)
 }
 
-// snapshotForPersist returns copies of the op set + overlay for LocalDB
-// persistence on the stream-apply path. Caller must NOT hold mu.
-func (o *opState) snapshotForPersist() ([]model.Operation, map[string]model.MachineState) {
+// snapshotForPersist returns copies of the op set, overlay and phone-home
+// latch for LocalDB persistence. Caller must NOT hold mu.
+func (o *opState) snapshotForPersist() PersistedOpState {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	ops := make([]model.Operation, 0, len(o.ops))
@@ -349,23 +337,32 @@ func (o *opState) snapshotForPersist() ([]model.Operation, map[string]model.Mach
 	for id, st := range o.machineState {
 		overlay[id.String()] = st
 	}
-	return ops, overlay
+	phoneHomed := make([]string, 0, len(o.phoneHomed))
+	for opID := range o.phoneHomed {
+		phoneHomed = append(phoneHomed, opID)
+	}
+	return PersistedOpState{Ops: ops, Overlay: overlay, PhoneHomed: phoneHomed}
 }
 
-// rehydrate loads a persisted op set + overlay into an untrusted opState on
-// cold start. Caller holds no other lock. The set stays untrusted until the
-// first op_resync.
-func (o *opState) rehydrate(ops []model.Operation, overlay map[string]model.MachineState) {
+// rehydrate loads a persisted op layer into an untrusted opState on cold
+// start. Caller holds no other lock. The set stays untrusted until the
+// first op_resync, which applies the restored awaiting_phone_home phases
+// (keepTerminalWait) and phoneHomed pins exactly as it would have before
+// the restart.
+func (o *opState) rehydrate(st PersistedOpState) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	for i := range ops {
-		op := ops[i]
+	for i := range st.Ops {
+		op := st.Ops[i]
 		o.ops[op.ID.String()] = &op
 	}
-	for idStr, st := range overlay {
+	for idStr, ms := range st.Overlay {
 		if id, err := uuid.Parse(idStr); err == nil {
-			o.machineState[id] = st
+			o.machineState[id] = ms
 		}
+	}
+	for _, opID := range st.PhoneHomed {
+		o.phoneHomed[opID] = true
 	}
 	o.untrusted = true
 }
@@ -453,6 +450,15 @@ func (o *opState) bootActionLocked(mac string) bootAction {
 	activeOp := o.activeLifecycleOpLocked(m.ID)
 	state := o.effectiveState(m.ID, m.State)
 
+	// The install is done and the host is rebooting into its fresh disk, in
+	// every machine state, not only deploying: a host can PXE on the
+	// pending-op clause below and finish the install before the claim's
+	// op_delta moves the machine off commissioned/failed. Serving the
+	// installer here would run it over the disk it just wrote.
+	if activeOp != nil && activeOp.Type == model.OpDeploy && activeOp.Phase == "awaiting_phone_home" {
+		return bootAction{action: model.BootLocal}
+	}
+
 	switch state {
 	case model.MachineStateCommissioning:
 		// Fail-closed: a transient commissioning state must be backed by
@@ -469,9 +475,6 @@ func (o *opState) bootActionLocked(mac string) bootAction {
 		return bootAction{action: model.BootLocal, warn: true, mac: mac, state: state}
 	case model.MachineStateDeploying:
 		if activeOp != nil && activeOp.Type == model.OpDeploy {
-			if activeOp.Phase == "awaiting_phone_home" {
-				return bootAction{action: model.BootLocal}
-			}
 			if o.untrusted {
 				return bootAction{action: model.BootLocal}
 			}
@@ -668,9 +671,10 @@ func (o *opState) commissionOpForMAC(mac string) *model.Operation {
 
 // recordPhoneHome sets the running overlay for a machine (if it exists in
 // the view), latches the deploy op as locally phone-homed, and returns the
-// active deploy op ID to complete, or "" if none. Combined reader/writer:
-// reads the view and writes the overlay + scans ops under one mu.Lock.
-func (o *opState) recordPhoneHome(machineID uuid.UUID) string {
+// active deploy op ID to complete, or uuid.Nil if none. Combined
+// reader/writer: reads the view and writes the overlay + scans ops under
+// one mu.Lock.
+func (o *opState) recordPhoneHome(machineID uuid.UUID) uuid.UUID {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	// Record the local machine-state advance as an overlay rather than
@@ -688,10 +692,10 @@ func (o *opState) recordPhoneHome(machineID uuid.UUID) string {
 			// that brings it back as claimed-deploying must not downgrade
 			// the running overlay and re-wipe the fresh disk.
 			o.phoneHomed[op.ID.String()] = true
-			return op.ID.String()
+			return op.ID
 		}
 	}
-	return ""
+	return uuid.Nil
 }
 
 // --- Op-set readers (ops only, under mu.RLock) ---
@@ -958,12 +962,20 @@ func (o *opState) updatePhase(opID, phase string) phaseUpdate {
 		return phaseUpdate{}
 	}
 
-	// A deploy op awaiting phone-home is in a terminal wait; the
-	// host is (re)booting its installed disk. Drop boot-prefix phase reports
-	// (from DHCP OnACK / the boot-script handler) that would knock it back
-	// to a PXE phase and re-trigger BootDeploy.
-	if op, ok := o.ops[opID]; ok &&
-		op.Phase == "awaiting_phone_home" && bootPrefixPhases[phase] {
+	// A deploy op awaiting phone-home is in a terminal wait: the install is
+	// done and the host is (re)booting its freshly installed disk.
+	// BootActionForMAC keys BootLocal on this phase, so any write that moves
+	// the op off it hands the next PXE BootDeploy and the host reinstalls
+	// over that disk. The writers that can still arrive here are the
+	// post-install firmware PXE (DHCP OnACK, the boot-script handler), the
+	// executor's power_cycle/pxe_booting when it drives an op whose install
+	// finished while the op was still pending, and an agent phase report
+	// processed after deploy_complete. Completion goes through
+	// RecordPhoneHome, not a phase write, so the only phase allowed to leave
+	// is the agent's "failed" (HandleProgressReport writes it just before
+	// MarkOpFailed). A same-phase write falls through to the dedup below.
+	if op, ok := o.ops[opID]; ok && op.Phase == "awaiting_phone_home" &&
+		phase != "awaiting_phone_home" && phase != "failed" {
 		return phaseUpdate{}
 	}
 

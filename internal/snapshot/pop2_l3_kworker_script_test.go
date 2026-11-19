@@ -160,3 +160,44 @@ func TestPop2L3KworkerScriptRejectsIncompleteModel(t *testing.T) {
 		t.Fatalf("wanted closed failure, exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
 	}
 }
+
+// TestPop2L3KworkerScriptRejectsLegsInDifferentSubnets: both legs of a kworker
+// land on one leaf pair, and that pair's /24 gives both leaf ASNs. Legs whose
+// /31s sit in two different /24s are a NetBox modeling error. Deriving the pair
+// from the lower leg alone would give the higher leg's neighbor the wrong
+// remote-as (leaf-4's 65024 on a leg in leaf-5/6's 10.253.29.0/24), a session
+// that can never establish, so the host would come up silently on one leg. The
+// check must also not depend on which leg sorts first.
+func TestPop2L3KworkerScriptRejectsLegsInDifferentSubnets(t *testing.T) {
+	for _, tc := range []struct{ name, legA, legB string }{
+		{"two known leaf pairs", "10.253.28.1/31", "10.253.29.1/31"},
+		{"unknown subnet on the higher leg", "10.253.28.1/31", "10.253.30.1/31"},
+		{"unknown subnet on the lower leg", "10.253.27.1/31", "10.253.28.1/31"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			facts := `[
+  {"name":"ens2f0np0","mac":"7c:c2:55:be:f6:3a","type":"physical","ip":"` + tc.legA + `"},
+  {"name":"ens2f1np1","mac":"7c:c2:55:be:f6:3b","type":"physical","ip":"` + tc.legB + `"},
+  {"name":"lo","type":"virtual","ip":"10.253.31.110/32"}
+]`
+			stdout, stderr, exit := runPop2L3KworkerScript(t, facts)
+			if exit == 0 {
+				var bundle netBundle
+				if err := json.Unmarshal([]byte(stdout), &bundle); err != nil {
+					t.Fatalf("expected hard-fail, got exit 0 and invalid bundle JSON: %v\n%s", err, stdout)
+				}
+				var frr string
+				for _, file := range bundle.Files {
+					if file.Path == "/etc/frr/frr.conf" {
+						frr = file.Content
+					}
+				}
+				t.Fatalf("expected hard-fail for legs %s and %s in different /24s, got success; frr.conf:\n%s",
+					tc.legA, tc.legB, frr)
+			}
+			if stdout != "" || !strings.Contains(stderr, "different /24s") {
+				t.Fatalf("wanted closed failure explaining the cross-subnet legs, exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
+			}
+		})
+	}
+}

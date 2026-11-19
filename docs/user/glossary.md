@@ -163,7 +163,9 @@ site workers. Subcommands include:
 ### Enroll
 
 Register a new Machine in slagworks. Triggered by a NetBox webhook when an
-operator creates a Device (or by the periodic reconciler as a safety net).
+operator creates a Device, or updates one so it becomes manageable (fills in
+its serial, or moves it into a claimed site or location); the periodic
+reconciler is the safety net.
 Enrollment allocates a BMC IP from NetBox IPAM (if BMC MAC is known) and
 creates the Machine in `new` state.
 

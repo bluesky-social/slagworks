@@ -122,38 +122,41 @@ func NewPDUController(_ context.Context, specs []PDUOutletSpec, log *slog.Logger
 	return p, nil
 }
 
-// PowerOff turns ALL feeds off. On a partial failure (one feed off, one
-// errored) it ROLLS BACK — issues olOn to every feed it cut — so a
-// failed PowerOff returns the box to its known-good fully-redundant
-// state rather than stranding it half-off. The rollback action only ever
+// PowerOff turns ALL feeds off. On a failure (one feed errored) it ROLLS
+// BACK — issues olOn to every feed it may have cut, including the one
+// whose olOff errored — so a failed PowerOff returns the box to its
+// known-good fully-redundant state rather than stranding it half-off.
+// The errored feed is included because a cli error does not mean the
+// command didn't run: the session can drop after the NMC executed olOff
+// but before its result code arrived. The rollback action only ever
 // powers toward up, so it is itself safe. See doc §D.
 func (p *PDUController) PowerOff(ctx context.Context) error {
-	var cut []outletConn
+	var attempted []outletConn
 	for _, oc := range p.outlets {
+		attempted = append(attempted, oc)
 		if _, err := oc.conn.cli(ctx, fmt.Sprintf("olOff %d", oc.outlet)); err != nil {
-			// Roll back the feeds we already cut, then report. Use a
+			// Roll back every feed we sent olOff to, then report. Use a
 			// context DETACHED from ctx's cancellation: if the PowerOff
 			// failed *because* ctx was cancelled/timed out, reusing ctx
 			// would make the rollback no-op instantly — defeating the
 			// rollback exactly when it's most needed. We still bound it
 			// with a fresh timeout so a wedged rollback can't hang.
 			rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
-			rbErr := p.rollbackOn(rbCtx, cut)
+			rbErr := p.rollbackOn(rbCtx, attempted)
 			rbCancel()
 			if rbErr != nil {
-				return fmt.Errorf("pdu power off %s outlet %d: %w; AND rollback failed: %v (box may be running on partial feeds)",
+				return fmt.Errorf("pdu power off %s outlet %d: %w; AND rollback failed: %v (box may be on partial feeds or off; check power status, then power on or retry)",
 					oc.host, oc.outlet, err, rbErr)
 			}
-			return fmt.Errorf("pdu power off %s outlet %d: %w (rolled back %d already-cut feed(s) to restore redundancy)",
-				oc.host, oc.outlet, err, len(cut))
+			return fmt.Errorf("pdu power off %s outlet %d: %w (rolled back %d feed(s) to on, including this one in case its olOff ran; retry the power off)",
+				oc.host, oc.outlet, err, len(attempted))
 		}
-		cut = append(cut, oc)
 	}
 	return nil
 }
 
 // rollbackOn issues olOn to each given outlet, restoring power. Used by
-// PowerOff on partial failure. Aggregates any errors; the box only ever
+// PowerOff on failure. Aggregates any errors; the box only ever
 // ends up more-powered, never darker, so this is the safe direction.
 func (p *PDUController) rollbackOn(ctx context.Context, outlets []outletConn) error {
 	var errs []error
@@ -265,10 +268,11 @@ func (p *PDUController) waitAllOn(ctx context.Context) error {
 // PowerStatus aggregates per-outlet Redfish state. Any confirmed-On feed
 // pins StateOn (a dual-fed box is powered as long as one feed is live;
 // reporting Off while a feed is confirmed up would be a dangerous lie).
-// StateUnknown only when no On is confirmed AND at least one read errored.
-// See doc §D.
+// StateOff only when every outlet read Off. With no On confirmed, a read
+// error gives StateUnknown plus that error, and an unrecognized outlet
+// state gives StateUnknown. See doc §D.
 func (p *PDUController) PowerStatus(ctx context.Context) (State, error) {
-	anyOn, anyOff, anyErr := false, false, false
+	anyOn, anyOff, anyErr, anyUnknown := false, false, false, false
 	var lastErr error
 	for _, oc := range p.outlets {
 		st, err := oc.conn.outletState(ctx, oc.outlet)
@@ -283,10 +287,11 @@ func (p *PDUController) PowerStatus(ctx context.Context) (State, error) {
 		case StateOff:
 			anyOff = true
 		case StateUnknown:
-			// An outlet that read successfully but returned an
-			// unrecognized SwitchedState; treat like a non-vote (neither
-			// confirms On nor Off). The aggregate falls through to the
-			// anyErr/default rules below.
+			// The outlet answered, but with a SwitchedState that is
+			// neither On nor Off. It does not confirm On, and like an
+			// unreachable feed it may be the one powering the box, so it
+			// also rules out an aggregate Off.
+			anyUnknown = true
 		}
 	}
 	switch {
@@ -299,9 +304,11 @@ func (p *PDUController) PowerStatus(ctx context.Context) (State, error) {
 		// No live feed confirmed and a read failed: we cannot rule out
 		// that a feed we couldn't reach is powering the box.
 		return StateUnknown, fmt.Errorf("pdu power status: no live feed confirmed and a read failed: %w", lastErr)
-	case anyOff:
+	case anyOff && !anyUnknown:
 		return StateOff, nil
 	default:
+		// No live feed confirmed, and at least one outlet reported a
+		// state that is neither On nor Off.
 		return StateUnknown, nil
 	}
 }

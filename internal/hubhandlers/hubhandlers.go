@@ -52,10 +52,13 @@ type LogStore interface {
 //
 // For OpDeploy, the worker only emits an op_update with status=
 // completed when phone-home arrives at the site worker (see
-// Cache.RecordPhoneHome). So this path is the canonical
-// `deploying → running` transition: deploy_complete from the agent
-// only updates phase to awaiting_phone_home; the op stays claimed
-// until phone-home flips it to completed via this path.
+// Cache.RecordPhoneHome). deploy_complete from the agent only updates
+// phase to awaiting_phone_home; the op stays claimed until phone-home
+// completes it. The same phone-home also sends a durable phone_home
+// observation naming the op, which internal/commission completes the op
+// from; whichever arrives first wins and the other is a no-op. That
+// observation is what survives when this fire-and-forget op_update is
+// lost.
 //
 // commission is handled through internal/commission's observation
 // path, not here, but we include it for completeness against ad-hoc
