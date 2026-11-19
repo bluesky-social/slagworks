@@ -58,7 +58,9 @@ precondition for deploy: the deploy preflight in
 to serve a deploy boot script, and the agent's bootloader install refuses to
 run, if the field is empty. There is deliberately no fallback console — a
 guessed `console=` produces a host whose serial output silently misses the
-BMC SOL port.
+BMC SOL port. The value is one line of space-separated kernel arguments:
+the agent trims leading and trailing whitespace and refuses the bootloader
+install if a control character (a tab or a line break, say) remains.
 
 **You usually don't set this by hand: commission determines it.** When the
 field is empty (the normal state for a device type commission just created
