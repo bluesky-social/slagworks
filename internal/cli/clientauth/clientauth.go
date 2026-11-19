@@ -5,7 +5,9 @@
 //   - Tokens stored at ~/.config/<AppName>/token.json (0600, via the userpath
 //     package — unix-style on all platforms), refreshed silently via a
 //     persisting, file-locked TokenSource so concurrent invocations don't race
-//     the refresh-token rotation and lock the operator out.
+//     the refresh-token rotation and lock the operator out. Login and logout
+//     change the cache under the same lock, so a refresh in flight elsewhere
+//     cannot undo them.
 //   - The access token is the API bearer; the slagworks API validates it
 //     offline against the issuer's signing keys. This package never verifies
 //     it.
@@ -109,7 +111,7 @@ func Bearer(ctx context.Context, cfg Config) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := writeCache(cache, tok); err != nil {
+	if err := storeToken(ctx, cache, tok); err != nil {
 		return "", fmt.Errorf("caching token: %w", err)
 	}
 	return tok.AccessToken, nil

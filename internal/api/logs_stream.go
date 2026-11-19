@@ -76,6 +76,14 @@ func (s *Server) handleLogsStream(c *echo.Context) error {
 	if err != nil {
 		return nil
 	}
+	// The subscribe is the only message a client sends. CloseRead drains
+	// the connection from here on and cancels ctx when the client closes
+	// or drops it. Nothing else would: the request context of a hijacked
+	// connection outlives the client, and a poll loop whose filter
+	// matches no new rows never writes, so it would never see the closed
+	// connection and would query the store every pollInterval for the
+	// life of the process.
+	ctx = conn.CloseRead(ctx)
 	var env ws.Envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		writeErr(ctx, conn, "protocol_error", "malformed subscribe envelope: "+err.Error())
@@ -119,6 +127,12 @@ func (s *Server) handleLogsStream(c *echo.Context) error {
 			return nil
 		}
 		if len(results) == 0 {
+			// The backlog is consumed: switch to the live tail and sleep
+			// before the next poll. The live tail stops bounding since
+			// on the emitter's ts alone: the cursor already bounds what
+			// is new, and a line from an emitter whose clock runs behind
+			// must stream once global has received it.
+			filter.SinceOrReceived = true
 			select {
 			case <-ctx.Done():
 				return nil
@@ -144,6 +158,12 @@ func buildFilter(sub ws.LogStreamSubscribeMsg) (logstore.QueryFilter, error) {
 		Sources:     normalizeSources(sub.Sources),
 		MinLevel:    strings.ToLower(sub.MinLevel),
 		LastSeenID:  sub.LastSeenID,
+		// A resume continues the live tail past the client's cursor, so
+		// it bounds since the way the live tail does.
+		SinceOrReceived: sub.LastSeenID > 0,
+	}
+	if err := logstore.ValidateMinLevel(sub.MinLevel); err != nil {
+		return f, err
 	}
 	if sub.TraceID != "" {
 		id, err := uuid.Parse(sub.TraceID)

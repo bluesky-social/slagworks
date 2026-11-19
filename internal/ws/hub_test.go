@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/model"
@@ -171,16 +173,36 @@ func dialHub(t *testing.T, srv *httptest.Server, token string) *Conn {
 	t.Helper()
 	u, _ := url.Parse(srv.URL)
 	u.Scheme = "ws"
+	h := http.Header{}
 	if token != "" {
-		u.RawQuery = "token=" + token
+		h.Set("Authorization", "Bearer "+token)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	conn, err := Dial(ctx, u.String(), nil)
+	conn, err := Dial(ctx, u.String(), &websocket.DialOptions{HTTPHeader: h})
 	if err != nil {
 		return nil
 	}
 	return conn
+}
+
+// getWithBearer sends a plain GET to target with the given Authorization
+// header value (none when empty) and returns the status code.
+func getWithBearer(t *testing.T, target, authorization string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
 }
 
 func TestHub_UnauthorizedMissingToken(t *testing.T) {
@@ -203,14 +225,33 @@ func TestHub_UnauthorizedBadToken(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "?token=nope")
-	if err != nil {
-		t.Fatal(err)
+	if got := getWithBearer(t, srv.URL, "Bearer nope"); got != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", got)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", resp.StatusCode)
+}
+
+// TestHub_TokenOnlyFromAuthorizationHeader: the hub reads the worker
+// token from the Authorization header and nowhere else. A registered
+// token in the URL query, or in the header without the Bearer scheme, is
+// refused: a URL-borne token is quoted by request loggers and by net/http
+// dial errors, which put it in logs that every operator can read.
+func TestHub_TokenOnlyFromAuthorizationHeader(t *testing.T) {
+	h, auth, _ := newTestHub(t)
+	auth.register("tok-1", "site-c", "worker-1")
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	if got := getWithBearer(t, srv.URL+"?token=tok-1", ""); got != http.StatusUnauthorized {
+		t.Errorf("token in the URL query: got %d, want 401", got)
 	}
+	if got := getWithBearer(t, srv.URL, "tok-1"); got != http.StatusUnauthorized {
+		t.Errorf("token in the header without the Bearer scheme: got %d, want 401", got)
+	}
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial with the token as Authorization: Bearer failed")
+	}
+	_ = conn.CloseNow()
 }
 
 func TestHub_HelloColdTriggersRebuild(t *testing.T) {
@@ -409,6 +450,124 @@ func TestHub_PushFansOutToAllWorkers(t *testing.T) {
 		if env.Type != TypeSnapshot {
 			t.Fatalf("expected snapshot, got %q", env.Type)
 		}
+	}
+}
+
+// TestHub_PushWithLowerSeqClosesWorkerConns: a pushed snapshot whose SeqNum
+// is below the cached one (site config deleted and recreated, database
+// restored) would be dropped as stale by a connected worker. The hub closes
+// the slug's connections instead of fanning it out, and the reconnect's
+// hello reply carries the new snapshot.
+func TestHub_PushWithLowerSeqClosesWorkerConns(t *testing.T) {
+	h, auth, _ := newTestHub(t)
+	auth.register("tok-1", "pop3", "worker-1")
+	h.Push("pop3", model.SiteSnapshot{SeqNum: 57, Site: model.SiteInfo{Slug: "pop3"}})
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	hello := HelloMsg{WorkerID: "worker-1", LastSeqNum: 57, Proto: OpStreamProto}
+	if err := conn.WriteTyped(ctx, TypeHello, "", hello); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // no_change, op_resync
+		if _, err := conn.ReadMessage(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h.Push("pop3", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"}})
+
+	env, err := conn.ReadMessage(ctx)
+	if err == nil {
+		t.Fatalf("got %s after a push with a lower SeqNum, want the connection closed", env.Type)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("connection still open after a push with a lower SeqNum")
+	}
+
+	conn2 := dialHub(t, srv, "tok-1")
+	if conn2 == nil {
+		t.Fatal("redial failed")
+	}
+	defer conn2.CloseNow()
+	if err := conn2.WriteTyped(ctx, TypeHello, "", hello); err != nil {
+		t.Fatal(err)
+	}
+	env, err = conn2.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg SnapshotMsg
+	if env.Type != TypeSnapshot || json.Unmarshal(env.Data, &msg) != nil || msg.Snapshot.SeqNum != 1 {
+		t.Fatalf("hello reply after reconnect = %s %s, want snapshot seq 1", env.Type, env.Data)
+	}
+}
+
+// pushDuringRebuild stands in for the rebuild actor when the slug's counter
+// resets while a cold hello waits: the hello's rebuild produced old, and
+// before the hello goroutine resumed, the actor went on to push the
+// recreated site's first snapshot.
+type pushDuringRebuild struct {
+	hub      *Hub
+	old, new model.SiteSnapshot
+}
+
+func (r *pushDuringRebuild) RebuildAndWait(context.Context, string) (model.SiteSnapshot, error) {
+	r.hub.Push("pop3", r.new)
+	return r.old, nil
+}
+
+// TestHub_ColdHelloKeepsSnapshotPushedDuringRebuild: a cold hello's rebuild
+// result must not replace a snapshot Push cached while the rebuild was
+// pending, even one with a lower SeqNum (the slug's counter reset). The
+// hub would otherwise answer this and every later hello with the
+// pre-reset site.
+func TestHub_ColdHelloKeepsSnapshotPushedDuringRebuild(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop3", "worker-1")
+	reb := &pushDuringRebuild{
+		old: model.SiteSnapshot{SeqNum: 57, Site: model.SiteInfo{Slug: "pop3"}},
+		new: model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"}},
+	}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: reb, RebuildTimeout: 2 * time.Second})
+	reb.hub = h
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeHello, "", HelloMsg{WorkerID: "worker-1", Proto: OpStreamProto}); err != nil {
+		t.Fatal(err)
+	}
+	// The hello reply precedes the op_resync; the pushed snapshot's
+	// fan-out may land on either side of it.
+	for {
+		env, err := conn.ReadMessage(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if env.Type == TypeOpResync {
+			break
+		}
+		var msg SnapshotMsg
+		if env.Type == TypeSnapshot && json.Unmarshal(env.Data, &msg) == nil && msg.Snapshot.SeqNum != 1 {
+			t.Errorf("worker was sent snapshot seq %d, want only the pushed seq 1", msg.Snapshot.SeqNum)
+		}
+	}
+	if snap, _ := h.snapshotFor("pop3"); snap.SeqNum != 1 {
+		t.Errorf("hub caches snapshot seq %d after the cold hello, want the pushed seq 1", snap.SeqNum)
 	}
 }
 
@@ -1256,6 +1415,100 @@ func TestHub_ClaimOp_IgnoresClientWorkerID(t *testing.T) {
 	}
 }
 
+// TestHub_ClaimOp_DeclinesOpOutsideClaimantsSite: a worker may claim only
+// ops whose machine is in its own site's snapshot. A won claim replies with
+// the full op row, and Operation.Params carries the op's site credentials,
+// which op_delta and op_resync keep inside the site by the same snapshot
+// membership. Here a worker authenticated for site-b presents the ID of a
+// pending deploy op on a site-a machine. The hub must decline before asking
+// the store to claim, send no op row, and leave the op for site-a. The
+// decline is already_claimed, the answer a lost race or an absent op gets,
+// so it does not tell the claimant that the op exists. A site-a worker then
+// claims the same op.
+func TestHub_ClaimOp_DeclinesOpOutsideClaimantsSite(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-site-a", "site-a", "worker-site-a")
+	auth.register("tok-site-b", "site-b", "worker-site-b")
+	siteAMachine, siteBMachine := uuid.New(), uuid.New()
+	pending := &model.Operation{
+		ID: uuid.New(), MachineID: siteAMachine, Type: model.OpDeploy, Status: model.OpPending,
+		Params: json.RawMessage(`{"bmc_runtime":{"username":"admin","password":"site-a-bmc-password"}}`),
+	}
+	claimed := *pending
+	claimed.Status = model.OpClaimed
+	claimed.Version = 1
+	// The fake store grants every claim it is asked for and records who
+	// asked, so a missing site check shows up as a granted claim, not as a
+	// lost race.
+	claimer := &fakeOpClaimer{pendingOp: pending, op: &claimed}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, OpClaimer: claimer})
+	h.Push("site-a", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "site-a"},
+		Machines: []model.MachineSnapshot{{ID: siteAMachine}}})
+	h.Push("site-b", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "site-b"},
+		Machines: []model.MachineSnapshot{{ID: siteBMachine}}})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	siteB := dialHub(t, srv, "tok-site-b")
+	if siteB == nil {
+		t.Fatal("dial failed")
+	}
+	defer siteB.CloseNow()
+	helloAndDrain(t, siteB, "worker-site-b")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	reqID := "claim-foreign"
+	if err := siteB.WriteTyped(ctx, TypeClaimOp, reqID, ClaimOpMsg{OperationID: pending.ID.String()}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := siteB.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Type != TypeClaimOpResp || env.RequestID != reqID {
+		t.Fatalf("envelope: got %+v, want the claim_op_response for %s", env, reqID)
+	}
+	if strings.Contains(string(env.Data), "site-a-bmc-password") {
+		t.Errorf("claim_op_response to a site-b worker carries the site-a op's credentials: %s", env.Data)
+	}
+	var resp RPCResponseMsg
+	if err := unmarshalData(env.Data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	var claimResp ClaimOpResponse
+	if err := unmarshalData(resp.Data, &claimResp); err != nil {
+		t.Fatalf("decode ClaimOpResponse: %v", err)
+	}
+	if claimResp.Operation != nil {
+		t.Errorf("a site-b worker was granted op %s, whose machine %s is only in site-a's snapshot",
+			pending.ID, siteAMachine)
+	}
+	if resp.Error != "" || !claimResp.AlreadyClaimed {
+		t.Errorf("out-of-site claim answered error=%q already_claimed=%v; want already_claimed and no error",
+			resp.Error, claimResp.AlreadyClaimed)
+	}
+	if calls := claimer.calls(); len(calls) != 0 {
+		t.Fatalf("the hub asked the store to claim a site-a op for %+v; want no store claim for an out-of-site op", calls)
+	}
+
+	// The decline is scoped to the claimant's site: site-a's worker claims
+	// the op as usual.
+	siteA := dialHub(t, srv, "tok-site-a")
+	if siteA == nil {
+		t.Fatal("dial failed")
+	}
+	defer siteA.CloseNow()
+	helloAndDrain(t, siteA, "worker-site-a")
+	got, errStr := claimAndRead(t, siteA, pending.ID)
+	if errStr != "" || got.Operation == nil {
+		t.Fatalf("site-a claim of its own op: error=%q granted=%v, want granted", errStr, got.Operation != nil)
+	}
+	if calls := claimer.calls(); len(calls) != 1 || calls[0].WorkerID != "worker-site-a" {
+		t.Errorf("store claims: got %+v, want exactly one, for worker-site-a", calls)
+	}
+}
+
 // helloAndDrain is a small helper used by op_update/log_lines tests
 // that only care about the post-hello state.
 func helloAndDrain(t *testing.T, conn *Conn, workerID string) {
@@ -1357,6 +1610,59 @@ func TestHub_LogBatchDispatchedToHandler(t *testing.T) {
 	got := logHandler.received[0]
 	if len(got.Envelopes) != 1 || got.Envelopes[0].Msg != "starting" {
 		t.Fatalf("received: %+v", got)
+	}
+}
+
+// A worker message larger than 1 MiB is legitimate: the worker ships its
+// log ring in log_batch messages of up to 256 envelopes, and one agent
+// exec envelope carries up to 16 KiB of stdout. The hub must read such a
+// message and keep serving the connection, not close it with
+// StatusMessageTooBig.
+func TestHub_AcceptsMultiMiBLogBatch(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "site-c", "worker-1")
+	logHandler := &fakeLogBatchHandler{}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, LogBatchHandler: logHandler})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	// 256 exec envelopes, each with a full 16 KiB stdout capture: about
+	// 4.3 MiB on the wire.
+	stdout := strings.Repeat("rsync: copied another file\n", (16<<10)/27)
+	batch := LogBatchMsg{}
+	for range 256 {
+		batch.Envelopes = append(batch.Envelopes, slogkit.Envelope{
+			TS: time.Unix(1_700_000_000, 0), Level: slogkit.LevelInfo, Source: slogkit.SourceAgent,
+			Msg: "exec", Extra: map[string]any{"argv": "rsync -a /mnt/image/ /target/", "stdout": stdout},
+		})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeLogBatch, "", batch); err != nil {
+		t.Fatalf("write log_batch: %v", err)
+	}
+	// The worker's next message on the same connection: an RPC whose
+	// reply proves the hub read past the batch and kept the connection.
+	if err := conn.WriteTyped(ctx, TypeClaimOp, "req-after-logs", ClaimOpMsg{OperationID: uuid.NewString()}); err != nil {
+		t.Fatalf("write claim_op after the log batch: %v", err)
+	}
+	env, err := conn.ReadMessage(ctx)
+	if err != nil {
+		t.Fatalf("hub dropped the connection on a multi-MiB log batch instead of processing it: %v", err)
+	}
+	if env.Type != TypeClaimOpResp || env.RequestID != "req-after-logs" {
+		t.Fatalf("got %q/%q, want the claim_op_response", env.Type, env.RequestID)
+	}
+	logHandler.mu.Lock()
+	defer logHandler.mu.Unlock()
+	if len(logHandler.received) != 1 || len(logHandler.received[0].Envelopes) != 256 {
+		t.Fatalf("log handler received %d batches, want one batch of 256 envelopes", len(logHandler.received))
 	}
 }
 
@@ -2017,6 +2323,158 @@ func TestHub_PublishDuringResyncOrdersAfter(t *testing.T) {
 		t.Fatalf("delta version = %d, want 2 (the newer post-resync state)", d.Operation.Version)
 	}
 	<-published
+}
+
+// TestHub_OpStreamKeepsPublishOrderPerConnection: two op-stream publishes
+// made back to back from one goroutine reach the worker in publish order,
+// here an op that is created (op_delta v0, pending) and immediately aborted
+// (op_removed v1). The workerConn doc promises this ordering.
+//
+// A hub that writes each publish from its own goroutine leaves the wire
+// order to the scheduler. The test pins the process to one P so that order
+// is deterministic rather than occasional: there a goroutine started last
+// is run first, which puts the op_removed on the wire ahead of the
+// op_delta on every round.
+func TestHub_OpStreamKeepsPublishOrderPerConnection(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop1", "worker-1")
+	hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}})
+	machine := uuid.New()
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"},
+		Machines: []model.MachineSnapshot{{ID: machine}}})
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for round := 0; round < 50; round++ {
+		op := model.Operation{ID: uuid.New(), MachineID: machine, Type: model.OpPowerCycle, Status: model.OpPending}
+		hub.PublishOpDelta(op, "")
+		op.Status, op.Version = model.OpFailed, 1
+		hub.PublishOpRemoved(op, "")
+
+		var order []string
+		for len(order) < 2 {
+			env, err := conn.ReadMessage(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if env.Type == TypeOpDelta || env.Type == TypeOpRemoved {
+				order = append(order, env.Type)
+			}
+		}
+		if order[0] != TypeOpDelta || order[1] != TypeOpRemoved {
+			t.Fatalf("round %d: published op_delta(v0) then op_removed(v1) for op %s; the worker received %v", round, op.ID, order)
+		}
+	}
+}
+
+// TestHub_PushKeepsOrderPerConnection is the snapshot counterpart of
+// TestHub_OpStreamKeepsPublishOrderPerConnection: two snapshots pushed back
+// to back for a site reach its worker in push order. Same single-P pin, for
+// the same reason.
+func TestHub_PushKeepsOrderPerConnection(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop1", "worker-1")
+	hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}})
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"}})
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for round := 0; round < 50; round++ {
+		first := int64(2 + 2*round)
+		hub.Push("pop1", model.SiteSnapshot{SeqNum: first, Site: model.SiteInfo{Slug: "pop1"}})
+		hub.Push("pop1", model.SiteSnapshot{SeqNum: first + 1, Site: model.SiteInfo{Slug: "pop1"}})
+
+		var seqs []int64
+		for len(seqs) < 2 {
+			env, err := conn.ReadMessage(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if env.Type != TypeSnapshot {
+				continue
+			}
+			var m SnapshotMsg
+			if err := unmarshalData(env.Data, &m); err != nil {
+				t.Fatal(err)
+			}
+			seqs = append(seqs, m.Snapshot.SeqNum)
+		}
+		if seqs[0] != first || seqs[1] != first+1 {
+			t.Fatalf("round %d: pushed snapshots %d then %d; the worker received %v", round, first, first+1, seqs)
+		}
+	}
+}
+
+// TestHub_OutboundQueueFullForcesReconnect: when a worker's outbound queue
+// fills (its writer is stuck on a write because the worker stopped
+// reading), publishing neither blocks nor drops the message unnoticed: the
+// hub force-closes the connection, and the reconnect's hello resync
+// replaces what was queued. Holding the conn's opStreamMu stands in for
+// the stuck write, since the writer needs it for its first op message.
+func TestHub_OutboundQueueFullForcesReconnect(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop1", "worker-1")
+	hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}})
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"}})
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	var wc *workerConn
+	hub.mu.RLock()
+	for c := range hub.connections["pop1"] {
+		wc = c
+	}
+	hub.mu.RUnlock()
+	wc.opStreamMu.Lock()
+	defer wc.opStreamMu.Unlock()
+
+	// The writer holds at most one message while it waits on opStreamMu and
+	// the queue holds outboundQueueSize more, so this many publishes
+	// overflow it however far the writer got.
+	op := model.Operation{ID: uuid.New(), MachineID: uuid.New(), Type: model.OpPowerCycle, Status: model.OpFailed, Version: 1}
+	published := make(chan struct{})
+	go func() {
+		for i := 0; i < outboundQueueSize+2; i++ {
+			hub.PublishOpRemoved(op, "")
+		}
+		close(published)
+	}()
+	select {
+	case <-published:
+	case <-time.After(3 * time.Second):
+		t.Fatal("PublishOpRemoved blocked on a worker whose outbound queue is full")
+	}
+	waitUntil(t, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		return len(hub.connections["pop1"]) == 0
+	}, 3*time.Second)
 }
 
 // TestHub_OpDeltaIsSlugScoped pins the confidentiality fix: an op_delta

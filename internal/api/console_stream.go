@@ -161,26 +161,14 @@ func (s *Server) handleConsoleStream(c *echo.Context) error {
 	// per-event frames (which freezes the client emulator). Faithful only
 	// while nothing trims the cast.
 	if snapshot {
-		var chunks [][]byte
-		drainCursor := int64(0)
-		for {
-			if ctx.Err() != nil {
-				return nil
-			}
-			rows, err := s.consoleStore.CastEventsSince(ctx, cast.ID, drainCursor, pageSize)
-			if err != nil {
+		frame, drainCursor, err := s.castSnapshot(ctx, cast, pageSize)
+		if err != nil {
+			if ctx.Err() == nil {
 				writeConsoleErr(ctx, conn, "query_error", err.Error())
-				return nil
 			}
-			for _, r := range rows {
-				chunks = append(chunks, r.Data)
-				drainCursor = r.TUs + 1
-			}
-			if len(rows) < pageSize {
-				break // caught up to the live edge
-			}
+			return nil
 		}
-		if frame := renderCastScreenANSI(chunks, cast.Width, cast.Height); len(frame) > 0 {
+		if len(frame) > 0 {
 			line, err := encodeSnapshotLine(frame)
 			if err != nil {
 				writeConsoleErr(ctx, conn, "encode_error", err.Error())
