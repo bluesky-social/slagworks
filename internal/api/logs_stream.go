@@ -153,6 +153,9 @@ func buildFilter(sub ws.LogStreamSubscribeMsg) (logstore.QueryFilter, error) {
 		MinLevel:    strings.ToLower(sub.MinLevel),
 		LastSeenID:  sub.LastSeenID,
 	}
+	if err := logstore.ValidateMinLevel(sub.MinLevel); err != nil {
+		return f, err
+	}
 	if sub.TraceID != "" {
 		id, err := uuid.Parse(sub.TraceID)
 		if err != nil {
