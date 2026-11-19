@@ -356,10 +356,15 @@ crash between them and the acknowledgement is safe to replay. A
 NetBox is unreachable. Deployed machines keep running from the last
 snapshot.
 
-The worker drops an entry itself, logging an error, when its `observation`
-message would exceed the 16 MiB message limit or cannot be encoded. Global
-could never read it, and resending it on every reconnect would hold up
-every observation and `op_update` queued behind it.
+An entry too large to send is never queued and never retried.
+`/api/v1/report` and `/api/v1/inventory` answer 413 for a body over
+`ws.MaxObservationDataBytes` (10 MiB, which leaves the rest of the 16 MiB
+message limit for the envelope), measured after the JSON escaping the
+worker applies when it re-encodes the body. The worker also drops an entry
+itself, logging an error, when its `observation` message would still exceed
+the 16 MiB message limit or cannot be encoded. Global could never read it,
+and resending it on every reconnect would hold up every observation and
+`op_update` queued behind it.
 
 ---
 

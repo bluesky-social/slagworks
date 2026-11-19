@@ -229,3 +229,26 @@ func TestWSConn_ObservationSizeCheckMatchesHubLimit(t *testing.T) {
 		})
 	}
 }
+
+// A body at the intake cap that /api/v1/inventory and /api/v1/report
+// enforce (ws.MaxObservationDataBytes) still encodes within
+// ws.MaxMessageBytes, so a body the worker answers 200 for is one the
+// drain can send.
+func TestObservationFrame_IntakeCapFitsMessageLimit(t *testing.T) {
+	data := append([]byte(`"`), bytes.Repeat([]byte("x"), ws.MaxObservationDataBytes-2)...)
+	data = append(data, '"')
+	frame, err := observationFrame(uuid.NewString(), model.Observation{
+		MachineID:   uuid.New(),
+		OperationID: uuid.New(),
+		Event:       "bmc_reconcile_report", // the longest event name
+		Timestamp:   time.Now(),
+		Data:        data,
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if len(frame) > ws.MaxMessageBytes {
+		t.Fatalf("a %d-byte body encodes to a %d-byte message, over the %d-byte limit",
+			len(data), len(frame), ws.MaxMessageBytes)
+	}
+}

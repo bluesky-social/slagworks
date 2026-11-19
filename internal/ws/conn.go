@@ -24,6 +24,14 @@ const (
 // without reading or answering it.
 const MaxMessageBytes = 16 << 20
 
+// MaxObservationDataBytes caps a request body that the site worker queues
+// for global as an observation's data (/api/v1/inventory and
+// /api/v1/report), measured as json.Marshal re-encodes it. It is the cap
+// /api/v1/inventory already put on its raw body, and it leaves the rest of
+// MaxMessageBytes for the observation message around the data, so a body
+// the worker accepts is one it can send.
+const MaxObservationDataBytes = 10 << 20
+
 // Conn wraps a coder/websocket connection with JSON envelope read/write.
 type Conn struct {
 	conn *websocket.Conn

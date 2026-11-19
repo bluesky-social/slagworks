@@ -886,9 +886,8 @@ func (s *Server) handleStorageScript(w http.ResponseWriter, machineID string) {
 }
 
 func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
-	if err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+	body, ok := readObservationBody(w, r, "inventory")
+	if !ok {
 		return
 	}
 	if len(body) == 0 || !json.Valid(body) {
@@ -923,6 +922,40 @@ func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("inventory report queued in outbox", "machine_id", machineID)
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, `{"status":"accepted"}`)
+}
+
+// readObservationBody reads the whole body of a request whose JSON the
+// worker queues for global inside an observation: all of it for
+// /api/v1/inventory, its commission_data for /api/v1/report (measuring the
+// whole body bounds the part inside it). It answers 413 and returns false
+// when the body, as the worker will encode it, is over
+// ws.MaxObservationDataBytes. The size is measured after encoding because
+// json.Marshal escapes '<', '>' and '&' as six-byte sequences, so a body
+// under the cap can grow past it, and past the message limit global reads
+// (ws.MaxMessageBytes). Accepting such a body would answer 200 for a
+// report that the drain then drops. The cap also bounds what one
+// unauthenticated request can make the worker hold in memory and write to
+// its outbox: /api/v1/report had no limit of its own.
+func readObservationBody(w http.ResponseWriter, r *http.Request, what string) ([]byte, bool) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, ws.MaxObservationDataBytes))
+	var mbe *http.MaxBytesError
+	tooLarge := errors.As(err, &mbe)
+	if err != nil && !tooLarge {
+		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return nil, false
+	}
+	if !tooLarge {
+		// Invalid JSON fails to encode; the caller rejects it with 400.
+		encoded, err := json.Marshal(json.RawMessage(body))
+		tooLarge = err == nil && len(encoded) > ws.MaxObservationDataBytes
+	}
+	if tooLarge {
+		http.Error(w, fmt.Sprintf("%s body is over the %d-byte limit the site worker can forward to global "+
+			"(measured after JSON escaping); send a smaller report", what, ws.MaxObservationDataBytes),
+			http.StatusRequestEntityTooLarge)
+		return nil, false
+	}
+	return body, true
 }
 
 func (s *Server) buildMux() *http.ServeMux {
@@ -968,8 +1001,12 @@ func (s *Server) buildMux() *http.ServeMux {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		body, ok := readObservationBody(w, r, "report")
+		if !ok {
+			return
+		}
 		var report model.ProgressReport
-		if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+		if err := json.Unmarshal(body, &report); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
