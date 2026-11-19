@@ -61,7 +61,12 @@ origin gets 403.
 
 - Errors: `{"message": "<text>"}` with the HTTP status (Echo's default
   error shape).
-- Request and response bodies are JSON.
+- Request and response bodies are JSON. Send a request body with
+  `Content-Type: application/json`; `curl -d` labels its body a form unless
+  given `-H 'Content-Type: application/json'`, and a form-labelled body is
+  refused. A body that is refused or fails to decode gets a 400 and changes
+  nothing; it is never read as an empty body. Routes whose body is optional
+  (deploy, commission, bmc-reconcile) accept a request with no body.
 - Machine identifiers: every `/machines/:id` route except `netbox-diff`
   accepts either the slagworks machine UUID or the NetBox device name
   (anything containing a `.`, e.g. `kworker-l34-1.pop1`). Name lookup
