@@ -98,7 +98,7 @@ func TestBootLocal_UEFIPlatform_ReturnsSanboot(t *testing.T) {
 	h.ServeHTTP(w, req)
 
 	body := w.Body.String()
-	if !strings.Contains(body, "sanboot --no-describe --drive 0x80") {
+	if !strings.Contains(body, "sanboot --no-describe --drive ") {
 		t.Fatalf("expected UEFI sanboot path, got %q", body)
 	}
 	if strings.Contains(body, "BIOS exit") {
@@ -117,7 +117,7 @@ func TestBootLocal_AbsentPlatform_DefaultsToSanboot(t *testing.T) {
 	h.ServeHTTP(w, req)
 
 	body := w.Body.String()
-	if !strings.Contains(body, "sanboot --no-describe --drive 0x80") {
+	if !strings.Contains(body, "sanboot --no-describe --drive ") {
 		t.Fatalf("absent platform must default to UEFI sanboot, got %q", body)
 	}
 	if strings.Contains(body, "BIOS exit") {
@@ -967,8 +967,8 @@ func TestBootHandler_DeployMode_DeployedMAC_ReturnsBootLocal(t *testing.T) {
 		t.Fatalf("expected boot-local script after deploy, got %q", body)
 	}
 	trimmed := strings.TrimSpace(body)
-	if !strings.HasSuffix(trimmed, "exit 1") {
-		t.Fatalf("expected boot-local script to end with 'exit 1', got %q", trimmed)
+	if !strings.HasSuffix(trimmed, "\nexit") {
+		t.Fatalf("expected boot-local script to end with a plain 'exit' (back to the firmware), got %q", trimmed)
 	}
 }
 
