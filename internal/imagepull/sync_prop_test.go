@@ -249,14 +249,19 @@ func runSyncHistory(t *rapid.T, allowHostile bool, stats map[string]int) {
 			if failing[name] {
 				stats["failed_pulls"]++
 				// Documented: a failure before the swap leaves the previous
-				// cache (marker and target) intact.
-				for k, v := range before {
-					if strings.HasPrefix(k, filepath.Join("site", "images", name)+string(filepath.Separator)) ||
-						k == filepath.Join("site", "images", name+".sha256") {
-						if after[k] != v {
-							t.Fatalf("step %d: failed pull of %q damaged its previous cache entry %s", step, name, k)
+				// cache (marker and target) intact, and installs nothing.
+				entry := func(tree map[string]string) map[string]string {
+					out := map[string]string{}
+					for k, v := range tree {
+						if strings.HasPrefix(k, filepath.Join("site", "images", name)+string(filepath.Separator)) ||
+							k == filepath.Join("site", "images", name+".sha256") {
+							out[k] = v
 						}
 					}
+					return out
+				}
+				if d := diffTrees(entry(before), entry(after)); d != "" {
+					t.Fatalf("step %d: failed pull of %q changed its cache entry: %s", step, name, d)
 				}
 				continue
 			}
@@ -288,13 +293,17 @@ func runSyncHistory(t *rapid.T, allowHostile bool, stats map[string]int) {
 			}
 		}
 
-		// Bystanders: nothing outside the benign images' own dir/marker may
-		// change, whatever names the snapshot carried.
+		// Bystanders: nothing outside the dir and marker of the valid images
+		// in this snapshot may change, whatever other names it carried. A
+		// cached image the snapshot no longer lists is a bystander too.
 		filter := func(tree map[string]string) map[string]string {
 			out := map[string]string{}
 			for k, v := range tree {
 				owned := false
-				for _, b := range benignImageNames {
+				for b := range images {
+					if !slices.Contains(benignImageNames, b) {
+						continue
+					}
 					if strings.HasPrefix(k, filepath.Join("site", "images", b)+string(filepath.Separator)) ||
 						k == filepath.Join("site", "images", b+".sha256") {
 						owned = true

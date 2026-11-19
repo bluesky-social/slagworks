@@ -985,6 +985,16 @@ func (c bootCase) expect() expectation {
 	return e
 }
 
+func consoleArgs(tokens []string) []string {
+	var out []string
+	for _, tok := range tokens {
+		if strings.HasPrefix(tok, "console=") {
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
 func sortedCopy(in []string) []string {
 	out := append([]string(nil), in...)
 	sort.Strings(out)
@@ -1107,6 +1117,11 @@ func checkBootCase(c bootCase, realHook bool, stats *propStats) error {
 	}
 	if g, w := sortedCopy(rest), sortedCopy(exp.tokens); strings.Join(g, "\x1f") != strings.Join(w, "\x1f") {
 		return fmt.Errorf("kernel arguments differ from intent.\n got: %q\nwant: %q\ncmdline: %q", g, w, cmdline)
+	}
+	// The console arguments also keep their order: the last console= is the
+	// one the kernel makes /dev/console.
+	if g, w := consoleArgs(rest), consoleArgs(exp.tokens); strings.Join(g, "\x1f") != strings.Join(w, "\x1f") {
+		return fmt.Errorf("console arguments are out of order.\n got: %q\nwant: %q\ncmdline: %q", g, w, cmdline)
 	}
 
 	// slagworks_kernel_params is verbatim kernel command line, so a
