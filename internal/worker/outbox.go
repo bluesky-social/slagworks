@@ -24,7 +24,9 @@ import (
 //     not in memory" window that reloadFromDisk would otherwise mistake
 //     for a stranded row.
 //   - opUpdates are best-effort and NOT persisted — they carry phase
-//     progress that's cheap to lose on crash.
+//     progress that's cheap to lose on crash. The worker's own copy of a
+//     phase survives in op_state (UpdateOpPhase persists it), which is
+//     what keeps the awaiting_phone_home latch across a restart.
 //   - ackObservation deletes the SQLite row only after global confirms
 //     receipt via rpc_response{ok:true}.
 //   - reloadFromDisk re-enqueues rows that were sent but not yet acked

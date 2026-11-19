@@ -274,11 +274,11 @@ func (l *LocalDB) AckOutboxRow(rowID uint64) {
 // state (Tier 2 Phase 2): the active op set + the op-driven machine-state
 // overlay. It is persisted OUTSIDE the snapshot path (SaveOpState),
 // because operations left SiteSnapshot and now flow on the op-event
-// stream — the op set is written on every stream apply, not on snapshot
-// apply. On rehydration the loaded set is treated as UNTRUSTED until the
-// first op_resync (it may be stale: global could have failed/completed an
-// op during the outage), so a persisted active deploy op never actuates a
-// re-wipe on cold start.
+// stream — the op set is written on every stream apply and every local
+// phase change, not on snapshot apply. On rehydration the loaded set is
+// treated as UNTRUSTED until the first op_resync (it may be stale: global
+// could have failed/completed an op during the outage), so a persisted
+// active deploy op never actuates a re-wipe on cold start.
 type PersistedOpState struct {
 	Ops     []model.Operation             `json:"ops"`
 	Overlay map[string]model.MachineState `json:"overlay"`
@@ -286,8 +286,9 @@ type PersistedOpState struct {
 
 // SaveOpState persists the op set + machine-state overlay to the kv table
 // under "op_state". Called on every op-stream apply (delta/resync/removed)
-// — small, bounded by active-op count. Best-effort: a failure is logged,
-// not fatal (the op set re-syncs from global on the next connect anyway).
+// and every accepted UpdateOpPhase — small, bounded by active-op count.
+// Best-effort: a failure is logged, not fatal (the op set re-syncs from
+// global on the next connect anyway).
 func (l *LocalDB) SaveOpState(ops []model.Operation, overlay map[string]model.MachineState) {
 	blob, err := json.Marshal(PersistedOpState{Ops: ops, Overlay: overlay})
 	if err != nil {

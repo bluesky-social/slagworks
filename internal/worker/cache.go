@@ -62,6 +62,8 @@ import (
 // while holding opState.mu/subsMu/outboxMu/imageSyncMu; no reader/mutator
 // holds more than one of opState.mu/subsMu/outboxMu/imageSyncMu; subscriber
 // callbacks run with none of these held. Pure readers take no lock.
+// persistOpState takes persistMu -> opState.mu.RLock (release) and is never
+// called with opState.mu held.
 type Cache struct {
 	// applyMu serializes ApplySnapshot end-to-end. Never taken by a reader.
 	applyMu sync.Mutex
@@ -103,6 +105,14 @@ type Cache struct {
 	// running without persistence (tests). The outbox holds its own
 	// reference for observation persistence.
 	localDB *LocalDB
+
+	// persistMu serializes persistOpState's snapshot-and-write, so the last
+	// op_state written to LocalDB is never older than the last op-layer
+	// change that asked to be persisted. Stream applies run on the WS read
+	// loop, but UpdateOpPhase runs on the executor, DHCP and HTTP
+	// goroutines; without this, an older snapshot could land on disk after a
+	// newer one. Taken before opState.mu (read), never while holding it.
+	persistMu sync.Mutex
 
 	// ImagesDir is the on-disk directory for boot images. When set,
 	// ApplySnapshot calls SyncImages after the view swap.
@@ -241,12 +251,15 @@ func (c *Cache) ApplyOpRemoved(opID, machineID string, version int, machineState
 }
 
 // persistOpState writes the current op set + overlay to LocalDB. Called
-// after every stream apply so a crash rehydrates the last-known op layer
+// after every stream apply and every accepted local phase change
+// (UpdateOpPhase), so a crash rehydrates the last-known op layer
 // (untrusted). Best-effort; a nil localDB (tests) is a no-op.
 func (c *Cache) persistOpState() {
 	if c.localDB == nil {
 		return
 	}
+	c.persistMu.Lock()
+	defer c.persistMu.Unlock()
 	ops, overlay := c.opState.snapshotForPersist()
 	c.localDB.SaveOpState(ops, overlay)
 }
@@ -1004,16 +1017,24 @@ func (c *Cache) PrepareDeployLogs(machineID, operationID string) {
 	c.localDB.SetCurrentDeployOp(machineID, operationID)
 }
 
-// UpdateOpPhase updates the phase of an operation in-memory, writes a
-// source:"phase" log entry, and queues the update for push to central.
-// If the operation has been marked failed, the update is rejected. The
-// awaiting_phone_home clobber guard and same-phase dedup live in
+// UpdateOpPhase updates the phase of an operation, persists the op layer,
+// writes a source:"phase" log entry, and queues the update for push to
+// central. If the operation has been marked failed, the update is rejected.
+// The awaiting_phone_home clobber guard and same-phase dedup live in
 // opState.updatePhase; see bootPrefixPhases (opstate_cache.go) for why.
 func (c *Cache) UpdateOpPhase(opID, phase string) {
 	upd := c.opState.updatePhase(opID, phase)
 	if !upd.proceed {
 		return
 	}
+
+	// Persist before queueing the op_update, which lives only in memory.
+	// The phase decides the boot action: if the worker restarts before
+	// global echoes awaiting_phone_home, the rehydrated op must still carry
+	// it so keepTerminalWait holds it against global's stale op_resync.
+	// Otherwise the post-install PXE gets BootDeploy and the host is
+	// re-deployed over the disk it just installed.
+	c.persistOpState()
 
 	// Emit a structured envelope for the phase change. site is the
 	// emitter; trace_id / op_id / machine_id come from the op so

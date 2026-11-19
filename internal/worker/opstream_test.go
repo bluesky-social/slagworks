@@ -473,6 +473,59 @@ func TestStaleResyncKeepsAwaitingPhoneHome(t *testing.T) {
 	}
 }
 
+// TestStaleResyncAfterRestartKeepsAwaitingPhoneHome is the restart variant of
+// TestStaleResyncKeepsAwaitingPhoneHome. The agent reports deploy_complete
+// while global is unreachable, so the awaiting_phone_home op_update never
+// leaves the worker's in-memory outbox. The worker then restarts, and global
+// comes back and resyncs the op at the last phase it received. The worker's
+// own copy of awaiting_phone_home must survive the restart so the stale
+// resync is held: the post-install PXE gets BootLocal, not BootDeploy (which
+// would re-deploy over the disk the agent just installed).
+func TestStaleResyncAfterRestartKeepsAwaitingPhoneHome(t *testing.T) {
+	dbPath := t.TempDir() + "/worker.db"
+	mac := "52:54:00:15:10:57"
+	id, opID := uuid.New(), uuid.New()
+	globalRow := model.Operation{
+		ID: opID, MachineID: id, Type: model.OpDeploy,
+		Status: model.OpClaimed, Phase: "rsyncing_os", Version: 5,
+	}
+
+	// First worker process. The outbox is never drained: global is down.
+	{
+		db, err := OpenLocalDB(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := NewCache(db)
+		deployingMachine(c, id, mac)
+		seedOpsResync(c, globalRow)
+		if err := c.HandleProgressReport(&model.ProgressReport{
+			MachineID: id.String(), OperationID: opID.String(), Event: "deploy_complete",
+		}); err != nil {
+			t.Fatalf("deploy_complete: %v", err)
+		}
+		if got := c.BootActionForMAC(mac); got != model.BootLocal {
+			t.Fatalf("precondition: before restart got %d, want BootLocal", got)
+		}
+	}
+
+	// Restarted worker: global reconnects and resyncs its unchanged row.
+	db, err := OpenLocalDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := NewCache(db)
+	deployingMachine(c, id, mac)
+	seedOpsResync(c, globalRow)
+	if got := c.BootActionForMAC(mac); got != model.BootLocal {
+		t.Fatalf("post-install PXE after worker restart: got %d, want BootLocal (%d); BootDeploy (%d) re-deploys over the fresh install",
+			got, model.BootLocal, model.BootDeploy)
+	}
+	if op := c.GetOperation(opID.String()); op == nil || op.Phase != "awaiting_phone_home" {
+		t.Fatalf("op after restart and resync = %+v, want phase awaiting_phone_home", op)
+	}
+}
+
 // TestFailedDeltaLeavesAwaitingPhoneHome: the phone-home timeout's failure
 // still applies; keepTerminalWait only blocks phase regressions on an op
 // global still shows active.

@@ -736,6 +736,20 @@ service POSTs `/api/v1/phone-home`, `RecordPhoneHome` fires the
 completion path described earlier, and the op transitions to
 `completed` with `machine.state = running`.
 
+The worker reaches `awaiting_phone_home` before global does: the phase
+travels up as an op update, which waits in the outbox's in-memory queue
+while the WebSocket is down. Until global echoes it, an `op_delta` or
+`op_resync` from global still carries the earlier phase.
+`keepTerminalWait` (`internal/worker/opstate_cache.go`) holds a local
+`awaiting_phone_home` against those stale rows, and only completion or
+failure may leave it. That hold also has to survive a worker restart,
+so `UpdateOpPhase` persists the op layer (LocalDB `op_state`) on every
+accepted phase change. The rehydrated op then carries
+`awaiting_phone_home`, and the first `op_resync` after the restart is
+held like any other. Tests: `TestStaleResyncKeepsAwaitingPhoneHome`
+and `TestStaleResyncAfterRestartKeepsAwaitingPhoneHome`
+(`internal/worker/opstream_test.go`).
+
 Timeout: `PhoneHomeTimeout` (30 minutes by default) anchored on
 `phase_entered_at`.
 
