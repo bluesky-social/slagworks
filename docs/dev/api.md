@@ -319,15 +319,16 @@ watch view. Registered only with the log store.
 2. The server replies `subscribed`, sends matching rows from
    `log_envelopes` as `log_stream_envelope` (`{"id","envelope"}`), then
    polls for new rows every 250 ms, holding back the newest 500 ms.
-   `since` bounds the backfill on the emitter's `ts`; the live tail
-   admits a row when its `ts` or `global_received_at` is at or after
-   `since`, so a line from an emitter whose clock runs behind still
-   streams.
+   `since` admits a row when its `ts` or `global_received_at` is at or
+   after it, so a line from an emitter whose clock runs behind still
+   streams. The rule is the same for the backfill and the live tail:
+   the stream pages by id, so a row that one query's bound hid and a
+   later one admitted would be stepped over and never sent.
 3. A bad subscription or query failure sends one `error`
    (`{"code","message"}`) and closes the connection.
 
-Clients resume after a disconnect with `last_seen_id`, which skips the
-backfill and continues the live tail past that id. The
+Clients resume after a disconnect with `last_seen_id`, which continues
+the stream past that id. The
 `log_stream_meta` type is defined and rendered by `slagctl` but not sent by
 the server.
 
