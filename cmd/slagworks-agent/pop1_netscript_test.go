@@ -216,3 +216,36 @@ func TestPop1Script_UnknownSubnetHardFails(t *testing.T) {
 		t.Errorf("stderr should explain the unknown-subnet failure, got: %s", stderr)
 	}
 }
+
+// TestPop1Script_LegsInDifferentSubnetsHardFail: both legs of a kworker land
+// on one leaf pair, and that pair's /24 gives both leaf ASNs. Legs whose /31s
+// sit in two different /24s are a NetBox modeling error. Deriving the pair from
+// the lower leg alone would give the higher leg's neighbor the wrong remote-as
+// (leaf-4's 65024 on a leg in leaf-5/6's 10.254.29.0/24), a session that can
+// never establish, so the host would come up silently on one leg. The check
+// must also not depend on which leg sorts first: an unknown /24 on the higher
+// leg must fail just like one on the lower leg.
+func TestPop1Script_LegsInDifferentSubnetsHardFail(t *testing.T) {
+	for _, tc := range []struct{ name, legA, legB string }{
+		{"two known leaf pairs", "10.254.28.1/31", "10.254.29.1/31"},
+		{"unknown subnet on the higher leg", "10.254.28.1/31", "10.254.30.1/31"},
+		{"unknown subnet on the lower leg", "10.254.27.1/31", "10.254.28.1/31"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			facts := `[
+	  {"name":"eth0","mac":"aa:bb:cc:00:00:01","type":"physical","ip":"` + tc.legA + `"},
+	  {"name":"eth1","mac":"aa:bb:cc:00:00:02","type":"physical","ip":"` + tc.legB + `"},
+	  {"name":"lo","type":"physical","ip":"10.254.31.67/32"}
+	]`
+			bundle, stderr, err := runPop1Script(t, facts)
+			if err == nil {
+				frr := bundleFile(t, bundle, "/etc/frr/frr.conf")["content"].(string)
+				t.Fatalf("expected hard-fail for legs %s and %s in different /24s, got success; frr.conf:\n%s",
+					tc.legA, tc.legB, frr)
+			}
+			if !strings.Contains(stderr, "different /24s") {
+				t.Errorf("stderr should explain the cross-subnet failure, got: %s", stderr)
+			}
+		})
+	}
+}

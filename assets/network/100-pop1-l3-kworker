@@ -22,8 +22,9 @@
 #   - a /32 on the `lo` interface is the identity loopback,
 #   - a /31 on a physical NIC is a routed P2P leg; its leaf-side next hop is
 #     the other address in the /31 (flip the last bit),
-#   - the /31 subnet identifies the leaf pair, which gives the leaf ASNs
-#     (in-script table — the only pair-dependent, not-derivable fact),
+#   - both legs land on one leaf pair, and the /24 holding both /31s
+#     identifies that pair, which gives the leaf ASNs (in-script table —
+#     the only pair-dependent, not-derivable fact),
 #   - the deploy-window resolver is the pop's oob-gw VIP at {a}.{b}.240.1.
 #
 # Two outputs, both emitted for a fully L3-modeled host:
@@ -214,11 +215,15 @@ def render_frr_conf(legs, loopback):
     address: legs[0] = leaf-A leg (lower /31), legs[1] = leaf-B leg. loopback
     is the /32 CIDR. Direct port of site Ansible kworker_frr/templates/frr.conf.j2.
 
-    Exits non-zero if the /31 subnet isn't a known pop1 leaf pair: a host that
-    matched the pop1 kworker script and has two /31 legs but an unrecognized
-    subnet is a NetBox-modeling inconsistency, and shipping netplan-only would
-    leave the loopback un-routable (no BGP announce) — a latent fabric break.
-    Fail loud, same posture as the storage wrong-disk hard-fail.
+    Exits non-zero if the two legs' /31s are in different /24s, or if their
+    shared /24 isn't a known pop1 leaf pair: a host that matched the pop1
+    kworker script and has two /31 legs but inconsistent or unrecognized
+    addressing is a NetBox-modeling inconsistency. Shipping netplan-only would
+    leave the loopback un-routable (no BGP announce), and deriving the pair
+    from one leg would give the other leg's neighbor a remote-as its leaf
+    does not have (a session that never establishes) — a latent fabric
+    break either way. Fail loud, same posture as the storage wrong-disk
+    hard-fail.
     """
     lo = nl.addr_only(loopback)
     leg_a_host = nl.addr_only(legs[0][1])
@@ -227,6 +232,15 @@ def render_frr_conf(legs, loopback):
     leg_b_leaf = legs[1][2]
 
     subnet = nl.subnet24(legs[0][1])
+    leg_b_subnet = nl.subnet24(legs[1][1])
+    if leg_b_subnet != subnet:
+        nl.fail(
+            f"ERROR: the two /31 legs {legs[0][1]} and {legs[1][1]} are in "
+            f"different /24s ({subnet} and {leg_b_subnet}); both legs of a pop1 "
+            f"kworker must land on one leaf pair, whose /24 gives both leaf "
+            f"ASNs (have {sorted(LEAF_PAIRS)}). Fix the /31 assignments in "
+            f"NetBox before deploy.\n"
+        )
     pair = LEAF_PAIRS.get(subnet)
     if pair is None:
         nl.fail(
