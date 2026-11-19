@@ -2,6 +2,7 @@ package dhcp
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"strings"
@@ -869,6 +870,56 @@ func TestHandlePacket_IgnoresNonDHCP(t *testing.T) {
 	reply := h.HandlePacket(release)
 	if reply != nil {
 		t.Fatal("expected nil for Release, got a response")
+	}
+}
+
+// TestHandlePacket_IgnoresNonBootRequestOpcode pins RFC 2131 / RFC 951: a
+// server acts only on BOOTP op=BOOTREQUEST (1). A datagram on UDP/67 with
+// any other op byte is not a client request, even when its option 53 says
+// DISCOVER or REQUEST (a corrupt relay, or another server's malformed
+// reply). It must get no reply and must not allocate a lease. Answering it
+// also puts a malformed packet on the wire: the library's reply builder
+// flips any non-BOOTREQUEST op to BOOTREQUEST, so the OFFER/ACK would leave
+// with op=1.
+func TestHandlePacket_IgnoresNonBootRequestOpcode(t *testing.T) {
+	ops := []dhcpv4.OpcodeType{dhcpv4.OpcodeBootReply, 0, 3, 0xff}
+	types := []dhcpv4.MessageType{dhcpv4.MessageTypeDiscover, dhcpv4.MessageTypeRequest}
+
+	for _, mt := range types {
+		// Control: the identical packet with op=BOOTREQUEST is served, so
+		// the cases below are refused for the opcode alone.
+		t.Run(mt.String()+"/op=BootRequest", func(t *testing.T) {
+			h := NewHandler(testConfig())
+			pkt, err := dhcpv4.New(
+				dhcpv4.WithHwAddr(net.HardwareAddr{0x52, 0x54, 0x00, 0xaa, 0xbb, 0x41}),
+				dhcpv4.WithMessageType(mt))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reply := h.HandlePacket(pkt); reply == nil {
+				t.Fatalf("control: op=BOOTREQUEST %s got no reply", mt)
+			}
+		})
+		for _, op := range ops {
+			t.Run(fmt.Sprintf("%s/op=%d", mt, uint8(op)), func(t *testing.T) {
+				h := NewHandler(testConfig())
+				pkt, err := dhcpv4.New(
+					dhcpv4.WithHwAddr(net.HardwareAddr{0x52, 0x54, 0x00, 0xaa, 0xbb, 0x41}),
+					dhcpv4.WithMessageType(mt))
+				if err != nil {
+					t.Fatal(err)
+				}
+				pkt.OpCode = op
+
+				if reply := h.HandlePacket(pkt); reply != nil {
+					t.Errorf("op=%d %s was answered with %s (op=%s), want no reply",
+						uint8(op), mt, reply.MessageType(), reply.OpCode)
+				}
+				if n := len(h.Leases()); n != 0 {
+					t.Errorf("op=%d %s allocated %d lease(s), want 0", uint8(op), mt, n)
+				}
+			})
+		}
 	}
 }
 
