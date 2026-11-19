@@ -34,7 +34,8 @@ type Client struct {
 }
 
 type ClientConfig struct {
-	// BaseURL is the NetBox instance URL (e.g., "https://netbox.example.com").
+	// BaseURL is the NetBox instance URL (e.g., "https://netbox.example.com"),
+	// optionally with a path ("https://netbox.example.com/netbox").
 	BaseURL string
 	// Token is the NetBox API token.
 	Token string
@@ -132,12 +133,11 @@ func (c *Client) listInto(ctx context.Context, path string, query url.Values, de
 	}
 
 	var allResults []json.RawMessage
-	currentPath := path
 	currentQuery := query
 
 	for {
 		var page ListResponse[json.RawMessage]
-		if err := c.do(ctx, http.MethodGet, currentPath, currentQuery, nil, &page); err != nil {
+		if err := c.do(ctx, http.MethodGet, path, currentQuery, nil, &page); err != nil {
 			return err
 		}
 		allResults = append(allResults, page.Results...)
@@ -146,12 +146,17 @@ func (c *Client) listInto(ctx context.Context, path string, query url.Values, de
 			break
 		}
 
-		// Parse the next URL to extract path and query for the next request.
-		nextPath, nextQuery, err := c.parseNextURL(*page.Next)
+		// NetBox builds the next link from the absolute request URI and
+		// changes only its query (offset, or start in cursor mode), so the
+		// next page is at the same endpoint: take only the query. The
+		// link's host is NetBox's view of itself (possibly an internal name
+		// behind a proxy), and its path includes the base URL's path prefix
+		// when NetBox runs under BASE_PATH but not behind a prefix-stripping
+		// proxy, so neither can be joined onto the configured base URL.
+		nextQuery, err := nextPageQuery(*page.Next)
 		if err != nil {
 			return fmt.Errorf("parsing pagination next URL: %w", err)
 		}
-		currentPath = nextPath
 		currentQuery = nextQuery
 	}
 
@@ -163,12 +168,12 @@ func (c *Client) listInto(ctx context.Context, path string, query url.Values, de
 	return json.Unmarshal(collected, dest)
 }
 
-func (c *Client) parseNextURL(nextURL string) (string, url.Values, error) {
+func nextPageQuery(nextURL string) (url.Values, error) {
 	u, err := url.Parse(nextURL)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
-	return u.Path, u.Query(), nil
+	return u.Query(), nil
 }
 
 // APIError represents a non-success HTTP response from NetBox.

@@ -47,7 +47,9 @@ variable shown, so a flag on the command line overrides the variable.
 - **`LISTEN_ADDR`** / `--addr` — API and WebSocket listen address.
   Default `:8081`.
 - **`NETBOX_URL`** / `--netbox-url` and **`NETBOX_TOKEN`** /
-  `--netbox-token` — NetBox base URL and API token. Both must be set;
+  `--netbox-token` — NetBox base URL and API token. The URL may carry a
+  path, such as `https://netbox.example.com/netbox` for a NetBox served
+  under `BASE_PATH` or behind a proxy prefix. Both must be set;
   either alone logs a warning and leaves NetBox disabled. Without NetBox,
   global serves the REST API but builds no snapshots, does not register
   the site-worker WebSocket (so no site worker can connect), the NetBox
