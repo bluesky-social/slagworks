@@ -640,7 +640,9 @@ func TestResolveMountDevices_NoESP(t *testing.T) {
 func TestPlan_BIOSGrub_HybridLayout(t *testing.T) {
 	// Hybrid layout (the matrix default): 1M bios_grub (EF02) + 512M
 	// ESP (EF00) + ext4 root. Asserts the EF02 type code and that the
-	// bios_grub partition gets NO mkfs (it's unformatted).
+	// bios_grub partition gets NO mkfs (it's unformatted), only the wipefs
+	// and boot-sector zeroing that clear whatever an earlier layout left at
+	// its offset.
 	layout := mustParseLayout(t, `{
 		"layout": {
 			"vda": {
@@ -669,6 +671,8 @@ func TestPlan_BIOSGrub_HybridLayout(t *testing.T) {
 		{"sgdisk", []string{"-n", "2:0:+512M", "-t", "2:EF00", "-c", "2:vda2", "/dev/vda"}},
 		{"sgdisk", []string{"-n", "3:0:0", "-t", "3:8300", "-c", "3:vda3", "/dev/vda"}},
 		{"blockdev", []string{"--rereadpt", "/dev/vda"}},
+		{"wipefs", []string{"-a", "/dev/vda1"}},
+		{"dd", []string{"if=/dev/zero", "of=/dev/vda1", "bs=4096", "count=1", "conv=fsync"}},
 		{"mkfs.fat", []string{"-F", "32", "/dev/vda2"}},
 		{"mkfs.ext4", []string{"-F", "/dev/vda3"}},
 		{"mkdir", []string{"-p", "/target"}},
