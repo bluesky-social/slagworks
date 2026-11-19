@@ -38,12 +38,12 @@ func TestPlan_VFATPartitionBelowFAT32MinimumRejected(t *testing.T) {
 		wantMin string // "" when the size is accepted
 	}{
 		{512, "32M", "33M"},
-		{512, "33791K", "33M"}, // 33 MiB less two sectors
+		{512, "33788K", "33M"}, // 33 MiB less 4K
 		{512, "33M", ""},
 		{512, "34M", ""},
 		{512, "256M", ""},
 		{4096, "256M", "257M"},
-		{4096, "263164K", "257M"}, // 257 MiB less one sector
+		{4096, "263164K", "257M"}, // 257 MiB less 4K
 		{4096, "257M", ""},
 		{4096, "258M", ""},
 		{4096, "512M", ""},
@@ -125,31 +125,33 @@ func TestPlan_VFATNeedsLogicalSectorSize(t *testing.T) {
 	}
 }
 
-func TestPartitionBytes(t *testing.T) {
+// TestSizeBytes: a fixed size is the same number of bytes on every disk,
+// because sizeBytes accepts only what sgdisk realizes exactly at both
+// 512-byte and 4096-byte sectors.
+func TestSizeBytes(t *testing.T) {
 	cases := []struct {
-		size   string
-		sector int64
-		want   int64
+		size string
+		want int64
 	}{
-		{"512M", 512, 512 << 20},
-		{"512m", 4096, 512 << 20},
-		{"1G", 512, 1 << 30},
-		{"2T", 4096, 2 << 40},
-		{"64K", 4096, 64 << 10},
-		{"6K", 4096, 4 << 10}, // rounded down to whole sectors
+		{"512M", 512 << 20},
+		{"512m", 512 << 20},
+		{"1G", 1 << 30},
+		{"2T", 2 << 40},
+		{"64K", 64 << 10},
+		{"4K", 4 << 10},
 	}
 	for _, c := range cases {
-		got, err := partitionBytes(c.size, c.sector)
+		got, err := sizeBytes(c.size)
 		if err != nil || got != c.want {
-			t.Errorf("partitionBytes(%q, %d) = %d, %v; want %d", c.size, c.sector, got, err, c.want)
+			t.Errorf("sizeBytes(%q) = %d, %v; want %d", c.size, got, err, c.want)
 		}
 	}
 	// A bare number is a sector count to sgdisk, so its size would depend on
 	// the disk; the layout grammar requires a unit. Under 4K is no sectors
-	// at all on a 4Kn disk.
-	for _, bad := range []string{"", "M", "2048", "0M", "3K", "1.5G", "-1G", "+1G", "512MB", "10X", "1P", "9999999999T"} {
-		if _, err := partitionBytes(bad, 512); err == nil {
-			t.Errorf("partitionBytes(%q) accepted a size outside the layout grammar", bad)
+	// at all on a 4Kn disk, and 6K is rounded down to 4K there.
+	for _, bad := range []string{"", "M", "2048", "0M", "3K", "6K", "1.5G", "-1G", "+1G", "512MB", "10X", "1P", "9999999999T"} {
+		if _, err := sizeBytes(bad); err == nil {
+			t.Errorf("sizeBytes(%q) accepted a size outside the layout grammar", bad)
 		}
 	}
 }
