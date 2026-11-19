@@ -223,6 +223,76 @@ func TestBuildIgnoresReservedIPs(t *testing.T) {
 	}
 }
 
+// TestBuildInterfaceIPWithSeveralActiveAddresses locks which address a machine
+// interface carries when NetBox assigns it more than one active IPAddress (a
+// secondary address, a VIP, or dual-stack). SnapshotInterface.IP feeds the
+// worker's DHCP reservation for the NIC's MAC, the interface's Gateway and the
+// network-script facts, so it must follow a fixed rule rather than whichever
+// row NetBox listed last. Each case builds the same two rows in both orders
+// and expects the same answer from each.
+func TestBuildInterfaceIPWithSeveralActiveAddresses(t *testing.T) {
+	nbID, ifID := 900, 901
+	cases := []struct {
+		name       string
+		primaryIP4 *netbox.NestedRef
+		ips        [2]netbox.IPAddress
+		want       string
+	}{
+		{
+			name: "lowest IPv4 when the device's primary_ip4 is on another interface",
+			// ID 99 is not on eth0, e.g. a loopback carrying primary_ip4.
+			primaryIP4: &netbox.NestedRef{ID: 99},
+			ips:        [2]netbox.IPAddress{{ID: 1, Address: "10.0.0.5/24"}, {ID: 2, Address: "10.0.0.9/24"}},
+			want:       "10.0.0.5/24",
+		},
+		{
+			name: "lowest compares numerically, not as text",
+			ips:  [2]netbox.IPAddress{{ID: 1, Address: "10.0.0.10/24"}, {ID: 2, Address: "10.0.0.9/24"}},
+			want: "10.0.0.9/24",
+		},
+		{
+			name:       "device primary_ip4 wins when it is on the interface",
+			primaryIP4: &netbox.NestedRef{ID: 2},
+			ips:        [2]netbox.IPAddress{{ID: 1, Address: "10.0.0.5/24"}, {ID: 2, Address: "10.0.0.9/24"}},
+			want:       "10.0.0.9/24",
+		},
+		{
+			name: "IPv4 wins over IPv6 on a dual-stack interface",
+			ips:  [2]netbox.IPAddress{{ID: 1, Address: "10.0.0.5/24"}, {ID: 2, Address: "2001:db8::5/64"}},
+			want: "10.0.0.5/24",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b := tc.ips[0], tc.ips[1]
+			for _, order := range [][]netbox.IPAddress{{a, b}, {b, a}} {
+				for i := range order {
+					order[i].AssignedObjectType = "dcim.interface"
+					order[i].AssignedObjectID = &ifID
+				}
+				snap, err := Build(Inputs{
+					Site:       netbox.Site{Name: "site-a", Slug: "site-a"},
+					Prefixes:   []netbox.Prefix{{Prefix: "10.0.0.0/24", CustomFields: gatewayJSON("10.0.0.1")}},
+					Devices:    []netbox.Device{{ID: nbID, Name: "host-1", Serial: "SN-1", PrimaryIP4: tc.primaryIP4}},
+					Interfaces: []netbox.Interface{{ID: ifID, Name: "eth0", MACAddress: "aa:bb:cc:00:09:01", Device: &netbox.NestedRef{ID: nbID}}},
+					IPs:        order,
+					Machines:   []model.Machine{{ID: uuid.MustParse("00000000-0000-0000-0000-000000000050"), NetBoxDeviceID: &nbID, NetBoxSerial: "SN-1"}},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := findIface(t, snap.Machines[0].Interfaces, "eth0")
+				if got.IP != tc.want {
+					t.Errorf("NetBox order %s, %s: interface IP = %q, want %q", order[0].Address, order[1].Address, got.IP, tc.want)
+				}
+				if got.Gateway != "10.0.0.1" {
+					t.Errorf("NetBox order %s, %s: interface Gateway = %q, want 10.0.0.1", order[0].Address, order[1].Address, got.Gateway)
+				}
+			}
+		})
+	}
+}
+
 // TestBuildBMCIPFromBMClessSwitch locks the mgmt_only-conflation fix: a BMC-less
 // device (e.g. an SN2700 switch) whose host PXE NIC is flagged mgmt_only
 // and carries an IP must NOT be mistaken for a BMC. MachineSnapshot.BMCIP

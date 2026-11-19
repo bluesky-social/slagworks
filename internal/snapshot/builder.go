@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
+	"slices"
 	"strings"
 
 	"github.com/bluesky-social/slagworks/internal/awssecrets"
@@ -121,10 +123,13 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 		}
 		ifacesByDev[iface.Device.ID] = append(ifacesByDev[iface.Device.ID], iface)
 	}
-	ipByIfaceID := make(map[int]string, len(in.IPs))
+	// Every active address per interface, not just the last one listed: an
+	// interface can carry several (a secondary address, a VIP, dual-stack).
+	// The machine loop picks one per interface with interfaceIP.
+	ipsByIfaceID := make(map[int][]netbox.IPAddress, len(in.IPs))
 	for _, ip := range in.IPs {
 		if ip.AssignedObjectID != nil && ip.AssignedObjectType == "dcim.interface" && ip.IsActive() {
-			ipByIfaceID[*ip.AssignedObjectID] = ip.Address
+			ipsByIfaceID[*ip.AssignedObjectID] = append(ipsByIfaceID[*ip.AssignedObjectID], ip)
 		}
 	}
 
@@ -243,13 +248,17 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 				}
 				ms.Console = consoleByDev[d.ID]
 			}
+			primaryIP4ID := 0
+			if dev != nil && dev.PrimaryIP4 != nil {
+				primaryIP4ID = dev.PrimaryIP4.ID
+			}
 			for _, ni := range ifacesByDev[*m.NetBoxDeviceID] {
 				iface := model.SnapshotInterface{
 					NetBoxID: ni.ID,
 					Name:     ni.Name,
 					MAC:      strings.ToLower(ni.GetMAC()),
 					Type:     classifyMachineInterface(ni, ms.BMCIP != ""),
-					IP:       ipByIfaceID[ni.ID],
+					IP:       interfaceIP(ipsByIfaceID[ni.ID], primaryIP4ID),
 				}
 				// L2-bond facts (additive; absent/zero on L3 hosts whose
 				// interfaces carry none of these in NetBox). LAG is the
@@ -461,9 +470,9 @@ func iprangeStringCF(r netbox.IPRange, field string) string {
 // prefixes, emit {MAC, IP}. mgmt_only/BMC interfaces are INCLUDED (the
 // whole point — the OOB net is mostly BMCs/PDUs/switch-mgmt ports). The
 // MAC is taken via Interface.GetMAC (NetBox 4.x primary_mac_address); the
-// IPs come from the raw IPAddress list (NOT the last-write-wins
-// ipByIfaceID map the machine loop uses) so a multi-IP interface is
-// actually visible here.
+// IPs come from the raw IPAddress list (NOT the single address interfaceIP
+// picks for the machine loop) so a multi-IP interface is actually visible
+// here.
 //
 // Fails loudly (per the plan's conflict-rejection rule) on:
 //   - more than one OOB IP on a single interface,
@@ -669,6 +678,64 @@ func classifyMachineInterface(i netbox.Interface, hasBMC bool) string {
 		return "physical"
 	}
 	return kind
+}
+
+// interfaceIP picks the one address a machine interface carries in the
+// snapshot (SnapshotInterface.IP) from that interface's active NetBox
+// addresses. NetBox lets an interface hold several (a secondary address, a
+// VIP, dual-stack), but the snapshot carries one, and it becomes the worker's
+// DHCP reservation for the NIC's MAC, the interface's Gateway and the
+// network-script facts. The rule, in order:
+//
+//  1. the device's primary_ip4, when it is one of this interface's
+//     addresses: it is the host's canonical address, which preflight
+//     already requires;
+//  2. otherwise the lowest IPv4 address, compared numerically: DHCP
+//     reservations and gateway resolution are IPv4, and the DHCP server
+//     ignores an IPv6 reservation as outside its subnet;
+//  3. otherwise (an IPv6-only interface) the lowest IPv6 address.
+//
+// The pick depends only on the set of addresses, never on the order NetBox
+// listed them in. primaryIP4ID is 0 when the device has no primary_ip4.
+//
+// A fixed rule rather than failing the build (as buildOOBReservations does
+// for two OOB IPs on one interface): a dual-stack or VIP-carrying host
+// interface is valid NetBox data, and failing would withhold the snapshot
+// from every machine at the site.
+func interfaceIP(ips []netbox.IPAddress, primaryIP4ID int) string {
+	if len(ips) == 0 {
+		return ""
+	}
+	if primaryIP4ID != 0 {
+		for _, ip := range ips {
+			if ip.ID == primaryIP4ID {
+				return ip.Address
+			}
+		}
+	}
+	return slices.MinFunc(ips, compareInterfaceAddr).Address
+}
+
+// compareInterfaceAddr orders NetBox CIDR addresses IPv4 before IPv6 and
+// numerically within a family (netip.Addr order, so 10.0.0.9 sorts before
+// 10.0.0.10). Rows that do not parse sort after every row that does. The raw
+// string breaks the remaining ties (the same address under two masks), so
+// the order is total and slices.MinFunc's pick never depends on input order.
+func compareInterfaceAddr(a, b netbox.IPAddress) int {
+	pa, errA := netip.ParsePrefix(a.Address)
+	pb, errB := netip.ParsePrefix(b.Address)
+	switch {
+	case errA != nil && errB != nil:
+		return strings.Compare(a.Address, b.Address)
+	case errA != nil:
+		return 1
+	case errB != nil:
+		return -1
+	}
+	if c := pa.Addr().Compare(pb.Addr()); c != 0 {
+		return c
+	}
+	return strings.Compare(a.Address, b.Address)
 }
 
 // newPrefixGatewayResolver returns a function mapping an interface CIDR to

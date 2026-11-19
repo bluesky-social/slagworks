@@ -138,7 +138,12 @@ type SnapshotInterface struct {
 	Name     string `json:"name"`
 	MAC      string `json:"mac"`
 	Type     string `json:"type"` // "physical" | "ipmi" | "lag"
-	IP       string `json:"ip,omitempty"`
+	// IP is one active NetBox address on the interface, in CIDR form. When
+	// NetBox assigns several, the builder takes the device's primary_ip4 if
+	// it sits on this interface, else the lowest IPv4 address, else the
+	// lowest IPv6 address (snapshot.interfaceIP), whatever order NetBox
+	// listed them in.
+	IP string `json:"ip,omitempty"`
 
 	// The fields below carry the extra topology an L2 bond host needs and
 	// an L3 routed-NIC host derives from its addressing. All omitempty so
