@@ -164,7 +164,8 @@ the shape; the interesting bits:
   `partitions: […]`) or a RAID array (`type: "raid"`, `level`, `members`).
   Set `boot: true` on a disk that carries the ESP so the layout is
   self-describing (the flag itself is advisory today).
-- Partitions carry `name`, `size` (`"512M"`, `"100G"`, or `"rest"`), an
+- Partitions carry `name` (the kernel's device node for that position on
+  the disk: `sda2`, `nvme0n1p2`), `size` (`"512M"`, `"100G"`, or `"rest"`), an
   optional `fs` (`vfat`, `ext4`, `xfs`, `swap`), and one of `bootable: true`
   (marks the ESP, GPT type EF00) or `bios_grub: true` (marks a legacy BIOS
   boot partition, GPT type EF02, for the legacy-GRUB install path). The

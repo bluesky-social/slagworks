@@ -184,9 +184,20 @@ func memberReferencesDisk(member, disk string) bool {
 func validateDisk(name string, dev Device) error {
 	// Disks with no partitions are valid — they may be whole-disk RAID members.
 	restCount := 0
-	for _, p := range dev.Partitions {
+	for i, p := range dev.Partitions {
 		if p.Name == "" {
 			return fmt.Errorf("disk %q: partition missing name", name)
+		}
+		// planDisk creates and formats partition i+1 at the node the kernel
+		// gives that position, while mounts, RAID members, fstab and the
+		// bootloader reach the partition through "/dev/" + its name. Any
+		// other name sends those to a different device than the one just
+		// formatted. A "/dev/"-prefixed name is the same node: resolveDevPath
+		// passes it through unchanged.
+		if want := partName(name, i+1); stripDevPrefix(p.Name) != want {
+			return fmt.Errorf("disk %q partition %d is named %q, but the kernel names it %q; "+
+				"rename it %q, since mounts and RAID members find a partition by its name",
+				name, i+1, p.Name, want, want)
 		}
 		if p.Size == "" {
 			return fmt.Errorf("disk %q partition %q: missing size", name, p.Name)
