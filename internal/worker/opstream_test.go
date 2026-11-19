@@ -473,6 +473,82 @@ func TestStaleResyncKeepsAwaitingPhoneHome(t *testing.T) {
 	}
 }
 
+// TestAwaitingPhoneHomeSurvivesRestart: the install finishes while global is
+// unreachable, so the awaiting_phone_home phase update (and, once the host
+// phones home, the completion) sit in the in-memory op_update queue and
+// never reach global. The worker restarts before it reconnects, losing that
+// queue. On reconnect the hub's hello sends the snapshot and then an
+// op_resync built from global's row, which is still claimed at the
+// pre-install phase. The installed host's next PXE must still boot its disk:
+// the local latch has to come back from LocalDB, or BootDeploy re-images it.
+func TestAwaitingPhoneHomeSurvivesRestart(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		phoneHome bool
+	}{
+		{"restart after deploy_complete", false},
+		{"restart after phone-home", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const mac = "52:54:00:15:10:57"
+			dbPath := t.TempDir() + "/worker.db"
+			id, opID := uuid.New(), uuid.New()
+			// Global's row never moves past this: it gets neither the phase
+			// nor the completion.
+			globalRow := model.Operation{
+				ID: opID, MachineID: id, Type: model.OpDeploy,
+				Status: model.OpClaimed, Phase: "finalizing", Version: 5,
+			}
+
+			db, err := OpenLocalDB(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := NewCache(db)
+			deployingMachine(c, id, mac)
+			seedOpsResync(c, globalRow)
+			// Global becomes unreachable. Agent and phone-home traffic is
+			// site-local, so the install still finishes.
+			if err := c.HandleProgressReport(&model.ProgressReport{
+				MachineID: id.String(), OperationID: opID.String(), Event: "deploy_complete",
+			}); err != nil {
+				t.Fatalf("deploy_complete: %v", err)
+			}
+			if tc.phoneHome {
+				c.RecordPhoneHome(id)
+			}
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("precondition: installed host got %d, want BootLocal", got)
+			}
+
+			// Restart: a new process over the same worker.db.
+			db2, err := OpenLocalDB(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c = NewCache(db2)
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("precondition: rehydrated, untrusted set got %d, want BootLocal", got)
+			}
+
+			// Reconnect: hello snapshot, then op_resync from global's row.
+			deployingMachine(c, id, mac)
+			seedOpsResync(c, globalRow)
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("installed host's next PXE after restart and op_resync: got %d, want BootLocal (%d); BootDeploy re-images it", got, model.BootLocal)
+			}
+			// The phone-home pin (applyOpResync keeps a phoned-home machine
+			// running while global still shows the op claimed) must come
+			// back too, not only the phase latch.
+			if tc.phoneHome {
+				if got := c.MachineState(id); got != string(model.MachineStateRunning) {
+					t.Fatalf("phoned-home machine after restart and op_resync: state %q, want running", got)
+				}
+			}
+		})
+	}
+}
+
 // TestFailedDeltaLeavesAwaitingPhoneHome: the phone-home timeout's failure
 // still applies; keepTerminalWait only blocks phase regressions on an op
 // global still shows active.

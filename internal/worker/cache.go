@@ -61,7 +61,9 @@ import (
 // release) -> imageSyncMu (image sync, release). No code acquires applyMu
 // while holding opState.mu/subsMu/outboxMu/imageSyncMu; no reader/mutator
 // holds more than one of opState.mu/subsMu/outboxMu/imageSyncMu; subscriber
-// callbacks run with none of these held. Pure readers take no lock.
+// callbacks run with none of these held. persistMu (persistOpState) is
+// never taken while holding opState.mu; it wraps only opState.mu.RLock and
+// the LocalDB write. Pure readers take no lock.
 type Cache struct {
 	// applyMu serializes ApplySnapshot end-to-end. Never taken by a reader.
 	applyMu sync.Mutex
@@ -103,6 +105,14 @@ type Cache struct {
 	// running without persistence (tests). The outbox holds its own
 	// reference for observation persistence.
 	localDB *LocalDB
+
+	// persistMu serializes persistOpState's read-then-write. The WS read
+	// loop (stream applies) and the agent / phone-home HTTP handlers (the
+	// latch mutations) both persist the op layer; without it a write of an
+	// older read could land after a newer one and drop the latch from
+	// disk. Taken before opState.mu (RLock, inside snapshotForPersist) and
+	// never while holding it.
+	persistMu sync.Mutex
 
 	// ImagesDir is the on-disk directory for boot images. When set,
 	// ApplySnapshot calls SyncImages after the view swap.
@@ -200,7 +210,7 @@ func NewCacheWithSerial(localDB *LocalDB, selfSerial string) *Cache {
 		// first op_resync (see opState.untrusted). Absent (fresh install,
 		// or a DB written by a pre-Tier-2 binary) leaves the empty set.
 		if os := localDB.LoadOpState(); os != nil {
-			c.opState.rehydrate(os.Ops, os.Overlay)
+			c.opState.rehydrate(*os)
 		}
 	}
 	c.view.Store(v)
@@ -240,15 +250,19 @@ func (c *Cache) ApplyOpRemoved(opID, machineID string, version int, machineState
 	c.persistOpState()
 }
 
-// persistOpState writes the current op set + overlay to LocalDB. Called
-// after every stream apply so a crash rehydrates the last-known op layer
-// (untrusted). Best-effort; a nil localDB (tests) is a no-op.
+// persistOpState writes the current op layer to LocalDB. Called after every
+// stream apply and after the local mutations that keep an installed host
+// from being re-imaged (UpdateOpPhase to awaiting_phone_home,
+// RecordPhoneHome), so a crash rehydrates the last-known op layer
+// (untrusted) with those latches intact. Best-effort; a nil localDB (tests)
+// is a no-op.
 func (c *Cache) persistOpState() {
 	if c.localDB == nil {
 		return
 	}
-	ops, overlay := c.opState.snapshotForPersist()
-	c.localDB.SaveOpState(ops, overlay)
+	c.persistMu.Lock()
+	defer c.persistMu.Unlock()
+	c.localDB.SaveOpState(c.opState.snapshotForPersist())
 }
 
 // LastSeqNum returns the SeqNum of the most recently applied snapshot,
@@ -420,6 +434,14 @@ func (c *Cache) RecordPhoneHome(machineID uuid.UUID) {
 	if deployOpID != uuid.Nil {
 		c.RecordOpUpdate(deployOpID.String(), string(model.OpCompleted), nil)
 	}
+
+	// The completion op_update is not durable, and global may be
+	// unreachable: persist the running overlay and the phoneHomed latch so a
+	// restart before global completes the op does not lose them. The first
+	// op_resync after the restart can still carry the op as
+	// claimed-deploying, and applyOpResync pins the machine running only if
+	// phoneHomed survived.
+	c.persistOpState()
 }
 
 // recordCommissionReport queues a commission_report observation. Unlike
@@ -1020,6 +1042,17 @@ func (c *Cache) PrepareDeployLogs(machineID, operationID string) {
 // opState.updatePhase; see bootPrefixPhases (opstate_cache.go) for why.
 func (c *Cache) UpdateOpPhase(opID, phase string) {
 	upd := c.opState.updatePhase(opID, phase)
+	if phase == "awaiting_phone_home" {
+		// The latch is the op row's phase, and the phase op_update below is
+		// not durable: if global is unreachable and the worker restarts
+		// before global echoes the phase back, LocalDB still holds the
+		// pre-latch row, keepTerminalWait has nothing to keep when the
+		// first op_resync carries global's row, and the installed host's
+		// next PXE gets BootDeploy. Persist it now. Not gated on proceed:
+		// updatePhase writes the row's phase before its same-phase dedup
+		// returns proceed=false, and that write must reach disk too.
+		c.persistOpState()
+	}
 	if !upd.proceed {
 		return
 	}

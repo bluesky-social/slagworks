@@ -48,6 +48,7 @@ import (
 //   - phoneHomed: deploy op IDs that phone-homed LOCALLY (RecordPhoneHome).
 //     A resync that brings the op back as claimed-deploying must not
 //     downgrade the running overlay this op earned — see applyOpResync.
+//     Persisted with the op set, so it survives a restart.
 //   - tombstones: opID -> terminal version; a late lower-version delta for
 //     a removed op is discarded so a concurrent-publisher race can't
 //     resurrect a zombie active op (which the fail-closed boot rule would
@@ -336,9 +337,9 @@ func (o *opState) putTombstone(opID string, version int) {
 	o.tombstoneOrder = append(o.tombstoneOrder, opID)
 }
 
-// snapshotForPersist returns copies of the op set + overlay for LocalDB
-// persistence on the stream-apply path. Caller must NOT hold mu.
-func (o *opState) snapshotForPersist() ([]model.Operation, map[string]model.MachineState) {
+// snapshotForPersist returns copies of the op set, overlay and phone-home
+// latch for LocalDB persistence. Caller must NOT hold mu.
+func (o *opState) snapshotForPersist() PersistedOpState {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	ops := make([]model.Operation, 0, len(o.ops))
@@ -349,23 +350,32 @@ func (o *opState) snapshotForPersist() ([]model.Operation, map[string]model.Mach
 	for id, st := range o.machineState {
 		overlay[id.String()] = st
 	}
-	return ops, overlay
+	phoneHomed := make([]string, 0, len(o.phoneHomed))
+	for opID := range o.phoneHomed {
+		phoneHomed = append(phoneHomed, opID)
+	}
+	return PersistedOpState{Ops: ops, Overlay: overlay, PhoneHomed: phoneHomed}
 }
 
-// rehydrate loads a persisted op set + overlay into an untrusted opState on
-// cold start. Caller holds no other lock. The set stays untrusted until the
-// first op_resync.
-func (o *opState) rehydrate(ops []model.Operation, overlay map[string]model.MachineState) {
+// rehydrate loads a persisted op layer into an untrusted opState on cold
+// start. Caller holds no other lock. The set stays untrusted until the
+// first op_resync, which applies the restored awaiting_phone_home phases
+// (keepTerminalWait) and phoneHomed pins exactly as it would have before
+// the restart.
+func (o *opState) rehydrate(st PersistedOpState) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	for i := range ops {
-		op := ops[i]
+	for i := range st.Ops {
+		op := st.Ops[i]
 		o.ops[op.ID.String()] = &op
 	}
-	for idStr, st := range overlay {
+	for idStr, ms := range st.Overlay {
 		if id, err := uuid.Parse(idStr); err == nil {
-			o.machineState[id] = st
+			o.machineState[id] = ms
 		}
+	}
+	for _, opID := range st.PhoneHomed {
+		o.phoneHomed[opID] = true
 	}
 	o.untrusted = true
 }
