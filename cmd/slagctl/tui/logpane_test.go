@@ -150,6 +150,34 @@ func TestLogPane_PhaseSurvivesExec(t *testing.T) {
 	}
 }
 
+// TestLogPane_FormatFoldsLineBreaks pins the single-row contract of format: a
+// line break inside the message (LF, CRLF, or a bare CR) becomes a visible
+// " ⏎ " so the whole entry stays on one row, and a trailing one is dropped.
+// The frame-level effect is guarded by TestFrame_LogLineBreaksKeepFrameShape.
+func TestLogPane_FormatFoldsLineBreaks(t *testing.T) {
+	p := newLogPane(time.UTC)
+	for _, tc := range []struct{ msg, want string }{
+		{"a\nb", "10:14:00 [agent ] a ⏎ b"},
+		{"a\r\nb", "10:14:00 [agent ] a ⏎ b"},
+		{"  5%\r100%", "10:14:00 [agent ]   5% ⏎ 100%"},
+		{"a\n\nb", "10:14:00 [agent ] a ⏎  ⏎ b"},
+		{"done\n", "10:14:00 [agent ] done"},
+		{"done\r\n", "10:14:00 [agent ] done"},
+	} {
+		if got := p.format(env(slogkit.SourceAgent, 0, tc.msg)); got != tc.want {
+			t.Errorf("format(%q) = %q, want %q", tc.msg, got, tc.want)
+		}
+	}
+
+	// The exec expansion builds the body from Extra; its fields fold too.
+	ex := env(slogkit.SourceAgent, 0, "exec")
+	ex.Extra = map[string]any{"argv": "mdadm --stop /dev/md0", "exit_code": float64(1), "err": "exit status 1\nmdadm: busy"}
+	want := "10:14:00 [agent ] exec: mdadm --stop /dev/md0 → exit 1 err=exit status 1 ⏎ mdadm: busy"
+	if got := p.format(ex); got != want {
+		t.Errorf("format(exec) = %q, want %q", got, want)
+	}
+}
+
 // TestLogPane_TimezoneInjection is the D9 guard proper: the same fixed-UTC
 // envelope formats to different wall-clock strings under different locations,
 // so a hardcoded time.Local would flap goldens between PST dev and UTC CI.
