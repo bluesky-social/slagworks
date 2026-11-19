@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/url"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/dhcp"
@@ -26,7 +27,8 @@ import (
 )
 
 // WSConn is the site worker's WebSocket connection to the global API.
-// It speaks the Plan 2 protocol: authenticate via ?token=, send a hello
+// It speaks the Plan 2 protocol: authenticate with the worker token in
+// the upgrade's Authorization header, send a hello
 // carrying the last-applied snapshot SeqNum, accept either a fresh
 // snapshot or a no_change ack, then enter the steady-state outbox
 // drain + heartbeat + log forward loop.
@@ -340,8 +342,7 @@ func (w *WSConn) Run(ctx context.Context) error {
 }
 
 func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) {
-	wsURL := w.buildURL()
-	conn, err := ws.Dial(ctx, wsURL, nil)
+	conn, err := ws.Dial(ctx, w.buildURL(), w.dialOptions())
 	if err != nil {
 		return false, fmt.Errorf("dial: %w", err)
 	}
@@ -510,7 +511,7 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 }
 
 // buildURL constructs the WS upgrade URL. Scheme is converted
-// http→ws, https→wss; token is the single query parameter.
+// http→ws, https→wss. The URL carries no credential: see dialOptions.
 func (w *WSConn) buildURL() string {
 	base := w.config.GlobalURL
 	switch {
@@ -519,11 +520,18 @@ func (w *WSConn) buildURL() string {
 	case strings.HasPrefix(base, "http://"):
 		base = "ws://" + strings.TrimPrefix(base, "http://")
 	}
-	u, _ := url.Parse(base + "/api/v1/ws/site")
-	q := u.Query()
-	q.Set("token", w.config.Token)
-	u.RawQuery = q.Encode()
-	return u.String()
+	return base + "/api/v1/ws/site"
+}
+
+// dialOptions sends the worker token in the upgrade request's
+// Authorization header. It must never ride the URL: a transport-level
+// dial failure returns a *url.Error quoting the full request URL, Run logs
+// that error, and the worker's log is forwarded to global and readable by
+// every operator. Request loggers (global's included) record the URL too.
+func (w *WSConn) dialOptions() *websocket.DialOptions {
+	return &websocket.DialOptions{HTTPHeader: http.Header{
+		"Authorization": {"Bearer " + w.config.Token},
+	}}
 }
 
 // checkReplyProto enforces the op-stream skew gate on a hello reply: the

@@ -21,7 +21,10 @@ The worker authenticates to global with a **per-worker bearer token**:
   its sha256 hash** in the `site_workers` Postgres table, and returns the
   plaintext **exactly once**.
 - The worker reads the plaintext from `SLAGWORKS_TOKEN` in
-  `/etc/slagworks/site.env`. The WS hub rejects a `hello` whose `worker_id`
+  `/etc/slagworks/site.env` and sends it in the WebSocket upgrade's
+  `Authorization: Bearer` header, never in the URL, so it stays out of
+  request and proxy logs. A proxy in front of global must pass that
+  header through. The WS hub rejects a `hello` whose `worker_id`
   doesn't match the registration the token was minted for.
 - Re-registering the same `(slug, worker_id)` pair **rotates** the token
   (mints a fresh one, invalidates the old). The plaintext is unrecoverable

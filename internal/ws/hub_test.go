@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/model"
@@ -171,16 +172,36 @@ func dialHub(t *testing.T, srv *httptest.Server, token string) *Conn {
 	t.Helper()
 	u, _ := url.Parse(srv.URL)
 	u.Scheme = "ws"
+	h := http.Header{}
 	if token != "" {
-		u.RawQuery = "token=" + token
+		h.Set("Authorization", "Bearer "+token)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	conn, err := Dial(ctx, u.String(), nil)
+	conn, err := Dial(ctx, u.String(), &websocket.DialOptions{HTTPHeader: h})
 	if err != nil {
 		return nil
 	}
 	return conn
+}
+
+// getWithBearer sends a plain GET to target with the given Authorization
+// header value (none when empty) and returns the status code.
+func getWithBearer(t *testing.T, target, authorization string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
 }
 
 func TestHub_UnauthorizedMissingToken(t *testing.T) {
@@ -203,14 +224,33 @@ func TestHub_UnauthorizedBadToken(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "?token=nope")
-	if err != nil {
-		t.Fatal(err)
+	if got := getWithBearer(t, srv.URL, "Bearer nope"); got != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", got)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", resp.StatusCode)
+}
+
+// TestHub_TokenOnlyFromAuthorizationHeader: the hub reads the worker
+// token from the Authorization header and nowhere else. A registered
+// token in the URL query, or in the header without the Bearer scheme, is
+// refused: a URL-borne token is quoted by request loggers and by net/http
+// dial errors, which put it in logs that every operator can read.
+func TestHub_TokenOnlyFromAuthorizationHeader(t *testing.T) {
+	h, auth, _ := newTestHub(t)
+	auth.register("tok-1", "pop3", "worker-1")
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	if got := getWithBearer(t, srv.URL+"?token=tok-1", ""); got != http.StatusUnauthorized {
+		t.Errorf("token in the URL query: got %d, want 401", got)
 	}
+	if got := getWithBearer(t, srv.URL, "tok-1"); got != http.StatusUnauthorized {
+		t.Errorf("token in the header without the Bearer scheme: got %d, want 401", got)
+	}
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial with the token as Authorization: Bearer failed")
+	}
+	_ = conn.CloseNow()
 }
 
 func TestHub_HelloColdTriggersRebuild(t *testing.T) {

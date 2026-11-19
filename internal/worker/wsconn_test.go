@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,13 +34,11 @@ func TestWSConn_BuildURL_HTTPS(t *testing.T) {
 		WorkerID:  "worker-1",
 	}}
 	got := w.buildURL()
-	for _, want := range []string{"wss://", "/api/v1/ws/site", "token=tok-abc"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("URL %q missing %q", got, want)
-		}
+	if want := "wss://global.example.com/api/v1/ws/site"; got != want {
+		t.Errorf("URL = %q, want %q", got, want)
 	}
-	if strings.Contains(got, "site_id=") || strings.Contains(got, "after_seq=") {
-		t.Errorf("URL still carries legacy query params: %s", got)
+	if strings.Contains(got, "tok-abc") {
+		t.Errorf("URL carries the worker token: %s", got)
 	}
 }
 
@@ -50,6 +50,128 @@ func TestWSConn_BuildURL_HTTP(t *testing.T) {
 	got := w.buildURL()
 	if !strings.HasPrefix(got, "ws://") {
 		t.Errorf("expected ws:// for http URL, got %q", got)
+	}
+}
+
+// envelopeCollector is a slogkit.Sink that keeps every envelope, standing in
+// for the site worker's log ring: cmd/slagworksd/site.go wires the ring as
+// the worker's slog sink, and the ring's contents are forwarded to global,
+// stored in log_envelopes and served to operators by /api/v1/logs/stream.
+// disconnected closes on the first reconnect warning Run logs.
+type envelopeCollector struct {
+	mu           sync.Mutex
+	envs         []slogkit.Envelope
+	once         sync.Once
+	disconnected chan struct{}
+}
+
+func newEnvelopeCollector() *envelopeCollector {
+	return &envelopeCollector{disconnected: make(chan struct{})}
+}
+
+func (c *envelopeCollector) Push(e slogkit.Envelope) {
+	c.mu.Lock()
+	c.envs = append(c.envs, e)
+	c.mu.Unlock()
+	if e.Msg == "WebSocket disconnected, reconnecting" {
+		c.once.Do(func() { close(c.disconnected) })
+	}
+}
+
+func (c *envelopeCollector) dump(t *testing.T) string {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b, err := json.Marshal(c.envs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// runUntilFirstDisconnect runs w against globalURL until Run logs its
+// first reconnect warning, then stops it and returns everything the worker
+// logged.
+func runUntilFirstDisconnect(t *testing.T, cfg WSConnConfig) string {
+	t.Helper()
+	sink := newEnvelopeCollector()
+	w := NewWSConn(cfg, nil, nil, nil)
+	w.SetLogger(slog.New(slogkit.NewHandler(slogkit.HandlerOptions{
+		Source: slogkit.SourceSite, Host: "w1", Sink: sink})))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = w.Run(ctx) }()
+	select {
+	case <-sink.disconnected:
+	case <-time.After(10 * time.Second):
+		t.Errorf("the worker logged no disconnect within 10s; log: %s", sink.dump(t))
+	}
+	cancel()
+	<-done
+	return sink.dump(t)
+}
+
+// TestWSConn_DialFailureDoesNotLogToken: when the dial to global fails
+// below HTTP (connection refused while global restarts, a DNS or TLS
+// failure, a timeout), net/http returns a *url.Error that quotes the full
+// request URL, and Run logs it at Warn on every retry. The worker's log is
+// forwarded to global and readable by every operator, so the bearer token
+// must not be part of that URL.
+func TestWSConn_DialFailureDoesNotLogToken(t *testing.T) {
+	const token = "tok-0123456789abcdef-site-worker-bearer"
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close() // nothing listens here now: the dial is refused
+
+	logged := runUntilFirstDisconnect(t, WSConnConfig{
+		GlobalURL: "http://" + addr, Token: token, WorkerID: "worker-1"})
+	if !strings.Contains(logged, "connection refused") {
+		t.Fatalf("expected a refused dial to be logged; log: %s", logged)
+	}
+	if strings.Contains(logged, token) {
+		t.Errorf("the site worker logged its own bearer token on a refused dial: %s",
+			strings.ReplaceAll(logged, token, "<TOKEN>"))
+	}
+}
+
+// TestWSConn_DialSendsTokenAsBearerHeader pins what global receives on
+// the upgrade request: the token as "Authorization: Bearer <token>"
+// (what ws.Hub.ServeHTTP reads) and a request URI without it, since
+// global's request logger records the URI of every request.
+func TestWSConn_DialSendsTokenAsBearerHeader(t *testing.T) {
+	const token = "tok-0123456789abcdef-site-worker-bearer"
+	type upgradeReq struct{ uri, authorization string }
+	reqs := make(chan upgradeReq, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		select {
+		case reqs <- upgradeReq{r.RequestURI, r.Header.Get("Authorization")}:
+		default:
+		}
+		http.Error(rw, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	logged := runUntilFirstDisconnect(t, WSConnConfig{
+		GlobalURL: srv.URL, Token: token, WorkerID: "worker-1"})
+	var got upgradeReq
+	select {
+	case got = <-reqs:
+	default:
+		t.Fatalf("global saw no upgrade request; worker log: %s", logged)
+	}
+	if got.authorization != "Bearer "+token {
+		t.Errorf("Authorization = %q, want %q", got.authorization, "Bearer "+token)
+	}
+	if got.uri != "/api/v1/ws/site" {
+		t.Errorf("request URI = %q, want /api/v1/ws/site with no query", got.uri)
+	}
+	if strings.Contains(logged, token) {
+		t.Errorf("the site worker logged its own bearer token on a refused upgrade: %s",
+			strings.ReplaceAll(logged, token, "<TOKEN>"))
 	}
 }
 
