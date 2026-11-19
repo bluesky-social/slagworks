@@ -29,6 +29,12 @@ import (
 	"github.com/bluesky-social/slagworks/internal/storage"
 )
 
+// propGenRAID456 lets the generator draw RAID5 and RAID6. It is off because
+// the deploy initrd cannot create either (the raid456 module is not baked
+// in; see TestStoragePropFindings/uefi-raid5-data), so every such case would
+// stop at the same known failure. Turn it on once that is fixed.
+const propGenRAID456 = false
+
 type propArrState struct {
 	a      propArray
 	intact bool
@@ -40,7 +46,11 @@ type propGen struct {
 	big  map[string]bool
 	sig  map[string]string // disk ID -> none | dirty | unknown
 	arrs map[string]*propArrState
-	next int
+	// holders records, per pinned array UUID, every disk that carries a
+	// member superblock of any generation of that array and has not been
+	// wiped since.
+	holders map[string]map[string]bool
+	next    int
 }
 
 func (g *propGen) pick(weights ...int) int {
@@ -82,7 +92,7 @@ func (g *propGen) addDisk(bus string, big bool, lbs int, discard bool, seed stri
 
 type propRootScheme struct {
 	grub      bool
-	esp       bool   // an ESP slot exists
+	esp       bool // an ESP slot exists
 	espSize   string
 	espOthers string // what the ESP slot holds on the other root disks: raw, vfat, none
 	swap      bool
@@ -177,10 +187,16 @@ func (g *propGen) genLayout(attach []string, keep []propArray, prev *propLayout)
 		topos = append(topos, topo{1, 2, 45}, topo{0, 2, 10})
 	}
 	if len(bigs) >= 3 {
-		topos = append(topos, topo{1, 3, 10}, topo{5, 3, 15})
+		topos = append(topos, topo{1, 3, 10})
+		if propGenRAID456 {
+			topos = append(topos, topo{5, 3, 15})
+		}
 	}
 	if len(bigs) >= 4 {
-		topos = append(topos, topo{10, 4, 15}, topo{6, 4, 8})
+		topos = append(topos, topo{10, 4, 15})
+		if propGenRAID456 {
+			topos = append(topos, topo{6, 4, 8})
+		}
 	}
 	ws := make([]int, len(topos))
 	for i, t := range topos {
@@ -289,6 +305,12 @@ func (g *propGen) genLayout(attach []string, keep []propArray, prev *propLayout)
 		default:
 			level = []int{0, 5, 6, 10}[g.rng.Intn(4)]
 		}
+		if !propGenRAID456 && (level == 5 || level == 6) {
+			level = []int{0, 1, 10}[g.rng.Intn(3)]
+			if take < 4 && level == 10 {
+				level = 1
+			}
+		}
 		// The first free name: mddata, mddata2, ...
 		slot := 1
 		name := "mddata"
@@ -385,6 +407,50 @@ func (g *propGen) predict(st propStep) (expect, why string) {
 	return final, why
 }
 
+// hazard names a known finding the step walks into, or "". The driver logs
+// the step's tree violations as known instead of failing on them.
+//
+// stale-uuid-member: the layout has an array with a pinned UUID while a disk
+// outside the layout, which this deploy will not wipe, still carries a member
+// superblock with that UUID. At boot the stale member can claim the array
+// before the real members do (TestStoragePropFindings/uefi-stale-uuid-member).
+func (g *propGen) hazard(st propStep) string {
+	wiped := map[string]bool{}
+	named := map[string]bool{}
+	for _, dl := range st.Layout.Disks {
+		wiped[dl.Disk] = true
+		named[dl.Disk] = true
+	}
+	for _, a := range st.Layout.Arrays {
+		for _, m := range a.Members {
+			named[m.Disk] = true
+		}
+	}
+	for _, id := range st.Layout.Retain {
+		named[id] = true
+	}
+	for _, id := range st.Attach {
+		if st.WipeAll && !named[id] {
+			wiped[id] = true
+		}
+	}
+	for _, a := range st.Layout.Arrays {
+		if a.UUID == "" {
+			continue
+		}
+		member := map[string]bool{}
+		for _, m := range a.Members {
+			member[m.Disk] = true
+		}
+		for _, id := range st.Attach {
+			if g.holders[a.UUID][id] && !member[id] && !wiped[id] {
+				return "stale-uuid-member"
+			}
+		}
+	}
+	return ""
+}
+
 // apply moves the model past a step.
 func (g *propGen) apply(st propStep) {
 	writes := false
@@ -429,6 +495,22 @@ func (g *propGen) apply(st propStep) {
 			}
 		}
 	}
+	for _, h := range g.holders {
+		for id := range touched {
+			delete(h, id)
+		}
+	}
+	for _, a := range st.Layout.Arrays {
+		if a.Type != "raid" || a.UUID == "" {
+			continue
+		}
+		if g.holders[a.UUID] == nil {
+			g.holders[a.UUID] = map[string]bool{}
+		}
+		for _, m := range a.Members {
+			g.holders[a.UUID][m.Disk] = true
+		}
+	}
 	// Arrays living on a disk this step rewrote are gone.
 	for _, s := range g.arrs {
 		for _, m := range s.a.Members {
@@ -470,6 +552,7 @@ func propGenCase(seed int64) propCase {
 	g := &propGen{
 		rng: rand.New(rand.NewSource(seed)), c: &c,
 		big: map[string]bool{}, sig: map[string]string{}, arrs: map[string]*propArrState{},
+		holders: map[string]map[string]bool{},
 	}
 	c.Firmware = "uefi"
 	if g.chance(40) {
@@ -499,6 +582,13 @@ func propGenCase(seed int64) propCase {
 			if big {
 				b = g.choose("virtio", "nvme")
 			}
+		}
+		// SeaBIOS here does not expose QEMU's NVMe disks as BIOS drives
+		// ("Boot failed: could not read the boot disk" on an NVMe-only
+		// machine with a valid boot sector), so a BIOS case never puts its
+		// root on NVMe. A limit of the test firmware, not a finding.
+		if bios && big && b == "nvme" {
+			b = "virtio"
 		}
 		// The VM has five free SATA ports.
 		if b == "sata" {
@@ -677,7 +767,21 @@ func propGenCase(seed int64) propCase {
 			}
 		}
 		st.Expect, st.Why = g.predict(st)
-		st.Reboot = st.Expect == "ok" && g.chance(40)
+		st.Hazard = g.hazard(st)
+		// A second boot goes PXE, then the boot-local script, which on UEFI
+		// tries the firmware's first two disks and boots whatever ESP it
+		// finds there, stale or not (two known findings, see
+		// TestStoragePropFindings). Until those are fixed the reboot check
+		// runs only when the ESP is on the firmware's first disk.
+		espFirst := bios
+		for _, dl := range st.Layout.Disks {
+			for _, p := range dl.Parts {
+				if p.ESP && dl.Disk == st.Attach[0] {
+					espFirst = true
+				}
+			}
+		}
+		st.Reboot = st.Expect == "ok" && espFirst && g.chance(50)
 		g.apply(st)
 		c.Steps = append(c.Steps, st)
 		lay := st.Layout

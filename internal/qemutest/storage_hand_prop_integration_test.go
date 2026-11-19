@@ -136,19 +136,64 @@ func propHandCases() []propCase {
 			},
 		},
 	}
+	cases = append(cases, propPatternCases()...)
 	// The safety check against each kind of prior content, without
-	// --destructive: every one of these disks holds data blkid can see.
-	for _, seed := range []string{"ext4", "luks", "dos", "ambiv"} {
-		cases = append(cases, propCase{
-			Name: "safety-" + seed, Firmware: "uefi",
-			Disks: []propDisk{propD("d0", "virtio", 8, 0, 512, seed)},
-			Steps: []propStep{{
-				Attach: all("d0"), Layout: propSingleLayout("d0", "ext4"),
-				Expect: "fatal:safety check", Why: "the target disk carries " + seed + " content and no --destructive",
-			}},
-		})
+	// --destructive. (The fourth kind, "ambiv", gets through the check and
+	// lives in storage_findings_prop_integration_test.go.)
+	for _, seed := range []string{"ext4", "luks", "dos"} {
+		cases = append(cases, propSafetyCase(seed))
 	}
 	return cases
+}
+
+// propPatternCases are targeted histories: each aims one suspected mechanism
+// at the system instead of waiting for the generator to stumble on it. The
+// ones that hit are in storage_findings_prop_integration_test.go.
+func propPatternCases() []propCase {
+	all := func(ids ...string) []string { return ids }
+	return []propCase{
+		{
+			// A mirror member becomes an unformatted slot at the same
+			// offset. Only the stale-state wipe stands between the old md
+			// superblock and the new partition: nothing formats the slot.
+			Name: "bios-raw-slot-over-member", Firmware: "bios",
+			Disks: []propDisk{propD("d0", "virtio", 8, 0, 512, ""), propD("d1", "virtio", 8, 1, 512, "")},
+			Steps: []propStep{
+				{Attach: all("d0", "d1"), Expect: "ok", Why: "blank disks",
+					Layout: propLayout{
+						Disks: []propDiskLayout{
+							{Disk: "d0", Parts: []propPart{{Size: "1M", BIOSGrub: true}, {Size: "rest"}}},
+							{Disk: "d1", Parts: []propPart{{Size: "1M", BIOSGrub: true}, {Size: "rest"}}},
+						},
+						Arrays: []propArray{{Name: "mdroot", Type: "raid", Level: 1, FS: "ext4", Mount: "/",
+							Members: []propMember{{Disk: "d0", Part: 2}, {Disk: "d1", Part: 2}}}},
+					}},
+				{Attach: all("d0", "d1"), Layout: propRAID1Layout("d0", "d1", "ext4"),
+					Destructive: true, Expect: "ok", Why: "destructive redeploy; d1's partition 2 is now a raw slot where a member began"},
+			},
+		},
+		{
+			// A destructive deploy over a disk with signatures outside
+			// where the new partition table and filesystems will land.
+			Name: "destructive-over-zfs", Firmware: "uefi",
+			Disks: []propDisk{propD("d0", "virtio", 8, 0, 512, "ambiv")},
+			Steps: []propStep{
+				{Attach: all("d0"), Layout: propSingleLayout("d0", "ext4"),
+					Destructive: true, Expect: "ok", Why: "destructive deploy"},
+			},
+		},
+	}
+}
+
+func propSafetyCase(seed string) propCase {
+	return propCase{
+		Name: "safety-" + seed, Firmware: "uefi",
+		Disks: []propDisk{propD("d0", "virtio", 8, 0, 512, seed)},
+		Steps: []propStep{{
+			Attach: []string{"d0"}, Layout: propSingleLayout("d0", "ext4"),
+			Expect: "fatal:safety check", Why: "the target disk carries " + seed + " content and no --destructive",
+		}},
+	}
 }
 
 func TestStoragePropHand(t *testing.T) {

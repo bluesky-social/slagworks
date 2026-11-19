@@ -93,6 +93,9 @@ type propStep struct {
 	Expect string `json:"expect"`
 	// Why says, for a reader of a failing case, what rule produced Expect.
 	Why string `json:"why,omitempty"`
+	// Hazard names a written-up finding this step is known to walk into.
+	// The driver then logs the step's tree violations instead of failing.
+	Hazard string `json:"hazard,omitempty"`
 }
 
 type propCase struct {
@@ -285,6 +288,8 @@ echo "@@@ swaps"; cat /proc/swaps
 echo "@@@ mdconf"; cat /etc/mdadm/mdadm.conf 2>&1
 echo "@@@ df"; df -B1 --output=source,size,used,target /
 echo "@@@ efi"; efibootmgr 2>&1 | head -40
+echo "@@@ growth"
+grep -h -i -E "growpart|resizefs|resize2fs|xfs_growfs" /var/log/cloud-init.log /var/log/cloud-init-output.log 2>/dev/null | tail -12
 echo "@@@ unitlogs"
 for u in $(systemctl --failed --no-legend --plain | awk '{print $1}'); do
   journalctl -b -u "$u" --no-pager -n 12 2>&1
@@ -496,13 +501,24 @@ func propHex(s string) string {
 type propTreeReport struct {
 	Hard []string
 	Soft []string
+	// Known entries are violations that match a finding already written up
+	// (see storage_findings_prop_integration_test.go). They are logged, not
+	// failed, so a soak run shows only what is new.
+	Known []string
 	// MountDev maps each layout mount point to the kernel device expected
 	// there, for the fstab and canary checks.
 	MountDev map[string]string
 }
 
-func (r *propTreeReport) hard(format string, a ...any) { r.Hard = append(r.Hard, fmt.Sprintf(format, a...)) }
-func (r *propTreeReport) soft(format string, a ...any) { r.Soft = append(r.Soft, fmt.Sprintf(format, a...)) }
+func (r *propTreeReport) hard(format string, a ...any) {
+	r.Hard = append(r.Hard, fmt.Sprintf(format, a...))
+}
+func (r *propTreeReport) soft(format string, a ...any) {
+	r.Soft = append(r.Soft, fmt.Sprintf(format, a...))
+}
+func (r *propTreeReport) known(format string, a ...any) {
+	r.Known = append(r.Known, fmt.Sprintf(format, a...))
+}
 
 func propSameSet(a, b []string) bool {
 	if len(a) != len(b) {
@@ -582,7 +598,15 @@ func propCheckTree(c propCase, st propStep, ins *propInspect) *propTreeReport {
 				continue
 			}
 			if want, fixed := propSizeBytes(p.Size, d.Bytes); fixed {
-				if got.Size != want {
+				grown := d.Bytes - used - got.Size
+				switch {
+				case got.Size == want:
+				case p.Mount == "/" && i == len(dl.Parts)-1 && grown >= 0 && grown <= 2*propMiB:
+					// Known finding: cloud-init's growpart grows a root
+					// partition into the free space after it on first boot.
+					rep.known("growpart: %s is %d bytes, layout asks for %s = %d; the root partition was grown to the end of the disk",
+						pk, got.Size, p.Size, want)
+				default:
 					rep.hard("%s: size %d, layout asks for %s = %d", pk, got.Size, p.Size, want)
 				}
 				used += want
@@ -605,14 +629,22 @@ func propCheckTree(c propCase, st propStep, ins *propInspect) *propTreeReport {
 			if got.PartType != propPartTypeGUID[code] {
 				rep.hard("%s: partition type %s, want %s (%s)", pk, got.PartType, propPartTypeGUID[code], code)
 			}
-			if got.PartLabel != pk {
-				rep.soft("%s: partition label %q differs from its kernel name (deploy-time and boot-time names differ?)", pk, got.PartLabel)
+			if got.PartLabel != pk && i == 0 {
+				rep.soft("renamed: %s was %q when it was deployed (kernel names moved between the deploy boot and this one)", pk, got.PartLabel)
 			}
 			wantFS := p.FS
 			if member[pk] {
 				wantFS = "linux_raid_member"
 			}
-			if got.FSType != wantFS {
+			stale := map[string]bool{"vfat": true, "ext4": true, "xfs": true, "swap": true}
+			switch {
+			case got.FSType == wantFS:
+			case wantFS == "" && stale[got.FSType]:
+				// Known finding: the stale-state wipe does not reach inside
+				// partitions, so a partition the layout leaves unformatted
+				// shows whatever filesystem last started at its offset.
+				rep.known("stale-fs: %s shows a %s filesystem, layout leaves it unformatted", pk, got.FSType)
+			default:
 				rep.hard("%s: filesystem %q, layout asks for %q", pk, got.FSType, wantFS)
 			}
 			if wantFS == "" {
@@ -769,9 +801,22 @@ func propCheckTree(c propCase, st propStep, ins *propInspect) *propTreeReport {
 			rep.soft("%s: wipefs did not list it", dev)
 			continue
 		}
-		if !propSameSet(got, want) {
-			rep.soft("stale-signature: %s carries %v, layout implies %v", dev, got, want)
+		if propSameSet(got, want) {
+			continue
 		}
+		// A --destructive deploy wipes its target disks first ("clear
+		// stale RAID superblocks and filesystem signatures from the disks
+		// this layout will write"), so a foreign signature on the whole
+		// disk afterwards is a miss. Under a partition's own signature it
+		// is shadowed and reported for a human to weigh.
+		if b := ins.Devs[dev]; st.Destructive && b != nil && b.Type == "disk" {
+			rep.hard("stale-signature: whole disk %s carries %v after a --destructive deploy, layout implies %v", dev, got, want)
+			continue
+		}
+		if len(want) == 0 {
+			continue // an unformatted partition: reported above as stale-fs
+		}
+		rep.soft("stale-signature: %s carries %v, layout implies %v", dev, got, want)
 	}
 
 	// Disks the layout does not name.

@@ -32,6 +32,11 @@ import (
 	"github.com/bluesky-social/slagworks/internal/qemutest"
 )
 
+// propKnownAreFailures makes the tree oracle fail on violations that match a
+// written-up finding instead of logging them as PROPKNOWN. The findings build
+// (tag proptest_findings) turns it on.
+var propKnownAreFailures = false
+
 const (
 	propDeployBudget = 6 * time.Minute
 	propBootBudget   = 5 * time.Minute
@@ -50,11 +55,15 @@ type propRun struct {
 	authKey string
 	dir     string
 	cur     map[string]string // disk ID -> current top image
+	// bootTop is, for the step in progress, each disk's second overlay:
+	// the one the installed system writes to. See splitPhases.
+	bootTop map[string]string
 	// canary remembers, per mounted data array, the token written into it
 	// and the step that wrote it.
 	canary map[string]string
 	fails  []string
 	notes  []string
+	known  []string
 }
 
 func (r *propRun) failf(step int, format string, a ...any) {
@@ -358,6 +367,7 @@ func (r *propRun) runStep(ctx context.Context, i int, st propStep) string {
 	waitBootDeployMAC(ctx, t, r.sw, mac)
 
 	// A fresh overlay per attached disk: what this step writes lands there.
+	r.bootTop = map[string]string{}
 	images := map[string]string{}
 	for _, id := range st.Attach {
 		top := filepath.Join(r.dir, fmt.Sprintf("%s.s%d.qcow2", id, i))
@@ -404,13 +414,23 @@ func (r *propRun) runStep(ctx context.Context, i int, st propStep) string {
 	}
 	vm.Stop()
 
-	// What did the step write, disk by disk?
-	written := map[string][][2]int64{}
+	// What did the step write, disk by disk? When the deploy completed, the
+	// overlay was split at the reboot: images[id] holds what the agent
+	// wrote, r.bootTop[id] what the installed system wrote afterwards.
+	agentW := map[string][][2]int64{}
+	bootW := map[string][][2]int64{}
 	for _, id := range st.Attach {
-		written[id] = propWritten(t, images[id])
-		t.Logf("PROPWRITES %s step=%d disk=%s ranges=%d %s", r.c.Name, i, id, len(written[id]), propRangesString(written[id]))
+		agentW[id] = propWritten(t, images[id])
+		line := fmt.Sprintf("PROPWRITES %s step=%d disk=%s agent=%d %s", r.c.Name, i, id, len(agentW[id]), propRangesString(agentW[id]))
+		if top, ok := r.bootTop[id]; ok {
+			bootW[id] = propWritten(t, top)
+			line += fmt.Sprintf(" | installed-system=%d %s", len(bootW[id]), propRangesString(bootW[id]))
+		}
+		t.Log(line)
 	}
-	r.checkWrites(i, st, got, written)
+	// Without a split, a step that booted has both writers in one overlay.
+	agentOnly := len(r.bootTop) == len(st.Attach) || (got != "ok" && got != "noboot")
+	r.checkWrites(i, st, got, agentW, bootW, agentOnly)
 
 	// A re-created array that never reached its first boot holds no canary
 	// any more; forget the old one so a later step does not expect it.
@@ -440,14 +460,16 @@ func propStoppedEarly(st propStep, got string) bool {
 }
 
 // checkWrites applies the no-write rules: a deploy refused before the
-// partitioning phase writes nothing at all, and a disk the layout does not
-// claim, or retains, is never written unless --wipe-all-disks asked for it.
-func (r *propRun) checkWrites(i int, st propStep, got string, written map[string][][2]int64) {
+// partitioning phase writes nothing at all, and the agent never writes a disk
+// the layout does not claim, or retains, unless --wipe-all-disks asked for
+// it. agentOnly says agentW holds the agent's writes alone; otherwise the
+// installed system's writes are mixed in and a hit needs a human.
+func (r *propRun) checkWrites(i int, st propStep, got string, agentW, bootW map[string][][2]int64, agentOnly bool) {
 	if propStoppedEarly(st, got) {
 		for _, id := range st.Attach {
-			if len(written[id]) != 0 {
+			if len(agentW[id]) != 0 {
 				r.failf(i, "deploy stopped at %q before partitioning, yet disk %s was written: %s",
-					got, id, propRangesString(written[id]))
+					got, id, propRangesString(agentW[id]))
 			}
 		}
 		return
@@ -467,20 +489,58 @@ func (r *propRun) checkWrites(i int, st propStep, got string, written map[string
 		role[id] = "retain"
 	}
 	for _, id := range st.Attach {
-		if len(written[id]) == 0 {
+		what := ""
+		switch {
+		case role[id] == "retain":
+			what = "retained disk"
+		case role[id] == "" && !st.WipeAll:
+			what = "disk outside the layout (no --wipe-all-disks)"
+		default:
 			continue
 		}
-		switch role[id] {
-		case "retain":
-			r.failf(i, "retained disk %s was written: %s", id, propRangesString(written[id]))
-		case "":
-			if !st.WipeAll {
-				// The installed system, not only the agent, ran during this
-				// step, and it assembles whatever arrays it finds. A write
-				// here needs a human to say which of the two did it.
-				r.notef(i, "bystander disk %s was written without --wipe-all-disks: %s", id, propRangesString(written[id]))
+		if len(agentW[id]) != 0 {
+			if agentOnly {
+				r.failf(i, "the deploy agent wrote %s %s: %s", what, id, propRangesString(agentW[id]))
+			} else {
+				r.notef(i, "%s %s was written during the step (agent or installed system): %s", what, id, propRangesString(agentW[id]))
 			}
 		}
+		if len(bootW[id]) != 0 {
+			// The installed system assembles whatever arrays it finds and
+			// updates their superblocks. Not the agent's doing, but worth
+			// seeing.
+			r.notef(i, "the installed system wrote %s %s: %s", what, id, propRangesString(bootW[id]))
+		}
+	}
+}
+
+// splitPhases freezes each disk's overlay at the moment the deploy agent has
+// exited and the machine is about to reboot, and puts a second overlay on
+// top for the installed system. It needs the VM paused only for the
+// snapshots themselves.
+func (r *propRun) splitPhases(ctx context.Context, i int, st propStep, vm *qemutest.VM) {
+	if err := vm.Serial.WaitFor(ctx, "slagworks: rebooting", 30*time.Second); err != nil {
+		r.notef(i, "no reboot marker after deploy complete, agent and installed-system writes are not separated: %v", err)
+		return
+	}
+	if err := vm.QMP.Stop(); err != nil {
+		r.notef(i, "could not pause the VM to separate writes: %v", err)
+		return
+	}
+	for _, id := range st.Attach {
+		top := filepath.Join(r.dir, fmt.Sprintf("%s.s%db.qcow2", id, i))
+		err := vm.QMP.Execute("blockdev-snapshot-sync", map[string]any{
+			"device": "prop" + id, "snapshot-file": top, "format": "qcow2",
+		})
+		if err != nil {
+			r.notef(i, "could not snapshot disk %s at the reboot: %v", id, err)
+			continue
+		}
+		r.bootTop[id] = top
+		r.cur[id] = top
+	}
+	if err := vm.QMP.Cont(); err != nil {
+		r.failf(i, "could not resume the VM after the snapshots: %v", err)
 	}
 }
 
@@ -493,6 +553,7 @@ func (r *propRun) afterComplete(ctx context.Context, i int, st propStep, vm *qem
 	awaiting.Status = model.OpClaimed
 	awaiting.Phase = "awaiting_phone_home"
 	r.push(machine, awaiting)
+	r.splitPhases(ctx, i, st, vm)
 
 	if _, err := r.env.Hub.WaitForObservation(ctx, r.slug, "deploy_complete", machine.ID); err != nil {
 		r.failf(i, "no deploy_complete observation: %v", err)
@@ -535,14 +596,32 @@ func (r *propRun) afterComplete(ctx context.Context, i int, st propStep, vm *qem
 	} else {
 		rep := propCheckTree(r.c, st, ins)
 		for _, h := range rep.Hard {
+			if st.Hazard != "" && !propKnownAreFailures {
+				r.known = append(r.known, fmt.Sprintf("step %d: %s: %s", i, st.Hazard, h))
+				t.Logf("PROPKNOWN %s step %d: %s: %s", r.c.Name, i, st.Hazard, h)
+				continue
+			}
 			r.failf(i, "tree: %s", h)
 		}
 		for _, s := range rep.Soft {
 			r.notef(i, "tree: %s", s)
 		}
+		for _, k := range rep.Known {
+			if propKnownAreFailures {
+				r.failf(i, "tree: %s", k)
+				continue
+			}
+			r.known = append(r.known, fmt.Sprintf("step %d: %s", i, k))
+			t.Logf("PROPKNOWN %s step %d: %s", r.c.Name, i, k)
+		}
 		r.checkCanaries(i, st, cli)
 		if st.Reboot {
-			r.checkReboot(ctx, i, vm, cli, ip, ins)
+			if !r.checkReboot(ctx, i, vm, cli, ip, ins) {
+				// The machine is not coming back; there is nothing to
+				// shut down cleanly.
+				_ = vm.QMP.Quit()
+				return "ok"
+			}
 			if c2, err := dialRecoverySSH(ctx, ip, r.signer, r.network); err == nil {
 				cli = c2
 				defer c2.Close()
@@ -590,7 +669,7 @@ func (r *propRun) checkCanaries(i int, st propStep, cli *ssh.Client) {
 
 // checkReboot restarts the installed system and requires it to come back on
 // the same root filesystem.
-func (r *propRun) checkReboot(ctx context.Context, i int, vm *qemutest.VM, cli *ssh.Client, ip string, before *propInspect) {
+func (r *propRun) checkReboot(ctx context.Context, i int, vm *qemutest.VM, cli *ssh.Client, ip string, before *propInspect) bool {
 	cursor := vm.Serial.Cursor()
 	_, _ = r.sshRun(cli, "sync; systemctl reboot")
 	_ = cli.Close()
@@ -611,14 +690,19 @@ func (r *propRun) checkReboot(ctx context.Context, i int, vm *qemutest.VM, cli *
 			lines = lines[len(lines)-80:]
 		}
 		r.failf(i, "second boot: installed system did not come back after a reboot: %v\n%s", err, strings.Join(lines, "\n"))
-		return
+		return false
 	}
 	defer c2.Close()
-	out, _ := r.sshRun(c2, "findmnt -n -o SOURCE,FSTYPE,UUID /; cat /proc/mdstat")
-	if want := strings.TrimSpace(before.Sections["root"]); !strings.HasPrefix(strings.TrimSpace(out), want) {
-		r.failf(i, "second boot: root is %q, first boot had %q", strings.TrimSpace(out), want)
+	// Compare the filesystem UUID, not the device: kernel names move
+	// between boots (sdb one boot, sdc the next) and that is not a fault.
+	out, _ := r.sshRun(c2, "findmnt -n -o UUID /; cat /proc/mdstat")
+	want := strings.Fields(before.Sections["root"])
+	got := strings.Fields(out)
+	if len(want) < 3 || len(got) < 1 || got[0] != want[2] {
+		r.failf(i, "second boot: root is %q, first boot had %q", strings.TrimSpace(out), strings.TrimSpace(before.Sections["root"]))
 	}
 	r.t.Logf("PROPREBOOT %s step=%d ok: %s", r.c.Name, i, strings.Join(strings.Fields(out), " "))
+	return true
 }
 
 // runPropCase plays a whole case.
@@ -671,7 +755,7 @@ func runPropCase(t *testing.T, c propCase) {
 	}
 	sort.Strings(r.notes)
 	res, _ := json.Marshal(map[string]any{
-		"case": c.Name, "outcomes": outcomes, "fails": r.fails, "notes": r.notes,
+		"case": c.Name, "outcomes": outcomes, "fails": r.fails, "notes": r.notes, "known": r.known,
 	})
 	t.Logf("PROPRESULT %s", res)
 }
