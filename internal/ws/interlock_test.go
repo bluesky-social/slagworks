@@ -466,6 +466,101 @@ func TestInterlock_StoreErrorResolvingRegistered_FailClosed(t *testing.T) {
 	}
 }
 
+// TestInterlock_HelloThatCannotPersistSerialRefused: INV-1 decides which
+// devices are serving site workers from the serials stored in site_workers,
+// not from live connections, and a worker's hello is what writes its verified
+// serial there (TouchSiteWorker). If that write fails and the hub keeps the
+// connection anyway, the worker is connected and serving under a serial INV-1
+// cannot see, so an outlet off for its own feed is granted to its partner.
+// The hub must refuse such a hello (fail-closed), and accept the worker's
+// reconnect once the store recovers.
+func TestInterlock_HelloThatCannotPersistSerialRefused(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop3", "worker-1")
+	auth.register("tok-2", "pop3", "worker-2")
+	// What the store holds: worker-1's serial from an earlier hello;
+	// worker-2's row has no serial yet (first connect, or a board swap).
+	auth.setSiteWorkers("pop3",
+		model.SiteWorker{SiteSlug: "pop3", WorkerID: "worker-1", Serial: "W1"},
+		model.SiteWorker{SiteSlug: "pop3", WorkerID: "worker-2", Serial: ""})
+
+	op := outletOp(t, model.OpPowerOff, "W2", false) // the outlet feeding worker-2
+	claimed := *op
+	claimed.Status = model.OpClaimed
+	claimed.ClaimedBy = "worker-1"
+	claimed.Version = 1
+	claimer := &fakeOpClaimer{pendingOp: op, op: &claimed}
+	hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, OpClaimer: claimer})
+	hub.Push("pop3", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"},
+		Machines: []model.MachineSnapshot{{ID: op.MachineID}}})
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+
+	conn1 := dialHub(t, srv, "tok-1")
+	if conn1 == nil {
+		t.Fatal("dial worker-1 failed")
+	}
+	defer conn1.CloseNow()
+	helloAndDrainSerial(t, conn1, "worker-1", "W1")
+
+	// The store fails the write on worker-2's hello (a dropped pooled
+	// connection, a lock timeout, a read-only primary after failover).
+	auth.mu.Lock()
+	auth.touchErr = errors.New("driver: bad connection")
+	auth.mu.Unlock()
+
+	conn2 := dialHub(t, srv, "tok-2")
+	if conn2 == nil {
+		t.Fatal("dial worker-2 failed")
+	}
+	defer conn2.CloseNow()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := conn2.WriteTyped(ctx, TypeHello, "", HelloMsg{
+		WorkerID: "worker-2", LastSeqNum: 1, Proto: OpStreamProto, Serial: "W2"}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := conn2.ReadMessage(ctx)
+	if err != nil {
+		t.Fatalf("read worker-2 hello reply: %v", err)
+	}
+	if env.Type != TypeError {
+		resp, _ := claimAndRead(t, conn1, op.ID)
+		t.Fatalf("worker-2's hello was accepted (reply %q) although its serial W2 was never written to "+
+			"site_workers; connected serials are %v, and worker-1's claim of an outlet off feeding W2 "+
+			"was granted=%t", env.Type, hub.ConnectedWorkerSerials("pop3"), resp.Operation != nil)
+	}
+	var e ErrorMsg
+	if err := unmarshalData(env.Data, &e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Code != "serial_persist_failed" {
+		t.Fatalf("refused hello error code = %q, want serial_persist_failed (message %q)", e.Code, e.Message)
+	}
+	for _, s := range hub.ConnectedWorkerSerials("pop3") {
+		if s == "W2" {
+			t.Fatal("worker-2 is registered with the hub although its hello was refused")
+		}
+	}
+
+	// The store recovers; worker-2's reconnect is accepted and records W2.
+	auth.mu.Lock()
+	auth.touchErr = nil
+	auth.mu.Unlock()
+	conn2b := dialHub(t, srv, "tok-2")
+	if conn2b == nil {
+		t.Fatal("redial worker-2 failed")
+	}
+	defer conn2b.CloseNow()
+	helloAndDrainSerial(t, conn2b, "worker-2", "W2")
+	auth.mu.Lock()
+	last := auth.touches[len(auth.touches)-1]
+	auth.mu.Unlock()
+	if last.workerID != "worker-2" || last.serial == nil || *last.serial != "W2" {
+		t.Fatalf("worker-2's accepted hello must record serial W2, last touch was %+v", last)
+	}
+}
+
 // TestInterlock_StoreErrorReadingOp_Retryable: the interlock reads the op row
 // before it can tell whether the op is an outlet op, so that read runs for
 // every claim, deploys included. A store failure on it must be answered as an

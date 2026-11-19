@@ -236,9 +236,13 @@ Connection setup:
 1. The worker connects with `?token=`.
 2. Its first message must be `hello`. Global rejects the connection when
    `hello.worker_id` differs from the token's worker, when `proto` is below
-   the current op-stream protocol (`OpStreamProto`, 1), or, when NetBox is
-   configured, when `serial` is empty or does not resolve to exactly one
-   NetBox device inside the worker's site-config scope.
+   the current op-stream protocol (`OpStreamProto`, 1), when, with NetBox
+   configured, `serial` is empty or does not resolve to exactly one NetBox
+   device inside the worker's site-config scope, or when it cannot write
+   `serial` to the worker's `site_workers` row (`serial_persist_failed`; the
+   outlet-op interlock reads serving workers from that column, so a worker
+   is never connected under a serial it lacks). The worker reconnects and
+   retries.
 3. Global replies with `snapshot` (worker is behind) or `no_change`, then
    sends `op_resync`. The worker drops the connection when its first message
    is anything else; a `snapshot` pushed by a content change may precede the
