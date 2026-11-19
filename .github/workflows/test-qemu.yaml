@@ -144,10 +144,13 @@ jobs:
   shard:
     needs: [image, shards]
     # 24.04, not the 26.04 the other jobs use: it is the release the boot
-    # image is built from, and UEFI test VMs do not get through boot with
-    # 26.04's QEMU 10, OVMF and iPXE ROM (they time out waiting for the
-    # agent). renovate.json holds this runner back. The harness itself
-    # already handles the QEMU 10 option and ROM path differences.
+    # image is built from, and UEFI test VMs did not get through boot with
+    # 26.04's QEMU 10, OVMF and iPXE ROM (they timed out waiting for the
+    # agent). That was measured while UEFI VMs still loaded QEMU's iPXE
+    # option ROM; it has not been re-tested since they stopped (see
+    # buildArgs in internal/qemutest/vm.go). renovate.json holds this
+    # runner back. The harness itself already handles the QEMU 10 option
+    # difference.
     runs-on: ubuntu-24.04
     # A shard takes about 10 minutes; the go test timeout below is the
     # tighter bound.
@@ -166,9 +169,10 @@ jobs:
           go-version-file: go.mod
 
       - name: Install the harness's host tools
-        # qemu + OVMF for the VMs, ipxe-qemu for the NIC option ROMs the UEFI
-        # tests point QEMU at (a hard dependency of qemu on 24.04, only
-        # recommended on 26.04), openipmi for ipmi_sim (the simulated
+        # qemu + OVMF for the VMs, ipxe-qemu for the NIC option ROM BIOS
+        # test VMs network-boot from (UEFI VMs load none and use OVMF's
+        # own NIC driver; the package is a hard dependency of qemu on
+        # 24.04, only recommended on 26.04), openipmi for ipmi_sim (the simulated
         # BMC), ipmitool, lvm2 and qemu-utils (qemu-img, qemu-nbd) for the
         # disk-preservation tests, systemd-boot-efi for the EFI stub the
         # site worker serves.
