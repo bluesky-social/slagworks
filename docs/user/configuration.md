@@ -67,15 +67,19 @@ variable shown, so a flag on the command line overrides the variable.
   comma-separated groups; a token is accepted when it carries any of them.
   Required: global refuses to start without at least one group. Blank
   entries are dropped. Every operator endpoint uses this check; there is
-  no separate read-only role. The device-credential endpoint can also
-  require `SLAGWORKS_OIDC_CREDENTIAL_GROUPS`.
+  no separate read-only role. The device-credential endpoint and
+  site-worker registration can also require
+  `SLAGWORKS_OIDC_CREDENTIAL_GROUPS`.
 - **`SLAGWORKS_OIDC_CREDENTIAL_GROUPS`** / `--oidc-credential-groups` —
   comma-separated groups allowed to read stored device credentials in
   plaintext: `GET /api/v1/devices/:ident/creds`, which
-  `slagctl machine creds` calls. When set, a caller must pass the
-  `SLAGWORKS_OIDC_REQUIRED_GROUPS` check and also carry any one of these
-  groups; other operators get 403 with a message naming this setting.
-  Unset or blank (the default), every operator may read credentials.
+  `slagctl machine creds` calls, and `POST /api/v1/site-workers`, which
+  `slagctl worker register` calls (a site-worker token receives the
+  site's device credentials with every operation it is sent). When set, a
+  caller must pass the `SLAGWORKS_OIDC_REQUIRED_GROUPS` check and also
+  carry any one of these groups; other operators get 403 with a message
+  naming this setting.
+  Unset or blank (the default), every operator may call both.
   Blank entries are dropped. Global logs at startup whether credential
   reads are restricted and by how many groups. Endpoints that only use a
   credential server-side (operations, power and boot status) are not

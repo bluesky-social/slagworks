@@ -93,15 +93,17 @@ func (s *Server) oidcAuth(next echo.HandlerFunc) echo.HandlerFunc {
 // credentialForbiddenMsg is the 403 body for an operator whose token carries
 // no credential group. It names the setting but echoes neither the caller's
 // groups nor the configured ones; credentialAuth logs both.
-const credentialForbiddenMsg = "not authorized to read device credentials: this server restricts them to the groups in " +
+const credentialForbiddenMsg = "not authorized to read device credentials or to mint a site-worker token (which receives them): " +
+	"this server restricts both to the groups in " +
 	"SLAGWORKS_OIDC_CREDENTIAL_GROUPS (--oidc-credential-groups) and your token carries none of them; " +
 	"ask a slagworks administrator to add you to one, then run `slagctl auth login` for a token that carries it"
 
 // credentialAuth gates the routes that return a stored device credential in
-// plaintext. It runs after oidcAuth, so the caller has already passed the
-// operator group check; when credential groups are configured (credAuthz
-// non-nil) the caller must also carry one of them. With none configured
-// every operator passes.
+// plaintext (GET /devices/:ident/creds) or mint a site-worker token, which
+// receives them on the op stream (POST /site-workers). It runs after
+// oidcAuth, so the caller has already passed the operator group check; when
+// credential groups are configured (credAuthz non-nil) the caller must also
+// carry one of them. With none configured every operator passes.
 //
 // Status codes:
 //   - 403 operator token without a credential group.
@@ -120,7 +122,7 @@ func (s *Server) credentialAuth(next echo.HandlerFunc) echo.HandlerFunc {
 			return next(c)
 		}
 		if err := s.credAuthz(claims); err != nil {
-			s.log.Info("credential read refused: token carries no credential group",
+			s.log.Info("credential route refused: token carries no credential group",
 				"err", err,
 				"sub", claims.Subject,
 				"preferred_username", claims.PreferredUsername,
