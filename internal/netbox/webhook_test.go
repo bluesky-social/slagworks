@@ -22,6 +22,7 @@ import (
 type fakeMirror struct {
 	creates []mirror.Device
 	updates []mirror.Device
+	moves   []int // device ids passed to OnDeviceMoved
 	deletes []deleteCall
 	drifts  []driftCall
 	err     error
@@ -38,6 +39,10 @@ func (f *fakeMirror) OnDeviceCreated(_ context.Context, d mirror.Device) error {
 }
 func (f *fakeMirror) OnDeviceUpdated(_ context.Context, d mirror.Device) error {
 	f.updates = append(f.updates, d)
+	return f.err
+}
+func (f *fakeMirror) OnDeviceMoved(_ context.Context, deviceID int) error {
+	f.moves = append(f.moves, deviceID)
 	return f.err
 }
 func (f *fakeMirror) OnDeviceDeleted(_ context.Context, deviceID int, configSlug string) error {
@@ -167,6 +172,8 @@ func TestWebhookDeleteKeysInvalidationOnConfigSlug(t *testing.T) {
 func TestWebhookProcessingErrorsAck200(t *testing.T) {
 	deviceBody := `{"event":"created","object_type":"dcim.device","data":{"id":777,"name":"h1","serial":"SN1","site":{"slug":"pop2"}}}`
 	deleteBody := `{"event":"deleted","object_type":"dcim.device","data":{"id":777,"site":{"slug":"pop2"}}}`
+	moveBody := `{"event":"updated","object_type":"dcim.device","data":{"id":777,"name":"h1","serial":"SN1","site":{"slug":"pop2"}},` +
+		`"snapshots":{"prechange":{"site":1,"location":21},"postchange":{"site":1,"location":99}}}`
 
 	cases := []struct {
 		name string
@@ -191,6 +198,13 @@ func TestWebhookProcessingErrorsAck200(t *testing.T) {
 				&fakeMirror{err: errors.New("pg down")},
 				&fakeResolver{byID: map[int][]string{777: {"pop2-old-cage"}}}, testSecret),
 			body: deleteBody,
+		},
+		{
+			name: "mirror move failure",
+			h: NewWebhookHandler(
+				&fakeMirror{err: errors.New("pg down")},
+				&fakeResolver{byID: map[int][]string{777: {"pop2-old-cage"}}}, testSecret),
+			body: moveBody,
 		},
 	}
 	for _, tc := range cases {
@@ -291,7 +305,7 @@ func TestWebhookNoSecretRejectsEveryDelivery(t *testing.T) {
 			if !strings.Contains(w.Body.String(), "SLAGWORKS_WEBHOOK_SECRET") {
 				t.Errorf("body should name the setting to configure: %q", w.Body.String())
 			}
-			if len(mir.creates)+len(mir.updates)+len(mir.deletes)+len(mir.drifts) != 0 {
+			if len(mir.creates)+len(mir.updates)+len(mir.moves)+len(mir.deletes)+len(mir.drifts) != 0 {
 				t.Fatalf("mirror changed with no secret configured: %+v", mir)
 			}
 		})
@@ -377,6 +391,11 @@ func TestWebhookValidSignatureDispatches(t *testing.T) {
 // topology field changed (site/location/rack/device_type/role) fires
 // OnDeviceExternalDrift with the changed fields; changes to fields
 // slagworks writes itself (serial, status, custom_fields...) do not.
+//
+// A site or location change also fires OnDeviceMoved, because the device
+// may have left the config that claimed it before (the resolver names
+// only the config that claims it now). That holds when the device lands
+// outside every claim, where the handler mirrors nothing else.
 func TestWebhookExternalDriftGate(t *testing.T) {
 	mkBody := func(pre, post string) string {
 		return `{"event":"updated","object_type":"dcim.device",
@@ -386,17 +405,33 @@ func TestWebhookExternalDriftGate(t *testing.T) {
 	cases := []struct {
 		name       string
 		body       string
+		unclaimed  bool // the resolver claims device 777 for no config
 		wantFields []string
+		wantMoved  bool
 	}{
 		{
 			name:       "location moved",
 			body:       mkBody(`{"location":{"id":21},"serial":"SN1"}`, `{"location":{"id":99},"serial":"SN1"}`),
 			wantFields: []string{"location"},
+			wantMoved:  true,
+		},
+		{
+			name:       "location moved out of every claim",
+			body:       mkBody(`{"site":1,"location":21}`, `{"site":1,"location":99}`),
+			unclaimed:  true,
+			wantFields: []string{"location"},
+			wantMoved:  true,
 		},
 		{
 			name:       "site and device_type moved",
 			body:       mkBody(`{"site":{"slug":"pop2"},"device_type":{"id":1}}`, `{"site":{"slug":"pop3"},"device_type":{"id":2}}`),
 			wantFields: []string{"site", "device_type"},
+			wantMoved:  true,
+		},
+		{
+			name:       "rack moved within the same location",
+			body:       mkBody(`{"site":1,"location":21,"rack":5}`, `{"site":1,"location":21,"rack":6}`),
+			wantFields: []string{"rack"},
 		},
 		{
 			name: "self-written fields exempt",
@@ -420,10 +455,21 @@ func TestWebhookExternalDriftGate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mir := &fakeMirror{}
 			res := &fakeResolver{byID: map[int][]string{777: {"pop2-old-cage"}}}
+			wantSlug := "pop2-old-cage"
+			if tc.unclaimed {
+				res = &fakeResolver{byID: map[int][]string{}}
+				wantSlug = ""
+			}
 			h := NewWebhookHandler(mir, res, testSecret)
 			w := postWebhook(t, h, tc.body)
 			if w.Code != http.StatusOK {
 				t.Fatalf("status %d", w.Code)
+			}
+			switch {
+			case tc.wantMoved && (len(mir.moves) != 1 || mir.moves[0] != 777):
+				t.Fatalf("OnDeviceMoved calls: got %v, want [777]", mir.moves)
+			case !tc.wantMoved && len(mir.moves) != 0:
+				t.Fatalf("unexpected OnDeviceMoved calls: %v", mir.moves)
 			}
 			if tc.wantFields == nil {
 				if len(mir.drifts) != 0 {
@@ -435,7 +481,7 @@ func TestWebhookExternalDriftGate(t *testing.T) {
 				t.Fatalf("expected 1 drift call, got %d", len(mir.drifts))
 			}
 			got := mir.drifts[0]
-			if got.deviceID != 777 || got.configSlug != "pop2-old-cage" {
+			if got.deviceID != 777 || got.configSlug != wantSlug {
 				t.Fatalf("drift call: %+v", got)
 			}
 			if len(got.fields) != len(tc.wantFields) {
@@ -447,5 +493,28 @@ func TestWebhookExternalDriftGate(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestWebhookMoveInvalidatesWhenClaimResolveFails: invalidating the config
+// a moved device left needs no claim, so a failed claim resolution (NetBox
+// unreachable for the location tree) does not skip it, though the rest of
+// the event is still left to reconcile.
+func TestWebhookMoveInvalidatesWhenClaimResolveFails(t *testing.T) {
+	mir := &fakeMirror{}
+	h := NewWebhookHandler(mir, &fakeResolver{err: errors.New("netbox down")}, testSecret)
+
+	body := `{"event":"updated","object_type":"dcim.device","data":{"id":777,"name":"h1","serial":"SN1","site":{"slug":"pop2"}},` +
+		`"snapshots":{"prechange":{"site":1,"location":21},"postchange":{"site":1,"location":99}}}`
+	w := postWebhook(t, h, body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status: got %d want 200", w.Code)
+	}
+	if len(mir.moves) != 1 || mir.moves[0] != 777 {
+		t.Fatalf("OnDeviceMoved calls: got %v, want [777]", mir.moves)
+	}
+	if len(mir.updates)+len(mir.drifts) != 0 {
+		t.Fatalf("claim-dependent calls ran without a claim: updates=%v drifts=%v", mir.updates, mir.drifts)
 	}
 }

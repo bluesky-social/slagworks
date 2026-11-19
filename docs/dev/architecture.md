@@ -244,7 +244,12 @@ that the endpoint is disabled. Handled models:
 
 - `device`: `created` / `updated` / `deleted` — resolves the owning
   `site_config` via `snapshot.ClaimResolver` and calls the matching
-  `mirror.OnDevice*` verb.
+  `mirror.OnDevice*` verb. An `updated` that changes the device's site
+  or location also calls `mirror.OnDeviceMoved`, which invalidates every
+  `site_config`: the resolver names only the config that claims the
+  device now, and NetBox's prechange snapshot names the old site and
+  location only by id, so the config the device left can't be resolved
+  directly.
 - `site`: only `updated` — enforces slug immutability and returns 409
   on a rename of a managed site.
 

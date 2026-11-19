@@ -291,7 +291,9 @@ There are two things called "claim" in the code base.
 NetBox device. This is location-subtree membership, not an
 operation claim. It is used by the NetBox webhook and by the
 reconciler to decide which site's snapshot needs invalidation on a
-device event.
+device event. It answers for the device as it is now, so when a webhook
+shows the device's site or location changed, the config it left is
+covered by invalidating every site config (`mirror.OnDeviceMoved`).
 
 ### Operation claim (the state-machine claim)
 
@@ -474,10 +476,15 @@ snapshot contains the op's machine (`Hub.machineInSlug`), preserving the
 pre-cutover baseline where ops rode the per-slug snapshot. The claim reply
 carries the op too, so `handleClaimOp` applies the same check before the
 claim CAS: a `claim_op` for an op whose machine is not in the worker's
-snapshot is answered `already_claimed` and the op stays pending. `op_removed`
-fans fleet-wide, unfiltered: it carries no params (no secrets) and must
-survive membership loss (a machine deleted from NetBox is in no snapshot,
-but its drift-failed op must still be dropped on the worker driving it).
+snapshot is answered `already_claimed` and the op stays pending. That
+cache is only as current as the slug's last push, so a device that moves
+out of a config's scope must get that config rebuilt too: the NetBox
+webhook invalidates every site config when a device's site or location
+changes (`mirror.OnDeviceMoved`), and the reconcile tick is the backstop.
+`op_removed` fans fleet-wide, unfiltered: it carries no params (no
+secrets) and must survive membership loss (a machine deleted from NetBox
+is in no snapshot, but its drift-failed op must still be dropped on the
+worker driving it).
 
 ### Credentials in operations
 
