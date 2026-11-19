@@ -69,6 +69,14 @@ a machine ever gets booted:
   `RangeStart` (reservations-only segment) still serves the full reservation
   set; a non-reserved MAC on such a segment gets no offer, which is what
   lets a slice-owning peer answer in an active/active split-pool cage.
+- **Address conflicts (DHCPDECLINE).** A client that checks its new address
+  for duplicates before using it (dhcpcd in the initrd, for instance) sends a
+  DECLINE when another host already answers for it, then starts over at
+  DISCOVER. `handleDecline` drops that lease and withholds the address from
+  dynamic allocation for one lease duration, so the retry gets a different
+  address, and logs a warning with the declined address: find and remove the
+  other host using it. A static reservation is still offered to its MAC, so a
+  declined reservation keeps failing until the conflict is resolved.
 - **Known-MAC filter.** When a segment is non-promiscuous and `KnownMACs` is
   set, an unregistered MAC's DHCP is silently dropped at debug level
   (`handler.go:424-428`). A promiscuous segment (typical for OOB where you

@@ -119,9 +119,9 @@ type Config struct {
 
 	// OnLeaseEvent, when non-nil, is called SYNCHRONOUSLY — in lease-
 	// mutation order, under h.mu — from every lease-table mutation site
-	// (allocate, renew, delete/expiry-sweep). This is deliberately NOT
-	// the OnACK pattern (`go callback()`) and NOT a drop-on-full
-	// channel: the ledger this feeds (see
+	// (allocate, renew, delete on expiry sweep or DECLINE). This is
+	// deliberately NOT the OnACK pattern (`go callback()`) and NOT a
+	// drop-on-full channel: the ledger this feeds (see
 	// docs/plans/2026-07-13-dhcp-lease-visibility.md Phase 3) folds
 	// events in order, and a dropped allocate/delete is a hole in the
 	// product's core deliverable (lease history), not a cosmetic gap.
@@ -142,7 +142,8 @@ type Config struct {
 // lease is written for the first time, or moves to a different IP —
 // including adopt-in-place), "renew" (a MAC's existing lease on the
 // SAME IP is extended), or "delete" (an expired entry is purged by
-// the sweep in allocateIP). Pool is the same subnet-CIDR label
+// the sweep in allocateIP, or a client DECLINEs its leased address —
+// see handleDecline). Pool is the same subnet-CIDR label
 // poolLabelForIP produces for the dhcp_leases RPC (Leases) — computed
 // here, under h.mu, rather than by the worker-side callback: the
 // callback runs INSIDE the same critical section (see OnLeaseEvent),
@@ -228,6 +229,7 @@ type Handler struct {
 	pools             PoolConfig             // base/default pool state; replaced by UpdatePools
 	ifaceParams       map[string]IfaceParams // per-interface overrides keyed by arrival iface; "" never present (base used)
 	leases            map[string]*lease      // keyed by MAC string (shared across all interfaces)
+	declined          map[string]time.Time   // IP string -> end of its quarantine after a DECLINE; see handleDecline
 	log               *slog.Logger
 	exhaustedLogTimes map[string]time.Time // MAC -> last time we logged "pool exhausted" for this MAC
 }
@@ -331,6 +333,7 @@ func NewHandler(cfg Config) *Handler {
 		pools:             cfg.PoolConfig,
 		ifaceParams:       make(map[string]IfaceParams),
 		leases:            make(map[string]*lease),
+		declined:          make(map[string]time.Time),
 		log:               slog.Default(),
 		exhaustedLogTimes: make(map[string]time.Time),
 	}
@@ -539,6 +542,9 @@ func (h *Handler) HandlePacketOn(req *dhcpv4.DHCPv4, iface string) *dhcpv4.DHCPv
 		return h.handleDiscover(req, mac, view, log)
 	case dhcpv4.MessageTypeRequest:
 		return h.handleRequest(req, mac, view, log)
+	case dhcpv4.MessageTypeDecline:
+		h.handleDecline(req, mac, view, log)
+		return nil
 	case dhcpv4.MessageTypeRelease:
 		log.Info("received DHCP Release, ignoring")
 		h.cfg.Metrics.drop(DropUnhandledType)
@@ -770,6 +776,58 @@ func (h *Handler) handleRequest(req *dhcpv4.DHCPv4, mac net.HardwareAddr, view i
 	}
 
 	return reply
+}
+
+// handleDecline implements RFC 2131 §4.3.3: the client's own duplicate-
+// address check (§4.4.1) found the address this server gave it already in
+// use, and the client is restarting at DISCOVER. The server MUST mark the
+// address as not available. Keeping the lease instead would make the
+// client's next DISCOVER take allocateIP's renew path and be offered the
+// same address again, looping for as long as the conflict stands.
+//
+// A DECLINE acts only on the address this server last leased to this MAC
+// (option 50 equals its lease-table entry, which may already have expired
+// but not yet been swept: the conflict report is no less true for that).
+// One naming another server (option 54) or any other address is ignored,
+// so a stray or forged DECLINE cannot withdraw an address from someone
+// else's lease or quarantine arbitrary pool addresses. On a match the
+// lease is dropped and the address withheld from dynamic allocation for
+// one lease duration, the period in which a lease on it would have needed
+// renewing; after that it is offered again, and a squatter that is still
+// there is caught by the next client's check. The quarantine is in memory
+// only: a restart or failover forgets it and costs at most one more
+// DECLINE.
+//
+// The quarantine applies to fresh dynamic allocation only. A static
+// reservation is still offered to its MAC (the reservation is definitive),
+// and classifyRequest's adopt-in-place still grants the address to a
+// client that REQUESTs it while already configured with it: the likeliest
+// such client is the squatter itself, holding a lease this server lost.
+func (h *Handler) handleDecline(req *dhcpv4.DHCPv4, mac net.HardwareAddr, view ifaceView, log *slog.Logger) {
+	if sid := req.ServerIdentifier(); sid != nil && !sid.IsUnspecified() && !sid.Equal(view.serverIP) {
+		log.Debug("DECLINE names another server, ignoring", "server_id", sid.String())
+		return
+	}
+	ip := req.RequestedIPAddress()
+	if ip == nil || ip.IsUnspecified() {
+		log.Info("DECLINE carries no requested address (option 50), ignoring")
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	l, ok := h.leases[mac.String()]
+	if !ok || !l.IP.Equal(ip) {
+		log.Info("DECLINE for an address this server did not lease to this client, ignoring",
+			"declined_ip", ip.String())
+		return
+	}
+	h.deleteLease(mac.String(), l)
+	until := time.Now().Add(view.leaseDuration)
+	h.declined[ip.String()] = until
+	log.Warn("client declined its address as already in use; lease dropped and address withheld from dynamic allocation; find the other host using this address",
+		"declined_ip", ip.String(),
+		"withheld_until", until.Format(time.RFC3339))
 }
 
 // requestedAddr returns the IPv4 address a DHCPREQUEST is asking to keep:
@@ -1260,17 +1318,21 @@ func (h *Handler) allocateIP(mac net.HardwareAddr, reserved net.IP, p *pool, arp
 		// the stale entry, freeing the old IP for other MACs.
 	}
 
-	// Find a free IP in the range, cleaning up expired leases along the way
+	// Find a free IP in the range, cleaning up expired leases and expired
+	// DECLINE quarantines along the way. A quarantined address is taken.
 	taken := make(map[string]bool)
 	for k, l := range h.leases {
 		if now.After(l.Expiry) {
-			delete(h.leases, k)
-			if h.cfg.LeaseStore != nil {
-				h.cfg.LeaseStore.DeleteLease(l.MAC)
-			}
-			h.emitLeaseEvent("delete", l.MAC, l.IP, l.Expiry)
+			h.deleteLease(k, l)
 		} else {
 			taken[l.IP.String()] = true
+		}
+	}
+	for ip, until := range h.declined {
+		if now.Before(until) {
+			taken[ip] = true
+		} else {
+			delete(h.declined, ip)
 		}
 	}
 
@@ -1298,8 +1360,10 @@ func (h *Handler) allocateIP(mac net.HardwareAddr, reserved net.IP, p *pool, arp
 				taken[ip.String()] = true
 				continue
 			}
-			// Re-check: another goroutine may have claimed this IP while lock was released
-			ipClaimed := false
+			// Re-check: another goroutine may have claimed this IP while
+			// lock was released, or a client may have DECLINEd it.
+			until, withheld := h.declined[ip.String()]
+			ipClaimed := withheld && now.Before(until)
 			for _, l := range h.leases {
 				if l.IP.Equal(ip) && now.Before(l.Expiry) {
 					ipClaimed = true
@@ -1335,6 +1399,16 @@ func (h *Handler) setLease(macStr string, mac net.HardwareAddr, ip net.IP, expir
 	h.leases[macStr] = &lease{MAC: mac, IP: ip, Expiry: expiry}
 	h.persistLease(mac, ip, expiry)
 	h.emitLeaseEvent(event, mac, ip, expiry)
+}
+
+// deleteLease removes macStr's lease l from the in-memory map and the
+// LeaseStore and emits a "delete" OnLeaseEvent. Caller must hold h.mu.
+func (h *Handler) deleteLease(macStr string, l *lease) {
+	delete(h.leases, macStr)
+	if h.cfg.LeaseStore != nil {
+		h.cfg.LeaseStore.DeleteLease(l.MAC)
+	}
+	h.emitLeaseEvent("delete", l.MAC, l.IP, l.Expiry)
 }
 
 // persistLease writes to the LeaseStore if configured. Caller must hold h.mu.
