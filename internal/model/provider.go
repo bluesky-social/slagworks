@@ -169,7 +169,6 @@ type MachineProvider interface {
 	// params, network script/facts, hostname, storage script) which key
 	// off the machine ID carried on the kernel cmdline.
 	MachineByID(id uuid.UUID) *MachineSnapshot
-	RecordPhoneHome(machineID uuid.UUID)
 	RecordInventoryReport(machineID uuid.UUID, data []byte)
 	DeployOpForMAC(mac string) *Operation
 	CommissionOpForMAC(mac string) *Operation

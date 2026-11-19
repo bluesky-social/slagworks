@@ -263,8 +263,10 @@ Prevents stuck operations from blocking the machine indefinitely.
 ### Phone Home
 
 Post-boot callback from the installed OS to the worker. A first-boot systemd
-oneshot service POSTs to `/api/v1/phone-home?mac=X`. Triggers the
-`deployed` -> `verified` state transition.
+oneshot service POSTs `{"machine_id":"...","op_id":"...","event":"phone_home"}`
+to `/api/v1/report`. The worker accepts it only for that machine's active
+deploy operation, completes the operation, and moves the machine from
+`deploying` to `running`.
 
 ---
 
