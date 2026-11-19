@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -190,8 +191,10 @@ func TestProp_RunnerNeverLeaksPassword(t *testing.T) {
 		_, err = runner.BootOption(context.Background(), c)
 		errs = append(errs, err)
 		errs = append(errs, runner.PowerCycle(context.Background(), c))
+		quoted := strconv.Quote(pass)
+		escaped := quoted[1 : len(quoted)-1]
 		for _, e := range errs {
-			if e != nil && strings.Contains(e.Error(), pass) {
+			if e != nil && (strings.Contains(e.Error(), pass) || strings.Contains(e.Error(), escaped)) {
 				rt.Fatalf("error leaks password %q: %v", pass, e)
 			}
 		}

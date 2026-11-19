@@ -256,7 +256,19 @@ func TestPDU_Prop_FaultSchedules(t *testing.T) {
 				st, serr := p.PowerStatus(ctx)
 				opErr = serr
 				truth := ch.poweredTruth()
+				faulted := false
+				for k := range ch.faults {
+					faulted = faulted || (k >= callsBefore && k < ch.calls)
+				}
+				want := StateOff
+				if truth {
+					want = StateOn
+				}
 				switch {
+				case !faulted && (serr != nil || st != want):
+					// Without this, a controller that always answered
+					// Unknown would satisfy the two cases below.
+					rt.Fatalf("%s: PowerStatus with every read answered = %v, %v; want %v", label, st, serr, want)
 				case serr == nil && st == StateOff && truth:
 					rt.Fatalf("%s: PowerStatus reported Off but outlets %v are powering the host", label, snapshot())
 				case serr == nil && st == StateOn && !truth:
