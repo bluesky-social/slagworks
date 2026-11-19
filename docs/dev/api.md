@@ -331,10 +331,6 @@ UTF-8 replaced. Errors after the upgrade arrive as a single
 `{"code","message"}` frame. Parameter errors before the upgrade return an
 HTTP 400.
 
-`internal/ws/messages.go` also defines `subscribe`, `log_entries`,
-`op_snapshot` and `op_status` for an operation-watch stream. No server
-endpoint serves them.
-
 ---
 
 ## Commission outbox contract

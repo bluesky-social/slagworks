@@ -256,6 +256,135 @@ func TestCastManager_MassDropSharedDeadline(t *testing.T) {
 	}
 }
 
+// stallingCastLister is a fakeCastLister whose first ListActiveMachineIDs
+// call reads the active set and then blocks until release is closed. That
+// holds one Reconcile pass between its cache read and its pump-set update.
+// Later calls do not block.
+type stallingCastLister struct {
+	fakeCastLister
+	stalled atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newStallingCastLister() *stallingCastLister {
+	return &stallingCastLister{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (l *stallingCastLister) ListActiveMachineIDs() []uuid.UUID {
+	ids := l.fakeCastLister.ListActiveMachineIDs()
+	if l.stalled.CompareAndSwap(false, true) {
+		close(l.entered)
+		<-l.release
+	}
+	return ids
+}
+
+// TestCastManager_ConcurrentReconcileKeepsNewestActiveSet: the site worker
+// calls Reconcile from two goroutines, the snapshot-applied callback (on
+// the WS goroutine) and the direct call when the manager starts. A pass
+// that read the active set before a snapshot apply must not commit after
+// the pass that apply triggered. Here machine X joins the active set and
+// the callback's pass spawns its pump; the older pass must not then tear
+// it down, which would leave X without console capture until a later
+// snapshot happens to change the active set.
+func TestCastManager_ConcurrentReconcileKeepsNewestActiveSet(t *testing.T) {
+	x := uuid.New()
+	lister := newStallingCastLister()
+	m := NewCastManager(CastManagerConfig{
+		Dialer: &fakeCastDialer{exitDur: time.Hour},
+		Sink:   &collectingSink{},
+		Resume: fixedResume{v: 0},
+		Cache:  lister,
+	})
+	m.Start(t.Context())
+	defer m.Shutdown()
+
+	// Pass A reads the old, empty active set, then stalls.
+	aDone := make(chan struct{})
+	go func() { defer close(aDone); m.Reconcile() }()
+	<-lister.entered
+
+	// A snapshot apply makes X active and runs pass B. Let B finish before A
+	// resumes if it can; when passes are serialized B waits for A instead,
+	// and this bound just lapses.
+	lister.setActive(x)
+	bDone := make(chan struct{})
+	go func() { defer close(bDone); m.Reconcile() }()
+	select {
+	case <-bDone:
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(lister.release)
+	<-aDone
+	<-bDone
+
+	m.mu.Lock()
+	_, ok := m.pumps[x]
+	m.mu.Unlock()
+	if !ok {
+		t.Fatalf("machine %s is in the newest active set but has no cast pump: a Reconcile pass that read the older set committed last", x)
+	}
+}
+
+// TestCastManager_ConcurrentReconcileDrainsDropBeforeRespawn: a pass that
+// drops a machine waits for the old pump to exit, so a re-add cannot race
+// it for the BMC's single SOL session. That has to hold against a
+// concurrent pass too: one that re-adds the machine while the dropped pump
+// is still exiting must not spawn the new pump until the old one is gone.
+func TestCastManager_ConcurrentReconcileDrainsDropBeforeRespawn(t *testing.T) {
+	x := uuid.New()
+	lister := &fakeCastLister{}
+	m := newManager(t, lister, &fakeCastDialer{exitDur: time.Hour})
+	m.Start(t.Context())
+	defer m.Shutdown()
+
+	// X's current pump takes a while to exit after cancel (ipmitool
+	// deactivating SOL).
+	oldExited := make(chan struct{})
+	m.mu.Lock()
+	m.pumps[x] = &castPumpHandle{cancel: func() {}, done: oldExited}
+	m.mu.Unlock()
+
+	// Pass A sees an empty active set, drops X and waits for its pump.
+	aDone := make(chan struct{})
+	go func() { defer close(aDone); m.Reconcile() }()
+	waitFor(t, func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		_, ok := m.pumps[x]
+		return !ok
+	})
+
+	// X comes back and pass B runs while the old pump is still exiting.
+	lister.setActive(x)
+	bDone := make(chan struct{})
+	go func() { defer close(bDone); m.Reconcile() }()
+	select {
+	case <-bDone:
+	case <-time.After(250 * time.Millisecond):
+	}
+	m.mu.Lock()
+	_, respawned := m.pumps[x]
+	m.mu.Unlock()
+
+	close(oldExited)
+	<-aDone
+	<-bDone
+	if respawned {
+		t.Fatalf("machine %s got a new cast pump while its dropped pump was still exiting: two SOL sessions would contend for the BMC", x)
+	}
+	m.mu.Lock()
+	_, ok := m.pumps[x]
+	m.mu.Unlock()
+	if !ok {
+		t.Fatalf("machine %s is active but has no cast pump after both passes", x)
+	}
+}
+
 // TestCastManager_ShutdownSharedDeadline: same property for Shutdown's
 // 5s grace — total, not per pump.
 func TestCastManager_ShutdownSharedDeadline(t *testing.T) {

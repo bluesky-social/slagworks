@@ -1,12 +1,15 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
+
+	"github.com/bluesky-social/slagworks/internal/model"
 )
 
 // newQuietEmulator builds a vt.Emulator that does NOT answer terminal status
@@ -50,23 +53,54 @@ func newQuietEmulator(width, height int) *vt.Emulator {
 // of ring size. The client feeds it through the same onBytes path as live
 // bytes (no wire-format change), then tails live frames from the live edge.
 //
+// The replay costs CPU in proportion to the cast's history, but global's
+// memory stays bounded by one page of rows plus one screen: each page is
+// written into the emulator as it is read and then dropped, and the emulator
+// keeps no scrollback. Cast events are kept forever, so anything held per
+// row would grow for the life of the machine, on every attach.
+//
 // This is faithful ONLY while nothing trims the cast: the replay starts at the
 // true session start (t_us=0), so every screen-setup escape is present. Adding
 // retention requires screen keyframes first — replaying from a
 // mid-stream survivor would miss the escapes that set the screen up.
 
-// renderCastScreenANSI replays the ordered raw cast event byte chunks through a
-// throwaway width x height vt emulator and returns an ANSI byte sequence that,
-// fed into a fresh emulator of the same size, reproduces the resulting screen
-// (cell text + final cursor position). Colors/attributes are flattened to plain
-// text: the historical screen renders uncolored, which is acceptable for a SOL
-// monitor (live bytes after the snapshot carry full attributes). Returns an
-// empty slice when there is nothing to render (no events), so the caller can
-// skip emitting a snapshot frame.
-func renderCastScreenANSI(chunks [][]byte, width, height int) []byte {
-	if len(chunks) == 0 {
-		return nil
+// castSnapshot replays cast from t_us=0 up to the live edge, pageSize rows at
+// a time, and returns the reconstructed-screen frame (nil for a cast with no
+// events) and the cursor just past the last row replayed, where a follow
+// stream continues. The emulator lives only for this call, so a follow
+// stream that runs for hours afterward does not keep it alive.
+func (s *Server) castSnapshot(ctx context.Context, cast *model.ConsoleCast, pageSize int) ([]byte, int64, error) {
+	screen := newCastScreen(cast.Width, cast.Height)
+	defer screen.Close()
+	cursor := int64(0)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		rows, err := s.consoleStore.CastEventsSince(ctx, cast.ID, cursor, pageSize)
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, r := range rows {
+			screen.Write(r.Data)
+			cursor = r.TUs + 1
+		}
+		if len(rows) < pageSize {
+			return screen.ANSI(), cursor, nil // caught up to the live edge
+		}
 	}
+}
+
+// castScreen is a throwaway width x height emulator that cast bytes are
+// written into in order, one chunk at a time, and that then renders the
+// resulting screen as a snapshot.
+type castScreen struct {
+	emu     *vt.Emulator
+	height  int
+	written bool
+}
+
+func newCastScreen(width, height int) *castScreen {
 	if width <= 0 {
 		width = 80
 	}
@@ -74,11 +108,38 @@ func renderCastScreenANSI(chunks [][]byte, width, height int) []byte {
 		height = 24
 	}
 	emu := newQuietEmulator(width, height)
-	defer emu.Close() //nolint:errcheck
-	for _, c := range chunks {
-		_, _ = emu.Write(c) // vt consumes everything; never a meaningful error
+	// The snapshot reads only the visible screen. vt otherwise keeps a
+	// DefaultScrollbackSize (10,000-line) scrollback of full cell rows, about
+	// 90 MiB once a long cast has scrolled that far. 1 is the smallest size
+	// vt accepts (0 selects its default). It caps the main screen only; vt
+	// exposes no setter for the alternate screen's scrollback, which a SOL
+	// console reaches only through a full-screen program scrolling in it.
+	emu.SetScrollbackSize(1)
+	return &castScreen{emu: emu, height: height}
+}
+
+// Write feeds the next chunk of cast bytes.
+func (s *castScreen) Write(b []byte) {
+	s.written = true
+	_, _ = s.emu.Write(b) // vt consumes everything; never a meaningful error
+}
+
+// ANSI returns an ANSI byte sequence that, fed into a fresh emulator of the
+// same size, reproduces the screen the written bytes produced (cell text +
+// final cursor position). Colors/attributes are flattened to plain text: the
+// historical screen renders uncolored, which is acceptable for a SOL monitor
+// (live bytes after the snapshot carry full attributes). Returns nil when
+// nothing was written (no events), so the caller can skip emitting a snapshot
+// frame.
+func (s *castScreen) ANSI() []byte {
+	if !s.written {
+		return nil
 	}
-	return reproduceScreenANSI(emu.String(), emu.CursorPosition(), height)
+	return reproduceScreenANSI(s.emu.String(), s.emu.CursorPosition(), s.height)
+}
+
+func (s *castScreen) Close() {
+	_ = s.emu.Close()
 }
 
 // reproduceScreenANSI turns a rendered screen (vt.Emulator.String(): height

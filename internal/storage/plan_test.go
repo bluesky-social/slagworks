@@ -451,6 +451,132 @@ func TestPlan_RejectsBadRAIDMember(t *testing.T) {
 	}
 }
 
+// mdadm --create takes each member for its array alone, so a RAID member
+// can have no other use in the layout. Each case below gives one a second
+// use. Plan must refuse it before the first disk is touched; accepted, the
+// deploy either fails at mdadm or mount after sgdisk --zap-all has run, or
+// (whole disk) silently overwrites partitions Plan has just created.
+func TestPlan_RejectsRAIDMemberWithSecondUse(t *testing.T) {
+	inventory := []BlockDevice{
+		{Name: "sda", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+		{Name: "sdb", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+		{Name: "sdc", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+	}
+	cases := []struct {
+		name    string
+		layout  string
+		wantErr string
+	}{
+		{
+			// A one-token typo in a RAID1 script (sdb for sdb2). Plan
+			// partitions sdb and formats its ESP, then mdadm --create
+			// /dev/sdb writes its superblock over the GPT and its data
+			// area over sdb1. Nothing mounts sdb1, so the second ESP is
+			// lost without an error.
+			name: "whole disk that also declares partitions",
+			layout: `{
+				"layout": {
+					"sda": { "type": "disk", "ptable": "gpt", "partitions": [
+						{ "name": "sda1", "fs": "vfat", "size": "512M", "bootable": true },
+						{ "name": "sda2", "size": "rest" } ] },
+					"sdb": { "type": "disk", "ptable": "gpt", "partitions": [
+						{ "name": "sdb1", "fs": "vfat", "size": "512M", "bootable": true },
+						{ "name": "sdb2", "size": "rest" } ] },
+					"md0": { "type": "raid", "level": 1, "members": ["sda2", "sdb"], "fs": "ext4" }
+				},
+				"mounts": { "/": { "device": "md0" }, "/boot/efi": { "device": "sda1" } }
+			}`,
+			wantErr: `member "sdb" is a whole disk that also declares partitions`,
+		},
+		{
+			name: "member listed twice in one array",
+			layout: `{
+				"layout": {
+					"sda": { "type": "disk", "ptable": "gpt", "partitions": [
+						{ "name": "sda1", "size": "100G" },
+						{ "name": "sda2", "fs": "ext4", "size": "rest" } ] },
+					"md0": { "type": "raid", "level": 1, "members": ["sda1", "sda1"], "fs": "ext4" }
+				},
+				"mounts": { "/": { "device": "sda2" } }
+			}`,
+			wantErr: `member "sda1" is listed twice`,
+		},
+		{
+			name: "member shared by two arrays",
+			layout: `{
+				"layout": {
+					"sda": { "type": "disk", "ptable": "gpt", "partitions": [ { "name": "sda1", "size": "rest" } ] },
+					"sdb": { "type": "disk", "ptable": "gpt", "partitions": [ { "name": "sdb1", "size": "rest" } ] },
+					"sdc": { "type": "disk", "ptable": "gpt", "partitions": [ { "name": "sdc1", "size": "rest" } ] },
+					"md0": { "type": "raid", "level": 1, "members": ["sda1", "sdb1"], "fs": "ext4" },
+					"md1": { "type": "raid", "level": 1, "members": ["sda1", "sdc1"], "fs": "ext4" }
+				},
+				"mounts": { "/": { "device": "md0" }, "/srv": { "device": "md1" } }
+			}`,
+			wantErr: `raid "md1": member "sda1" is already a member of raid "md0"`,
+		},
+		{
+			// The member declares fs, so the mount check for fs-less
+			// partitions does not catch it.
+			name: "member also mounted",
+			layout: `{
+				"layout": {
+					"sda": { "type": "disk", "ptable": "gpt", "partitions": [ { "name": "sda1", "fs": "ext4", "size": "rest" } ] },
+					"sdb": { "type": "disk", "ptable": "gpt", "partitions": [ { "name": "sdb1", "fs": "ext4", "size": "rest" } ] },
+					"md0": { "type": "raid", "level": 1, "members": ["sda1", "sdb1"], "fs": "xfs" }
+				},
+				"mounts": { "/": { "device": "md0" }, "/srv": { "device": "sda1" } }
+			}`,
+			wantErr: `mount "/srv" references "sda1", a member of raid "md0"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmds, err := Plan(mustParseLayout(t, tc.layout), inventory)
+			if err == nil {
+				logPlan(t, cmds)
+				t.Fatalf("Plan accepted the layout; want an error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Plan rejected the layout for another reason:\n  got:  %v\n  want: an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// Whole-disk members stay valid on a disk that declares no partitions, and
+// a partition member may share its disk with a mounted partition.
+func TestPlan_AcceptsRAIDMembersWithOneUse(t *testing.T) {
+	layout := mustParseLayout(t, `{
+		"layout": {
+			"sda": { "type": "disk", "ptable": "gpt", "partitions": [
+				{ "name": "sda1", "fs": "vfat", "size": "512M", "bootable": true },
+				{ "name": "sda2", "size": "rest" } ] },
+			"sdb": { "type": "disk", "ptable": "gpt", "partitions": [
+				{ "name": "sdb1", "fs": "vfat", "size": "512M", "bootable": true },
+				{ "name": "sdb2", "size": "rest" } ] },
+			"sdc": { "type": "disk", "ptable": "gpt" },
+			"sdd": { "type": "disk", "ptable": "gpt" },
+			"mdroot": { "type": "raid", "level": 1, "members": ["sda2", "sdb2"], "fs": "ext4" },
+			"mddata": { "type": "raid", "level": 0, "members": ["sdc", "sdd"], "fs": "xfs" }
+		},
+		"mounts": {
+			"/": { "device": "mdroot" },
+			"/boot/efi": { "device": "sda1" },
+			"/data": { "device": "mddata" }
+		}
+	}`)
+	inventory := []BlockDevice{
+		{Name: "sda", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+		{Name: "sdb", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+		{Name: "sdc", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+		{Name: "sdd", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+	}
+	if _, err := Plan(layout, inventory); err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+}
+
 func TestPlan_RejectsUnsupportedFS(t *testing.T) {
 	layout := mustParseLayout(t, `{
 		"layout": {
@@ -974,6 +1100,69 @@ func TestPlan_RejectsMountingRAIDWithoutFS(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for mounting a RAID device with no filesystem")
+	}
+}
+
+// Swap is formatted with mkswap but is not a mountable filesystem: a mount
+// of it fails with "unknown filesystem type 'swap'" after the disks were
+// zapped. Plan must refuse it up front, whatever kind of device holds it.
+func TestPlan_RejectsMountingSwap(t *testing.T) {
+	inventory := []BlockDevice{
+		{Name: "sda", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+		{Name: "sdb", SizeBytes: 1 << 40, LogicalSectorBytes: 512},
+	}
+	cases := []struct {
+		name   string
+		layout string
+	}{
+		{
+			name: "swap partition",
+			layout: `{
+				"layout": {
+					"sda": { "type": "disk", "ptable": "gpt", "partitions": [
+						{ "name": "sda1", "fs": "swap", "size": "8G" },
+						{ "name": "sda2", "fs": "ext4", "size": "rest" } ] }
+				},
+				"mounts": { "/": { "device": "sda2" }, "/swap": { "device": "sda1" } }
+			}`,
+		},
+		{
+			name: "swap raid array",
+			layout: `{
+				"layout": {
+					"sda": { "type": "disk", "ptable": "gpt", "partitions": [
+						{ "name": "sda1", "size": "8G" },
+						{ "name": "sda2", "fs": "ext4", "size": "rest" } ] },
+					"sdb": { "type": "disk", "ptable": "gpt", "partitions": [ { "name": "sdb1", "size": "8G" } ] },
+					"mdswap": { "type": "raid", "level": 1, "members": ["sda1", "sdb1"], "fs": "swap" }
+				},
+				"mounts": { "/": { "device": "sda2" }, "/swap": { "device": "mdswap" } }
+			}`,
+		},
+		{
+			name: "swap preserve array",
+			layout: `{
+				"layout": {
+					"sda": { "type": "disk", "ptable": "gpt", "partitions": [ { "name": "sda1", "fs": "ext4", "size": "rest" } ] },
+					"mdswap": { "type": "preserve", "level": 1, "members": ["sdy1", "sdz1"], "fs": "swap",
+						"array_uuid": "22222222-2222-2222-2222-222222222222" }
+				},
+				"mounts": { "/": { "device": "sda1" }, "/swap": { "device": "mdswap" } }
+			}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmds, err := Plan(mustParseLayout(t, tc.layout), inventory)
+			const want = `mount "/swap" references swap device`
+			if err == nil {
+				logPlan(t, cmds)
+				t.Fatalf("Plan accepted the layout; want an error containing %q", want)
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("Plan rejected the layout for another reason:\n  got:  %v\n  want: an error containing %q", err, want)
+			}
+		})
 	}
 }
 
