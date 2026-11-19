@@ -453,7 +453,9 @@ wait:
 		return nil
 	case tui.OutcomeFailed:
 		if reason != "" {
-			return fmt.Errorf("operation %s failed: %s", opID, reason)
+			// The failure cause is the target agent's own report, and main
+			// prints this error to the terminal.
+			return fmt.Errorf("operation %s failed: %s", opID, format.Untrusted(reason))
 		}
 		return errOperationFailed(opID)
 	default:
