@@ -385,15 +385,23 @@ func (c *Cache) recordBMCReconcileReport(machineID, operationID uuid.UUID, rep m
 }
 
 // RecordPhoneHome is the canonical signal that the installed OS
-// booted successfully. It completes the active deploy op (queues an
-// op_update with status=completed, which flows through the hub and
-// transitions Machine.state from `deploying` → `running`) and updates
+// booted successfully. It completes the active deploy op and updates
 // the local cache state.
 //
+// The completion travels on two channels. The phone_home observation
+// carries the deploy op's ID and is the durable one: it sits in the
+// SQLite outbox until global acks it, and global's observation handler
+// completes the op (deploying → running) from it. That matters because
+// the installed OS phones home exactly once after a 2xx, so nothing
+// re-sends the completion if it is lost after we answer. The op_update
+// with status=completed is memory-only (lost on a worker restart, on a
+// connection that dies before the hub reads it, or on a failed hub
+// handler call); it stays as the existing path, and whichever of the
+// two reaches global first completes the op while the other is a no-op.
+//
 // If no active deploy op is found (late phone-home, op already
-// completed by timeout, etc.), the observation still goes out —
-// global ignores it for state transitions but the deploy_logs and
-// audit trail still benefit.
+// completed by timeout, etc.), the observation still goes out with no
+// operation ID: global acks it without a state transition.
 func (c *Cache) RecordPhoneHome(machineID uuid.UUID) {
 	// opState records the local machine-state advance as an overlay rather
 	// than mutating the (immutable) view: the machine stays `running`
@@ -403,13 +411,14 @@ func (c *Cache) RecordPhoneHome(machineID uuid.UUID) {
 	deployOpID := c.opState.recordPhoneHome(machineID)
 
 	c.appendObservation(model.Observation{
-		MachineID: machineID,
-		Event:     "phone_home",
-		Timestamp: time.Now(),
+		MachineID:   machineID,
+		OperationID: deployOpID,
+		Event:       "phone_home",
+		Timestamp:   time.Now(),
 	})
 
-	if deployOpID != "" {
-		c.RecordOpUpdate(deployOpID, string(model.OpCompleted), nil)
+	if deployOpID != uuid.Nil {
+		c.RecordOpUpdate(deployOpID.String(), string(model.OpCompleted), nil)
 	}
 }
 

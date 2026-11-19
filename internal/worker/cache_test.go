@@ -3,6 +3,7 @@ package worker
 import (
 	"encoding/json"
 	"net"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/uuid"
@@ -476,6 +477,53 @@ func TestCacheRecordPhoneHome_NoActiveOpStillEmitsObs(t *testing.T) {
 	if len(updates) != 0 {
 		t.Errorf("no active op → no op_update expected, got: %+v", updates)
 	}
+}
+
+// TestRecordPhoneHome_CompletionSurvivesRestart pins that the deploy's
+// completion is durable once the worker has answered the phone-home. The
+// installed OS stops phoning home after its first 2xx, so if the only
+// record of the completion is the memory-only op_update, a worker restart
+// before the drain loop sends it loses the completion for good: global
+// keeps the op at awaiting_phone_home and fails the healthy host at
+// PhoneHomeTimeout. The phone_home observation is persisted in the SQLite
+// outbox, so it must name the deploy op for global to complete it from.
+func TestRecordPhoneHome_CompletionSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.db")
+	db, err := OpenLocalDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, opID := uuid.New(), uuid.New()
+	c := NewCache(db)
+	c.ApplySnapshot(snapMachine(id, "52:54:00:e1:00:01", model.MachineStateDeploying))
+	seedOpsResync(c, model.Operation{
+		ID: opID, MachineID: id, Type: model.OpDeploy,
+		Status: model.OpClaimed, Phase: "awaiting_phone_home",
+	})
+
+	// The installed OS phones home; a nil return is what gives it its 200.
+	if err := c.HandleProgressReport(&model.ProgressReport{
+		MachineID: id.String(), OperationID: opID.String(), Event: "phone_home",
+	}); err != nil {
+		t.Fatalf("phone_home: %v", err)
+	}
+
+	// The worker restarts before the drain loop sends anything.
+	closeLocalDB(t, db)
+	db2, err := OpenLocalDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeLocalDB(t, db2) })
+	obs, updates := NewCache(db2).DrainOutbox()
+
+	for _, p := range obs {
+		if p.Obs.Event == "phone_home" && p.Obs.OperationID == opID && p.Obs.MachineID == id {
+			return
+		}
+	}
+	t.Fatalf("after a restart no durable phone_home observation names deploy op %s (observations %+v, op updates %+v): "+
+		"global never learns the host phoned home and fails the deploy at PhoneHomeTimeout", opID, obs, updates)
 }
 
 // TestHandleProgressReport_DeployComplete_WithBMCCreds verifies the
