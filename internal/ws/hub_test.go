@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2135,6 +2136,158 @@ func TestHub_PublishDuringResyncOrdersAfter(t *testing.T) {
 		t.Fatalf("delta version = %d, want 2 (the newer post-resync state)", d.Operation.Version)
 	}
 	<-published
+}
+
+// TestHub_OpStreamKeepsPublishOrderPerConnection: two op-stream publishes
+// made back to back from one goroutine reach the worker in publish order,
+// here an op that is created (op_delta v0, pending) and immediately aborted
+// (op_removed v1). The workerConn doc promises this ordering.
+//
+// A hub that writes each publish from its own goroutine leaves the wire
+// order to the scheduler. The test pins the process to one P so that order
+// is deterministic rather than occasional: there a goroutine started last
+// is run first, which puts the op_removed on the wire ahead of the
+// op_delta on every round.
+func TestHub_OpStreamKeepsPublishOrderPerConnection(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop1", "worker-1")
+	hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}})
+	machine := uuid.New()
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"},
+		Machines: []model.MachineSnapshot{{ID: machine}}})
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for round := 0; round < 50; round++ {
+		op := model.Operation{ID: uuid.New(), MachineID: machine, Type: model.OpPowerCycle, Status: model.OpPending}
+		hub.PublishOpDelta(op, "")
+		op.Status, op.Version = model.OpFailed, 1
+		hub.PublishOpRemoved(op, "")
+
+		var order []string
+		for len(order) < 2 {
+			env, err := conn.ReadMessage(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if env.Type == TypeOpDelta || env.Type == TypeOpRemoved {
+				order = append(order, env.Type)
+			}
+		}
+		if order[0] != TypeOpDelta || order[1] != TypeOpRemoved {
+			t.Fatalf("round %d: published op_delta(v0) then op_removed(v1) for op %s; the worker received %v", round, op.ID, order)
+		}
+	}
+}
+
+// TestHub_PushKeepsOrderPerConnection is the snapshot counterpart of
+// TestHub_OpStreamKeepsPublishOrderPerConnection: two snapshots pushed back
+// to back for a site reach its worker in push order. Same single-P pin, for
+// the same reason.
+func TestHub_PushKeepsOrderPerConnection(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop1", "worker-1")
+	hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}})
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"}})
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for round := 0; round < 50; round++ {
+		first := int64(2 + 2*round)
+		hub.Push("pop1", model.SiteSnapshot{SeqNum: first, Site: model.SiteInfo{Slug: "pop1"}})
+		hub.Push("pop1", model.SiteSnapshot{SeqNum: first + 1, Site: model.SiteInfo{Slug: "pop1"}})
+
+		var seqs []int64
+		for len(seqs) < 2 {
+			env, err := conn.ReadMessage(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if env.Type != TypeSnapshot {
+				continue
+			}
+			var m SnapshotMsg
+			if err := unmarshalData(env.Data, &m); err != nil {
+				t.Fatal(err)
+			}
+			seqs = append(seqs, m.Snapshot.SeqNum)
+		}
+		if seqs[0] != first || seqs[1] != first+1 {
+			t.Fatalf("round %d: pushed snapshots %d then %d; the worker received %v", round, first, first+1, seqs)
+		}
+	}
+}
+
+// TestHub_OutboundQueueFullForcesReconnect: when a worker's outbound queue
+// fills (its writer is stuck on a write because the worker stopped
+// reading), publishing neither blocks nor drops the message unnoticed: the
+// hub force-closes the connection, and the reconnect's hello resync
+// replaces what was queued. Holding the conn's opStreamMu stands in for
+// the stuck write, since the writer needs it for its first op message.
+func TestHub_OutboundQueueFullForcesReconnect(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop1", "worker-1")
+	hub := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}})
+	hub.Push("pop1", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"}})
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	var wc *workerConn
+	hub.mu.RLock()
+	for c := range hub.connections["pop1"] {
+		wc = c
+	}
+	hub.mu.RUnlock()
+	wc.opStreamMu.Lock()
+	defer wc.opStreamMu.Unlock()
+
+	// The writer holds at most one message while it waits on opStreamMu and
+	// the queue holds outboundQueueSize more, so this many publishes
+	// overflow it however far the writer got.
+	op := model.Operation{ID: uuid.New(), MachineID: uuid.New(), Type: model.OpPowerCycle, Status: model.OpFailed, Version: 1}
+	published := make(chan struct{})
+	go func() {
+		for i := 0; i < outboundQueueSize+2; i++ {
+			hub.PublishOpRemoved(op, "")
+		}
+		close(published)
+	}()
+	select {
+	case <-published:
+	case <-time.After(3 * time.Second):
+		t.Fatal("PublishOpRemoved blocked on a worker whose outbound queue is full")
+	}
+	waitUntil(t, func() bool {
+		hub.mu.RLock()
+		defer hub.mu.RUnlock()
+		return len(hub.connections["pop1"]) == 0
+	}, 3*time.Second)
 }
 
 // TestHub_OpDeltaIsSlugScoped pins the confidentiality fix: an op_delta

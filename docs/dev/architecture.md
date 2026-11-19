@@ -464,10 +464,15 @@ cast pipeline, and the `SourceSOL` constant no longer exists.
 - Registers each connection under its `SiteSlug` derived from the
   token (`register`, 373).
 - Fans snapshot pushes out to every connected worker for the slug
-  (`Push`, 301) — one goroutine per worker, per-connection write
-  order preserved via `workerConn.writeMu`. A push whose SeqNum is
-  below the cached one closes the slug's connections instead, so each
-  worker reconnects and adopts the new snapshot from its hello reply.
+  (`Push`, 301). Each connection has one outbound queue, drained by its
+  own writer goroutine, that carries both snapshot pushes and op-stream
+  messages, so a worker receives them in the order the hub published
+  them and a slow worker never delays the others. A queue that fills
+  (the worker stopped reading) force-closes the connection, and the
+  reconnect's hello resends the snapshot and the op set. A push whose
+  SeqNum is below the cached one closes the slug's connections instead,
+  so each worker reconnects and adopts the new snapshot from its hello
+  reply.
 - On hello, sends a snapshot or `no_change`. Coalesces concurrent
   hello-triggered rebuilds through a
   `singleflight.Group` (`helloRebuild`, 226).
