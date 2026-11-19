@@ -15,6 +15,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -37,8 +38,20 @@ import (
 // documented is gone: build.sh now bakes the slagworks BOOT hook
 // into the initrd at image-build time, so what we download is what
 // we serve.
+//
+// Each name becomes <imagesDir>/<name>, which pullImage removes and
+// replaces, so a name that fails model.ValidateImageName is skipped
+// before anything is downloaded or touched: "." or ".." would otherwise
+// point that removal at imagesDir or its parent. A skipped name does not
+// stop the other images from syncing; it is reported in the returned
+// error.
 func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Image) error {
+	var refused []error
 	for name, img := range images {
+		if err := model.ValidateImageName(name); err != nil {
+			refused = append(refused, fmt.Errorf("image not synced: %w; rename or delete the image row", err))
+			continue
+		}
 		if img.URL == "" {
 			continue
 		}
@@ -54,16 +67,16 @@ func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Ima
 
 		log.Info("downloading image", "name", name, "url", img.URL)
 		if err := pullImage(log, img, target); err != nil {
-			return fmt.Errorf("image %s: %w", name, err)
+			return errors.Join(append(refused, fmt.Errorf("image %s: %w", name, err))...)
 		}
 		// Marker is the last write — a transient failure before this
 		// point leaves the previous (intact) cache for rollback.
 		if err := os.WriteFile(markerPath, []byte(img.SHA256+"\n"), 0644); err != nil {
-			return fmt.Errorf("image %s marker: %w", name, err)
+			return errors.Join(append(refused, fmt.Errorf("image %s marker: %w", name, err))...)
 		}
 		log.Info("image ready", "name", name, "sha256", img.SHA256)
 	}
-	return nil
+	return errors.Join(refused...)
 }
 
 // minProgressBytes is the smallest download that emits progress snapshots

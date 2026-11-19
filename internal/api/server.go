@@ -1877,6 +1877,12 @@ func (s *Server) createImage(c *echo.Context) error {
 	if img.Name == "" || img.Version == "" || img.SHA256 == "" || img.URL == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "name, version, sha256, and url are required")
 	}
+	// The name becomes a directory on every site worker; "..", "." or a
+	// name with a slash would point SyncImages' remove-and-replace outside
+	// that worker's images dir.
+	if err := model.ValidateImageName(img.Name); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
 	if err := s.store.CreateImage(&img); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
@@ -1904,6 +1910,11 @@ func (s *Server) upsertImage(c *echo.Context) error {
 	img.Name = c.Param("name")
 	if img.Name == "" || img.Version == "" || img.SHA256 == "" || img.URL == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "name (in path), version, sha256, and url are required")
+	}
+	// Same check as createImage: the name becomes a directory on every
+	// site worker.
+	if err := model.ValidateImageName(img.Name); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 	if err := s.store.UpsertImage(&img); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())

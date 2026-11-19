@@ -662,7 +662,10 @@ snapshot's images map. For each image it compares the on-disk
 `sha256`; on mismatch it downloads the tarball from the URL in the
 image row and calls `extractTarGz` (`imagepull.go:173`). Idempotent
 and safe under concurrent snapshot applies (see
-`imageSyncMu` in the cache).
+`imageSyncMu` in the cache). The image name becomes the directory it
+removes and replaces, so it skips, with an error, a name that fails
+`model.ValidateImageName` before downloading anything, and still syncs
+the other images; the API applies the same rule when the row is written.
 
 ## The on-target agent
 
