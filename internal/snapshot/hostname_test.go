@@ -67,6 +67,27 @@ func TestHostnameTemplate_Unset(t *testing.T) {
 	}
 }
 
+// NetBox stores a device name as free text. A name that does not make a
+// valid hostname gives none (the agent keeps the image's default) instead of
+// a malformed /etc/hostname, and instead of a newline that would add lines
+// to the deployed host's /etc/hosts.
+func TestHostnameTemplate_NotAHostname(t *testing.T) {
+	assertExpansions(t, HostnameTemplate{}, map[string]string{
+		"web1\n203.0.113.9 registry.example.net": "",
+		"web 1.pop1":                             "",
+		"web_1.pop1":                             "",
+		"web1..pop1":                             "",
+		"-web1.pop1":                             "",
+	})
+	assertExpansions(t, mustParseHostnameTemplate(t, internalZoneTemplate), map[string]string{
+		"web1\n203.0.113.9 registry.pop1": "",
+		"web 1.pop1":                      "",
+		"web1.po p1":                      "",
+		// Already qualified: passed through, so still checked.
+		"web 1.internal.pop1.example.net": "",
+	})
+}
+
 func TestHostnameTemplate_NamePlaceholder(t *testing.T) {
 	assertExpansions(t, mustParseHostnameTemplate(t, "{name}.example.net"), map[string]string{
 		// {name} needs no dot: every non-empty name expands.

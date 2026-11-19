@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/bluesky-social/slagworks/internal/model"
 )
 
 // HostnameTemplate derives a machine's deployed hostname
@@ -69,11 +71,21 @@ func (t HostnameTemplate) String() string { return t.raw }
 
 // Expand returns the hostname for a NetBox device name. Returns "" when the
 // template uses {node} or {zone} and the name has no dot, or nothing on one
-// side of its last dot (no zone to place): the agent then leaves the deployed
-// image's default hostname rather than writing a malformed one. That check
-// runs before the already-qualified passthrough, so it holds even for a name
-// that ends in the template's trailing literal.
+// side of its last dot (no zone to place), and when the result is not a
+// valid hostname (model.ValidHostname: NetBox device names are free text, and
+// a space or newline would corrupt /etc/hostname and /etc/hosts). The agent
+// then leaves the deployed image's default hostname rather than writing a
+// malformed one. The no-zone check runs before the already-qualified
+// passthrough, so it holds even for a name that ends in the template's
+// trailing literal.
 func (t HostnameTemplate) Expand(name string) string {
+	if h := t.expand(name); model.ValidHostname(h) {
+		return h
+	}
+	return ""
+}
+
+func (t HostnameTemplate) expand(name string) string {
 	name = strings.TrimSpace(name)
 	if t.raw == "" || name == "" {
 		return name

@@ -101,7 +101,11 @@ variable shown, so a flag on the command line overrides the variable.
   set, each deploy operation carries a single-use auth key (valid 2 hours)
   tagged `tag:<pop>`, where `<pop>` is the device's NetBox site slug, so
   the OAuth client must own those tags. Either empty disables enrollment;
-  a mint failure is logged and the deploy proceeds without it.
+  a mint failure is logged and the deploy proceeds without it. The same
+  happens, with no key minted, when the device's tailnet hostname
+  (`<name>-<pop>`, with a trailing `.<pop>` dropped from the name) is not a
+  valid hostname: dot-separated labels of letters, digits and hyphens, none
+  starting or ending with a hyphen.
 - **`SLAGWORKS_HOSTNAME_TEMPLATE`** / `--hostname-template` — how a
   deployed machine's hostname is derived from its NetBox device name.
   The agent writes the result to `/etc/hostname` and `/etc/hosts`.
@@ -119,7 +123,10 @@ variable shown, so a flag on the command line overrides the variable.
   (here `.example.net`) is used unchanged. When the template uses
   `{node}` or `{zone}` and a device name has no dot (or nothing on one
   side of its last dot), the machine gets no hostname from slagworks
-  and keeps the deployed image's default. Any other `{...}`, or a
+  and keeps the deployed image's default. So does a machine whose result
+  is not a valid hostname (dot-separated labels of letters, digits and
+  hyphens, none starting or ending with a hyphen), such as a device name
+  with a space or an underscore in it. Any other `{...}`, or a
   template with no placeholder, is a configuration error: global
   refuses to start. Changing the template changes the hostname every
   machine gets on its next deploy.

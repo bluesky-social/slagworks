@@ -835,8 +835,11 @@ command line arguments (`internal/httpboot/handler.go:381`):
 - `slagworks.destructive`
 - `slagworks.wipe_all_disks`
 - `slagworks.recovery`
-- `slagworks.tailscale_authkey=<key>` (when a Tailscale runtime blob
-  is attached)
+- `slagworks.tailscale_authkey=<key>` and
+  `slagworks.tailscale_hostname=<name>` (when a Tailscale runtime blob
+  is attached; neither when its hostname is not a valid hostname, so
+  the agent skips enrollment rather than the device name reaching the
+  script)
 
 The agent parses the boolean flags (`cmd/slagworks-agent/main.go:136`)
 and consumes them:
