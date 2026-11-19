@@ -381,6 +381,9 @@ func (r *webhookRecorder) OnDeviceDeleted(_ context.Context, deviceID int, confi
 	r.deletes = append(r.deletes, deleteCall{deviceID, configSlug})
 	return nil
 }
+func (r *webhookRecorder) OnDeviceMoved(_ context.Context, _ int) error {
+	return nil
+}
 func (r *webhookRecorder) OnDeviceExternalDrift(_ context.Context, _ int, _ []string, _ string) error {
 	return nil
 }

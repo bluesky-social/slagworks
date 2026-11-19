@@ -109,6 +109,47 @@ func TestAppendConsoleCastEvents_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestScanCastEventsForNonce_MatchesLiterally: the scan answers "did
+// this marker reach the machine's console". The nonce is matched as a
+// literal byte string: an empty nonce names no marker, and SQL LIKE
+// metacharacters ('%', '_') are ordinary bytes, so neither reports a hit
+// merely because the console printed something. A marker split across
+// two pump flushes (two event rows) still matches.
+func TestScanCastEventsForNonce_MatchesLiterally(t *testing.T) {
+	st := testStore(t)
+	mid, cast := mustEnsureCast(t, st)
+	if err := st.AppendConsoleCastEvents(context.Background(), CastEventBatch{
+		CastID: cast.ID,
+		Events: []CastEventInput{
+			{TUs: 1, Data: []byte("Linux version 6.8.0 ... Command line: console=tty0\r\nSLAG-CONSOLE-PROBE-m-aaaa0000")},
+			{TUs: 2, Data: []byte("11112222\n")},
+		},
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	for _, tc := range []struct {
+		nonce string
+		want  bool
+	}{
+		{"", false},
+		{"%", false},
+		{"_", false},
+		{"L_nux", false},
+		{"aaaa%2222", false},
+		{"version 6.8.0", true},
+		{"aaaa000011112222", true}, // spans the two rows
+	} {
+		hit, err := st.ScanCastEventsForNonce(context.Background(), mid, tc.nonce, time.Hour)
+		if err != nil {
+			t.Fatalf("scan %q: %v", tc.nonce, err)
+		}
+		if hit != tc.want {
+			t.Errorf("ScanCastEventsForNonce(nonce=%q) = %v, want %v", tc.nonce, hit, tc.want)
+		}
+	}
+}
+
 // TestLiveEdgeCastFloor: NULL fallback (empty cast) returns 0;
 // otherwise returns MAX(t_us)+1. The +1 matters: setting the floor
 // to exactly MAX(t_us) would still match the historical event with

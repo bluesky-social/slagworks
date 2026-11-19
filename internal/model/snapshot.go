@@ -191,8 +191,8 @@ type MachineSnapshot struct {
 	// gets "oob-gw-1.internal.pop1.example.net". With no template it is the
 	// device name. The deploy agent writes this to /etc/hostname +
 	// /etc/hosts on the target. Empty when the template needs {node}/{zone}
-	// and Hostname has no dot to split at (agent then leaves the image
-	// default).
+	// and Hostname has no dot to split at, or when the result is not a valid
+	// hostname (agent then leaves the image default).
 	FQDN        string              `json:"fqdn,omitempty"`
 	Interfaces  []SnapshotInterface `json:"interfaces,omitempty"`
 	BMCIP       string              `json:"bmc_ip,omitempty"`

@@ -174,16 +174,29 @@ type Interface struct {
 }
 
 // GetMAC returns the interface's MAC address, preferring the primary MAC,
-// falling back to the first entry in mac_addresses (NetBox v4.3+).
+// falling back to the first entry in mac_addresses (NetBox v4.3+). The
+// fallback suits readers identifying the NIC; code deciding whether the
+// primary still needs setting must use primaryMACAddress.
 func (i Interface) GetMAC() string {
-	if i.MACAddress != "" {
-		return i.MACAddress
-	}
-	if i.PrimaryMAC != nil && i.PrimaryMAC.MACAddress != "" {
-		return i.PrimaryMAC.MACAddress
+	if mac := i.primaryMACAddress(); mac != "" {
+		return mac
 	}
 	if len(i.MACAddresses) > 0 {
 		return i.MACAddresses[0].MACAddress
+	}
+	return ""
+}
+
+// primaryMACAddress returns the MAC NetBox reports as the interface's
+// own: mac_address, which NetBox derives from primary_mac_address. It is
+// empty when MAC objects are assigned to the interface but none is marked
+// primary.
+func (i Interface) primaryMACAddress() string {
+	if i.MACAddress != "" {
+		return i.MACAddress
+	}
+	if i.PrimaryMAC != nil {
+		return i.PrimaryMAC.MACAddress
 	}
 	return ""
 }

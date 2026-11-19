@@ -171,7 +171,9 @@ against NetBox, then:
   Only a device with no stored entry (a new BMC) gets a freshly generated
   password, which is stored there;
 - disables and clears every other named account (a leftover
-  `slagworks` or `maas` account, for example);
+  `slagworks` or `maas` account, for example). When no empty slot is
+  left for `monitor`, it takes a leftover's slot instead, disabling the
+  leftover before renaming it;
 - brings the BMC's time settings into compliance (see "Time compliance"
   below).
 

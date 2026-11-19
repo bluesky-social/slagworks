@@ -6,6 +6,15 @@ import (
 	"testing"
 )
 
+// testDisks is an inventory of 8 GiB disks with 512-byte logical sectors.
+func testDisks(names ...string) []BlockDevice {
+	inv := make([]BlockDevice, len(names))
+	for i, name := range names {
+		inv[i] = BlockDevice{Name: name, SizeBytes: 8 << 30, LogicalSectorBytes: 512}
+	}
+	return inv
+}
+
 // cmdIndex returns the index of the first command matching pred, or -1.
 func cmdIndex(cmds []Command, pred func(Command) bool) int {
 	return slices.IndexFunc(cmds, pred)
@@ -87,7 +96,7 @@ func TestPlan_WipesPartitionsItDoesNotFormat(t *testing.T) {
 		},
 		Mounts: map[string]Mount{"/": {Device: "mdroot"}, "/boot/efi": {Device: "vdb2"}},
 	}
-	cmds, err := Plan(layout, []BlockDevice{{Name: "vda", LogicalSectorBytes: 512}, {Name: "vdb", LogicalSectorBytes: 512}})
+	cmds, err := Plan(layout, testDisks("vda", "vdb"))
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -151,7 +160,7 @@ func TestPlan_WipesRAIDArrayItDoesNotFormat(t *testing.T) {
 		},
 		Mounts: map[string]Mount{"/": {Device: "vda2"}, "/boot/efi": {Device: "vda1"}},
 	}
-	cmds, err := Plan(layout, []BlockDevice{{Name: "vda", LogicalSectorBytes: 512}, {Name: "vdb", LogicalSectorBytes: 512}, {Name: "vdc", LogicalSectorBytes: 512}})
+	cmds, err := Plan(layout, testDisks("vda", "vdb", "vdc"))
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
@@ -196,7 +205,7 @@ func TestPlan_NeverWipesPreservedOrRetainedDevices(t *testing.T) {
 			"/data": { "device": "mddata" }
 		}
 	}`)
-	cmds, err := Plan(layout, []BlockDevice{{Name: "nvme0n1", LogicalSectorBytes: 512}, {Name: "nvme1n1", LogicalSectorBytes: 512}, {Name: "nvme4n1", LogicalSectorBytes: 512}})
+	cmds, err := Plan(layout, testDisks("nvme0n1", "nvme1n1", "nvme4n1"))
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}

@@ -279,6 +279,93 @@ func TestRedactParams_FailsClosed(t *testing.T) {
 	}
 }
 
+// TestRedactParams_RepeatedKeyDropsEarlierMembers: JSON allows an object to
+// repeat a key, and DecodeParams merges the repeated members field by field,
+// so a credential in an earlier member still reaches the worker. The
+// operator view must not carry it, even when the last member holds no
+// credential: it keeps only the last member of the repeated key, the same
+// view RedactParams gives when the last member does hold one.
+func TestRedactParams_RepeatedKeyDropsEarlierMembers(t *testing.T) {
+	cases := map[string]struct {
+		in, want string
+	}{
+		"runtime repeated, last has no password": {
+			`{"bmc_runtime":{"username":"ADMIN","password":"fixture-bmc-pw"},"bmc_runtime":{"username":"ADMIN"}}`,
+			`{"bmc_runtime":{"username":"ADMIN"}}`,
+		},
+		"runtime repeated, last is null": {
+			`{"monitor_runtime":{"password":"fixture-monitor-pw"},"monitor_runtime":null}`,
+			`{"monitor_runtime":null}`,
+		},
+		"password repeated, last is empty": {
+			`{"amt_runtime":{"host":"h","username":"u","password":"fixture-amt-pw","password":""}}`,
+			`{"amt_runtime":{"host":"h","password":"","username":"u"}}`,
+		},
+		"repeat spelled with an escape": {
+			`{"tailscale_runtime":{"auth_key":"fixture-tskey","auth_key":"","hostname":"h"}}`,
+			`{"tailscale_runtime":{"auth_key":"","hostname":"h"}}`,
+		},
+		"outlets repeated, last is empty": {
+			`{"pdu_runtime":{"outlets":[{"pdu_host":"h","outlet":1,"password":"fixture-pdu-pw-1"}],"outlets":[]}}`,
+			`{"pdu_runtime":{"outlets":[]}}`,
+		},
+		"password repeated inside an outlet": {
+			`{"pdu_runtime":{"outlets":[{"outlet":1,"password":"fixture-pdu-pw-1","password":""}]}}`,
+			`{"pdu_runtime":{"outlets":[{"outlet":1,"password":""}]}}`,
+		},
+	}
+	for name, tc := range cases {
+		if !json.Valid([]byte(tc.in)) {
+			t.Fatalf("%s: fixture is not valid JSON", name)
+		}
+		got := RedactParams(json.RawMessage(tc.in))
+		if n := leakedFixtureSecrets(got); n > 0 {
+			t.Errorf("%s: the operator view still carries %d credential(s)", name, n)
+			continue
+		}
+		if string(got) != tc.want {
+			t.Errorf("%s: got %s, want %s", name, got, tc.want)
+		}
+	}
+}
+
+// TestDecodeParams_RefusesCaseVariantCredentialKeys: encoding/json matches
+// an object key to a struct field ignoring letter case, but RedactParams and
+// the terminal-op scrub (store.ScrubTerminalOperationCredentials) find a
+// credential by its exact key. Params that spell a key on a credential path
+// any other way would hand the worker a credential that operators see in the
+// clear and the operations table keeps forever, so DecodeParams refuses them
+// (and the worker fails the op).
+func TestDecodeParams_RefusesCaseVariantCredentialKeys(t *testing.T) {
+	for name, raw := range map[string]string{
+		"runtime key":           `{"BMC_Runtime":{"username":"ADMIN","password":"fixture-bmc-pw"}}`,
+		"credential key":        `{"bmc_runtime":{"username":"ADMIN","Password":"fixture-bmc-pw"}}`,
+		"outlets key":           `{"pdu_runtime":{"Outlets":[{"pdu_host":"h","outlet":1,"password":"fixture-pdu-pw-1"}]}}`,
+		"outlet credential key": `{"pdu_runtime":{"outlets":[{"pdu_host":"h","outlet":1},{"pdu_host":"h","outlet":2,"PASSWORD":"fixture-pdu-pw-2"}]}}`,
+		"amt credential key":    `{"amt_runtime":{"host":"h","username":"admin","passWord":"fixture-amt-pw"}}`,
+		"auth key":              `{"tailscale_runtime":{"AUTH_KEY":"fixture-tskey","hostname":"h"}}`,
+		"monitor runtime key":   `{"MONITOR_RUNTIME":{"password":"fixture-monitor-pw"}}`,
+		// U+017F LATIN SMALL LETTER LONG S folds to "s" under the Unicode
+		// simple folding encoding/json applies, so this decodes as password.
+		"unicode case folding": `{"bmc_runtime":{"pa\u017f\u017fword":"fixture-bmc-pw"}}`,
+		"beside the exact key": `{"bmc_runtime":{"password":"","Password":"fixture-bmc-pw"}}`,
+		// The decoder merges both members; the variant is in the first.
+		"under a repeated key": `{"bmc_runtime":{"Password":"fixture-bmc-pw"},"bmc_runtime":{"username":"ADMIN"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, err := DecodeParams(json.RawMessage(raw))
+			if err == nil {
+				decoded, _ := json.Marshal(p)
+				t.Fatalf("DecodeParams accepted a case-variant key: it decoded %d credential(s), and RedactParams leaves %d in the clear",
+					leakedFixtureSecrets(decoded), leakedFixtureSecrets(RedactParams(json.RawMessage(raw))))
+			}
+			if !strings.Contains(err.Error(), "letter case") {
+				t.Fatalf("DecodeParams failed for another reason, so the fixture no longer exercises the case check: %v", err)
+			}
+		})
+	}
+}
+
 // TestRedactParams_DoesNotMutateInput: the worker-facing publish shares the
 // op's Params bytes with the operator response, so redaction must never
 // write into its input.

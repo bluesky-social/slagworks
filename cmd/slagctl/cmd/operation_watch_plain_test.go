@@ -197,6 +197,29 @@ func TestWatchPlain_FailedOpExitsNonZero(t *testing.T) {
 	}
 }
 
+// The failure cause in the returned error is the target agent's report, and
+// main prints that error to the terminal, so control sequences in it must
+// come back escaped (here an OSC 52 clipboard write and a screen clear).
+func TestWatchPlain_EscapesFailureCause(t *testing.T) {
+	op := runningOp()
+	newFakeGlobal(t, op,
+		terminalEnvelope(op.MachineID, op.ID, model.OpFailed, "boom\x1b]52;c;cHduZWQ=\x07\x1b[2J"))
+	out, _ := tempOut(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := watchPlain(ctx, op, out, time.Hour)
+	if err == nil {
+		t.Fatal("plain watch of a failed op returned nil")
+	}
+	if strings.ContainsAny(err.Error(), "\x1b\x07") {
+		t.Errorf("returned error carries raw terminal controls: %q", err.Error())
+	}
+	if want := `boom\x1b]52;c;cHduZWQ=\x07\x1b[2J`; !strings.Contains(err.Error(), want) {
+		t.Errorf("returned error %q does not show the escaped cause %q", err.Error(), want)
+	}
+}
+
 // The subscription matches the machine as well as the op, so a terminal
 // envelope for another op on the same machine arrives too. It must not end
 // the watch.

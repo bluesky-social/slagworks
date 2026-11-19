@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // OpParams is the typed union of everything that can ride in an
@@ -39,7 +40,8 @@ import (
 // (RedactParams) and what the operations table drops once an op is
 // terminal (store.ScrubTerminalOperationCredentials);
 // TestOpParamsCredentialFieldsAreMarked fails on an unmarked
-// credential-looking field.
+// credential-looking field. Both match keys exactly, so DecodeParams
+// refuses a credential key spelled in any other letter case.
 type OpParams struct {
 	// Deploy flags.
 	Destructive  bool `json:"destructive,omitempty"`
@@ -233,12 +235,88 @@ func isJSONObject(raw []byte) bool {
 	return len(trimmed) > 0 && trimmed[0] == '{'
 }
 
+// transportKeys are the OpParams keys whose presence routes the executor
+// to a PDU or AMT controller instead of the BMC.
+var transportKeys = []string{"pdu_runtime", "amt_runtime"}
+
+// exactKeyPaths are the params locations that something other than
+// encoding/json reads, by exact key: every credential (RedactParams and
+// store.ScrubTerminalOperationCredentials) and each transport key (the
+// null check in DecodeParams).
+var exactKeyPaths = func() [][]string {
+	var paths [][]string
+	for _, p := range secretParamPaths {
+		paths = append(paths, p)
+	}
+	for _, k := range transportKeys {
+		paths = append(paths, []string{k})
+	}
+	return paths
+}()
+
+// refuseCaseVariantKey returns an error when v, walked along path, has a
+// key that differs from the path's key only in letter case: encoding/json
+// matches such a key to the field (by strings.EqualFold, its rule), but
+// the exact-key readers of exactKeyPaths do not see it. Every member of an
+// object is checked, a repeated key's earlier members included, because the
+// decoder reads them all. It runs on params the typed decode has accepted,
+// so each value it walks is the object or array the path expects, or null.
+// at is the dotted location of v, for the error.
+func refuseCaseVariantKey(v json.RawMessage, path []string, at string) error {
+	if len(path) == 0 {
+		return nil
+	}
+	if path[0] == EachElement {
+		at = strings.TrimSuffix(at, ".") + EachElement + "."
+		var elems []json.RawMessage
+		if err := json.Unmarshal(v, &elems); err != nil {
+			return fmt.Errorf("decode op params: %w", err)
+		}
+		for _, e := range elems {
+			if err := refuseCaseVariantKey(e, path[1:], at); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(v))
+	tok, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("decode op params: %w", err)
+	}
+	if tok != json.Delim('{') {
+		return nil // null: nothing below it
+	}
+	for dec.More() {
+		if tok, err = dec.Token(); err != nil {
+			return fmt.Errorf("decode op params: %w", err)
+		}
+		var child json.RawMessage
+		if err := dec.Decode(&child); err != nil {
+			return fmt.Errorf("decode op params: %w", err)
+		}
+		switch k, _ := tok.(string); {
+		case k == path[0]:
+			if err := refuseCaseVariantKey(child, path[1:], at+k+"."); err != nil {
+				return err
+			}
+		case strings.EqualFold(k, path[0]):
+			return fmt.Errorf("decode op params: key %q differs from %q only in letter case; write the exact key "+
+				"(the credential redaction, the terminal-op credential scrub and the transport check match keys exactly)",
+				at+k, at+path[0])
+		}
+	}
+	return nil
+}
+
 // DecodeParams unmarshals an operation's params blob into the typed
 // union. Empty/nil params and non-object params (null/array/scalar)
 // decode to the zero OpParams with no error — those carry no typed
 // content. A JSON object that fails to decode into OpParams (e.g. a
 // malformed runtime block) returns an error so a consumer can fail the
-// op cleanly rather than silently mis-parse it.
+// op cleanly rather than silently mis-parse it, and so does one that
+// spells a credential or transport key in any letter case but the exact
+// one (see refuseCaseVariantKey).
 func DecodeParams(raw json.RawMessage) (OpParams, error) {
 	var p OpParams
 	if len(raw) == 0 || !isJSONObject(raw) {
@@ -251,7 +329,7 @@ func DecodeParams(raw json.RawMessage) (OpParams, error) {
 	// IPMI). Fail closed: reject null explicitly.
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &probe); err == nil {
-		for _, key := range []string{"pdu_runtime", "amt_runtime"} {
+		for _, key := range transportKeys {
 			if v, ok := probe[key]; ok && bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
 				return OpParams{}, fmt.Errorf("decode op params: %s is null (must be an object); refusing to fall back to BMC transport", key)
 			}
@@ -259,6 +337,15 @@ func DecodeParams(raw json.RawMessage) (OpParams, error) {
 	}
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return OpParams{}, fmt.Errorf("decode op params: %w", err)
+	}
+	// encoding/json read {"bmc_runtime":{"Password":...}} as the BMC
+	// credential just now, but the redaction would show it to operators and
+	// the scrub would leave it in the table, since both look for "password"
+	// exactly; the null check above likewise missed {"PDU_Runtime":null}.
+	for _, path := range exactKeyPaths {
+		if err := refuseCaseVariantKey(raw, path, ""); err != nil {
+			return OpParams{}, err
+		}
 	}
 	return p, nil
 }

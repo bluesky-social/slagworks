@@ -115,9 +115,14 @@ func redactedJSON() json.RawMessage { return json.RawMessage(`"` + RedactedMarke
 // the credential paths are carried as raw JSON, never decoded. A credential
 // path whose shape cannot be walked (a string where the typed union has an
 // object, say) is withheld whole as the marker rather than passed through.
+// An object along a credential path that repeats the path's next key keeps
+// only that key's last member (what a jsonb column stores): earlier members
+// are dropped rather than passed through, because DecodeParams merges them
+// into the params a worker uses, credential included.
 //
-// raw is never modified. When nothing needs redacting, raw itself is
-// returned, so the result must be treated as read-only like the input.
+// raw is never modified. When nothing needs redacting or dropping, raw
+// itself is returned, so the result must be treated as read-only like the
+// input.
 func RedactParams(raw json.RawMessage) json.RawMessage {
 	out := raw
 	for _, p := range secretParamPaths {
@@ -173,11 +178,41 @@ func redactAt(v json.RawMessage, path SecretParamPath) (json.RawMessage, bool) {
 		return v, false
 	}
 	child, changed := redactAt(child, path[1:])
-	if !changed {
+	// obj holds only the last member of a repeated key, and only that member
+	// was walked. Returning v would pass any earlier member through
+	// unredacted, so v is kept only when the key occurs once; otherwise the
+	// re-encoded map drops the earlier members.
+	if !changed && soleMember(v, path[0]) {
 		return v, false
 	}
 	obj[path[0]] = child
 	return marshalOrWithhold(obj), true
+}
+
+// soleMember reports whether exactly one member of the JSON object v has
+// key, comparing keys after unescaping as json.Unmarshal does. Any decode
+// error reports false, so the caller re-encodes rather than returning v;
+// none is expected, since json.Unmarshal has already accepted v.
+func soleMember(v json.RawMessage, key string) bool {
+	dec := json.NewDecoder(bytes.NewReader(v))
+	if _, err := dec.Token(); err != nil {
+		return false
+	}
+	n := 0
+	for dec.More() {
+		k, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		if k == key {
+			n++
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return false
+		}
+	}
+	return n == 1
 }
 
 // marshalOrWithhold re-encodes a container of json.RawMessage values, all

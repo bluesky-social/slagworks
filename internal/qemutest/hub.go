@@ -174,8 +174,8 @@ func newFakeHub(env *Env) *FakeHub {
 
 // RegisterWorker creates an auth entry for a new site worker and
 // returns a plaintext token. The site worker dials with
-// `?token=<plaintext>` and FakeHub matches via hashed lookup (same as
-// production).
+// `Authorization: Bearer <plaintext>` and FakeHub matches via hashed
+// lookup (same as production).
 func (fh *FakeHub) RegisterWorker(slug, workerID, fqdn string) string {
 	var b [24]byte
 	if _, err := rand.Read(b[:]); err != nil {
