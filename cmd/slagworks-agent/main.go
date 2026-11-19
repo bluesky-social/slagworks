@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/agent"
+	"github.com/bluesky-social/slagworks/internal/agent/bootloader"
 	"github.com/bluesky-social/slagworks/internal/agent/execkit"
 	"github.com/bluesky-social/slagworks/internal/agentlog"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
@@ -259,6 +260,8 @@ func main() {
 		fatal:         fatal,
 		done:          done,
 		checkIdentity: verifyIdentity,
+		armBootNext:   bootloader.SetBootNextToInstalledOS,
+		reboot:        rebootInto,
 	})
 }
 

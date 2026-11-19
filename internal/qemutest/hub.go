@@ -239,6 +239,37 @@ func (fh *FakeHub) SetActiveOps(slug string, ops []model.Operation) {
 	fh.activeOps[slug] = stamped
 }
 
+// FailOperation ends an active operation the way global does for an
+// operator abort or a timeout sweep: the op leaves the slug's active set, so
+// a later op_resync does not carry it, and an op_removed carrying
+// machineState (the durable state the failure wrote; MachineStateFailed for
+// a claimed deploy) is fanned to every connected worker. It does not touch
+// the host, exactly like the real abort.
+func (fh *FakeHub) FailOperation(slug string, opID uuid.UUID, machineState model.MachineState) {
+	fh.mu.Lock()
+	var removed *model.Operation
+	var kept []model.Operation
+	for _, op := range fh.activeOps[slug] {
+		if op.ID == opID {
+			cp := op
+			removed = &cp
+			continue
+		}
+		kept = append(kept, op)
+	}
+	if removed == nil {
+		fh.mu.Unlock()
+		panic(fmt.Sprintf("qemutest: FailOperation: op %s is not in slug %q's active set", opID, slug))
+	}
+	fh.activeOps[slug] = kept
+	fh.opVersion[opID.String()]++
+	removed.Version = fh.opVersion[opID.String()]
+	removed.Status = model.OpFailed
+	fh.mu.Unlock()
+
+	fh.hub.PublishOpRemoved(*removed, machineState)
+}
+
 // opDeltaState returns the machine-state overlay an op_delta should carry
 // for a claimed/running lifecycle op (mirrors the hub's resync derivation
 // via opstate.ClaimTransition). Pending ops carry no state.

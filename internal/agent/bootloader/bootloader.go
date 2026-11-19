@@ -129,7 +129,8 @@ func InstallSystemdBoot(ctx *agent.Context, image, rootDev, espDev, machineID st
 	// fixed disks. Ubuntu's shim-install / grub-install does this
 	// automatically when run from inside the OS; we do it here from
 	// the deploy initrd because we never run grub-install (we ship
-	// systemd-boot pre-built).
+	// systemd-boot pre-built). BootNext is NOT set here: the deploy
+	// arms it once deploy_complete has been accepted.
 	if err := RegisterEFIBootEntry(ctx, espDev); err != nil {
 		// Hard failure: AMI Aptio (Supermicro AS-1115HS-TNR / pop1
 		// kworkers) refuses to boot from disk without an active
@@ -302,12 +303,21 @@ func SetGrubDefaultCmdline(path, cmdline string) error {
 // RegisterEFIBootEntry creates a UEFI Boot#### variable pointing at
 // the bootloader. Idempotent across redeploys: drops any existing
 // "Slagworks" entries first to avoid pile-up in BootOrder.
+//
+// It does not set BootNext. Registering the entry is part of installing
+// the bootloader and happens long before the deploy is complete; BootNext
+// commits the machine's next boot to the installed OS, so it is set only
+// once the site worker has accepted deploy_complete (SetBootNextToInstalledOS).
 func RegisterEFIBootEntry(ctx *agent.Context, espDev string) error {
 	if !IsUEFI() {
 		ctx.Log.Info("not booted in UEFI mode, skipping efibootmgr")
 		return nil
 	}
+	return registerEFIBootEntry(ctx, espDev)
+}
 
+// registerEFIBootEntry is RegisterEFIBootEntry on a host known to be UEFI.
+func registerEFIBootEntry(ctx *agent.Context, espDev string) error {
 	// efivarfs is required for efibootmgr to read/write
 	// EFI variables. On AMI Aptio firmware (pop1 H13 hosts) the
 	// kernel comes up with /sys/firmware/efi populated but
@@ -352,38 +362,58 @@ func RegisterEFIBootEntry(ctx *agent.Context, espDev string) error {
 	}
 
 	// `-c` creates a new entry and prepends it to BootOrder.
-	if err := ctx.Exec.Run("efibootmgr",
+	return ctx.Exec.Run("efibootmgr",
 		"-c",
 		"-d", disk,
 		"-p", fmt.Sprint(partNum),
 		"-L", "Slagworks",
 		"-l", `\EFI\BOOT\BOOTX64.EFI`,
-	); err != nil {
-		return err
-	}
+	)
+}
 
-	// Set BootNext to the Slagworks entry so the IMMEDIATE next boot
-	// goes to disk. On the AMI Aptio firmware these pop1 H13/RS501A
-	// hosts run, the OS-set BootOrder does NOT stick across the
-	// post-deploy reboot — the firmware network-boots first regardless
-	// of the order `-c` prepended, so the box re-PXEs into the deploy
-	// agent and loops (observed on kworker-l34-2, 2026-06-01).
-	// BootNext is a one-shot override AMI honors reliably, so it boots
-	// the freshly-installed OS once; from there the OS owns its own
-	// boot and phone-home completes. Best-effort: if we can't resolve
-	// the entry's boot number, log and continue — the host may still
-	// boot via BootOrder on firmware that does honor it.
+// SetBootNextToInstalledOS sets BootNext to the "Slagworks" entry so the
+// IMMEDIATE next boot goes to the installed disk. On the AMI Aptio firmware
+// the pop1 H13/RS501A hosts run, the OS-set BootOrder does NOT stick across
+// the post-deploy reboot: the firmware network-boots first regardless of the
+// order `-c` prepended, so the box re-PXEs (observed on kworker-l34-2,
+// 2026-06-01). BootNext is a one-shot override AMI honors reliably, so it
+// boots the freshly-installed OS once; from there the OS owns its own boot
+// and phone-home completes.
+//
+// The firmware honors BootNext ahead of everything else, including the
+// one-shot PXE override the site worker arms on the BMC before it power
+// cycles a host for its next operation. That is why the caller sets it only
+// after the site worker has accepted deploy_complete, immediately before the
+// reboot. Set while the bootloader was being installed, it stayed armed in
+// NVRAM through the rest of the deploy, so a deploy that was aborted, failed
+// or timed out after that point left the host's next boot committed to the
+// unfinished install: the next deploy's power cycle booted that disk instead
+// of PXE and the new operation waited out its timeout for an agent that
+// never came.
+//
+// Best-effort: without BootNext the host PXE-boots and the awaiting_phone_home
+// latch sends it to its disk, or the firmware follows BootOrder to the
+// registered entry. No-op on a BIOS host.
+func SetBootNextToInstalledOS(ctx *agent.Context) {
+	if !IsUEFI() {
+		return
+	}
+	setBootNextToInstalledOS(ctx)
+}
+
+// setBootNextToInstalledOS is SetBootNextToInstalledOS on a host known to be
+// UEFI.
+func setBootNextToInstalledOS(ctx *agent.Context) {
 	id, err := slagworksBootNum(ctx)
 	if err != nil {
-		ctx.Log.Warn("could not resolve Slagworks boot entry for BootNext; relying on BootOrder", "err", err)
-		return nil
+		ctx.Log.Warn("could not resolve Slagworks boot entry for BootNext; relying on the firmware boot order", "err", err)
+		return
 	}
 	if err := ctx.Exec.Run("efibootmgr", "-n", id); err != nil {
-		ctx.Log.Warn("efibootmgr -n (BootNext) failed; relying on BootOrder", "boot_id", id, "err", err)
-	} else {
-		ctx.Log.Info("set BootNext (Slagworks), next boot is the installed OS", "boot_id", id)
+		ctx.Log.Warn("efibootmgr -n (BootNext) failed; relying on the firmware boot order", "boot_id", id, "err", err)
+		return
 	}
-	return nil
+	ctx.Log.Info("set BootNext (Slagworks), next boot is the installed OS", "boot_id", id)
 }
 
 // slagworksBootNum re-reads efibootmgr and returns the 4-hex-digit boot
