@@ -42,9 +42,8 @@ func (s *Server) consoleProbe(c *echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "nonce too long")
 	}
 	// Reject anything outside hex. The agent emits 16 hex chars
-	// from rand.Read; restricting the API surface to hex prevents
-	// LIKE wildcard injection (a `%` nonce would match every event
-	// in the window and false-positive every probe).
+	// from rand.Read, so any other value cannot name one of its
+	// markers.
 	for _, ch := range nonce {
 		isHex := (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
 		if !isHex {

@@ -68,7 +68,10 @@ nonce marker (`consoleprobe.Sweep` in `internal/agent/consoleprobe/probe.go`),
 and global resolves which nonce actually arrived over BMC SOL in
 `console_cast_events` — then writes the winning `console=` back to the
 device type (`internal/commission/consolesweep.go`, WARN-logged with the
-evidence; it never overwrites a non-empty field). If no nonce arrives (no
+evidence; it never overwrites a non-empty field). Only a candidate from the
+probed set (`ttyS0` or `ttyS1` at 115200, with the 16-hex-character nonce the
+agent generates) can win; global ignores and WARN-logs any other candidate a
+commission report carries. If no nonce arrives (no
 SOL, no serial hardware), the field stays empty and deploy keeps refusing
 until you set a value manually or the explicit opt-out:
 
