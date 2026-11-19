@@ -251,6 +251,102 @@ func TestFrame_ErrorCauseSurvivesLongHistory(t *testing.T) {
 	}
 }
 
+// TestErrorPaneBody_WrapsMultiLineCause guards the agent failure shape: a
+// stage prefix, then the failing config script's stderr on following lines,
+// ending in what to fix. The cause must be wrapped to the pane width, one row
+// per line, never clamped to a single ellipsized row (which cut off the
+// actionable text) nor left as one entry with embedded newlines (which broke
+// the box's row budget). Log history tails into the rows that remain.
+func TestErrorPaneBody_WrapsMultiLineCause(t *testing.T) {
+	in := frameInput{
+		failReason: "net: script failed\nERROR: no bond. Fix the NetBox model.",
+		logLines:   []string{"log 1", "log 2", "log 3", "log 4"},
+	}
+	got := errorPaneBody(in, 20, 5)
+	want := []string{
+		"net: script failed",
+		"ERROR: no bond. Fix ",
+		"the NetBox model.",
+		"log 3",
+		"log 4",
+	}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("errorPaneBody =\n%q\nwant\n%q", got, want)
+	}
+
+	// A cause taller than the pane keeps the stage line and the END (where
+	// the script's decisive ERROR is), marks the cut, and leaves no log rows.
+	in.failReason = "net: script failed\nWARNING: one\nWARNING: two\nWARNING: three\nERROR: fix the model"
+	got = errorPaneBody(in, 80, 4)
+	want = []string{"net: script failed", causeOmittedMarker, "WARNING: three", "ERROR: fix the model"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("errorPaneBody (4 rows) =\n%q\nwant\n%q", got, want)
+	}
+	got = errorPaneBody(in, 80, 2)
+	want = []string{"net: script failed", "ERROR: fix the model"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("errorPaneBody (2 rows) = %q, want %q", got, want)
+	}
+}
+
+// TestWrapLines_WideCharacters pins cell-aware wrapping: a script's stderr is
+// arbitrary text, and a row of wide characters wrapped by rune count would
+// render at twice the pane width and break the row budget.
+func TestWrapLines_WideCharacters(t *testing.T) {
+	for _, line := range wrapLines(strings.Repeat("界", 15), 10) {
+		if w := lipgloss.Width(line); w > 10 {
+			t.Errorf("wrapped row %q is %d cells wide, want <= 10", line, w)
+		}
+	}
+}
+
+// TestFrame_MultiLineFailureKeepsLayout renders a full frame with a multi-line
+// cause longer than the pane width and checks the whole cause is visible and
+// the frame height is unchanged from a one-line cause.
+func TestFrame_MultiLineFailureKeepsLayout(t *testing.T) {
+	frame := func(reason string) string {
+		lc := newLifecyclePane(model.OpDeploy)
+		lc.Observe("power_cycle", at(0))
+		lc.Observe("finalizing", at(30*time.Second))
+		now := fixedClock(at(42 * time.Second))
+		lc.now = now
+		lc.Fail(at(42 * time.Second))
+		return plain(renderFrame(frameInput{
+			opType:     model.OpDeploy,
+			machine:    "kworker-l34-1.pop1",
+			opID:       "8b2e3f1a",
+			startedAt:  at(0),
+			console:    newConsolePane(),
+			lifecycle:  lc,
+			logLines:   []string{"10:14:14 [agent ] FATAL during applying network config"},
+			done:       true,
+			failed:     true,
+			failReason: reason,
+			width:      minTermCols,
+			height:     minRows,
+			spinner:    "⠙",
+			now:        now,
+		}))
+	}
+	long := "applying network config: network script failed: exit status 1; script stderr:\n" +
+		"ERROR: kworker-l34-1 does not have exactly one bond interface (type=lag with an IP); " +
+		"found 0. Fix the NetBox model: create the bond, set both member NICs' lag field to " +
+		"it, assign the host IP to the bond, then redeploy.\n" +
+		"END-OF-CAUSE"
+	got := frame(long)
+	for _, want := range []string{"script stderr:", "ERROR: kworker-l34-1", "END-OF-CAUSE"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("frame missing %q from the cause:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "…") {
+		t.Errorf("cause must wrap, not ellipsize:\n%s", got)
+	}
+	if gotH, wantH := lipgloss.Height(got), lipgloss.Height(frame("one-line cause")); gotH != wantH {
+		t.Errorf("frame height = %d with a multi-line cause, want %d (layout must not grow)", gotH, wantH)
+	}
+}
+
 // TestFrame_LongPhaseNamesNotEllipsized is the regression for the
 // fixed-narrow-column bug: the lifecycle/summary boxes were pinned to a
 // hardcoded inner width (24) that couldn't hold the longest phase labels, so
