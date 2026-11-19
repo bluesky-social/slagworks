@@ -870,7 +870,15 @@ func (s *Store) CreateMachineOp(machineID uuid.UUID, opType model.OperationType,
 	var op model.Operation
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var m model.Machine
-		if err := tx.Select("state", "locked", "pxe_eligible").Where("id = ?", machineID).First(&m).Error; err != nil {
+		// FOR KEY SHARE is the lock the operation INSERT below takes through
+		// fk_operations_machine anyway; taking it here instead means a
+		// machine delete (DeleteMachineIfIdle holds the row FOR UPDATE)
+		// cannot land between this read and the insert. The delete either
+		// waits for this create and sees its op, or commits first and this
+		// read reports the machine gone, instead of the checks below passing
+		// against a doomed row and the insert failing the foreign key.
+		if err := tx.Clauses(clause.Locking{Strength: "KEY SHARE"}).
+			Select("state", "locked", "pxe_eligible").Where("id = ?", machineID).First(&m).Error; err != nil {
 			return fmt.Errorf("machine not found: %w", err)
 		}
 		if m.Locked {

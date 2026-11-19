@@ -161,19 +161,24 @@ func (f *fakeStore) SetMachineNetBoxDeviceID(id uuid.UUID, netboxDeviceID int) e
 	return nil
 }
 
-func (f *fakeStore) DeleteMachine(id uuid.UUID) error {
+// DeleteMachineIfIdle mirrors the real store: a machine with in-flight ops
+// is left alone (false), an absent machine counts as deleted (true).
+func (f *fakeStore) DeleteMachineIfIdle(id uuid.UUID) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.machines[id]
 	if !ok {
-		return errors.New("not found")
+		return true, nil
+	}
+	if f.inFlightOps[id] > 0 {
+		return false, nil
 	}
 	delete(f.machines, id)
 	delete(f.bySerial, m.NetBoxSerial)
 	if m.NetBoxDeviceID != nil {
 		delete(f.byDevice, *m.NetBoxDeviceID)
 	}
-	return nil
+	return true, nil
 }
 
 // AnySiteConfigForNetBoxSite reports whether any config mirrors the given
@@ -485,6 +490,44 @@ func TestOnDeviceDeletedMidOpFreezesInsteadOfDeleting(t *testing.T) {
 	}
 	if pub.states[0] != model.MachineStateFailed {
 		t.Fatalf("op_removed machine_state = %q, want failed", pub.states[0])
+	}
+}
+
+// refusingStore stands for a machine whose op appeared after the mirror's
+// in-flight check (so DeleteMachineIfIdle refuses) and then finished before
+// the mirror could fail it.
+type refusingStore struct{ *fakeStore }
+
+func (refusingStore) DeleteMachineIfIdle(uuid.UUID) (bool, error) { return false, nil }
+
+// TestOnDeviceDeletedRefusedDeleteStillInvalidates: when the delete is
+// refused but nothing is left to fail, the row stays for the next sweep
+// and no op_removed goes out, but the device is gone from NetBox, so the
+// snapshot is still invalidated.
+func TestOnDeviceDeletedRefusedDeleteStillInvalidates(t *testing.T) {
+	st, inv, _ := withSite(t)
+	m := New(refusingStore{st}, inv)
+	pub := &fakePublisher{}
+	m.SetPublisher(pub)
+	id := uuid.New()
+	nbID := 44
+	if err := st.CreateMachine(&model.Machine{
+		ID: id, NetBoxDeviceID: &nbID, NetBoxSerial: "SN-REFUSED", State: model.MachineStateCommissioned,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.OnDeviceDeleted(context.Background(), 44, "pop3"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetMachine(id); err != nil {
+		t.Fatalf("machine row must be retained when the delete is refused: %v", err)
+	}
+	if pub.removedCount() != 0 {
+		t.Fatalf("expected no op_removed publishes, got %d", pub.removedCount())
+	}
+	if inv.count("pop3") != 1 {
+		t.Fatalf("expected one pop3 invalidation, got %d", inv.count("pop3"))
 	}
 }
 
