@@ -409,11 +409,11 @@ func TestReconcileInterfaces_DuplicateMACFallsBackToName(t *testing.T) {
 // the duplicate-MAC case above. Once two same-MAC NICs have been
 // reconciled, NetBox holds two rows with that MAC (eth0 and eth1, the
 // state the test above and a first reconcile of an empty device both
-// leave). byMAC keeps one row per MAC, so if the MAC lookup ran before an
-// exact name+MAC match, NIC eth0 would claim the eth1 row, try to rename
-// it onto its own eth0 row, and fail on the MAC-bearing "squatter"; every
-// later commission of the host would fail. SyncCommissionData promises
-// idempotency, so the rerun must be a pure update in either list order.
+// leave). If a MAC-only match could run before the exact name+MAC match,
+// NIC eth0 could claim the eth1 row, try to rename it onto its own eth0
+// row, and fail on the MAC-bearing "squatter"; every later commission of
+// the host would fail. SyncCommissionData promises idempotency, so the
+// rerun must be a pure update in either list order.
 func TestReconcileInterfaces_DuplicateMACRerunIsIdempotent(t *testing.T) {
 	eth0 := ifaceRow(40, "eth0", "25gbase-x-sfp28", "AA:BB:CC:DD:EE:01", nil)
 	eth1 := ifaceRow(41, "eth1", "25gbase-x-sfp28", "AA:BB:CC:DD:EE:01", nil)
@@ -449,6 +449,75 @@ func TestReconcileInterfaces_DuplicateMACRerunIsIdempotent(t *testing.T) {
 			}
 			if len(f.macs) != 0 {
 				t.Errorf("MACs already match: expected no MAC-object creations, got %v", f.macs)
+			}
+		})
+	}
+}
+
+// TestReconcileInterfaces_NewNICDoesNotTakeRenamedNICsRow pins that a row
+// follows its MAC even when a NIC reported earlier now carries the row's
+// name. The initrd names NICs in driver-probe order, so adding a card that
+// probes first shifts the bond member from eth0 to eth1 and gives eth0 to
+// the new card. The new card has no MAC match; if it fell back to name
+// before the member's MAC was matched, it would claim the member's row
+// (and with it the lag, IPs and cable) and re-MAC it, and the real member
+// would get a bare new row: deploy then builds the bond from the wrong
+// port. The new card must get a new row, created after the member's row
+// has given up the name.
+func TestReconcileInterfaces_NewNICDoesNotTakeRenamedNICsRow(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		newMAC string // the new card's MAC; empty when the agent reports none
+	}{
+		{"new NIC with unknown MAC", "aa:00:00:00:00:02"},
+		{"new NIC without MAC", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bondRef := map[string]any{"id": 10, "name": "bond0"}
+			f := newReconcileFixture([]map[string]any{
+				ifaceRow(10, "bond0", "lag", "", nil),
+				ifaceRow(11, "eth0", "25gbase-x-sfp28", "AA:00:00:00:00:01", bondRef),
+			})
+			srv := f.server(t)
+			defer srv.Close()
+			c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+			err := c.ReconcileInterfaces(context.Background(), 1, []NICData{
+				{Name: "eth0", MAC: tc.newMAC, IntfType: "25gbase-x-sfp28"},           // new card, probed first
+				{Name: "eth1", MAC: "aa:00:00:00:00:01", IntfType: "25gbase-x-sfp28"}, // the bond member
+			}, false)
+			if err != nil {
+				t.Fatalf("ReconcileInterfaces: %v", err)
+			}
+
+			// Row 11 may first be renamed aside to free eth0 for the new
+			// row (planNameMoves); it must end up named eth1.
+			ps := f.patches[11]
+			if got := f.rows[11]["name"]; got != "eth1" {
+				t.Errorf("row 11 (bond member): final name %v, want eth1 (PATCHes %v)", got, ps)
+			}
+			for _, p := range ps {
+				if _, hasLag := p["lag"]; hasLag {
+					t.Errorf("row 11: PATCH %v sets lag (must leave membership untouched)", p)
+				}
+			}
+			if len(f.posts) != 1 || f.posts[0]["name"] != "eth0" {
+				t.Fatalf("expected exactly one POST, for the new eth0, got %v", f.posts)
+			}
+			newID := fmt.Sprint(f.posts[0]["id"])
+			var wantMACs []string
+			if tc.newMAC != "" {
+				wantMACs = []string{newID + "=" + tc.newMAC}
+			}
+			var gotMACs []string
+			for _, m := range f.macs {
+				gotMACs = append(gotMACs, fmt.Sprint(m["assigned_object_id"])+"="+fmt.Sprint(m["mac_address"]))
+			}
+			if fmt.Sprint(gotMACs) != fmt.Sprint(wantMACs) {
+				t.Errorf("MAC objects (interface=mac) = %v, want %v: row 11 keeps its MAC, only the new row gets one", gotMACs, wantMACs)
+			}
+			if len(f.deletes) != 0 {
+				t.Errorf("expected no deletions, got %v", f.deletes)
 			}
 		})
 	}
