@@ -30,7 +30,7 @@ import (
 type Inputs struct {
 	Site           netbox.Site
 	Config         model.SiteConfig
-	Prefixes       []netbox.Prefix  // tag=slagworks-production expected at index 0
+	Prefixes       []netbox.Prefix  // tag=slagworks-production; [0] is the DHCP primary, so callers pass a stable order
 	OOBPrefixes    []netbox.Prefix  // tag=slagworks-oob; empty pre-cutover
 	OOBRanges      []netbox.IPRange // role=slagworks-oob-dynamic; empty pre-cutover
 	Devices        []netbox.Device
