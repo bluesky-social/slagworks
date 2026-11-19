@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -29,10 +30,10 @@ func TestParseUserList(t *testing.T) {
 4   monitor          true    false      true       USER
 `,
 			want: []User{
-				{Slot: 1, Name: "", Privilege: PrivAdmin, Enabled: true},
-				{Slot: 2, Name: "ADMIN", Privilege: PrivAdmin, Enabled: true},
-				{Slot: 3, Name: "slagworks", Privilege: PrivOperator, Enabled: true},
-				{Slot: 4, Name: "monitor", Privilege: PrivUser, Enabled: true},
+				{Slot: 1, Name: "", Privilege: PrivAdmin, Enabled: true, LANAccess: false},
+				{Slot: 2, Name: "ADMIN", Privilege: PrivAdmin, Enabled: true, LANAccess: true},
+				{Slot: 3, Name: "slagworks", Privilege: PrivOperator, Enabled: true, LANAccess: true},
+				{Slot: 4, Name: "monitor", Privilege: PrivUser, Enabled: true, LANAccess: false},
 			},
 		},
 		{
@@ -42,8 +43,24 @@ func TestParseUserList(t *testing.T) {
 2   ADMIN            true    true       true       ADMINISTRATOR
 `,
 			want: []User{
-				{Slot: 1, Name: "", Privilege: 0, Enabled: false},
-				{Slot: 2, Name: "ADMIN", Privilege: PrivAdmin, Enabled: true},
+				{Slot: 1, Name: "", Privilege: 0, Enabled: false, LANAccess: false},
+				{Slot: 2, Name: "ADMIN", Privilege: PrivAdmin, Enabled: true, LANAccess: true},
+			},
+		},
+		{
+			// LANAccess needs all three channel-access columns true; each
+			// one false on its own clears it.
+			name: "channel access columns",
+			in: userListHeader +
+				userRow(3, "all-on", true, true, true, "USER") +
+				userRow(4, "callin-off", false, true, true, "USER") +
+				userRow(5, "linkauth-off", true, false, true, "USER") +
+				userRow(6, "ipmimsg-off", true, true, false, "USER"),
+			want: []User{
+				{Slot: 3, Name: "all-on", Privilege: PrivUser, Enabled: true, LANAccess: true},
+				{Slot: 4, Name: "callin-off", Privilege: PrivUser, Enabled: true, LANAccess: false},
+				{Slot: 5, Name: "linkauth-off", Privilege: PrivUser, Enabled: true, LANAccess: false},
+				{Slot: 6, Name: "ipmimsg-off", Privilege: PrivUser, Enabled: true, LANAccess: false},
 			},
 		},
 	}
@@ -229,6 +246,78 @@ func TestReconcile_WrongPriv_FixedInPlace_NoPasswordRewrite(t *testing.T) {
 	}
 	if len(res.LeftoversDisabled) != 0 {
 		t.Errorf("expected no leftovers, got %v", res.LeftoversDisabled)
+	}
+}
+
+// userListHeader is the header of ipmitool's `user list` table, with the
+// columns at the offsets userRow prints them.
+const userListHeader = "ID  Name             Callin  Link Auth  IPMI Msg   Channel Priv Limit\n"
+
+// userRow renders one `user list` row the way ipmitool does
+// (lib/ipmi_user.c, dump_user_access: "%-4d%-17s%-8s%-11s%-11s%-s"), with
+// the Callin, Link Auth and IPMI Msg flags spelled out.
+func userRow(slot int, name string, callin, linkAuth, ipmiMsg bool, priv string) string {
+	return fmt.Sprintf("%-4d%-17s%-8t%-11t%-11t%-s\n", slot, name, callin, linkAuth, ipmiMsg, priv)
+}
+
+// TestReconcile_NoLANAccess_FixedInPlace_NoPasswordRewrite: an enabled
+// monitor at the right privilege whose channel-1 access is off (any of the
+// Callin, Link Auth and IPMI Msg columns false) cannot be used over the
+// LAN, which is where ipmi_exporter scrapes it. A run that stopped between
+// `user priv` and `channel setaccess` leaves exactly that row, and the
+// in-band reconcile (no Password, no Rotate) is what the next deploy runs.
+// It must re-apply priv/channel access/enabled in place, as for a wrong
+// privilege, without writing a password; it must not report the account
+// compliant on its privilege alone.
+func TestReconcile_NoLANAccess_FixedInPlace_NoPasswordRewrite(t *testing.T) {
+	cases := []struct {
+		name                     string
+		callin, linkAuth, ipmiOn bool
+	}{
+		{"link auth and ipmi msg off", true, false, false},
+		{"link auth off", true, false, true},
+		{"ipmi msg off", true, true, false},
+		{"callin off", false, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeIPMITool(t)
+			fake.queueOutput("user list 1", userListHeader+
+				userRow(1, "", true, false, false, "ADMINISTRATOR")+
+				userRow(2, "ADMIN", true, true, true, "ADMINISTRATOR")+
+				userRow(4, MonitorUser, tc.callin, tc.linkAuth, tc.ipmiOn, "USER"))
+			queueFixInPlace(fake)
+			fake.queueOutput("chassis bootparam set bootflag force_pxe options=PEF,timestamp,reset_persistence", "")
+			fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+
+			// The in-band deploy path's options (cmd/slagworks-agent
+			// inBandReconcileOptions): provision once, no Password or Rotate.
+			res, err := Reconcile(context.Background(), Options{
+				IPMITool:      fake.path,
+				IPMIInterface: "open",
+				Desired:       []DesiredUser{{Name: MonitorUser, Privilege: PrivUser}},
+				AdminUser:     "ADMIN",
+			})
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			calls := fake.calls()
+			for _, want := range []string{
+				"user priv 4 2 1",
+				"channel setaccess 1 4 callin=on ipmi=on link=on privilege=2",
+				"user enable 4",
+			} {
+				if countCalls(calls, want) != 1 {
+					t.Errorf("monitor without LAN channel access was treated as compliant: no %q; calls: %+v", want, calls)
+				}
+			}
+			if n := countCalls(calls, "user set password"); n != 0 {
+				t.Errorf("an enabled monitor keeps its working password; got %d password writes", n)
+			}
+			if len(res.CreatedOrUpdated) != 0 {
+				t.Errorf("no password was written, but CreatedOrUpdated = %+v", res.CreatedOrUpdated)
+			}
+		})
 	}
 }
 

@@ -101,6 +101,11 @@ type User struct {
 	Name      string
 	Enabled   bool
 	Privilege PrivLevel
+	// LANAccess is true when the row's Callin, Link Auth and IPMI Msg
+	// columns all read true: the channel-1 access applyPrivAndEnable grants
+	// (callin=on link=on ipmi=on). Without it the account cannot be used
+	// over the LAN, whatever its privilege.
+	LANAccess bool
 }
 
 // DesiredUser describes a user we want present after reconcile. Name
@@ -408,7 +413,12 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 				})
 				continue
 			}
-			if existing.Privilege == d.Privilege && existing.Enabled {
+			// Compliant only when everything applyPrivAndEnable writes that
+			// `user list` shows is already in place: the privilege limit and
+			// the channel access. A run that stopped between `user priv` and
+			// `channel setaccess` leaves the right privilege without LAN
+			// access, which is not compliant.
+			if existing.Privilege == d.Privilege && existing.Enabled && existing.LANAccess {
 				continue // nothing to do
 			}
 			// An existing-but-DISABLED user is treated as not-yet-fully-
@@ -420,8 +430,9 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			// needsPassword we'd "fix" such a slot to enabled at the right
 			// priv with an unknown password and never report a cred — a
 			// stranded account (idempotency-of-partial-retry break). An
-			// ENABLED user with merely the wrong privilege is a genuine
-			// in-place priv fix: leave its working password alone.
+			// ENABLED user with merely the wrong privilege or no LAN channel
+			// access is a genuine in-place fix: leave its working password
+			// alone.
 			plans = append(plans, plan{
 				desired:       d,
 				slot:          existing.Slot,
@@ -455,9 +466,9 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 	// Apply each plan. For a Desired user with neither Password nor Rotate
 	// this is PROVISION ONCE, NEVER ROTATE: a password is generated and
 	// written ONLY when CREATING an absent user. For a user that already
-	// exists but has the wrong privilege or is disabled, we fix the
-	// privilege/channel-access/enabled state IN PLACE and leave its password
-	// untouched — so the monitor cred already stored in
+	// exists but has the wrong privilege, lacks LAN channel access, or is
+	// disabled, we fix the privilege/channel-access/enabled state IN PLACE
+	// and leave its password untouched — so the monitor cred already stored in
 	// pop/<pop>/bmc-creds-monitor stays valid. Regenerating on every deploy
 	// made the cred a moving target that drifted whenever a deploy half-ran.
 	// The remote path instead always asserts a password: the stored one
@@ -518,11 +529,12 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			continue
 		}
 		// UPDATE IN PLACE: the user exists, is ENABLED (so it has a working
-		// password slagworksd already holds), but its privilege is wrong. Fix
-		// priv + channel access + enabled WITHOUT touching the password. No
-		// CreatedOrUpdated entry: the password is unchanged, so there is
-		// nothing new to phone home and global keeps the cred it has.
-		// (provision-once: never rotate a working cred.)
+		// password slagworksd already holds), but its privilege is wrong or it
+		// lacks LAN channel access. Fix priv + channel access + enabled
+		// WITHOUT touching the password. No CreatedOrUpdated entry: the
+		// password is unchanged, so there is nothing new to phone home and
+		// global keeps the cred it has. (provision-once: never rotate a
+		// working cred.)
 		if err := applyPrivAndEnable(ctx, opt, p.slot, p.desired.Privilege); err != nil {
 			return res, err
 		}
@@ -711,9 +723,11 @@ func ListUsers(ctx context.Context, opt Options) ([]User, error) {
 //	ID  Name             Callin  Link Auth  IPMI Msg   Channel Priv Limit
 //
 // We capture the start of "Name" and the start of "Callin" — those
-// bracket the Name field. The privilege string is everything from
-// "Channel" onwards (the right edge varies but the privilege token
-// starts at that column, so right-trimmed slice is fine).
+// bracket the Name field. "Callin", "Link Auth", "IPMI Msg" and
+// "Channel" likewise bracket the three channel-access flags (LANAccess).
+// The privilege string is everything from "Channel" onwards (the right
+// edge varies but the privilege token starts at that column, so
+// right-trimmed slice is fine).
 func parseUserList(s string) ([]User, error) {
 	lines := strings.Split(s, "\n")
 	var headerLine string
@@ -736,9 +750,14 @@ func parseUserList(s string) ([]User, error) {
 
 	nameStart := strings.Index(headerLine, "Name")
 	callinStart := strings.Index(headerLine, "Callin")
+	linkStart := strings.Index(headerLine, "Link Auth")
+	ipmiStart := strings.Index(headerLine, "IPMI Msg")
 	channelStart := strings.Index(headerLine, "Channel")
-	if nameStart < 0 || callinStart < 0 || channelStart < 0 {
+	if nameStart < 0 || callinStart < 0 || linkStart < 0 || ipmiStart < 0 || channelStart < 0 {
 		return nil, fmt.Errorf("user list header missing expected columns: %q", headerLine)
+	}
+	flag := func(line string, start, end int) bool {
+		return strings.TrimSpace(safeSlice(line, start, end)) == "true"
 	}
 
 	var users []User
@@ -766,6 +785,9 @@ func parseUserList(s string) ([]User, error) {
 			Name:      name,
 			Enabled:   enabled,
 			Privilege: priv,
+			LANAccess: flag(line, callinStart, linkStart) &&
+				flag(line, linkStart, ipmiStart) &&
+				flag(line, ipmiStart, channelStart),
 		})
 	}
 	if len(users) == 0 {
@@ -855,7 +877,8 @@ type plan struct {
 	// absent user, an existing-but-disabled slot left by a partial create,
 	// or any existing user whose Desired entry carries a Password or Rotate.
 	// False for an enabled existing user whose only problem is the wrong
-	// privilege — provision-once leaves its working password untouched.
+	// privilege or missing LAN channel access — provision-once leaves its
+	// working password untouched.
 	needsPassword bool
 }
 
