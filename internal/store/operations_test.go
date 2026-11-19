@@ -1896,3 +1896,176 @@ func TestListActiveOperationsClaimedBy(t *testing.T) {
 		t.Fatalf("worker-3: got %d ops, want 0", len(none))
 	}
 }
+
+// TestSetOperationPhase_DoesNotRewriteTerminalOp: a phase report that
+// arrives after its op went terminal must not rewrite the row. The worker
+// does send these: a report already in flight when the operator aborts, or
+// the executor's power_cycle/pxe_booting updates after op_removed. The
+// phase the op ended in, phase_entered_at, and the version that workers
+// order the op stream by are all part of the terminal record, and a
+// reported change makes the hub publish an op_delta for a dead op.
+func TestSetOperationPhase_DoesNotRewriteTerminalOp(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func(st *Store, m *model.Machine, op *model.Operation) error
+		want model.OperationStatus
+	}{
+		{"aborted", func(st *Store, m *model.Machine, _ *model.Operation) error {
+			_, _, err := st.AbortMachine(m.ID)
+			return err
+		}, model.OpFailed},
+		{"completed", func(st *Store, _ *model.Machine, op *model.Operation) error {
+			_, err := st.CompleteOperationWithState(op.ID, model.MachineStateRunning, nil)
+			return err
+		}, model.OpCompleted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-late-phase", State: model.MachineStateCommissioned, PXEEligible: true}
+			if err := st.CreateMachine(m); err != nil {
+				t.Fatal(err)
+			}
+			op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claimed, err := st.ClaimOperation(op.ID, "worker-1"); err != nil || claimed == nil {
+				t.Fatalf("claim: op=%v err=%v", claimed, err)
+			}
+			if _, err := st.SetOperationPhase(op.ID, "partitioning"); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.end(st, m, op); err != nil {
+				t.Fatal(err)
+			}
+			before, err := st.GetOperation(op.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if before.Status != tc.want || before.Phase != "partitioning" {
+				t.Fatalf("setup: op is %s in phase %q, want %s in partitioning", before.Status, before.Phase, tc.want)
+			}
+
+			// The report that was still in flight when the op ended.
+			tr, err := st.SetOperationPhase(op.ID, "rsyncing_os")
+			if err != nil {
+				t.Fatalf("late phase report: %v", err)
+			}
+
+			after, err := st.GetOperation(op.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tr.Changed || tr.Op != nil {
+				t.Errorf("SetOperationPhase reported a phase change on a %s op (Changed=%v, Op set=%v); the hub publishes an op_delta for every reported change",
+					tc.want, tr.Changed, tr.Op != nil)
+			}
+			if after.Phase != "partitioning" {
+				t.Errorf("%s op's phase was rewritten: %q -> %q", tc.want, before.Phase, after.Phase)
+			}
+			if after.Version != before.Version {
+				t.Errorf("%s op's version moved after it went terminal: %d -> %d (workers accept any delta above their tombstone version)",
+					tc.want, before.Version, after.Version)
+			}
+			if !after.PhaseEnteredAt.Equal(before.PhaseEnteredAt) {
+				t.Errorf("%s op's phase_entered_at moved: %s -> %s", tc.want, before.PhaseEnteredAt, after.PhaseEnteredAt)
+			}
+		})
+	}
+}
+
+// TestSetOperationPhase_AbortBetweenReadAndWrite: an abort that lands after
+// SetOperationPhase has read the op as active, and before it writes, must
+// still have the last word on the row. The abort starts in its own goroutine
+// right after the read, and the read's transaction waits until the abort has
+// either committed or blocked on a row lock before it goes on to write, so
+// the test is deterministic whether SetOperationPhase guards its write with
+// a status check or serializes against the abort with a lock.
+func TestSetOperationPhase_AbortBetweenReadAndWrite(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-abort-mid-phase", State: model.MachineStateCommissioned, PXEEligible: true}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := st.ClaimOperation(op.ID, "worker-1"); err != nil || claimed == nil {
+		t.Fatalf("claim: op=%v err=%v", claimed, err)
+	}
+	if _, err := st.SetOperationPhase(op.ID, "partitioning"); err != nil {
+		t.Fatal(err)
+	}
+
+	type abortResult struct {
+		outs []OpOutcome
+		err  error
+	}
+	aborted := make(chan abortResult, 1)
+	sqlDB, err := st.db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "abort-mid-phase:" + uuid.NewString()
+	fired := false
+	// SetOperationPhase's read is the only query that names phase_entered_at.
+	if err := st.db.Callback().Query().After("gorm:query").Register(name, func(tx *gorm.DB) {
+		if fired || !strings.Contains(tx.Statement.SQL.String(), `"phase_entered_at"`) {
+			return
+		}
+		fired = true
+		go func() {
+			_, outs, err := st.AbortMachine(m.ID)
+			aborted <- abortResult{outs, err}
+		}()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case r := <-aborted:
+				aborted <- r
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+			var waiters int
+			if err := sqlDB.QueryRow(`SELECT count(*) FROM pg_stat_activity
+				WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiters); err == nil && waiters > 0 {
+				return
+			}
+		}
+		t.Error("abort neither finished nor blocked on a lock within 10s")
+	}); err != nil {
+		t.Fatalf("register interleave callback: %v", err)
+	}
+	t.Cleanup(func() { _ = st.db.Callback().Query().Remove(name) })
+
+	tr, err := st.SetOperationPhase(op.ID, "rsyncing_os")
+	if err != nil {
+		t.Fatalf("phase report: %v", err)
+	}
+	if !fired {
+		t.Fatal("setup: SetOperationPhase's read was not intercepted; the abort never ran between read and write")
+	}
+	ab := <-aborted
+	if ab.err != nil {
+		t.Fatalf("abort: %v", ab.err)
+	}
+	if len(ab.outs) != 1 {
+		t.Fatalf("abort failed %d ops, want 1", len(ab.outs))
+	}
+	failed := ab.outs[0].Op
+
+	got, err := st.GetOperation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Either order is legal (phase then fail, or fail and the phase report
+	// dropped), but in both the fail is the last write to the row.
+	if tr.Op != nil && tr.Op.Status == model.OpFailed {
+		t.Errorf("phase write landed on the failed row (version %d) and was reported for publication", tr.Op.Version)
+	}
+	if got.Version != failed.Version || got.Phase != failed.Phase {
+		t.Errorf("row moved after the abort failed it: abort left phase %q version %d, row now has phase %q version %d",
+			failed.Phase, failed.Version, got.Phase, got.Version)
+	}
+}
