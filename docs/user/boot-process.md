@@ -349,6 +349,13 @@ What the agent actually does, in order:
     and deletes the backups, which on an XFS root can leave a hole in
     that directory; GRUB 2.12 cannot read past one and stops at
     `error: not a correct XFS inode.`
+  - **RAID** (layouts with md arrays): `target.ConfigureRAID` writes
+    `/etc/mdadm/mdadm.conf` with `AUTO -all` and an `ARRAY` line, by UUID,
+    for each array the layout names, regenerates the target's initramfs so
+    it carries that file, and on UEFI replaces the ESP's
+    `/slagworks/initrd.img` with it. The installed system then assembles
+    those arrays and no others (see `docs/user/storage-scripts.md`). Any
+    failure here is a hard fail.
 - `finalizing`: write `/etc/fstab`, seed cloud-init, apply the network
   config script (with NetBox facts injected), write the hostname, disable
   first-boot apt timers, write operator SSH keys, enroll on tailscale (if

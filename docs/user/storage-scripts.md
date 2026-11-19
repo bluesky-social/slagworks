@@ -88,6 +88,21 @@ redeploy with `--destructive`.
 
 `array_uuid` (optional) pins the array's md UUID instead of letting mdadm pick a random one, so a later `preserve` deploy can find the array by it. At boot the array is identified by that UUID alone, so the agent refuses a deploy when a disk it leaves unwritten still carries a member superblock with the same UUID, typically the disk a redeploy moved the array off: that stale member could claim the array ahead of the real members. Redeploy with `--wipe-all-disks` to zero such disks, or zero the named device with `mdadm --zero-superblock` from a `--recovery` boot.
 
+The installed system assembles exactly the arrays the layout names, created
+(`raid`) or reassembled (`preserve`), and no others. The agent writes
+`/etc/mdadm/mdadm.conf` with `AUTO -all` and one `ARRAY` line per layout
+array, identified by its UUID, then regenerates the initramfs so the
+initramfs carries that file. An md superblock on a disk the layout leaves
+alone (a disk outside the layout, or a `retain` disk) is therefore never
+assembled at boot, and so cannot take the `/dev/mdN` name a layout array
+needs. To keep using such an array, name it in the layout as a `preserve`
+device. An array created on the installed system later is not assembled at
+boot until its `ARRAY` line is in `mdadm.conf` (`mdadm --detail --brief
+<dev>` prints it) and the initramfs the bootloader loads carries that file:
+run `update-initramfs -u`, and on UEFI also copy the regenerated
+`/boot/initrd.img-<version>` to `/boot/efi/slagworks/initrd.img`, the copy
+systemd-boot loads.
+
 **Mounts** — maps mount points to device names from the layout.
 
 ```json
