@@ -166,6 +166,8 @@ func TestClassifyInterfaceType(t *testing.T) {
 		want           string
 	}{
 		// Speed + port type fallback
+		// 400G must not fall into the 40G tier: "400000Mb/s" begins with "40000".
+		{"400G fibre", "", "400000Mb/s", "Fibre", "", nil, "400gbase-x-qsfpdd"},
 		{"100G fibre", "", "100000Mb/s", "Fibre", "", nil, "100gbase-x-qsfp28"},
 		{"100G copper", "", "100000Mb/s", "TP", "", nil, "100gbase-x-cxp"},
 		{"50G fibre", "", "50000Mb/s", "Fibre", "", nil, "50gbase-x-sfp28"},
@@ -195,6 +197,11 @@ func TestClassifyInterfaceType(t *testing.T) {
 		{"25G SR", "", "25000Mb/s", "FIBRE", "", &TransceiverInfo{
 			Identifier: "0x03 (SFP)", Connector: "0x07 (LC)", Wavelength: "850nm",
 		}, "25gbase-x-sfp28"},
+		// Transceiver EEPROM: the EEPROM path has no 400G case, so a 400G
+		// DAC falls through to the speed tier rather than to 40G.
+		{"400G DAC", "mlx5_core", "400000Mb/s", "FIBRE", "", &TransceiverInfo{
+			Identifier: "0x18 (QSFP-DD Double Density 8X Pluggable Transceiver)", Connector: "0x23 (No separable connector)",
+		}, "400gbase-x-qsfpdd"},
 		// Transceiver EEPROM: 100G DAC (no separable connector)
 		{"100G DAC", "", "100000Mb/s", "FIBRE", "", &TransceiverInfo{
 			Identifier: "0x11 (QSFP28)", Connector: "0x23 (No separable connector)",
