@@ -329,6 +329,12 @@ What the agent actually does, in order:
   - **Legacy BIOS**: `installGRUBBIOS` — install GRUB i386-pc onto each
     disk with a `bios_grub` (EF02) partition. No BIOS-grub partition on
     any disk is a hard fail — we refuse to leave the host unbootable.
+    `grub-install` runs once per disk, and `/boot/grub/i386-pc` is
+    removed before each run so every run writes a fresh module
+    directory. A run that finds the previous run's modules backs them up
+    and deletes the backups, which on an XFS root can leave a hole in
+    that directory; GRUB 2.12 cannot read past one and stops at
+    `error: not a correct XFS inode.`
 - `finalizing`: write `/etc/fstab`, seed cloud-init, apply the network
   config script (with NetBox facts injected), write the hostname, disable
   first-boot apt timers, write operator SSH keys, enroll on tailscale (if
