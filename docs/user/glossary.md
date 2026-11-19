@@ -236,7 +236,9 @@ the persistent WebSocket.
 
 - **Push down**: global pushes a full `SiteSnapshot` to the worker whenever
   site state changes (debounced). Snapshots carry a per-site `SeqNum`;
-  workers apply strictly by SeqNum to prevent stale overwrites.
+  within a connection workers apply strictly by SeqNum to prevent stale
+  overwrites. The first snapshot on each connection is global's current
+  view and replaces whatever the worker held, even at a lower SeqNum.
 - **Push up**: the worker sends observations, operation updates, and log
   envelopes upstream on the same socket, draining its durable local outbox.
 
@@ -263,8 +265,11 @@ Prevents stuck operations from blocking the machine indefinitely.
 ### Phone Home
 
 Post-boot callback from the installed OS to the worker. A first-boot systemd
-oneshot service POSTs to `/api/v1/phone-home?mac=X`. Triggers the
-`deployed` -> `verified` state transition.
+oneshot service POSTs `{"machine_id":"...","op_id":"...","event":"phone_home"}`
+to `/api/v1/report`, retrying until it succeeds. The worker accepts it only for
+that machine's active deploy operation and only after the agent has reported
+the install finished (phase `awaiting_phone_home`), then completes the
+operation and moves the machine from `deploying` to `running`.
 
 ---
 

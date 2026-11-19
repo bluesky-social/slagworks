@@ -60,7 +60,7 @@ func TestBuildGlobal_MissingOIDCIsConfigError(t *testing.T) {
 // naming the flag and env var to fix.
 func TestBuildGlobal_BadHostnameTemplateIsConfigError(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	for _, tmpl := range []string{"{host}.example.net", "host.example.net"} {
+	for _, tmpl := range []string{"{host}.example.net", "host.example.net", "{node}.internal.{zone}.example_net"} {
 		_, err := buildGlobal(context.Background(), log, globalConfig{
 			// Unreachable: the template check must fail before any connect.
 			DSN:              "host=nonexistent.invalid port=1 user=x password=x dbname=x sslmode=disable connect_timeout=1",

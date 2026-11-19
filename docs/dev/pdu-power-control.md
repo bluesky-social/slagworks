@@ -342,12 +342,14 @@ stopping early would defeat redundancy by leaving a reachable feed un-powered. O
 | mixed (all readable) | `StateOn` + WARN |
 | any `On`, others errored | `StateOn` + WARN (box is definitely powered) |
 | no `On` confirmed, ≥1 errored | `StateUnknown` + error |
+| no `On` confirmed, none errored, ≥1 neither `On` nor `Off` | `StateUnknown` |
 
 *Any confirmed-live feed pins `StateOn`: a dual-fed box is powered as long as one
 feed is live, and reporting `Off`/`Unknown` while a feed is confirmed up is a lie
-that could send an operator to touch live hardware. `StateUnknown` is reserved for
-"no live feed confirmed AND a read errored" — we can't rule out a feed we couldn't
-reach.*
+that could send an operator to touch live hardware. `StateOff` needs every feed to
+read `Off`. With no live feed confirmed, `StateUnknown` covers a read that errored
+(we can't rule out a feed we couldn't reach) and an outlet whose `SwitchedState` is
+missing or unrecognized (we can't rule out a feed we couldn't interpret).*
 
 **Failure handling (per CLAUDE.md "trigger/preconditions/failure/rollback"):**
 
@@ -363,8 +365,15 @@ reach.*
   model. Operator retries. *This safety is the entire payoff of the atomic reversal.*
 - **PowerOff partial failure: roll back to fully-on.** If `olOff` cuts feed A but
   feed B's `olOff` fails, the box is left running on one PSU — degraded, redundancy
-  silently lost. The controller **issues `olOn` to every feed it successfully cut**,
-  restoring the device to its known-good pre-op state, then reports the op failed.
+  silently lost. The controller **issues `olOn` to every feed it sent `olOff` to,
+  including the one whose `olOff` failed**, restoring the device to its known-good
+  pre-op state, then reports the op failed. The failing feed is included because
+  a failed `olOff` may still have cut it: the SSH session can drop, hit the
+  command timeout, or return output with no result code after the NMC has
+  executed the command, and the transport reports each of those as an error.
+  `olOn` only powers toward up, so sending it to a feed whose `olOff` never ran
+  leaves that feed on. The same applies to a single-feed device: a failed `olOff`
+  gets an `olOn`.
   *I chose rollback-to-pre-op-state over leave-half-off (the rest of this design's
   no-rollback stance) specifically for PowerOff, because a FAILED op should return
   to the baseline the operator can reason about, not strand the box in a degraded
@@ -375,11 +384,14 @@ reach.*
   fails the box only ends up more-powered, never stranded. (Contrast PowerCycle,
   where the firmware completes the cycle autonomously — there is nothing to roll
   back; and PowerOn, which is already best-effort toward up.) If the rollback `olOn`
-  also fails, report both errors; the box is then in the same single-feed state the
-  failure left it, which a subsequent `PowerStatus` reports truthfully.
+  also fails, report both errors; the box is then in whatever partial-feed (or, on a
+  single feed, off) state the failure left it, which a subsequent `PowerStatus`
+  reports. When the failing feed's PDU is simply unreachable, its rollback `olOn`
+  fails too, so the op reports "rollback failed" even though that feed was never
+  cut; that is the accepted cost of not guessing whether a failed `olOff` ran.
 - **PowerOn partial failure:** best-effort all feeds, then report aggregate.
 - **Rollback:** the *only* rollback is PowerOff's redundancy-restore above
-  (`olOn` the feeds it cut). PowerCycle and PowerOn do NOT roll back: PowerCycle
+  (`olOn` the feeds it may have cut). PowerCycle and PowerOn do NOT roll back: PowerCycle
   has no intermediate state to revert from (the firmware completes the cycle
   autonomously — a failed dispatch leaves the box either up on the other feed or
   mid-firmware-cycle), and PowerOn is already best-effort toward up. The reason

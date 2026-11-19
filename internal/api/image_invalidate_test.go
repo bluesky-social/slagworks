@@ -130,3 +130,76 @@ func TestImageUpsert_InvalidatesAllSites(t *testing.T) {
 		}
 	}
 }
+
+// TestImageWrite_RejectsInvalidName: an image name becomes a directory on
+// every site worker (imagepull.SyncImages removes and replaces
+// <images_dir>/<name>), so POST and PUT must refuse a name that is not a
+// plain path element with a 400, store nothing, and push no snapshot.
+// Before the fix both accepted "..", "." and "../victim", and the next
+// snapshot made every site worker delete its data dir, its images dir, or
+// a sibling of it.
+func TestImageWrite_RejectsInvalidName(t *testing.T) {
+	db := testpg.DB(t, store.Migrate)
+	st := store.New(db)
+	if err := st.CreateSiteConfig(&model.SiteConfig{
+		Slug:               "pop-a",
+		NetBoxSite:         "pop-a",
+		EphemeralPoolStart: "10.0.0.10",
+		EphemeralPoolEnd:   "10.0.0.250",
+	}); err != nil {
+		t.Fatalf("seed site_config: %v", err)
+	}
+	inv := &fakeInvalidator{}
+	s := &Server{store: st, invalidator: inv, echo: echo.New()}
+	s.echo.PUT("/api/v1/images/:name", s.upsertImage)
+	s.echo.POST("/api/v1/images", s.createImage)
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	send := func(method, path, name string) int {
+		t.Helper()
+		body, _ := json.Marshal(model.Image{
+			Name:    name,
+			Version: "24.04",
+			SHA256:  "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00",
+			URL:     "https://example.com/noble-pxe/abc.tar.gz",
+		})
+		req, _ := http.NewRequest(method, srv.URL+path, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	for _, name := range []string{"..", ".", "../victim", "noble-pxe/..", ".hidden", "Noble-PXE", "noble pxe"} {
+		if code := send(http.MethodPost, "/api/v1/images", name); code != http.StatusBadRequest {
+			t.Errorf("POST image name %q: status %d, want 400", name, code)
+		}
+	}
+	// The PUT name comes from the path; ".." and "." reach the handler
+	// as-is (Go's client and echo's router do not clean them).
+	for _, name := range []string{"..", ".", ".hidden", "Noble-PXE"} {
+		if code := send(http.MethodPut, "/api/v1/images/"+name, "noble-pxe"); code != http.StatusBadRequest {
+			t.Errorf("PUT image name %q: status %d, want 400", name, code)
+		}
+	}
+
+	imgs, err := st.ListImages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imgs) != 0 {
+		t.Errorf("refused writes stored rows: %+v", imgs)
+	}
+	if got := inv.seen(); len(got) != 0 {
+		t.Errorf("refused writes pushed snapshots to %v", got)
+	}
+
+	// A conventional name is still accepted.
+	if code := send(http.MethodPost, "/api/v1/images", "noble-pxe"); code != http.StatusCreated {
+		t.Errorf("POST image name noble-pxe: status %d, want 201", code)
+	}
+}

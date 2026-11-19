@@ -221,8 +221,8 @@ func (s *Store) DeleteSiteWorker(id uuid.UUID) error {
 }
 
 // HashWorkerToken returns the canonical lowercase-hex sha256 of a
-// plaintext token. Callers that need to compare an incoming ?token=
-// query-string value against stored hashes use this.
+// plaintext token. Callers that need to compare an incoming bearer
+// token against stored hashes use this.
 func HashWorkerToken(plaintext string) string {
 	sum := sha256.Sum256([]byte(plaintext))
 	return hex.EncodeToString(sum[:])

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
@@ -44,7 +45,11 @@ type OpPoller func(ctx context.Context) (terminal, failed bool, reason string, e
 type RunConfig struct {
 	OpType  model.OperationType
 	Machine string
-	OpID    string
+	// OpID is the watched op. The logs stream also carries other ops on the
+	// same machine; only envelopes stamped with this id (or with no op id)
+	// drive the lifecycle, the worker and the outcome (translateEnvelope).
+	// The header shows its first 8 characters when Command is empty.
+	OpID    uuid.UUID
 	Command string // human-readable invocation (e.g. "machine deploy host --destructive")
 	Worker  string // claimed_by hostname if known at startup (attach-after-claim backfill)
 	Loc     *time.Location
@@ -120,7 +125,7 @@ type RunResult struct {
 // auto-Quit (the reducer already does this) and leaving failure on screen until
 // q when decideHold says so.
 func Run(ctx context.Context, cfg RunConfig) (result RunResult, err error) {
-	m := newModelAt(cfg.OpType, cfg.Machine, cfg.OpID, cfg.OpStartedAt, cfg.Loc, time.Now)
+	m := newModelAt(cfg.OpType, cfg.Machine, cfg.OpID.String()[:8], cfg.OpStartedAt, cfg.Loc, time.Now)
 	m.worker = cfg.Worker
 	m.command = cfg.Command
 	m.resolveWorker = cfg.ResolveWorker
@@ -175,7 +180,7 @@ func Run(ctx context.Context, cfg RunConfig) (result RunResult, err error) {
 	if cfg.Logs != nil {
 		go func() {
 			_ = cfg.Logs(ctx, func(id int64, env slogkit.Envelope) {
-				if msg := translateEnvelope(id, env); msg != nil {
+				if msg := translateEnvelope(id, env, cfg.OpID); msg != nil {
 					p.Send(msg)
 				}
 			})

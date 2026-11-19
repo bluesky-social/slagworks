@@ -546,7 +546,29 @@ func (c *Cache) RecordDHCPLease(machineID uuid.UUID, event, mac, ip, kind, pool 
 // Machines whose Interfaces slice is empty (soft-decommissioned per the
 // NetBox-SSoT model) simply don't appear in macIndex — so BootActionForMAC
 // returns BootLocal for their old MACs.
-func (c *Cache) ApplySnapshot(snap *model.SiteSnapshot) {
+//
+// Reports whether snap was applied (false: rejected as stale).
+func (c *Cache) ApplySnapshot(snap *model.SiteSnapshot) bool {
+	return c.applySnapshot(snap, false)
+}
+
+// AdoptSnapshot applies snap as global's current view of the site whatever
+// its SeqNum, skipping ApplySnapshot's stale check. The WS client calls it
+// for the first snapshot on each connection, which global sends as its
+// current view (the hello reply, or a fan-out at least as new).
+//
+// ApplySnapshot's check exists for snapshots reordered within one
+// connection. Across connections global's per-site counter can go
+// backwards: the site config was deleted and recreated (the new row starts
+// again at 0), global's database was restored from a backup, or the worker
+// was pointed at a different global. A worker holding a higher SeqNum
+// would otherwise drop every snapshot until global's counter passed it,
+// and keep serving the stale site meanwhile, across restarts.
+func (c *Cache) AdoptSnapshot(snap *model.SiteSnapshot) {
+	c.applySnapshot(snap, true)
+}
+
+func (c *Cache) applySnapshot(snap *model.SiteSnapshot, adopt bool) bool {
 	c.applyMu.Lock()
 	defer c.applyMu.Unlock()
 
@@ -565,9 +587,17 @@ func (c *Cache) ApplySnapshot(snap *model.SiteSnapshot) {
 	// covers the new field, so it never bumps SeqNum again, and without
 	// this the worker would run on the field-stripped copy indefinitely
 	// (serial console capture never started on pop1, 2026-10-24).
+	//
+	// An adopted snapshot skips the check (see AdoptSnapshot).
 	cur := c.view.Load().seqNum
-	if snap.SeqNum != 0 && (snap.SeqNum < cur || (snap.SeqNum == cur && !c.viewFromDisk)) {
-		return
+	if !adopt && snap.SeqNum != 0 && (snap.SeqNum < cur || (snap.SeqNum == cur && !c.viewFromDisk)) {
+		return false
+	}
+	if adopt && snap.SeqNum < cur {
+		slog.Warn("adopting global's snapshot although its sequence is lower than the one this worker holds",
+			"held_seq", cur, "global_seq", snap.SeqNum,
+			"hint", "expected after the site config was deleted and recreated or global's database was restored; "+
+				"if neither happened, check that SLAGWORKS_API_URL names the intended global")
 	}
 	c.viewFromDisk = false
 
@@ -685,6 +715,7 @@ func (c *Cache) ApplySnapshot(snap *model.SiteSnapshot) {
 	for _, cb := range cbs {
 		cb()
 	}
+	return true
 }
 
 // OnSnapshotApplied registers a callback invoked at the end of every

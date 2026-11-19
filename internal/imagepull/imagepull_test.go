@@ -354,6 +354,69 @@ func TestSyncImages_RollbackSurvivesDownloadFailure(t *testing.T) {
 	}
 }
 
+// TestSyncImages_RefusesPathShapedName: an image's name becomes a path
+// under imagesDir, and the name arrives from the image row via the site
+// snapshot (or from slagctl image sync --images-json). A name that is not
+// a plain single path element must be refused before anything is
+// downloaded or removed. Before the fix, "" and "." made pullImage
+// RemoveAll imagesDir itself (every image and the package-installed
+// systemd-bootx64.efi), ".." removed imagesDir's parent (the worker's
+// data dir), and "../victim" replaced a sibling directory with the
+// tarball's contents. A valid image in the same snapshot must still sync.
+func TestSyncImages_RefusesPathShapedName(t *testing.T) {
+	tarPath, sha := buildTestTarball(t, "noble-pxe")
+	tarData, _ := os.ReadFile(tarPath)
+	var downloads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads.Add(1)
+		w.Write(tarData)
+	}))
+	defer srv.Close()
+
+	for _, name := range []string{"", ".", "..", "../victim", "noble-pxe/.."} {
+		t.Run(name, func(t *testing.T) {
+			downloads.Store(0)
+			base := t.TempDir()
+			imagesDir := filepath.Join(base, "site", "images")
+			bystanders := map[string]string{
+				filepath.Join(imagesDir, "systemd-bootx64.efi"):   "package-installed efi",
+				filepath.Join(imagesDir, "jammy-pxe", "vmlinuz"):  "another image",
+				filepath.Join(base, "site", "worker.db"):          "site worker state",
+				filepath.Join(base, "site", "victim", "precious"): "sibling of imagesDir",
+			}
+			for p, content := range bystanders {
+				if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			err := SyncImages(slog.Default(), imagesDir, map[string]*model.Image{
+				name:        {Name: name, SHA256: sha, URL: srv.URL + "/bad.tar.gz"},
+				"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: srv.URL + "/noble-pxe.tar.gz"},
+			})
+
+			for p, want := range bystanders {
+				got, rerr := os.ReadFile(p)
+				if rerr != nil || string(got) != want {
+					t.Errorf("SyncImages with image name %q destroyed %s (read %q, %v)", name, p, got, rerr)
+				}
+			}
+			if err == nil {
+				t.Errorf("SyncImages accepted image name %q, want an error", name)
+			}
+			if n := downloads.Load(); n != 1 {
+				t.Errorf("downloads = %d, want 1 (the valid image only; the refused name must not be fetched)", n)
+			}
+			if _, serr := os.Stat(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); serr != nil {
+				t.Errorf("valid image noble-pxe was not synced alongside refused name %q: %v", name, serr)
+			}
+		})
+	}
+}
+
 func TestSyncImages_RejectsBADSHA(t *testing.T) {
 	tarPath, _ := buildTestTarball(t, "noble-bad")
 
