@@ -443,6 +443,9 @@ func TestInterlock_StoreErrorResolvingRegistered_FailClosed(t *testing.T) {
 	cp.Status = model.OpClaimed
 	claimer := &fakeOpClaimer{op: &cp, pendingOp: op}
 	h := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, OpClaimer: claimer})
+	// The op is on this worker's site, so the claim reaches the interlock.
+	h.Push("pop3", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"},
+		Machines: []model.MachineSnapshot{{ID: op.MachineID}}})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 

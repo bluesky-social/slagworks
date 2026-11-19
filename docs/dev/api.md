@@ -139,7 +139,8 @@ a restart then invalidates outstanding tokens.
 | GET | `/operations/:id` | read | One operation by UUID. |
 
 Site workers claim operations over the WebSocket (`claim_op`), never over
-REST. The claim uses the connection's authenticated worker identity.
+REST. The claim uses the connection's authenticated worker identity, and a
+worker can claim only operations on its own site's machines.
 
 Every response that returns an operation (these two reads and the 201
 from each op-creating POST) shows each credential in `params`
@@ -280,7 +281,7 @@ Global to worker:
 | `boot_status` | RPC request `{"machine_id","bmc_runtime"}`. |
 | `dhcp_leases` | RPC request `{}`, sent to every connected worker for the site. |
 | `rpc_response` | `{"data","error","terminal"}`. Reply to `observation` and `cast_resume`. `terminal: true` tells the worker to drop the entry rather than retry. |
-| `claim_op_response` | `rpc_response`-shaped; `data` is `{"operation"}` when the worker won the claim or `{"already_claimed": true}` when it lost. |
+| `claim_op_response` | `rpc_response`-shaped; `data` is `{"operation"}` when the worker won the claim or `{"already_claimed": true}` when it lost, including when the operation's machine is not in the worker's site. |
 | `error` | `{"code","message","proto"}`, e.g. a rejected hello. |
 
 `internal/ws/messages.go` also defines `op_dispatch` and `cast_resume_ok`,

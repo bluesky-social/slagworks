@@ -225,6 +225,139 @@ func TestOperatorReadsRedactCredentials_WorkerStillReceivesThem(t *testing.T) {
 	}
 }
 
+// TestClaimOp_ForeignSiteWorkerGetsNoCredentials: the claim reply carries the
+// op's params unredacted, so it is scoped by site like the rest of the op
+// stream. A worker authenticated for site A that names an op on a site-B
+// machine (an op ID it can only have learned out of band) must get
+// already_claimed and no site B credential in any message, whether the op is
+// still pending (it must stay pending for site B's worker) or already claimed
+// by site B's worker.
+func TestClaimOp_ForeignSiteWorkerGetsNoCredentials(t *testing.T) {
+	st := store.New(testpg.DB(t, store.Migrate))
+	machineA, machineB := uuid.New(), uuid.New()
+	for id, sn := range map[uuid.UUID]string{machineA: "SN-A", machineB: "SN-B"} {
+		if err := st.CreateMachine(&model.Machine{ID: id, NetBoxSerial: sn, State: model.MachineStateRunning}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Worker IDs are unique only per site. Both sites name theirs worker-1,
+	// so the store's idempotent re-claim, which matches on worker ID alone,
+	// cannot tell them apart once site B's worker holds the claim.
+	const workerID = "worker-1"
+	_, tokenA, err := st.RegisterSiteWorker("popa", workerID, "w1.popa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tokenB, err := st.RegisterSiteWorker("popb", workerID, "w1.popb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Both slugs are cached before any worker connects, so hello never
+	// rebuilds and the rebuilder is unused.
+	hub := ws.NewHub(ws.HubConfig{Auth: st, Rebuilder: staticRebuilder{}, OpClaimer: st, ActiveOps: st, Logger: quiet})
+	hub.Push("popa", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "popa"},
+		Machines: []model.MachineSnapshot{{ID: machineA}}})
+	hub.Push("popb", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "popb"},
+		Machines: []model.MachineSnapshot{{ID: machineB}}})
+	s := NewServer(Config{
+		RequiredGroups: []string{"platform"},
+		Store:          st, WSHub: hub, OpPublisher: hub,
+		Verifier: &fakeVerifier{claims: map[string]*tokenverify.Claims{}},
+	})
+	s.SetLogger(quiet)
+	srv := httptest.NewServer(s.Echo())
+	defer srv.Close()
+
+	// A pending power op on site B's machine, carrying site B's BMC password.
+	const siteBPassword = "site-b-bmc-password"
+	opB, err := st.CreatePowerOp(machineB, model.OpPowerCycle,
+		json.RawMessage(`{"bmc_runtime":{"expected_chassis_serial":"SN-B","username":"ADMIN","password":"`+siteBPassword+`","extra_config":{}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// claim connects a worker, sends claim_op for opB, and returns the claim
+	// reply plus every message body the worker received up to it (hello
+	// reply, op_resync, any op_delta).
+	claim := func(token string) (ws.ClaimOpResponse, []byte) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		conn, err := ws.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/api/v1/ws/site?token="+token, nil)
+		if err != nil {
+			t.Fatalf("worker dial: %v", err)
+		}
+		defer conn.CloseNow()
+		if err := conn.WriteTyped(ctx, ws.TypeHello, "", ws.HelloMsg{
+			WorkerID: workerID, LastSeqNum: 1, Proto: ws.OpStreamProto}); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.WriteTyped(ctx, ws.TypeClaimOp, "claim-1", ws.ClaimOpMsg{OperationID: opB.ID.String()}); err != nil {
+			t.Fatal(err)
+		}
+		var seen []byte
+		for {
+			env, err := conn.ReadMessage(ctx)
+			if err != nil {
+				t.Fatalf("worker read: %v", err)
+			}
+			seen = append(seen, env.Data...)
+			if env.Type != ws.TypeClaimOpResp {
+				continue
+			}
+			var resp ws.RPCResponseMsg
+			if err := json.Unmarshal(env.Data, &resp); err != nil {
+				t.Fatal(err)
+			}
+			if resp.Error != "" {
+				t.Fatalf("claim: rpc error %q", resp.Error)
+			}
+			var out ws.ClaimOpResponse
+			if err := json.Unmarshal(resp.Data, &out); err != nil {
+				t.Fatal(err)
+			}
+			return out, seen
+		}
+	}
+	// siteADeclined has site A's worker claim site B's op by ID.
+	siteADeclined := func(when string) {
+		t.Helper()
+		got, seen := claim(tokenA)
+		if bytes.Contains(seen, []byte(siteBPassword)) {
+			t.Errorf("%s: site A's worker received site B's BMC password", when)
+		}
+		if got.Operation != nil || !got.AlreadyClaimed {
+			t.Errorf("%s: site A's worker got operation=%t already_claimed=%t, want already_claimed only",
+				when, got.Operation != nil, got.AlreadyClaimed)
+		}
+	}
+
+	siteADeclined("op pending")
+	row, err := st.GetOperation(opB.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != model.OpPending || row.ClaimedBy != "" {
+		t.Errorf("site B's op is now status=%s claimed_by=%q; it must stay pending for a site B worker", row.Status, row.ClaimedBy)
+	}
+
+	// Site B's own worker still wins it, with the real credential.
+	got, _ := claim(tokenB)
+	if got.Operation == nil {
+		t.Fatal("site B's worker could not claim its own site's op")
+	}
+	p, err := got.Operation.DecodeParams()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.BMCRuntime == nil || p.BMCRuntime.Password != siteBPassword {
+		t.Error("site B's worker won its claim without the real BMC password")
+	}
+
+	siteADeclined("op claimed by site B's worker")
+}
+
 // TestListenAndServe_ScrubsTerminalCredentialsAtStartup: starting global's
 // API strips credentials from ops that went terminal while it was down (and
 // from all history on the first rollout), and leaves an active op's alone.

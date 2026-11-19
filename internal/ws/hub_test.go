@@ -1256,6 +1256,100 @@ func TestHub_ClaimOp_IgnoresClientWorkerID(t *testing.T) {
 	}
 }
 
+// TestHub_ClaimOp_DeclinesOpOutsideClaimantsSite: a worker may claim only
+// ops whose machine is in its own site's snapshot. A won claim replies with
+// the full op row, and Operation.Params carries the op's site credentials,
+// which op_delta and op_resync keep inside the site by the same snapshot
+// membership. Here a worker authenticated for pop2 presents the ID of a
+// pending deploy op on a pop1 machine. The hub must decline before asking
+// the store to claim, send no op row, and leave the op for pop1. The
+// decline is already_claimed, the answer a lost race or an absent op gets,
+// so it does not tell the claimant that the op exists. A pop1 worker then
+// claims the same op.
+func TestHub_ClaimOp_DeclinesOpOutsideClaimantsSite(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-pop1", "pop1", "worker-pop1")
+	auth.register("tok-pop2", "pop2", "worker-pop2")
+	pop1Machine, pop2Machine := uuid.New(), uuid.New()
+	pending := &model.Operation{
+		ID: uuid.New(), MachineID: pop1Machine, Type: model.OpDeploy, Status: model.OpPending,
+		Params: json.RawMessage(`{"bmc_runtime":{"username":"admin","password":"pop1-bmc-password"}}`),
+	}
+	claimed := *pending
+	claimed.Status = model.OpClaimed
+	claimed.Version = 1
+	// The fake store grants every claim it is asked for and records who
+	// asked, so a missing site check shows up as a granted claim, not as a
+	// lost race.
+	claimer := &fakeOpClaimer{pendingOp: pending, op: &claimed}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, OpClaimer: claimer})
+	h.Push("pop1", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop1"},
+		Machines: []model.MachineSnapshot{{ID: pop1Machine}}})
+	h.Push("pop2", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop2"},
+		Machines: []model.MachineSnapshot{{ID: pop2Machine}}})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	pop2 := dialHub(t, srv, "tok-pop2")
+	if pop2 == nil {
+		t.Fatal("dial failed")
+	}
+	defer pop2.CloseNow()
+	helloAndDrain(t, pop2, "worker-pop2")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	reqID := "claim-foreign"
+	if err := pop2.WriteTyped(ctx, TypeClaimOp, reqID, ClaimOpMsg{OperationID: pending.ID.String()}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := pop2.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Type != TypeClaimOpResp || env.RequestID != reqID {
+		t.Fatalf("envelope: got %+v, want the claim_op_response for %s", env, reqID)
+	}
+	if strings.Contains(string(env.Data), "pop1-bmc-password") {
+		t.Errorf("claim_op_response to a pop2 worker carries the pop1 op's credentials: %s", env.Data)
+	}
+	var resp RPCResponseMsg
+	if err := unmarshalData(env.Data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	var claimResp ClaimOpResponse
+	if err := unmarshalData(resp.Data, &claimResp); err != nil {
+		t.Fatalf("decode ClaimOpResponse: %v", err)
+	}
+	if claimResp.Operation != nil {
+		t.Errorf("a pop2 worker was granted op %s, whose machine %s is only in pop1's snapshot",
+			pending.ID, pop1Machine)
+	}
+	if resp.Error != "" || !claimResp.AlreadyClaimed {
+		t.Errorf("out-of-site claim answered error=%q already_claimed=%v; want already_claimed and no error",
+			resp.Error, claimResp.AlreadyClaimed)
+	}
+	if calls := claimer.calls(); len(calls) != 0 {
+		t.Fatalf("the hub asked the store to claim a pop1 op for %+v; want no store claim for an out-of-site op", calls)
+	}
+
+	// The decline is scoped to the claimant's site: pop1's worker claims
+	// the op as usual.
+	pop1 := dialHub(t, srv, "tok-pop1")
+	if pop1 == nil {
+		t.Fatal("dial failed")
+	}
+	defer pop1.CloseNow()
+	helloAndDrain(t, pop1, "worker-pop1")
+	got, errStr := claimAndRead(t, pop1, pending.ID)
+	if errStr != "" || got.Operation == nil {
+		t.Fatalf("pop1 claim of its own op: error=%q granted=%v, want granted", errStr, got.Operation != nil)
+	}
+	if calls := claimer.calls(); len(calls) != 1 || calls[0].WorkerID != "worker-pop1" {
+		t.Errorf("store claims: got %+v, want exactly one, for worker-pop1", calls)
+	}
+}
+
 // helloAndDrain is a small helper used by op_update/log_lines tests
 // that only care about the post-hello state.
 func helloAndDrain(t *testing.T, conn *Conn, workerID string) {
