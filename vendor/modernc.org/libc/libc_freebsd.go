@@ -12,7 +12,6 @@ import (
 	"math"
 	mbits "math/bits"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -31,7 +30,6 @@ import (
 	"modernc.org/libc/limits"
 	"modernc.org/libc/netdb"
 	"modernc.org/libc/netinet/in"
-	"modernc.org/libc/pthread"
 	"modernc.org/libc/signal"
 	"modernc.org/libc/stdio"
 	"modernc.org/libc/sys/socket"
@@ -48,7 +46,7 @@ var (
 )
 
 // // Keep these outside of the var block otherwise go generate will miss them.
-var X__stderrp = Xstdout
+var X__stderrp = Xstderr
 var X__stdinp = Xstdin
 var X__stdoutp = Xstdout
 
@@ -247,7 +245,7 @@ func Xlocaltime(_ *TLS, timep uintptr) uintptr {
 	localtime.Ftm_mon = int32(t.Month() - 1)
 	localtime.Ftm_year = int32(t.Year() - 1900)
 	localtime.Ftm_wday = int32(t.Weekday())
-	localtime.Ftm_yday = int32(t.YearDay())
+	localtime.Ftm_yday = int32(t.YearDay() - 1)
 	localtime.Ftm_isdst = Bool32(isTimeDST(t))
 	_, off := t.Zone()
 	setTmGmtoff(&localtime, off)
@@ -269,7 +267,7 @@ func Xlocaltime_r(_ *TLS, timep, result uintptr) uintptr {
 	(*time.Tm)(unsafe.Pointer(result)).Ftm_mon = int32(t.Month() - 1)
 	(*time.Tm)(unsafe.Pointer(result)).Ftm_year = int32(t.Year() - 1900)
 	(*time.Tm)(unsafe.Pointer(result)).Ftm_wday = int32(t.Weekday())
-	(*time.Tm)(unsafe.Pointer(result)).Ftm_yday = int32(t.YearDay())
+	(*time.Tm)(unsafe.Pointer(result)).Ftm_yday = int32(t.YearDay() - 1)
 	(*time.Tm)(unsafe.Pointer(result)).Ftm_isdst = Bool32(isTimeDST(t))
 	_, off := t.Zone()
 	setTmGmtoff((*time.Tm)(unsafe.Pointer(result)), off)
@@ -343,6 +341,24 @@ func Xfsync(t *TLS, fd int32) int32 {
 	// if dmesgs {
 	// 	dmesg("%v: %d: ok", origin(1), fd)
 	// }
+	return 0
+}
+
+// int fdatasync(int fd);
+func Xfdatasync(t *TLS, fd int32) int32 {
+	if __ccgo_strace {
+		trc("t=%v fd=%v, (%v:)", t, fd, origin(2))
+	}
+	if noFsync {
+		// Simulate -DSQLITE_NO_SYNC for sqlite3 testfixture, see function full_sync in sqlite3.c
+		return Xfstat(t, fd, uintptr(unsafe.Pointer(&fsyncStatbuf)))
+	}
+
+	if _, _, err := unix.Syscall(unix.SYS_FDATASYNC, uintptr(fd), 0, 0); err != 0 {
+		t.setErrno(err)
+		return -1
+	}
+
 	return 0
 }
 
@@ -868,28 +884,6 @@ func Xgetpid(t *TLS) int32 {
 	return int32(os.Getpid())
 }
 
-// int system(const char *command);
-func Xsystem(t *TLS, command uintptr) int32 {
-	if __ccgo_strace {
-		trc("t=%v command=%v, (%v:)", t, command, origin(2))
-	}
-	s := GoString(command)
-	if command == 0 {
-		panic(todo(""))
-	}
-
-	cmd := exec.Command("sh", "-c", s)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		ps := err.(*exec.ExitError)
-		return int32(ps.ExitCode())
-	}
-
-	return 0
-}
-
 // int setvbuf(FILE *stream, char *buf, int mode, size_t size);
 func Xsetvbuf(t *TLS, stream, buf uintptr, mode int32, size types.Size_t) int32 {
 	if __ccgo_strace {
@@ -1200,14 +1194,6 @@ func Xperror(tls *TLS, msg uintptr) {
 	fmt.Fprintf(os.Stderr, "%s\n", GoString(errstr))
 }
 
-// int pclose(FILE *stream);
-func Xpclose(t *TLS, stream uintptr) int32 {
-	if __ccgo_strace {
-		trc("t=%v stream=%v, (%v:)", t, stream, origin(2))
-	}
-	panic(todo(""))
-}
-
 var gai_strerrorBuf [100]byte
 
 // const char *gai_strerror(int errcode);
@@ -1284,14 +1270,6 @@ func Xnl_langinfo(t *TLS, item langinfo.Nl_item) uintptr {
 		trc("t=%v item=%v, (%v:)", t, item, origin(2))
 	}
 	return uintptr(unsafe.Pointer(&emptyStr)) //TODO
-}
-
-// FILE *popen(const char *command, const char *type);
-func Xpopen(t *TLS, command, type1 uintptr) uintptr {
-	if __ccgo_strace {
-		trc("t=%v type1=%v, (%v:)", t, type1, origin(2))
-	}
-	panic(todo(""))
 }
 
 // char *realpath(const char *path, char *resolved_path);
@@ -1510,7 +1488,9 @@ func Xgetservbyname(t *TLS, name, proto uintptr) uintptr {
 	}
 	var protoent *gonetdb.Protoent
 	if proto != 0 {
-		protoent = gonetdb.GetProtoByName(GoString(proto))
+		if protoent = gonetdb.GetProtoByName(GoString(proto)); protoent == nil {
+			return 0
+		}
 	}
 	servent := gonetdb.GetServByName(GoString(name), protoent)
 	if servent == nil {
@@ -1520,68 +1500,47 @@ func Xgetservbyname(t *TLS, name, proto uintptr) uintptr {
 		return 0
 	}
 
-	Xfree(t, (*netdb.Servent)(unsafe.Pointer(&getservbynameStaticResult)).Fs_name)
-	if v := (*netdb.Servent)(unsafe.Pointer(&getservbynameStaticResult)).Fs_aliases; v != 0 {
-		for {
-			p := *(*uintptr)(unsafe.Pointer(v))
-			if p == 0 {
-				break
-			}
-
-			Xfree(t, p)
-			v += unsafe.Sizeof(uintptr(0))
+	// The result is static storage that owns its strings and the aliases
+	// array until the next call frees them, even after a failed call.
+	r := &getservbynameStaticResult
+	Xfree(t, r.Fs_name)
+	if v := r.Fs_aliases; v != 0 {
+		for p := v; *(*uintptr)(unsafe.Pointer(p)) != 0; p += unsafe.Sizeof(uintptr(0)) {
+			Xfree(t, *(*uintptr)(unsafe.Pointer(p)))
 		}
 		Xfree(t, v)
 	}
-	Xfree(t, (*netdb.Servent)(unsafe.Pointer(&getservbynameStaticResult)).Fs_proto)
-	cname, err := CString(servent.Name)
-	if err != nil {
-		getservbynameStaticResult = netdb.Servent{}
+	Xfree(t, r.Fs_proto)
+	*r = netdb.Servent{}
+	var err error
+	if r.Fs_name, err = CString(servent.Name); err != nil {
 		return 0
 	}
 
-	var protoname uintptr
-	if protoent != nil {
-		if protoname, err = CString(protoent.Name); err != nil {
-			Xfree(t, cname)
-			getservbynameStaticResult = netdb.Servent{}
-			return 0
-		}
+	if r.Fs_aliases = Xcalloc(t, types.Size_t(len(servent.Aliases)+1), types.Size_t(unsafe.Sizeof(uintptr(0)))); r.Fs_aliases == 0 {
+		return 0
 	}
-	var a []uintptr
-	for _, v := range servent.Aliases {
-		cs, err := CString(v)
+
+	for i, v := range servent.Aliases {
+		p, err := CString(v)
 		if err != nil {
-			for _, v := range a {
-				Xfree(t, v)
-			}
 			return 0
 		}
 
-		a = append(a, cs)
-	}
-	v := Xcalloc(t, types.Size_t(len(a)+1), types.Size_t(unsafe.Sizeof(uintptr(0))))
-	if v == 0 {
-		Xfree(t, cname)
-		Xfree(t, protoname)
-		for _, v := range a {
-			Xfree(t, v)
-		}
-		getservbynameStaticResult = netdb.Servent{}
-		return 0
-	}
-	for _, p := range a {
-		*(*uintptr)(unsafe.Pointer(v)) = p
-		v += unsafe.Sizeof(uintptr(0))
+		*(*uintptr)(unsafe.Pointer(r.Fs_aliases + uintptr(i)*unsafe.Sizeof(uintptr(0)))) = p
 	}
 
-	getservbynameStaticResult = netdb.Servent{
-		Fs_name:    cname,
-		Fs_aliases: v,
-		Fs_port:    int32(servent.Port),
-		Fs_proto:   protoname,
+	// servent.Protocol is nil only for a protocol missing from /etc/protocols.
+	var protoname string
+	if servent.Protocol != nil {
+		protoname = servent.Protocol.Name
 	}
-	return uintptr(unsafe.Pointer(&getservbynameStaticResult))
+	if r.Fs_proto, err = CString(protoname); err != nil {
+		return 0
+	}
+
+	r.Fs_port = int32(Xhtons(t, uint16(servent.Port)))
+	return uintptr(unsafe.Pointer(r))
 }
 
 func Xreaddir64(t *TLS, dir uintptr) uintptr {
@@ -1804,11 +1763,41 @@ func X__env_rm_add(tls *TLS, old uintptr, new uintptr) { /* setenv.c:5:6: */
 }
 
 // int unsetenv(const char *name);
+//
+// It is musl's unsetenv. It removes every entry of name from environ and
+// frees those that setenv allocated, which __env_rm_add tracks.
 func Xunsetenv(t *TLS, name uintptr) int32 {
 	if __ccgo_strace {
 		trc("t=%v name=%v, (%v:)", t, name, origin(2))
 	}
-	panic(todo(""))
+	if name == 0 {
+		t.setErrno(errno.EINVAL)
+		return -1
+	}
+
+	l := X__strchrnul(t, name, '=') - name
+	if l == 0 || *(*byte)(unsafe.Pointer(name + l)) != 0 {
+		t.setErrno(errno.EINVAL)
+		return -1
+	}
+
+	p := Environ()
+	w := p
+	for r := p; ; r += uintptrSize {
+		e := *(*uintptr)(unsafe.Pointer(r))
+		if e == 0 {
+			*(*uintptr)(unsafe.Pointer(w)) = 0
+			return 0
+		}
+
+		if Xstrncmp(t, name, e, size_t(l)) == 0 && *(*byte)(unsafe.Pointer(e + l)) == '=' {
+			X__env_rm_add(t, e, 0)
+			continue
+		}
+
+		*(*uintptr)(unsafe.Pointer(w)) = e
+		w += uintptrSize
+	}
 }
 
 // int pause(void);
@@ -2012,21 +2001,6 @@ func X__ccgo_getMutexType(tls *TLS, m uintptr) int32 { /* pthread_mutex_lock.c:3
 	return (*(*int32)(unsafe.Pointer((m /* &.__u */ /* &.__i */))) & 15)
 }
 
-func X__ccgo_pthreadAttrGetDetachState(tls *TLS, a uintptr) int32 { /* pthread_attr_get.c:3:5: */
-	if __ccgo_strace {
-		trc("tls=%v a=%v, (%v:)", tls, a, origin(2))
-	}
-	return *(*int32)(unsafe.Pointer((a /* &.__u */ /* &.__i */) + 6*4))
-}
-
-func Xpthread_attr_init(t *TLS, pAttr uintptr) int32 {
-	if __ccgo_strace {
-		trc("t=%v pAttr=%v, (%v:)", t, pAttr, origin(2))
-	}
-	*(*pthread.Pthread_attr_t)(unsafe.Pointer(pAttr)) = pthread.Pthread_attr_t(0)
-	return 0
-}
-
 // The pthread_mutex_init() function shall initialize the mutex referenced by
 // mutex with attributes specified by attr. If attr is NULL, the default mutex
 // attributes are used; the effect shall be the same as passing the address of
@@ -2046,30 +2020,7 @@ func Xpthread_mutex_init(t *TLS, pMutex, pAttr uintptr) int32 {
 	if pAttr != 0 {
 		typ = int(X__ccgo_pthreadMutexattrGettype(t, pAttr))
 	}
-	mutexesMu.Lock()
-
-	defer mutexesMu.Unlock()
-
-	mutexes[pMutex] = newMutex(typ)
-	return 0
-}
-
-func Xpthread_attr_getdetachstate(tls *TLS, a uintptr, state uintptr) int32 { /* pthread_attr_get.c:7:5: */
-	if __ccgo_strace {
-		trc("tls=%v a=%v state=%v, (%v:)", tls, a, state, origin(2))
-	}
-	*(*int32)(unsafe.Pointer(state)) = *(*int32)(unsafe.Pointer((a /* &.__u */ /* &.__i */) + 6*4))
-	return 0
-}
-
-func Xpthread_attr_setdetachstate(tls *TLS, a uintptr, state int32) int32 { /* pthread_attr_setdetachstate.c:3:5: */
-	if __ccgo_strace {
-		trc("tls=%v a=%v state=%v, (%v:)", tls, a, state, origin(2))
-	}
-	if uint32(state) > 1 {
-		return 22
-	}
-	*(*int32)(unsafe.Pointer((a /* &.__u */ /* &.__i */) + 6*4)) = state
+	setMutex(pMutex, newMutex(typ))
 	return 0
 }
 
