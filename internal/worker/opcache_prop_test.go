@@ -97,6 +97,13 @@ type pcStats struct {
 
 var pcStat = &pcStats{n: map[string]int{}}
 
+// reset clears the counters, so each test's coverage log covers that test.
+func (s *pcStats) reset() {
+	s.mu.Lock()
+	s.n = map[string]int{}
+	s.mu.Unlock()
+}
+
 func (s *pcStats) add(k string) {
 	s.mu.Lock()
 	s.n[k]++
@@ -1944,17 +1951,14 @@ func (w *pcWorld) step() {
 			pcStat.add("step/noop")
 			return // a well-bound report is w.agent_phase's job
 		}
-		before := w.c.GetOperation(o.id.String())
 		err := w.report(o, mi, model.ProgressReport{Phase: "partitioning"})
-		if mustReject {
-			pcStat.add("worker/report_mismatch_rejected")
-			if err == nil {
-				w.violate("report-binding", "report for %s with machine M%d accepted (op machine M%d, cache=%v)", pcShort(o.id), mi, o.mi, g != nil)
-			}
-			after := w.c.GetOperation(o.id.String())
-			if (before == nil) != (after == nil) || (before != nil && (before.Phase != after.Phase || before.Status != after.Status)) {
-				w.violate("report-binding", "rejected report mutated %s", pcShort(o.id))
-			}
+		pcStat.add("worker/report_mismatch_rejected")
+		if err == nil {
+			w.violate("report-binding", "report for %s with machine M%d accepted (op machine M%d, cache=%v)", pcShort(o.id), mi, o.mi, g != nil)
+		}
+		after := w.c.GetOperation(o.id.String())
+		if (g == nil) != (after == nil) || (g != nil && (g.Phase != after.Phase || g.Status != after.Status)) {
+			w.violate("report-binding", "rejected report mutated %s", pcShort(o.id))
 		}
 	})
 	total := 0
@@ -2193,9 +2197,11 @@ func pcRunCase(t *rapid.T, forceTier int, useDB bool, scratch func() string) {
 	w.checkConverged("after-resync", true)
 }
 
-// pcQuiet silences the Cache's slog output (fail-closed warnings, duplicate
-// MAC warnings) for the duration of a property test.
+// pcQuiet starts a property test: it clears the coverage counters and
+// silences the Cache's slog output (fail-closed warnings, duplicate MAC
+// warnings) for the duration of the test.
 func pcQuiet(t *testing.T) {
+	pcStat.reset()
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -2253,31 +2259,24 @@ func TestOpCacheProp_TombstoneBound(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		c := NewCache(nil)
 		mid := pcMachineID(0)
-		type tomb struct {
-			id  uuid.UUID
-			ver int
-		}
-		var fifo []tomb // model: oldest first
-		find := func(id uuid.UUID) int {
-			for i := range fifo {
-				if fifo[i].id == id {
-					return i
-				}
-			}
-			return -1
-		}
+		// Model: the tombstoned ops in order of first removal (oldest first)
+		// and the highest version each was removed at.
+		var fifo []uuid.UUID
+		vers := map[uuid.UUID]int{}
 		remove := func(id uuid.UUID, ver int) {
 			c.ApplyOpRemoved(id.String(), mid.String(), ver, "")
-			if i := find(id); i >= 0 {
-				if ver > fifo[i].ver {
-					fifo[i].ver = ver
+			if cur, ok := vers[id]; ok {
+				if ver > cur {
+					vers[id] = ver
 				}
 				return
 			}
 			if len(fifo) >= tombstoneCap {
+				delete(vers, fifo[0])
 				fifo = fifo[1:]
 			}
-			fifo = append(fifo, tomb{id, ver})
+			fifo = append(fifo, id)
+			vers[id] = ver
 		}
 		next := 0
 		fresh := func() uuid.UUID {
@@ -2312,15 +2311,15 @@ func TestOpCacheProp_TombstoneBound(t *testing.T) {
 				id := rapid.SampledFrom(seen).Draw(rt, "id")
 				ver := rapid.IntRange(0, 6).Draw(rt, "ver")
 				c.ApplyOpDelta(model.Operation{ID: id, MachineID: mid, Type: model.OpDeploy, Status: model.OpClaimed, Version: ver}, "")
-				i := find(id)
-				wantHeld := i < 0 || ver > fifo[i].ver
+				tombVer, tombstoned := vers[id]
+				wantHeld := !tombstoned || ver > tombVer
 				got := c.GetOperation(id.String()) != nil
 				if got != wantHeld {
-					rt.Fatalf("late op_delta v%d for a removed op (tombstone index %d of %d): held=%v, want %v",
-						ver, i, len(fifo), got, wantHeld)
+					rt.Fatalf("late op_delta v%d for a removed op (tombstoned=%v at v%d, %d tombstones): held=%v, want %v",
+						ver, tombstoned, tombVer, len(fifo), got, wantHeld)
 				}
 				switch {
-				case got && i < 0:
+				case got && !tombstoned:
 					pcStat.add("tombstone/resurrected_after_eviction")
 				case got:
 					pcStat.add("tombstone/accepted_above_tombstone")
