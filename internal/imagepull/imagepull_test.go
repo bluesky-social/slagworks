@@ -2,6 +2,7 @@ package imagepull
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -884,6 +885,121 @@ func TestSyncImages_DigestSpellingDoesNotMatter(t *testing.T) {
 			}
 			if n := downloads.Load(); n != 1 {
 				t.Errorf("downloads = %d after two syncs of the same row, want 1 (the second must find the version installed)", n)
+			}
+		})
+	}
+}
+
+// orderedEntry is one regular-file entry under noble-pxe/ in an
+// orderedTarball, which keeps entries in the given order and allows a path
+// to appear more than once.
+type orderedEntry struct {
+	name string
+	body string
+	mode int64
+}
+
+func orderedTarball(t *testing.T, entries []orderedEntry) (blob []byte, sha string) {
+	t.Helper()
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+	if err := tw.WriteHeader(&tar.Header{Name: "noble-pxe/", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		hdr := &tar.Header{Name: "noble-pxe/" + e.name, Typeflag: tar.TypeReg, Mode: e.mode, Size: int64(len(e.body))}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(e.body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(buf.Bytes())
+	return buf.Bytes(), hex.EncodeToString(sum[:])
+}
+
+// TestSyncImages_DuplicateTarEntryLaterWins: when a tarball holds the same
+// path twice (for example after `tar -r` appended a replacement file), the
+// later entry is the file, as with tar(1). Before the fix, extraction
+// opened the file the earlier entry had left without truncating it, so a
+// shorter later copy kept the earlier copy's tail: vmlinuz held bytes that
+// appear in neither entry, SyncImages reported success, and the marker was
+// written, so the image was never pulled again. The earlier file was also
+// opened in place, so the later entry's mode was ignored and a read-only
+// earlier copy made extraction fail for a non-root caller.
+func TestSyncImages_DuplicateTarEntryLaterWins(t *testing.T) {
+	others := []orderedEntry{
+		{name: "initrd", body: "i", mode: 0o644},
+		{name: "initrd-local", body: "l", mode: 0o644},
+		{name: "root.squashfs", body: "r", mode: 0o644},
+	}
+	cases := []struct {
+		name           string
+		earlier, later orderedEntry
+	}{
+		{
+			name:    "shorter later copy",
+			earlier: orderedEntry{name: "vmlinuz", body: "old-kernel-bytes", mode: 0o644},
+			later:   orderedEntry{name: "vmlinuz", body: "new", mode: 0o644},
+		},
+		{
+			// Passed before the fix too: the later entry already won when it
+			// was at least as long, which pins the failure above to the
+			// missing truncation rather than to first-entry-wins.
+			name:    "longer later copy",
+			earlier: orderedEntry{name: "vmlinuz", body: "new", mode: 0o644},
+			later:   orderedEntry{name: "vmlinuz", body: "old-kernel-bytes", mode: 0o644},
+		},
+		{
+			name:    "read-only earlier copy",
+			earlier: orderedEntry{name: "vmlinuz", body: "old-kernel-bytes", mode: 0o444},
+			later:   orderedEntry{name: "vmlinuz", body: "new", mode: 0o644},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := append([]orderedEntry{tc.earlier}, others...)
+			entries = append(entries, tc.later)
+			blob, sha := orderedTarball(t, entries)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(blob)
+			}))
+			defer srv.Close()
+
+			imagesDir := t.TempDir()
+			images := map[string]*model.Image{
+				"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: srv.URL + "/noble-pxe.tar.gz"},
+			}
+			if err := SyncImages(slog.Default(), imagesDir, images); err != nil {
+				t.Fatalf("SyncImages: %v", err)
+			}
+
+			path := filepath.Join(imagesDir, "noble-pxe", "vmlinuz")
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.later.body {
+				t.Errorf("vmlinuz = %q, want %q (the later entry; the earlier one was %q)", got, tc.later.body, tc.earlier.body)
+			}
+			fi, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Owner bits only, so the check holds under any umask that
+			// leaves the owner's permissions alone.
+			want := os.FileMode(tc.later.mode) & 0o700
+			if perm := fi.Mode().Perm() & 0o700; perm != want {
+				t.Errorf("vmlinuz owner permissions = %#o, want %#o (the later entry's mode %#o, not the earlier %#o)",
+					perm, want, tc.later.mode, tc.earlier.mode)
 			}
 		})
 	}

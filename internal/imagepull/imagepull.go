@@ -572,7 +572,18 @@ func extractTarGz(tarPath, destDir string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
 			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, os.FileMode(hdr.Mode))
+			// A path can appear more than once in a tarball (tar -r appends
+			// a replacement); as with tar(1), the later entry is the file.
+			// Remove the earlier entry's file so this one is created with
+			// its own bytes and mode: writing into the old file would keep
+			// its tail when this entry is shorter, keep its mode, and fail
+			// for a non-root caller when it is read-only.
+			if fi, err := os.Lstat(target); err == nil && fi.Mode().IsRegular() {
+				if err := os.Remove(target); err != nil {
+					return err
+				}
+			}
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, os.FileMode(hdr.Mode))
 			if err != nil {
 				return err
 			}
