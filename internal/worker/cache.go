@@ -412,8 +412,11 @@ func (c *Cache) recordBMCReconcileReport(machineID, operationID uuid.UUID, rep m
 }
 
 // RecordPhoneHome is the canonical signal that the installed OS
-// booted successfully. It completes the active deploy op and updates
-// the local cache state.
+// booted successfully. It completes the deploy op the phone-home named
+// (opID, already checked by validateReportBinding) and updates the local
+// cache state. It never picks a deploy op by machine: the worker can
+// briefly hold a machine's next deploy alongside the one that installed
+// the disk, and only the named one ran.
 //
 // The completion travels on two channels. The phone_home observation
 // carries the deploy op's ID and is the durable one: it sits in the
@@ -426,16 +429,16 @@ func (c *Cache) recordBMCReconcileReport(machineID, operationID uuid.UUID, rep m
 // handler call); it stays as the existing path, and whichever of the
 // two reaches global first completes the op while the other is a no-op.
 //
-// If no active deploy op is found (late phone-home, op already
-// completed by timeout, etc.), the observation still goes out with no
+// If the worker no longer holds the named op as an active deploy op
+// (it ended after validation), the observation still goes out with no
 // operation ID: global acks it without a state transition.
-func (c *Cache) RecordPhoneHome(machineID uuid.UUID) {
+func (c *Cache) RecordPhoneHome(machineID, opID uuid.UUID) {
 	// opState records the local machine-state advance as an overlay rather
 	// than mutating the (immutable) view: the machine stays `running`
 	// locally until the next snapshot carries the authoritative state, at
 	// which point ApplySnapshot clears the overlay. This is what keeps
 	// BootActionForMAC returning BootLocal on the post-install reboot.
-	deployOpID := c.opState.recordPhoneHome(machineID)
+	deployOpID := c.opState.recordPhoneHome(machineID, opID)
 
 	c.appendObservation(model.Observation{
 		MachineID:   machineID,
@@ -1276,7 +1279,7 @@ func (c *Cache) HandleProgressReport(report *model.ProgressReport) error {
 	case "commission_report":
 		c.recordCommissionReport(mid, oid, report.CommissionData)
 	case "phone_home":
-		c.RecordPhoneHome(mid)
+		c.RecordPhoneHome(mid, oid)
 	}
 	return nil
 }

@@ -886,11 +886,17 @@ func (o *opState) commissionOpForMAC(mac string) *model.Operation {
 }
 
 // recordPhoneHome sets the running overlay for a machine (if it exists in
-// the view), latches the deploy op as locally phone-homed, and returns the
-// active deploy op ID to complete, or uuid.Nil if none. Combined
-// reader/writer: reads the view and writes the overlay + scans ops under
+// the view), latches the deploy op the phone-home named as locally
+// phone-homed, and returns that op's ID to complete, or uuid.Nil if this
+// worker no longer holds it as an active deploy op of the machine. Combined
+// reader/writer: reads the view and writes the overlay + reads the op under
 // one mu.Lock.
-func (o *opState) recordPhoneHome(machineID uuid.UUID) uuid.UUID {
+//
+// The op is looked up by the ID the report named, never by machine: while a
+// new deploy's op_delta is ahead of the previous deploy's op_removed, the
+// worker holds two active deploy ops for the machine, and global completes
+// whichever one the phone_home observation carries.
+func (o *opState) recordPhoneHome(machineID, opID uuid.UUID) uuid.UUID {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	// Record the local machine-state advance as an overlay rather than
@@ -901,18 +907,17 @@ func (o *opState) recordPhoneHome(machineID uuid.UUID) uuid.UUID {
 	if _, ok := o.view.Load().machines[machineID]; ok {
 		o.machineState[machineID] = model.MachineStateRunning
 	}
-	for _, op := range o.ops {
-		if op.MachineID == machineID && op.Type == model.OpDeploy &&
-			op.Status != model.OpCompleted && op.Status != model.OpFailed {
-			// Latch this op as locally phone-homed: a reconnect op_resync
-			// that brings it back as claimed-deploying must not downgrade
-			// the running overlay and re-wipe the fresh disk.
-			o.phoneHomed[op.ID.String()] = true
-			o.settlePhoneHome(op.ID.String(), machineID)
-			return op.ID
-		}
+	op, ok := o.ops[opID.String()]
+	if !ok || op.MachineID != machineID || op.Type != model.OpDeploy ||
+		op.Status == model.OpCompleted || op.Status == model.OpFailed {
+		return uuid.Nil
 	}
-	return uuid.Nil
+	// Latch this op as locally phone-homed: a reconnect op_resync that
+	// brings it back as claimed-deploying must not downgrade the running
+	// overlay and re-wipe the fresh disk.
+	o.phoneHomed[op.ID.String()] = true
+	o.settlePhoneHome(op.ID.String(), machineID)
+	return op.ID
 }
 
 // --- Op-set readers (ops only, under mu.RLock) ---

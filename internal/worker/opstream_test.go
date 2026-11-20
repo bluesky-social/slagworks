@@ -41,7 +41,7 @@ func TestRewipeWindow_BothOrders(t *testing.T) {
 			Status: model.OpClaimed, Phase: "awaiting_phone_home", Version: 1,
 		})
 		// Local phone-home: overlay -> running, op latched.
-		c.RecordPhoneHome(id)
+		c.RecordPhoneHome(id, opID)
 		if got := c.BootActionForMAC(mac); got != model.BootLocal {
 			t.Fatalf("after phone-home: got %d, want BootLocal", got)
 		}
@@ -715,7 +715,7 @@ func TestAwaitingPhoneHomeSurvivesRestart(t *testing.T) {
 				t.Fatalf("deploy_complete: %v", err)
 			}
 			if tc.phoneHome {
-				c.RecordPhoneHome(id)
+				c.RecordPhoneHome(id, opID)
 			}
 			if got := c.BootActionForMAC(mac); got != model.BootLocal {
 				t.Fatalf("precondition: installed host got %d, want BootLocal", got)

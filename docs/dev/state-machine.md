@@ -680,10 +680,16 @@ Path depends on the op type.
   MAC-only phone-home route: a request that names no op cannot
   complete one (`TestPhoneHome_CompletesOnlyTheBoundDeployAwaitingIt`,
   `internal/httpboot/phone_home_test.go`). An accepted report
-  calls `Cache.RecordPhoneHome` (`internal/worker/cache.go`).
-  That sets the machine's local state to `running`, emits a
-  `phone_home` observation carrying the deploy op's ID, and calls
-  `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. Both reach
+  calls `Cache.RecordPhoneHome` (`internal/worker/cache.go`) with
+  the op it named. That sets the machine's local state to `running`,
+  emits a `phone_home` observation carrying that op's ID, and calls
+  `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. It never
+  looks the op up by machine: a worker can briefly hold two active
+  deploy ops for one machine, when the next deploy's `op_delta`
+  arrives ahead of the previous one's `op_removed`, and global
+  completes whichever op the observation carries, pending included
+  (`TestPhoneHome_CompletesTheOpItNames`,
+  `internal/worker/opstate_redeploy_test.go`). Both reach
   `Store.CompleteOperationWithState(opID, Running, ...)`, which
   auto-locks the machine: the op update through
   `hubhandlers.OpUpdate.HandleOpUpdate`, the observation through
@@ -696,8 +702,9 @@ Path depends on the op type.
   acks it. Without it, a worker restart, a dropped connection or a
   failed op-update handler between the 2xx and delivery would leave
   the op at `awaiting_phone_home` until `PhoneHomeTimeout` fails a
-  healthy host. A `phone_home` with no op ID (the worker held no
-  active deploy op) changes nothing.
+  healthy host. A `phone_home` with no op ID (the named op ended
+  between the worker validating the report and recording it) changes
+  nothing.
 - **Commission** completes via the commission report path, not the
   op-update path. The observation handler calls
   `Store.CommitCommissionResult(opID, machineID, data)`, which revalidates
