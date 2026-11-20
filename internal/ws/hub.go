@@ -1264,11 +1264,6 @@ func (c *workerConn) handleHello(ctx context.Context, hello HelloMsg) error {
 		rctx, cancel := context.WithTimeout(ctx, c.hub.cfg.RebuildTimeout)
 		defer cancel()
 		built, err := c.hub.cfg.Rebuilder.RebuildAndWait(rctx, c.slug)
-		if err != nil {
-			c.writeError(ctx, "rebuild_failed", err.Error())
-			return fmt.Errorf("hello-triggered rebuild: %w", err)
-		}
-		snap = built
 		// Cache the rebuilt snapshot. The dispatcher only Pushes (and so
 		// only populates h.snapshots) on a content-hash CHANGE; after a
 		// global restart with unchanged content the rebuild returns
@@ -1284,13 +1279,33 @@ func (c *workerConn) handleHello(ctx context.Context, hello HelloMsg) error {
 		// from it.
 		// Comparing SeqNums instead would put a pre-reset snapshot back
 		// when the slug's counter went backwards in the meantime.
+		//
+		// The same holds when the wait failed (the rebuild errored or
+		// outlasted RebuildTimeout): a hello that arrives while a rebuild
+		// runs waits for the next one, so the running one may have pushed
+		// meanwhile, and the Push fanned out to this conn, which registered
+		// before this reply. The worker may already hold that snapshot as
+		// its hello reply. Answer from the cache; refuse only when it is
+		// still empty.
 		c.hub.mu.Lock()
-		if cur, ok := c.hub.snapshots[c.slug]; ok {
-			snap = cur
-		} else {
+		cur, cached := c.hub.snapshots[c.slug]
+		if !cached && err == nil {
 			c.hub.snapshots[c.slug] = built
 		}
 		c.hub.mu.Unlock()
+		switch {
+		case cached:
+			if err != nil {
+				c.log.Warn("hello-triggered rebuild failed; answering the hello from the snapshot cached while it waited",
+					"seq", cur.SeqNum, "err", err)
+			}
+			snap = cur
+		case err != nil:
+			c.writeError(ctx, "rebuild_failed", err.Error())
+			return fmt.Errorf("hello-triggered rebuild: %w", err)
+		default:
+			snap = built
+		}
 	}
 
 	if snap.SeqNum == hello.LastSeqNum && snap.SeqNum != 0 {

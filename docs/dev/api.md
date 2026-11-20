@@ -275,7 +275,11 @@ Connection setup:
    whose only workers are still waiting for it answers those reads as if no
    worker were connected. The worker adopts the first snapshot on a
    connection even when its SeqNum is lower than the one it holds, and
-   drops a later one that is older than what it holds.
+   drops a later one that is older than what it holds. When global holds no
+   snapshot for the site yet (it has just started), it builds one before
+   replying, waiting up to 30 s; if that build fails and no snapshot for the
+   site has been cached in the meantime, it rejects the connection with
+   `rebuild_failed` and the worker reconnects and retries.
 
 Worker to global:
 

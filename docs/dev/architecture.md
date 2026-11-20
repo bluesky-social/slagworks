@@ -516,9 +516,13 @@ cast pipeline, and the `SourceSOL` constant no longer exists.
   SeqNum is below the cached one closes the slug's connections instead,
   so each worker reconnects and adopts the new snapshot from its hello
   reply.
-- On hello, sends a snapshot or `no_change`. Coalesces concurrent
-  hello-triggered rebuilds through a
-  `singleflight.Group` (`helloRebuild`, 226).
+- On hello, sends a snapshot or `no_change`. With no cached snapshot for
+  the slug (global just started) the hello waits, up to `RebuildTimeout`,
+  on the slug's rebuild actor (`Rebuilder.RebuildAndWait`), where
+  concurrent hellos batch onto one rebuild. When that wait fails, the hello
+  is still answered from a snapshot cached meanwhile (by a push, or by
+  another worker's hello); it is refused with `rebuild_failed` only when
+  the cache is still empty.
 - Dispatches inbound envelopes per type (`dispatch`, 701) to
   handlers implemented in `internal/hubhandlers`:
   `handleObservation` (789), `handleOpUpdate` (837),

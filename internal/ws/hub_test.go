@@ -571,6 +571,137 @@ func TestHub_ColdHelloKeepsSnapshotPushedDuringRebuild(t *testing.T) {
 	}
 }
 
+// fillThenFail stands in for the slug's rebuild actor when a cold hello's
+// own rebuild wait fails although the hub's cache was filled while it
+// waited. A hello that arrives while a rebuild is already running waits for
+// the next one; fill is what happens in between (the running rebuild
+// pushes, or a sibling worker's cold hello caches its result), and the
+// error is the next rebuild failing or outlasting RebuildTimeout.
+type fillThenFail struct {
+	fill func(ctx context.Context)
+}
+
+func (r *fillThenFail) RebuildAndWait(ctx context.Context, _ string) (model.SiteSnapshot, error) {
+	r.fill(ctx)
+	return model.SiteSnapshot{}, errors.New("netbox: context deadline exceeded")
+}
+
+// readHelloCompletion reads the rest of a hello exchange: zero or more
+// snapshots carrying wantSeq, then the op_resync that completes the hello.
+// An error message or a dropped connection fails the test.
+func readHelloCompletion(ctx context.Context, t *testing.T, h *Hub, conn *Conn, slug string, wantSeq int64) {
+	t.Helper()
+	for {
+		env, err := conn.ReadMessage(ctx)
+		if err != nil {
+			t.Fatalf("the hub dropped the connection instead of completing the hello: %v", err)
+		}
+		switch env.Type {
+		case TypeSnapshot:
+			var msg SnapshotMsg
+			if json.Unmarshal(env.Data, &msg) != nil || msg.Snapshot.SeqNum != wantSeq {
+				t.Fatalf("snapshot = %s, want seq %d", env.Data, wantSeq)
+			}
+		case TypeOpResync:
+			if n := len(h.rpcTargets(slug)); n != 1 {
+				t.Errorf("hello completed but the hub has %d RPC targets for the site, want 1", n)
+			}
+			return
+		case TypeError:
+			t.Fatalf("the hub refused a hello it can answer from its cached snapshot: %s", env.Data)
+		default:
+			t.Fatalf("unexpected message %s before op_resync", env.Type)
+		}
+	}
+}
+
+// TestHub_ColdHelloAnsweredFromPushedSnapshotWhenItsRebuildFails: a
+// connection registers for Push fan-out before its hello is answered, so a
+// snapshot pushed while a cold hello waits on its rebuild reaches the
+// worker as the connection's first message. The worker takes it for the
+// hello reply and considers itself connected (it reports READY, drains its
+// outbox, claims operations). When the hello's own rebuild wait then
+// fails, the hub must still finish the hello from the snapshot it now
+// caches, not refuse and close a connection the worker is already using.
+func TestHub_ColdHelloAnsweredFromPushedSnapshotWhenItsRebuildFails(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "site-a", "worker-1")
+	pushed := model.SiteSnapshot{SeqNum: 4, Site: model.SiteInfo{Slug: "site-a"}}
+	delivered := make(chan struct{})
+	reb := &fillThenFail{}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: reb, RebuildTimeout: 2 * time.Second})
+	reb.fill = func(ctx context.Context) {
+		h.Push("site-a", pushed)
+		// Fail only once the worker holds the fan-out, the order a
+		// production rebuild's debounce and NetBox gather produce.
+		select {
+		case <-delivered:
+		case <-ctx.Done():
+		}
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer func() { _ = conn.CloseNow() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeHello, "", HelloMsg{WorkerID: "worker-1", Proto: OpStreamProto}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := conn.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg SnapshotMsg
+	if env.Type != TypeSnapshot || json.Unmarshal(env.Data, &msg) != nil || msg.Snapshot.SeqNum != 4 {
+		t.Fatalf("first message = %s %s, want the pushed snapshot seq 4", env.Type, env.Data)
+	}
+	close(delivered)
+	readHelloCompletion(ctx, t, h, conn, "site-a", 4)
+}
+
+// TestHub_ColdHelloAnsweredFromSiblingsSnapshotWhenItsRebuildFails: the
+// same failure when the cache was filled without a Push, by another
+// worker's cold hello for the site caching its rebuild result. Nothing has
+// reached this connection yet, so the hello reply carries the snapshot.
+func TestHub_ColdHelloAnsweredFromSiblingsSnapshotWhenItsRebuildFails(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "site-a", "worker-1")
+	reb := &fillThenFail{}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: reb, RebuildTimeout: 2 * time.Second})
+	reb.fill = func(context.Context) {
+		h.mu.Lock()
+		h.snapshots["site-a"] = model.SiteSnapshot{SeqNum: 4, Site: model.SiteInfo{Slug: "site-a"}}
+		h.mu.Unlock()
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer func() { _ = conn.CloseNow() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeHello, "", HelloMsg{WorkerID: "worker-1", Proto: OpStreamProto}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := conn.ReadMessage(ctx)
+	if err != nil {
+		t.Fatalf("the hub dropped the connection instead of answering the hello: %v", err)
+	}
+	var msg SnapshotMsg
+	if env.Type != TypeSnapshot || json.Unmarshal(env.Data, &msg) != nil || msg.Snapshot.SeqNum != 4 {
+		t.Fatalf("hello reply = %s %s, want the cached snapshot seq 4", env.Type, env.Data)
+	}
+	readHelloCompletion(ctx, t, h, conn, "site-a", 4)
+}
+
 func TestHub_UnregisterOnDisconnect(t *testing.T) {
 	h, auth, _ := newTestHub(t)
 	auth.register("tok-1", "pop3", "worker-1")
