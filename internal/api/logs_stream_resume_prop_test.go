@@ -64,10 +64,10 @@ func TestLogsStreamResumeThroughFaultProxy_Prop(t *testing.T) {
 	// A case streams up to 1200 rows through up to eight faults, and the
 	// handler polls for new rows only every pollInterval.
 	lowerDefaultRapidChecks(t, 25)
-	var cases, rowsTotal, reconnTotal, faultTotal, chunkedCases atomic.Int64
+	var cases, rowsTotal, reconnTotal, faultTotal, chunkedCases, lifetimeDrops atomic.Int64
 	defer func() {
-		t.Logf("logs resume coverage: cases=%d rows=%d reconnects=%d faults=%d chunkedCases=%d",
-			cases.Load(), rowsTotal.Load(), reconnTotal.Load(), faultTotal.Load(), chunkedCases.Load())
+		t.Logf("logs resume coverage: cases=%d rows=%d reconnects=%d faults=%d chunkedCases=%d lifetimeDrops=%d",
+			cases.Load(), rowsTotal.Load(), reconnTotal.Load(), faultTotal.Load(), chunkedCases.Load(), lifetimeDrops.Load())
 	}()
 	rapid.Check(t, func(rt *rapid.T) {
 		cases.Add(1)
@@ -200,7 +200,11 @@ func TestLogsStreamResumeThroughFaultProxy_Prop(t *testing.T) {
 				case 3:
 					px.SetChunking(rapid.IntRange(1, 64).Draw(rt, "chunk"), 0)
 				case 4:
-					px.SetMaxLifetime(time.Duration(rapid.IntRange(5, 50).Draw(rt, "lifeMs")) * time.Millisecond)
+					// Held for longer than the limit, so a connection open
+					// now is cut by it before the writer moves on.
+					life := time.Duration(rapid.IntRange(5, 50).Draw(rt, "lifeMs")) * time.Millisecond
+					px.SetMaxLifetime(life)
+					time.Sleep(life + 20*time.Millisecond)
 				default:
 					px.SetChunking(0, 0)
 					px.SetMaxLifetime(0)
@@ -214,6 +218,7 @@ func TestLogsStreamResumeThroughFaultProxy_Prop(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		rowsTotal.Add(int64(len(ids)))
+		lifetimeDrops.Add(px.Stats().Dropped)
 		reconnTotal.Add(int64(reconnects))
 		if stalled != "" {
 			rt.Fatalf("stream stalled with rows still owed: %s (received %d of %d rows, reconnects=%d)", stalled, len(got), len(ids), reconnects)

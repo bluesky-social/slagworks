@@ -42,7 +42,8 @@ type Proxy struct {
 	ln      net.Listener
 	addr    string
 	pairs   map[*pair]struct{}
-	refuse  []int // status codes for the next upgrades, consumed in order
+	pending map[net.Conn]struct{} // accepted, upgrade request not yet forwarded
+	refuse  []int                 // status codes for the next upgrades, consumed in order
 	reqs    []Request
 	silence int // the next silence accepted connections go silent after the upgrade
 	closed  bool
@@ -85,7 +86,7 @@ type pair struct {
 
 // New starts a proxy on 127.0.0.1 forwarding to target ("host:port").
 func New(target string) (*Proxy, error) {
-	p := &Proxy{target: target, pairs: map[*pair]struct{}{}}
+	p := &Proxy{target: target, pairs: map[*pair]struct{}{}, pending: map[net.Conn]struct{}{}}
 	p.seed.Store(1)
 	if err := p.listen("127.0.0.1:0"); err != nil {
 		return nil, err
@@ -219,6 +220,13 @@ func (p *Proxy) drop(rst bool) int {
 	for _, pr := range prs {
 		pr.kill(rst)
 	}
+	// A connection still sending its upgrade request is open too: closing
+	// it ends its handler, which otherwise waits out the request deadline.
+	p.mu.Lock()
+	for c := range p.pending {
+		_ = c.Close()
+	}
+	p.mu.Unlock()
 	return len(prs)
 }
 
@@ -317,6 +325,19 @@ func (p *Proxy) acceptLoop(ln net.Listener) {
 }
 
 func (p *Proxy) handle(client net.Conn) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		_ = client.Close()
+		return
+	}
+	p.pending[client] = struct{}{}
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.pending, client)
+		p.mu.Unlock()
+	}()
 	br := bufio.NewReader(client)
 	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
 	req, err := http.ReadRequest(br)
