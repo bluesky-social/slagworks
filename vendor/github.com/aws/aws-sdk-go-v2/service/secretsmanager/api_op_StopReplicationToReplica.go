@@ -4,21 +4,33 @@ package secretsmanager
 
 import (
 	"context"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager/schemas"
+	smithy "github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 )
 
-// Removes the link between the replica secret and the primary secret and promotes
-// the replica to a primary secret in the replica Region.
+// Removes the link between a replica secret and its primary secret, and stops
+// replication to the replica. You call this operation from the replica account or
+// Region. Depending on the type of replica, the behavior is:
 //
-// You must call this operation from the Region in which you want to promote the
-// replica to a primary secret.
+//   - Cross-Region replica: promotes the replica to a standalone primary secret
+//     in the replica Region.
+//
+//   - Cross-account replica: promotes the replica in your account to a standalone
+//     secret and stops replication from its primary secret in the other account.
+//     Secrets Manager updates the primary secret's replication status to Detached
+//     for this replica.
+//
+// To stop cross-account replication from the primary account instead, use DisassociateCrossAccountReplica.
 //
 // Secrets Manager generates a CloudTrail log entry when you call this action. Do
 // not include sensitive information in request parameters because it might be
 // logged. For more information, see [Logging Secrets Manager events with CloudTrail].
 //
-// Required permissions: secretsmanager:StopReplicationToReplica . For more
-// information, see [IAM policy actions for Secrets Manager]and [Authentication and access control in Secrets Manager].
+// Required permissions: secretsmanager:StopReplicationToReplica . For
+// cross-account replica secrets, you must also have
+// secretsmanager:DeleteResourcePolicy permissions. For more information, see [IAM policy actions for Secrets Manager] and [Authentication and access control in Secrets Manager]
+// .
 //
 // [Authentication and access control in Secrets Manager]: https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access.html
 // [Logging Secrets Manager events with CloudTrail]: https://docs.aws.amazon.com/secretsmanager/latest/userguide/retrieve-ct-entries.html
@@ -40,8 +52,12 @@ func (c *Client) StopReplicationToReplica(ctx context.Context, params *StopRepli
 
 type StopReplicationToReplicaInput struct {
 
-	// The name of the secret or the replica ARN. The replica ARN is the same as the
-	// original primary secret ARN expect the Region is changed to the replica Region.
+	// The ARN or name of the replica secret.
+	//
+	// For a cross-region replica, the replica ARN is the same as the original primary
+	// secret ARN except that the Region is changed to the replica Region. For a
+	// cross-account replica, this is the ARN or name of the replica secret in your
+	// account.
 	//
 	// This member is required.
 	SecretId *string
@@ -49,10 +65,23 @@ type StopReplicationToReplicaInput struct {
 	noSmithyDocumentSerde
 }
 
+func (v *StopReplicationToReplicaInput) Serialize(s smithy.ShapeSerializer) {
+	s.WriteStruct(schemas.StopReplicationToReplicaRequest)
+	v.SerializeMembers(s)
+	s.CloseStruct()
+}
+
+func (v *StopReplicationToReplicaInput) SerializeMembers(s smithy.ShapeSerializer) {
+	if v.SecretId != nil {
+		s.WriteString(schemas.StopReplicationToReplicaRequest_SecretId, *v.SecretId)
+	}
+}
+
 type StopReplicationToReplicaOutput struct {
 
-	// The ARN of the promoted secret. The ARN is the same as the original primary
-	// secret except the Region is changed.
+	// The ARN of the promoted secret. For a cross-region replica, this ARN is the
+	// same as the original primary secret's ARN except that the Region is changed. For
+	// a cross-account replica, this is the ARN of the promoted secret in your account.
 	ARN *string
 
 	// Metadata pertaining to the operation's result.
@@ -61,13 +90,32 @@ type StopReplicationToReplicaOutput struct {
 	noSmithyDocumentSerde
 }
 
+func (v *StopReplicationToReplicaOutput) Serialize(s smithy.ShapeSerializer) {
+	s.WriteStruct(schemas.StopReplicationToReplicaResponse)
+	v.SerializeMembers(s)
+	s.CloseStruct()
+}
+
+func (v *StopReplicationToReplicaOutput) SerializeMembers(s smithy.ShapeSerializer) {
+	if v.ARN != nil {
+		s.WriteString(schemas.StopReplicationToReplicaResponse_ARN, *v.ARN)
+	}
+}
+func (v *StopReplicationToReplicaOutput) Deserialize(d smithy.ShapeDeserializer) error {
+	return smithy.ReadStruct(d, schemas.StopReplicationToReplicaResponse, func(s *smithy.Schema) error {
+		switch s {
+		case schemas.StopReplicationToReplicaResponse_ARN:
+			v.ARN = new(string)
+			return d.ReadString(schemas.StopReplicationToReplicaResponse_ARN, v.ARN)
+		}
+		return nil
+	})
+}
 func (c *Client) addOperationStopReplicationToReplicaMiddlewares(stack *middleware.Stack, options Options) (err error) {
-	err = stack.Serialize.Add(&awsAwsjson11_serializeOpStopReplicationToReplica{}, middleware.After)
-	if err != nil {
+	if err := stack.Serialize.Add(&serializeRequestMiddleware{options: &options, operationSchema: smithy.NewOperationSchema(schemas.StopReplicationToReplica, schemas.StopReplicationToReplicaRequest, schemas.StopReplicationToReplicaResponse)}, middleware.After); err != nil {
 		return err
 	}
-	err = stack.Deserialize.Add(&awsAwsjson11_deserializeOpStopReplicationToReplica{}, middleware.After)
-	if err != nil {
+	if err := stack.Deserialize.Add(&deserializeResponseMiddleware{options: &options, operationSchema: smithy.NewOperationSchema(schemas.StopReplicationToReplica, schemas.StopReplicationToReplicaRequest, schemas.StopReplicationToReplicaResponse), output: &StopReplicationToReplicaOutput{}}, middleware.After); err != nil {
 		return err
 	}
 
