@@ -262,7 +262,11 @@ func TestLogRingDrainLoop_BoundsBatchBytes(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// The loop below already blocks on each batch as it arrives; the
+	// deadline only bounds a run in which they never do. About 16 MiB of
+	// envelopes takes seconds to cross the race-instrumented encoder and
+	// decoder on a loaded machine, so it is set far above that.
+	ctx, cancel := context.WithTimeout(context.Background(), uplinkWait)
 	defer cancel()
 	conn, err := ws.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
 	if err != nil {

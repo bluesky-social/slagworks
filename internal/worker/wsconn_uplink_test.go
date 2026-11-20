@@ -23,6 +23,40 @@ type uplinkGlobal struct {
 	hellos  int
 	obs     []model.Observation
 	updates []ws.OpUpdateMsg
+	// changed is signalled after every hello, observation and op_update,
+	// so await blocks on what global received and not on the clock.
+	changed chan struct{}
+}
+
+// uplinkWait bounds every wait in these tests. It is how long a test that is
+// going to fail takes to say so, not how long a passing one takes: a pass
+// returns as soon as what it waits for happens. A 16 MiB message crosses the
+// race-instrumented encoder, WebSocket and decoder in a few seconds on a
+// loaded machine, so the bound is far above that.
+const uplinkWait = 2 * time.Minute
+
+func (g *uplinkGlobal) signal() {
+	select {
+	case g.changed <- struct{}{}:
+	default:
+	}
+}
+
+// await blocks until cond holds over what global has received, and reports
+// whether it did within uplinkWait.
+func (g *uplinkGlobal) await(cond func(hellos, obs, updates int) bool) bool {
+	deadline := time.NewTimer(uplinkWait)
+	defer deadline.Stop()
+	for {
+		if cond(g.counts()) {
+			return true
+		}
+		select {
+		case <-g.changed:
+		case <-deadline.C:
+			return cond(g.counts())
+		}
+	}
 }
 
 func (g *uplinkGlobal) GetSiteWorkerByTokenHash(hash string) (*model.SiteWorker, error) {
@@ -37,6 +71,7 @@ func (g *uplinkGlobal) TouchSiteWorker(slug, workerID, _ string, serial *string)
 		g.mu.Lock()
 		g.hellos++
 		g.mu.Unlock()
+		g.signal()
 	}
 	return &model.SiteWorker{SiteSlug: slug, WorkerID: workerID}, nil
 }
@@ -49,15 +84,17 @@ func (g *uplinkGlobal) RebuildAndWait(context.Context, string) (model.SiteSnapsh
 
 func (g *uplinkGlobal) HandleObservation(_ context.Context, o model.Observation) error {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.obs = append(g.obs, o)
+	g.mu.Unlock()
+	g.signal()
 	return nil
 }
 
 func (g *uplinkGlobal) HandleOpUpdate(_ context.Context, m ws.OpUpdateMsg) error {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.updates = append(g.updates, m)
+	g.mu.Unlock()
+	g.signal()
 	return nil
 }
 
@@ -71,7 +108,7 @@ func (g *uplinkGlobal) counts() (hellos, obs, updates int) {
 // for the worker's first sync.
 func connectUplink(t *testing.T) (*uplinkGlobal, *Cache, *LocalDB) {
 	t.Helper()
-	g := &uplinkGlobal{}
+	g := &uplinkGlobal{changed: make(chan struct{}, 1)}
 	hub := ws.NewHub(ws.HubConfig{Auth: g, Rebuilder: g, ObsHandler: g, OpUpdateHandler: g})
 	srv := httptest.NewServer(hub)
 	t.Cleanup(srv.Close)
@@ -93,7 +130,7 @@ func connectUplink(t *testing.T) (*uplinkGlobal, *Cache, *LocalDB) {
 		<-done
 	})
 
-	sctx, scancel := context.WithTimeout(ctx, 5*time.Second)
+	sctx, scancel := context.WithTimeout(ctx, uplinkWait)
 	defer scancel()
 	if err := wsc.WaitForSync(sctx); err != nil {
 		t.Fatalf("worker never synced: %v", err)
@@ -101,9 +138,11 @@ func connectUplink(t *testing.T) (*uplinkGlobal, *Cache, *LocalDB) {
 	return g, cache, localDB
 }
 
-// eventually polls cond for up to 4s and reports whether it became true.
+// eventually polls cond for up to uplinkWait and reports whether it became
+// true. It is for worker-side state with nothing to block on (outbox rows on
+// disk); what global received is waited for with uplinkGlobal.await.
 func eventually(cond func() bool) bool {
-	for deadline := time.Now().Add(4 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+	for deadline := time.Now().Add(uplinkWait); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
 		if cond() {
 			return true
 		}
@@ -127,12 +166,12 @@ func TestWSConn_LargeInventoryReportDoesNotWedgeUplink(t *testing.T) {
 
 	body := jsonBlob(2 << 20)
 	cache.RecordInventoryReport(uuid.Nil, body)
-	delivered := eventually(func() bool { _, obs, _ := g.counts(); return obs == 1 })
+	delivered := g.await(func(_, obs, _ int) bool { return obs == 1 })
 	acked := eventually(func() bool { return len(localDB.ListPendingOutbox()) == 0 })
 
 	// An op the worker is driving reports completion.
 	cache.RecordOpUpdate(uuid.NewString(), "completed", nil)
-	updated := eventually(func() bool { _, _, upd := g.counts(); return upd == 1 })
+	updated := g.await(func(_, _, upd int) bool { return upd == 1 })
 
 	hellos, obs, upd := g.counts()
 	if !delivered {
@@ -166,7 +205,7 @@ func TestWSConn_UndeliverableObservationIsDropped(t *testing.T) {
 			cache.RecordInventoryReport(uuid.Nil, jsonBlob(16))
 			cache.RecordOpUpdate(uuid.NewString(), "completed", nil)
 
-			if !eventually(func() bool { _, obs, upd := g.counts(); return obs == 1 && upd == 1 }) {
+			if !g.await(func(_, obs, upd int) bool { return obs == 1 && upd == 1 }) {
 				_, obs, upd := g.counts()
 				t.Fatalf("what was queued behind the undeliverable observation never arrived: observations %d (want 1), op_updates %d (want 1)", obs, upd)
 			}
@@ -219,7 +258,7 @@ func TestWSConn_ObservationSizeCheckMatchesHubLimit(t *testing.T) {
 			if tc.delivered {
 				want = 1
 			}
-			if !eventually(func() bool { _, obs, upd := g.counts(); return obs == want && upd == 1 }) {
+			if !g.await(func(_, obs, upd int) bool { return obs == want && upd == 1 }) {
 				_, obs, upd := g.counts()
 				t.Fatalf("observations delivered: %d (want %d), op_updates: %d (want 1)", obs, want, upd)
 			}
