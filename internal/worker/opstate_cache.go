@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/model"
+	"github.com/bluesky-social/slagworks/internal/opstate"
 )
 
 // opState is the mutable op-layer of the site cache. Post-Tier-2 it is fed
@@ -46,8 +47,9 @@ import (
 //     (keepLocalFailure) until op_removed clears it.
 //   - phaseStart: opID -> phase timing, for phase-duration logging. Local.
 //   - phoneHomed: deploy op IDs that phone-homed LOCALLY (RecordPhoneHome).
-//     A resync that brings the op back as claimed-deploying must not
-//     downgrade the running overlay this op earned — see applyOpResync.
+//     A resync or delta that brings the op back as claimed-deploying must
+//     not downgrade the running overlay this op earned — see applyOpResync
+//     and applyOpDelta.
 //     Persisted with the op set, so it survives a restart.
 //   - phoneHomeSettled: deploy op ID -> machine ID for every deploy whose
 //     phone-home is settled as far as this worker can prove: it recorded the
@@ -74,6 +76,23 @@ import (
 //     set is resynced. A worker started without a persisted op layer is
 //     neither untrusted nor resynced until its first op_resync, and must
 //     not tell a healthy deploy's agent to stop in that window.
+//   - claimUnanswered: op IDs whose most recent claim this process sent
+//     without learning the outcome (rollBackClaim: transport error, RPC
+//     timeout). That claim may have COMMITTED on global, and global's row
+//     for the op (claimed by this worker, no phase) can then reach the cache
+//     after the rollback and replace its pending mark; reclaimableOps keeps
+//     such an op in front of the executor so it re-claims it (B4). Cleared
+//     when the next claim attempt starts (markClaimAttempt) and on
+//     op_removed. Deliberately not pruned by op_resync: an op whose machine
+//     briefly leaves the site's scope drops out of a resync and comes back
+//     still claimed by this worker. An entry outlives its op only when the
+//     worker misses that op's op_removed while disconnected; entries come
+//     only from claims lost to transport failures, so the set stays small,
+//     and a stale entry is harmless: it matches only its own op ID, which
+//     global never reuses. In memory only, never persisted: after a restart
+//     the worker cannot tell an unanswered claim from one it won and acted
+//     on, so such an op is ExpireOrphanedClaims' to fail, not this worker's
+//     to drive again.
 type opState struct {
 	mu sync.RWMutex
 
@@ -87,6 +106,8 @@ type opState struct {
 
 	phoneHomeSettled      map[string]uuid.UUID
 	phoneHomeSettledOrder []string
+
+	claimUnanswered map[string]bool
 
 	tombstones     map[string]int
 	tombstoneOrder []string
@@ -176,6 +197,29 @@ func (o *opState) keepLocalFailure(incoming *model.Operation) {
 	incoming.Status = model.OpFailed
 }
 
+// keepPhoneHome holds the completion a local phone-home recorded
+// (RecordPhoneHome: Status completed, overlay running, the phoneHomed latch)
+// on an op global's incoming row still shows active, and reports whether it
+// did, in which case the caller keeps the machine's overlay at running too.
+// The completion is written without a Version bump, so a row global built
+// before it processed the phone-home (the claim's delayed op_delta, or a
+// resync) carries a higher Version, an active status and the claim's
+// transient state. Accepting it undoes the phone-home: the machine reads
+// deploying again, so the installed OS's retried phone-home is processed in
+// full and queues a second completion, and with the op active again a late
+// agent report can still fail a deploy that finished. A completed or failed
+// row from global applies; op_removed clears the latch. Caller holds mu.
+func (o *opState) keepPhoneHome(incoming *model.Operation) bool {
+	if !o.phoneHomed[incoming.ID.String()] {
+		return false
+	}
+	if incoming.Status == model.OpCompleted || incoming.Status == model.OpFailed {
+		return false
+	}
+	incoming.Status = model.OpCompleted
+	return true
+}
+
 // newOpState builds an empty op-layer whose combined reads load and whose
 // identity applies swap through the given view pointer (Cache.view). wake
 // is the executor wake channel (may be nil in tests). untrusted marks a
@@ -183,17 +227,20 @@ func (o *opState) keepLocalFailure(incoming *model.Operation) {
 // op_resync.
 func newOpState(view *atomic.Pointer[snapshotView], wake chan struct{}, untrusted bool, selfSerial string) *opState {
 	return &opState{
-		view:             view,
-		ops:              make(map[string]*model.Operation),
-		machineState:     make(map[uuid.UUID]model.MachineState),
-		failedOps:        make(map[string]bool),
-		phaseStart:       make(map[string]phaseState),
-		phoneHomed:       make(map[string]bool),
-		tombstones:       make(map[string]int),
+		view:         view,
+		ops:          make(map[string]*model.Operation),
+		machineState: make(map[uuid.UUID]model.MachineState),
+		failedOps:    make(map[string]bool),
+		phaseStart:   make(map[string]phaseState),
+		phoneHomed:   make(map[string]bool),
+		tombstones:   make(map[string]int),
+
+		claimUnanswered:  make(map[string]bool),
 		phoneHomeSettled: make(map[string]uuid.UUID),
-		wake:             wake,
-		untrusted:        untrusted,
-		selfSerial:       selfSerial,
+
+		wake:       wake,
+		untrusted:  untrusted,
+		selfSerial: selfSerial,
 	}
 }
 
@@ -217,6 +264,13 @@ func (o *opState) fireWake() {
 // an op_removed must not resurrect a zombie active op). On accept, the op
 // is stored and, when machineState is non-empty, the overlay is set to it.
 // Returns true if a PENDING op was added/updated (caller fires the wake).
+//
+// Like applyOpResync, it preserves what a local phone-home earned
+// (keepPhoneHome): a delta that still shows a phoneHomed op active carries
+// a status and a state from before the phone-home. The usual one is the
+// claim's own delta (claimed, deploying), arriving after a host that
+// installed on the pending-op boot clause already phoned home. A delta that
+// ends the op (completed or failed) is global's verdict and applies whole.
 func (o *opState) applyOpDelta(op model.Operation, machineState model.MachineState) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -232,6 +286,9 @@ func (o *opState) applyOpDelta(op model.Operation, machineState model.MachineSta
 	cp := op
 	o.keepLocalFailure(&cp)
 	keepTerminalWait(o.ops[id], &cp)
+	if o.keepPhoneHome(&cp) {
+		machineState = model.MachineStateRunning
+	}
 	o.ops[id] = &cp
 	if machineState != "" {
 		o.machineState[op.MachineID] = machineState
@@ -246,8 +303,9 @@ func (o *opState) applyOpDelta(op model.Operation, machineState model.MachineSta
 // resync as claimed-deploying (global hasn't processed the completion yet),
 // forcing the overlay back to deploying would re-wipe the freshly-installed
 // disk. So for any active op in phoneHomed we pin the overlay to running,
-// overriding the resync's transient state. Entries in phoneHomed whose op
-// is no longer active (global completed it) are pruned.
+// overriding the resync's transient state, and keep the op completed
+// (keepPhoneHome). Entries in phoneHomed whose op is no longer active
+// (global completed it) are pruned.
 func (o *opState) applyOpResync(ops []model.Operation, states map[string]model.MachineState) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -268,6 +326,7 @@ func (o *opState) applyOpResync(ops []model.Operation, states map[string]model.M
 		}
 		o.keepLocalFailure(&op)
 		keepTerminalWait(o.ops[op.ID.String()], &op)
+		o.keepPhoneHome(&op)
 		next[op.ID.String()] = &op
 		if op.Status == model.OpPending {
 			anyPending = true
@@ -320,6 +379,7 @@ func (o *opState) applyOpRemoved(opID, machineIDStr string, version int, machine
 	delete(o.failedOps, opID)
 	delete(o.phaseStart, opID)
 	delete(o.phoneHomed, opID)
+	delete(o.claimUnanswered, opID)
 
 	if machineState != "" {
 		if id, err := uuid.Parse(machineIDStr); err == nil {
@@ -917,6 +977,37 @@ func (o *opState) pendingLifecycleOps() []model.Operation {
 	return ops
 }
 
+// reclaimableOps returns copies of the ops whose most recent claim went
+// unanswered (claimUnanswered) and whose row global has since delivered as
+// claimed by workerID with no phase (opstate.CanReclaim): the claim committed
+// and only its reply was lost. The executor re-claims them, which
+// ClaimOperation's idempotent re-claim branch grants (B4). While the
+// rollback's pending mark still stands the op is pending and the pending
+// readers return it instead. Same untrusted and view-membership gates as
+// pendingPowerOps. The executor sent the lost claim for an op a pending
+// reader returned, so the op already passed their type bucketing and
+// self-outlet skip.
+func (o *opState) reclaimableOps(workerID string) []model.Operation {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.untrusted {
+		return nil
+	}
+	v := o.view.Load()
+	var ops []model.Operation
+	for opID := range o.claimUnanswered {
+		op, ok := o.ops[opID]
+		if !ok || !opstate.CanReclaim(op, workerID) {
+			continue
+		}
+		if _, ok := v.machines[op.MachineID]; !ok {
+			continue
+		}
+		ops = append(ops, *op)
+	}
+	return ops
+}
+
 // activeOpCount returns the number of non-terminal operations.
 func (o *opState) activeOpCount() int {
 	o.mu.RLock()
@@ -1012,6 +1103,38 @@ func (o *opState) setStatus(opID string, status model.OperationStatus) {
 	defer o.mu.Unlock()
 	if op, ok := o.ops[opID]; ok {
 		op.Status = status
+	}
+}
+
+// markClaimAttempt marks an op claimed locally as the executor sends a claim
+// for it, so the pending readers stop returning it, and forgets any earlier
+// unanswered claim: this attempt's outcome now decides, and rollBackClaim
+// records it again if it goes unanswered too.
+func (o *opState) markClaimAttempt(opID string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.claimUnanswered, opID)
+	if op, ok := o.ops[opID]; ok {
+		op.Status = model.OpClaimed
+	}
+}
+
+// rollBackClaim handles a claim that got no answer: it sets the local mark
+// back to pending so the pending readers return the op for a retry, and
+// records the claim as unanswered so reclaimableOps returns the op if
+// global's claimed row replaces that mark first. A no-op for an op that
+// ended while the claim was in flight (op_removed left its tombstone). An op
+// a resync merely omitted meanwhile (its machine left the site's scope) has
+// no row to roll back but keeps the record, for when the row comes back.
+func (o *opState) rollBackClaim(opID string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if _, ended := o.tombstones[opID]; ended {
+		return
+	}
+	o.claimUnanswered[opID] = true
+	if op, ok := o.ops[opID]; ok {
+		op.Status = model.OpPending
 	}
 }
 

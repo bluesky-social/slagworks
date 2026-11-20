@@ -120,7 +120,7 @@ func TestProp_ChassisSerialGate(t *testing.T) {
 			factory: func(context.Context, *model.MachineSnapshot, model.BMCRuntime, *model.PDURuntime, *model.AMTRuntime) (power.Controller, error) {
 				return ctrl, nil
 			},
-			bmcReconcile: func(context.Context, bmcreconcile.LANTarget, string) (*bmcreconcile.Result, error) {
+			bmcReconcile: func(context.Context, bmcreconcile.LANTarget, string, []string) (*bmcreconcile.Result, error) {
 				ctrl.calls = append(ctrl.calls, "reconcile")
 				return nil, errors.New("stop after the gate")
 			},

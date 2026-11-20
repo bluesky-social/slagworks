@@ -12,7 +12,8 @@
 //     model, so the agent needs no network credential; it learns only the
 //     admin account's NAME (AdminUserKernelArg) for the slot-2 gate. This
 //     path provisions once and never rotates a working password, and it
-//     re-asserts the persistent PXE boot order.
+//     re-asserts the account's enable bit and the persistent PXE boot
+//     order.
 //
 //   - Over the LAN, from the site worker that owns the BMC's OOB network
 //     (the bmc_reconcile op; RemoteOptions / ReconcileRemote). The session
@@ -23,7 +24,9 @@
 //     only when the BMC does not hold it, since MegaRAC refuses to set a
 //     password to its current value), and generates a fresh one only when
 //     the store has none for the device or the operator passed
-//     --rotate-monitor. A
+//     --rotate-monitor. A generated password whose write may or may not
+//     have been applied is stored beside the current one, and the next
+//     run asks the BMC which of them it holds. A
 //     rotation leaves the oob-gw exporters scraping with a stale password
 //     until Ansible re-renders their config, so compliance must not rotate.
 //     It never touches boot order, because it may target production hosts
@@ -133,6 +136,17 @@ type DesiredUser struct {
 	// password. It is a secret: it never enters a Result, and runIPMITool
 	// redacts it from every error.
 	Password string
+	// Unconfirmed lists generated passwords an earlier run may have written
+	// to the account without learning the outcome
+	// (ProvisionedUser.PasswordUnconfirmed), oldest first, which the caller
+	// kept beside Password. Only with Password. When an existing account
+	// does not hold Password, each is tested, newest first, and one the BMC
+	// holds is adopted instead of writing Password: the account keeps it,
+	// and it is reported in Result.PasswordVerified for the caller to store
+	// as the account's password. That is the only way back on MegaRAC,
+	// which keeps the replaced Password in its reuse history and refuses to
+	// set it again (0x19). They are secrets, handled like Password.
+	Unconfirmed []string
 	// Rotate writes a freshly generated password even to an account that
 	// exists and is compliant. The remote path sets it when nothing is
 	// stored for the device, or on an explicit --rotate-monitor.
@@ -148,12 +162,19 @@ type Result struct {
 	// DesiredUser.Password the reconciler wrote is not, since the caller
 	// already holds it. Empty slice means everything was already
 	// provisioned (subsequent-deploy happy path).
+	//
+	// An entry with PasswordUnconfirmed carries a generated password whose
+	// write failed in a way that leaves the BMC possibly holding it. It
+	// only ever comes with an error, and the caller must keep it beside the
+	// password it already stores (see ProvisionedUser.PasswordUnconfirmed).
 	CreatedOrUpdated []ProvisionedUser
 
 	// PasswordVerified is the set of existing users whose
 	// DesiredUser.Password the BMC already held (`user test` matched), so
 	// the reconciler wrote no password; their privilege, channel access and
-	// enabled state were still re-applied. Password is always empty.
+	// enabled state were still re-applied. Password is empty, except when
+	// the BMC held one of DesiredUser.Unconfirmed instead: then it is that
+	// password, which the caller must store as the account's password.
 	PasswordVerified []ProvisionedUser
 
 	// CurrentUsers is the post-reconcile snapshot of the user table.
@@ -193,6 +214,20 @@ type ProvisionedUser struct {
 	// non-empty Password means the account's password was rotated.
 	Password  string
 	Privilege PrivLevel
+	// PasswordUnconfirmed is true when Password is a generated password the
+	// BMC may or may not hold: every write attempt failed, and the test
+	// after the last one could not run (a lost response followed by a BMC
+	// that stopped answering). The account now holds either this password
+	// or the one it held before, so the caller must keep both: store this
+	// one beside the password it already has, never over it, and hand both
+	// to the next run (DesiredUser.Password and Unconfirmed), which asks
+	// the BMC which one it holds. Dropping this one loses the only copy of
+	// a password that may be live; storing it over the old one loses the
+	// old one when the BMC never applied the write. A caller that stores
+	// no password for the account stores this one as the password: the
+	// next run then confirms it or, since it was never on the BMC, writes
+	// it.
+	PasswordUnconfirmed bool
 }
 
 // MonitorUser is the read-only account every reconcile provisions: the
@@ -250,6 +285,7 @@ func (o Options) secrets() []string {
 	var out []string
 	for _, d := range o.Desired {
 		out = append(out, d.Password)
+		out = append(out, d.Unconfirmed...)
 	}
 	for _, e := range o.Env {
 		if v, ok := strings.CutPrefix(e, "IPMI_PASSWORD="); ok {
@@ -290,24 +326,27 @@ func lanSession(t LANTarget) Options {
 // boot-order write. monitorPassword is the device's stored
 // pop/<pop>/bmc-creds-monitor password, which is re-asserted; empty (no
 // stored entry, or an explicit rotation) rotates the monitor password to a
-// freshly generated one.
-func RemoteOptions(t LANTarget, monitorPassword string) Options {
+// freshly generated one. unconfirmed is the stored entry's unconfirmed
+// passwords (DesiredUser.Unconfirmed), nil when it has none or on a
+// rotation.
+func RemoteOptions(t LANTarget, monitorPassword string, unconfirmed []string) Options {
 	opt := lanSession(t)
 	opt.Desired = []DesiredUser{{
-		Name:      MonitorUser,
-		Privilege: PrivUser,
-		Password:  monitorPassword,
-		Rotate:    monitorPassword == "",
+		Name:        MonitorUser,
+		Privilege:   PrivUser,
+		Password:    monitorPassword,
+		Unconfirmed: unconfirmed,
+		Rotate:      monitorPassword == "",
 	}}
 	opt.AdminUser = t.Username
 	opt.SkipBootOrder = true
 	return opt
 }
 
-// ReconcileRemote runs Reconcile with RemoteOptions(t, monitorPassword)
-// against ipmitool on PATH.
-func ReconcileRemote(ctx context.Context, t LANTarget, monitorPassword string) (*Result, error) {
-	return Reconcile(ctx, RemoteOptions(t, monitorPassword))
+// ReconcileRemote runs Reconcile with RemoteOptions(t, monitorPassword,
+// unconfirmed) against ipmitool on PATH.
+func ReconcileRemote(ctx context.Context, t LANTarget, monitorPassword string, unconfirmed []string) (*Result, error) {
+	return Reconcile(ctx, RemoteOptions(t, monitorPassword, unconfirmed))
 }
 
 // reservedSlots are slots the reconciler never touches:
@@ -340,8 +379,9 @@ var reservedSlots = map[int]bool{
 // acceptable because reconcile is idempotent: re-running picks up
 // where the previous run left off. A nil Result means nothing was
 // written; a non-nil Result alongside an error carries every generated
-// password already written, which the caller must still deliver to
-// slagworksd.
+// password already written, and one whose write may have been applied
+// (ProvisionedUser.PasswordUnconfirmed), which the caller must still deliver
+// to slagworksd.
 func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 	if opt.IPMITool == "" {
 		opt.IPMITool = "ipmitool"
@@ -358,6 +398,10 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 		if len(d.Password) > maxPasswordBytes {
 			return nil, fmt.Errorf("bmcreconcile: the password for desired user %q is longer than %d bytes, the IPMI maximum; "+
 				"fix the stored entry, or re-run with --rotate-monitor to replace it with a fresh one", d.Name, maxPasswordBytes)
+		}
+		if len(d.Unconfirmed) > 0 && d.Password == "" {
+			return nil, fmt.Errorf("bmcreconcile: desired user %q carries unconfirmed passwords but no password to re-assert; "+
+				"they are only tested against an account that does not hold the stored password", d.Name)
 		}
 	}
 
@@ -425,8 +469,18 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			// the channel access. A run that stopped between `user priv` and
 			// `channel setaccess` leaves the right privilege without LAN
 			// access, which is not compliant.
+			//
+			// The enable bit is not among them: `user list` prints the channel
+			// privilege limit whatever the bit (User.Enabled only means the
+			// limit is not NO ACCESS), so an account whose create stopped
+			// before its last step, or that was disabled by hand, lists as
+			// compliant while it cannot log in. `user enable` is therefore sent
+			// to every account that lists compliant; on an enabled one it
+			// changes nothing. The password stays: its write was reported
+			// before the create's enable step.
 			if existing.Privilege == d.Privilege && existing.Enabled && existing.LANAccess {
-				continue // nothing to do
+				plans = append(plans, plan{desired: d, slot: existing.Slot, exists: true, enableOnly: true})
+				continue
 			}
 			// An existing-but-DISABLED user is treated as not-yet-fully-
 			// provisioned and gets a fresh password (needsPassword). This
@@ -539,11 +593,13 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			u := ProvisionedUser{Slot: p.slot, Name: p.desired.Name, Privilege: p.desired.Privilege}
 			if p.exists && p.desired.Password != "" {
 				// RE-ASSERT on an existing account: test before writing.
-				wrote, err := reassertPassword(ctx, opt, p.slot, p.desired.Password)
+				wrote, adopted, err := reassertPassword(ctx, opt, p.slot, p.desired.Password, p.desired.Unconfirmed)
 				switch {
 				case wrote:
 					res.CreatedOrUpdated = append(res.CreatedOrUpdated, u)
 				case err == nil:
+					// adopted is "" when the BMC held the caller's password.
+					u.Password = adopted
 					res.PasswordVerified = append(res.PasswordVerified, u)
 				}
 				if err != nil {
@@ -558,13 +614,28 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 					}
 					password, u.Password = pw, pw
 				}
-				if err := setPassword(ctx, opt, p.slot, password); err != nil {
+				if maybeApplied, err := setPassword(ctx, opt, p.slot, password); err != nil {
+					if maybeApplied && u.Password != "" {
+						// The BMC may hold the generated password, and this
+						// Result is its only copy: report it.
+						u.PasswordUnconfirmed = true
+						res.CreatedOrUpdated = append(res.CreatedOrUpdated, u)
+						return res, fmt.Errorf("%w; the BMC may have applied the generated password all the same (the test after "+
+							"the failed write could not run), so it is reported for storing beside the current one; re-run the "+
+							"reconcile, which finds out which of the two the BMC holds", err)
+					}
 					return res, err
 				}
 				res.CreatedOrUpdated = append(res.CreatedOrUpdated, u)
 			}
 			if err := applyPrivAndEnable(ctx, opt, p.slot, p.desired.Privilege); err != nil {
 				return res, err
+			}
+			continue
+		}
+		if p.enableOnly {
+			if err := runIPMIToolVoid(ctx, opt, "user", "enable", strconv.Itoa(p.slot)); err != nil {
+				return res, fmt.Errorf("bmcreconcile: enable slot %d: %w", p.slot, err)
 			}
 			continue
 		}
@@ -941,6 +1012,11 @@ type plan struct {
 	// privilege or missing LAN channel access — provision-once leaves its
 	// working password untouched.
 	needsPassword bool
+	// enableOnly is true for an existing account that lists compliant
+	// (right privilege, LAN access) and carries no Password or Rotate: the
+	// only write is `user enable`, because the list cannot show the enable
+	// bit.
+	enableOnly bool
 }
 
 // setPassword writes password to the slot. Some BMC firmware (notably
@@ -958,7 +1034,11 @@ type plan struct {
 // caller. After each failure the slot is therefore tested (`user test`),
 // and a slot that holds the password is a success. A test that cannot run
 // proves nothing, so the ladder goes on.
-func setPassword(ctx context.Context, opt Options, slot int, password string) error {
+//
+// When every attempt fails, maybeApplied reports whether the slot may hold
+// the password anyway: true when the test after the last attempt could not
+// run, false when it ran and found a different password.
+func setPassword(ctx context.Context, opt Options, slot int, password string) (maybeApplied bool, err error) {
 	var passErr error
 	for _, attempt := range []struct {
 		args  []string
@@ -973,13 +1053,15 @@ func setPassword(ctx context.Context, opt Options, slot int, password string) er
 		}
 		passErr = runIPMIToolVoid(ctx, opt, attempt.args...)
 		if passErr == nil {
-			return nil
+			return false, nil
 		}
-		if held, err := testPassword(ctx, opt, slot, password); err == nil && held {
-			return nil
+		held, testErr := testPassword(ctx, opt, slot, password)
+		if testErr == nil && held {
+			return false, nil
 		}
+		maybeApplied = testErr != nil
 	}
-	return fmt.Errorf("bmcreconcile: set password slot %d: %w", slot, passErr)
+	return maybeApplied, fmt.Errorf("bmcreconcile: set password slot %d: %w", slot, passErr)
 }
 
 // reassertPassword makes an existing slot hold password, writing it only when
@@ -989,25 +1071,42 @@ func setPassword(ctx context.Context, opt Options, slot int, password string) er
 // refusal), which failed every compliance run on cpu3.pop3 (2026-10-30).
 // After a write the password is tested again, so a write the BMC did not
 // apply is an error rather than a compliant result.
-func reassertPassword(ctx context.Context, opt Options, slot int, password string) (bool, error) {
+//
+// unconfirmed is DesiredUser.Unconfirmed. When the slot does not hold
+// password, each is tested, newest first, before anything is written: one
+// the slot holds is returned as adopted and nothing is written. A test that
+// cannot run fails the call before any write, like the first one.
+func reassertPassword(ctx context.Context, opt Options, slot int, password string, unconfirmed []string) (wrote bool, adopted string, err error) {
 	held, err := testPassword(ctx, opt, slot, password)
 	if err != nil || held {
-		return false, err
+		return false, "", err
 	}
-	if err := setPassword(ctx, opt, slot, password); err != nil {
-		return false, fmt.Errorf("bmcreconcile: slot %d does not hold the stored password, and writing it failed "+
+	for i := len(unconfirmed) - 1; i >= 0; i-- {
+		if len(unconfirmed[i]) > maxPasswordBytes {
+			continue // ipmitool can neither test nor set it; the BMC cannot hold it
+		}
+		held, err := testPassword(ctx, opt, slot, unconfirmed[i])
+		if err != nil {
+			return false, "", err
+		}
+		if held {
+			return false, unconfirmed[i], nil
+		}
+	}
+	if _, err := setPassword(ctx, opt, slot, password); err != nil {
+		return false, "", fmt.Errorf("bmcreconcile: slot %d does not hold the stored password, and writing it failed "+
 			"(MegaRAC refuses a password still in its reuse history with completion code 0x19): %w; "+
 			"set the account's password on the BMC to the stored one, or re-run with --rotate-monitor to replace it with a fresh one", slot, err)
 	}
 	held, err = testPassword(ctx, opt, slot, password)
 	if err != nil {
-		return true, fmt.Errorf("bmcreconcile: wrote the stored password to slot %d but could not confirm it: %w", slot, err)
+		return true, "", fmt.Errorf("bmcreconcile: wrote the stored password to slot %d but could not confirm it: %w", slot, err)
 	}
 	if !held {
-		return true, fmt.Errorf("bmcreconcile: wrote the stored password to slot %d but the BMC does not confirm holding it (user test still fails); "+
+		return true, "", fmt.Errorf("bmcreconcile: wrote the stored password to slot %d but the BMC does not confirm holding it (user test still fails); "+
 			"check the account on the BMC, or re-run with --rotate-monitor to replace it with a fresh one", slot)
 	}
-	return true, nil
+	return true, "", nil
 }
 
 // testPassword reports whether slot holds password, asking the BMC with

@@ -89,6 +89,12 @@ type BMCUserCred struct {
 	Username     string `json:"username"`
 	Password     string `json:"password"`
 	IPMIUserSlot int    `json:"ipmi_user_slot"`
+	// PasswordUnconfirmed is true when Password is a generated password
+	// whose write failed with the outcome unknown: the BMC holds either it
+	// or the password it held before. Global keeps it beside the stored
+	// password instead of replacing that one, and the next bmc_reconcile op
+	// carries both so the worker can ask the BMC which it holds.
+	PasswordUnconfirmed bool `json:"password_unconfirmed,omitempty"`
 }
 
 // BMCReconcileReport is the Data of a bmc_reconcile_report observation:
@@ -103,16 +109,21 @@ type BMCReconcileReport struct {
 	// password of: its slot always, and its password only when
 	// MonitorRotated. nil when reconcile failed before either.
 	Monitor *BMCUserCred `json:"monitor,omitempty"`
-	// MonitorRotated is true when the written password was freshly
-	// generated (the store had no entry for the device, or the op asked to
-	// rotate), so global must store it. False when reconcile re-asserted
-	// the stored password the op carried: the password does not ride the
-	// report back, and global writes no new secret version.
+	// MonitorRotated is true when the BMC's monitor password is a generated
+	// one global does not store as the device's password yet: freshly
+	// written (the store had no entry for the device, or the op asked to
+	// rotate), or an unconfirmed password of an earlier op that this one
+	// found the BMC holding. Global must store it. False when reconcile
+	// re-asserted the stored password the op carried: the password does not
+	// ride the report back, and global writes no new secret version. Also
+	// false when Monitor.PasswordUnconfirmed: nothing is known to have
+	// changed on the BMC.
 	MonitorRotated bool `json:"monitor_rotated"`
 	// MonitorPasswordWritten is true when reconcile wrote the monitor
 	// password (a rotation, a created account, or a stored password the BMC
 	// did not hold), and false when the BMC already held the stored one, so
-	// nothing was written.
+	// nothing was written, or when the only write's outcome is unknown
+	// (Monitor.PasswordUnconfirmed).
 	MonitorPasswordWritten bool `json:"monitor_password_written"`
 	// LeftoversDisabled names the accounts reconcile disabled. Each name
 	// was also cleared from its slot where the BMC allowed it (Supermicro

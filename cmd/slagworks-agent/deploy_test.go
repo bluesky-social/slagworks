@@ -166,7 +166,9 @@ func examineMember(dev, arrayUUID string) string {
 // everything the agent did to the disks before it began partitioning.
 type mdHostRunner struct {
 	examine map[string]string
-	runs    []string
+	// mdstat is /proc/mdstat's content; empty means no array is assembled.
+	mdstat string
+	runs   []string
 }
 
 func (r *mdHostRunner) Run(name string, args ...string) error {
@@ -197,6 +199,9 @@ func (r *mdHostRunner) Output(name string, args ...string) (string, error) {
 		}
 		return "", errors.New("exit status 1: mdadm: No md superblock detected")
 	case argv == "cat /proc/mdstat":
+		if r.mdstat != "" {
+			return r.mdstat, nil
+		}
 		return "Personalities : [raid1]\nunused devices: <none>", nil
 	case strings.HasPrefix(argv, "wipefs --noheadings --output TYPE,OFFSET "):
 		return "", nil // no signatures: a clean disk
@@ -370,6 +375,96 @@ func TestRunDeploy_StaleMemberWithPinnedArrayUUID(t *testing.T) {
 			for _, bad := range tt.notInRefusal {
 				if strings.Contains(msg, bad) {
 					t.Errorf("refusal should not offer %q, got: %v", bad, msg)
+				}
+			}
+		})
+	}
+}
+
+// TestRunDeploy_BystanderArrayHoldsPlannedMDName is the regression for a
+// deploy found by the storage property suite: every disk in the layout is
+// blank, the layout builds /data as a RAID over vdc and vdd (at /dev/md0),
+// and vdb, outside the layout, carries an old array the deploy environment
+// assembled as /dev/md0. Without --destructive nothing stops that array, so
+// the deploy partitioned the blank disks and then failed at mdadm --create.
+//
+// Without --destructive the agent must refuse before the partitioning phase
+// and before any command that changes a disk or an array; with it, the
+// arrays are stopped and the deploy reaches partitioning.
+func TestRunDeploy_BystanderArrayHoldsPlannedMDName(t *testing.T) {
+	const mdstat = "Personalities : [raid1]\n" +
+		"md0 : active raid1 vdb[0]\n" +
+		"      4189184 blocks super 1.2 [2/1] [U_]\n\n" +
+		"unused devices: <none>"
+	layout := pinnedDataLayout("")
+	mddata := layout.Devices["mddata"]
+	mddata.ArrayUUID = ""
+	layout.Devices["mddata"] = mddata
+
+	for _, destructive := range []bool{false, true} {
+		t.Run(fmt.Sprintf("destructive=%v", destructive), func(t *testing.T) {
+			const machineID = "6b1f0c3e-9a52-4d55-8f0e-1c2d3e4f5a6b"
+			layoutJSON, err := json.Marshal(layout)
+			if err != nil {
+				t.Fatalf("marshal layout: %v", err)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v1/machines/" + machineID + "/storage-script":
+					fmt.Fprintf(w, "#!/bin/sh\ncat <<'EOF'\n%s\nEOF\n", layoutJSON)
+				case "/api/v1/machines/" + machineID + "/network-script":
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			runner := &mdHostRunner{mdstat: mdstat}
+			ctx := &agent.Context{
+				Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+				Exec:   runner,
+				Server: strings.TrimPrefix(srv.URL, "http://"),
+			}
+			var phases []string
+			p := deployParams{
+				machineID:     machineID,
+				operationID:   "0d9e8f7a-6b5c-4d3e-2f1a-0b9c8d7e6f5a",
+				expectUUID:    "ignored-by-checkIdentity",
+				destructive:   destructive,
+				checkIdentity: func(string) error { return nil },
+				setPhase:      func(phase string) { phases = append(phases, phase) },
+				fatal: func(stage string, err error) {
+					panic(deployStop{kind: "fatal", stage: stage, err: err})
+				},
+				done: make(chan struct{}),
+			}
+			stop, stopped := runDeployUntilStop(ctx, p)
+			if !stopped {
+				t.Fatal("runDeploy returned without reaching the plan's first sgdisk")
+			}
+
+			if destructive {
+				if stop.kind != "run" || !strings.HasPrefix(stop.stage, "sgdisk ") {
+					t.Fatalf("--destructive deploy stopped at %s %q (%v), want it to reach partitioning", stop.kind, stop.stage, stop.err)
+				}
+				if !slices.Contains(runner.runs, "mdadm --stop --scan") {
+					t.Errorf("--destructive deploy partitioned without stopping the assembled arrays; runs: %v", runner.runs)
+				}
+				return
+			}
+
+			if stop.kind != "fatal" || stop.stage != "md name check" {
+				t.Fatalf("deploy stopped at %s %q (%v), want the md name check to refuse it (phases %v, runs %v)",
+					stop.kind, stop.stage, stop.err, phases, runner.runs)
+			}
+			if slices.Contains(phases, "partitioning") || len(runner.runs) != 0 {
+				t.Errorf("the refusal must come before any disk or array is changed: phases=%v runs=%v", phases, runner.runs)
+			}
+			msg := stop.err.Error()
+			for _, want := range []string{`"mddata"`, "/dev/md0", "vdb[0]", "--destructive", "nothing has been changed"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("refusal should mention %q, got: %v", want, msg)
 				}
 			}
 		})

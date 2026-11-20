@@ -79,7 +79,10 @@ type CastScanner interface {
 // monitor secret. The deploy_complete and bmc_reconcile_report handlers
 // upsert a per-host entry, keyed by NetBox device serial, into
 // pop/<pop>/bmc-creds-monitor when a new monitor password was written.
+// They read the entry back only to change its unconfirmed passwords, which
+// must not replace the password it holds.
 type MonitorWriter interface {
+	GetMonitorEntry(ctx context.Context, pop, serial string) (*awssecrets.BMCMonitorEntry, error)
 	UpsertMonitorEntry(ctx context.Context, pop, serial string, entry awssecrets.BMCMonitorEntry) error
 }
 

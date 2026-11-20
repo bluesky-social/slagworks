@@ -46,10 +46,7 @@ func Collect(r agent.Runner, opts Options) *CommissionResult {
 		}
 		return verdictForSystem(res.System)
 	})
-	sr.record("lscpu", func() stepVerdict {
-		res.CPUs = collectCPUs(r)
-		return verdictForSlice(len(res.CPUs), "lscpu produced no CPU info")
-	})
+	sr.record("lscpu", func() stepVerdict { return lscpuStep(r, res) })
 	sr.record("dmidecode_memory", func() stepVerdict {
 		res.Memory = collectMemory(r)
 		return verdictForMemory(res.Memory)
@@ -109,10 +106,7 @@ func CollectGraceful(r agent.Runner, opts Options) *CommissionResult {
 		}
 		return verdictForSystem(res.System)
 	})
-	sr.record("lscpu", func() stepVerdict {
-		res.CPUs = collectCPUs(r)
-		return verdictForSlice(len(res.CPUs), "lscpu produced no CPU info")
-	})
+	sr.record("lscpu", func() stepVerdict { return lscpuStep(r, res) })
 	sr.record("dmidecode_memory", func() stepVerdict {
 		res.Memory = collectMemory(r)
 		return verdictForMemory(res.Memory)

@@ -155,6 +155,13 @@ func scrubProperty(t *testing.T, opts paramsgen.Options, typedShapes bool) {
 					p.MonitorRuntime != nil && p.MonitorRuntime.Password != "" {
 					rt.Fatalf("a scrubbed %s op still decodes to a credential\n   in %s\n  now %s", o.status, o.raw, got.Params)
 				}
+				if p.MonitorRuntime != nil {
+					for _, u := range p.MonitorRuntime.Unconfirmed {
+						if u.Password != "" {
+							rt.Fatalf("a scrubbed %s op still decodes to an unconfirmed monitor password\n   in %s\n  now %s", o.status, o.raw, got.Params)
+						}
+					}
+				}
 				if p.PDURuntime != nil {
 					for _, out := range p.PDURuntime.Outlets {
 						if out.Password != "" {
@@ -234,6 +241,11 @@ func TestProp_Scrub_CaseVariantKeys(t *testing.T) {
 				p.AMTRuntime != nil && strings.Contains(p.AMTRuntime.Password, c) ||
 				p.TailscaleRuntime != nil && strings.Contains(p.TailscaleRuntime.AuthKey, c) ||
 				p.MonitorRuntime != nil && strings.Contains(p.MonitorRuntime.Password, c)
+			if p.MonitorRuntime != nil {
+				for _, u := range p.MonitorRuntime.Unconfirmed {
+					held = held || strings.Contains(u.Password, c)
+				}
+			}
 			if p.PDURuntime != nil {
 				for _, o := range p.PDURuntime.Outlets {
 					held = held || strings.Contains(o.Password, c)

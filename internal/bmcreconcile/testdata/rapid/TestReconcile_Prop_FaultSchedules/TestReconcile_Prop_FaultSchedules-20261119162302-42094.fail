@@ -1,0 +1,135 @@
+# 2026/11/19 16:23:02.303409 [TestReconcile_Prop_FaultSchedules] [rapid] draw megarac: false
+# 2026/11/19 16:23:02.303414 [TestReconcile_Prop_FaultSchedules] [rapid] draw noEmptyName: true
+# 2026/11/19 16:23:02.303417 [TestReconcile_Prop_FaultSchedules] [rapid] draw tabs: true
+# 2026/11/19 16:23:02.303417 [TestReconcile_Prop_FaultSchedules] [rapid] draw disableShowsNoAccess: true
+# 2026/11/19 16:23:02.303420 [TestReconcile_Prop_FaultSchedules] [rapid] draw nslots: 4
+# 2026/11/19 16:23:02.303423 [TestReconcile_Prop_FaultSchedules] [rapid] draw adminName: "ADMIN"
+# 2026/11/19 16:23:02.303424 [TestReconcile_Prop_FaultSchedules] [rapid] draw slot1priv: 4
+# 2026/11/19 16:23:02.303425 [TestReconcile_Prop_FaultSchedules] [rapid] draw priv3: 0
+# 2026/11/19 16:23:02.303426 [TestReconcile_Prop_FaultSchedules] [rapid] draw pw3: "Mon1tor!Alpha"
+# 2026/11/19 16:23:02.303426 [TestReconcile_Prop_FaultSchedules] [rapid] draw name3: ""
+# 2026/11/19 16:23:02.303427 [TestReconcile_Prop_FaultSchedules] [rapid] draw lan3: true
+# 2026/11/19 16:23:02.303427 [TestReconcile_Prop_FaultSchedules] [rapid] draw priv4: 3
+# 2026/11/19 16:23:02.303428 [TestReconcile_Prop_FaultSchedules] [rapid] draw pw4: "Mon1tor!Alpha"
+# 2026/11/19 16:23:02.303428 [TestReconcile_Prop_FaultSchedules] [rapid] draw name4: "slagworks"
+# 2026/11/19 16:23:02.303428 [TestReconcile_Prop_FaultSchedules] [rapid] draw en4: false
+# 2026/11/19 16:23:02.303429 [TestReconcile_Prop_FaultSchedules] [rapid] draw lan4: false
+# 2026/11/19 16:23:02.303429 [TestReconcile_Prop_FaultSchedules] [rapid] draw stored: "A"
+# 2026/11/19 16:23:02.303430 [TestReconcile_Prop_FaultSchedules] [rapid] draw nruns: 4
+# 2026/11/19 16:23:02.303431 [TestReconcile_Prop_FaultSchedules] [rapid] draw kind0: 3
+# 2026/11/19 16:23:02.303431 [TestReconcile_Prop_FaultSchedules] [rapid] draw rotate0: 1
+# 2026/11/19 16:23:02.303432 [TestReconcile_Prop_FaultSchedules] [rapid] draw nfaults0: 1
+# 2026/11/19 16:23:02.303432 [TestReconcile_Prop_FaultSchedules] [rapid] draw fidx0_0: 1
+# 2026/11/19 16:23:02.303433 [TestReconcile_Prop_FaultSchedules] [rapid] draw fkind0_0: "before"
+# 2026/11/19 16:23:02.303433 [TestReconcile_Prop_FaultSchedules] [rapid] draw kind1: 0
+# 2026/11/19 16:23:02.303434 [TestReconcile_Prop_FaultSchedules] [rapid] draw nfaults1: 0
+# 2026/11/19 16:23:02.303434 [TestReconcile_Prop_FaultSchedules] [rapid] draw kind2: 1
+# 2026/11/19 16:23:02.303434 [TestReconcile_Prop_FaultSchedules] [rapid] draw rotate2: 0
+# 2026/11/19 16:23:02.303435 [TestReconcile_Prop_FaultSchedules] [rapid] draw nfaults2: 2
+# 2026/11/19 16:23:02.303435 [TestReconcile_Prop_FaultSchedules] [rapid] draw fidx2_0: 1
+# 2026/11/19 16:23:02.303435 [TestReconcile_Prop_FaultSchedules] [rapid] draw fkind2_0: "down"
+# 2026/11/19 16:23:02.303436 [TestReconcile_Prop_FaultSchedules] [rapid] draw fidx2_1: 1
+# 2026/11/19 16:23:02.303436 [TestReconcile_Prop_FaultSchedules] [rapid] draw fkind2_1: "down"
+# 2026/11/19 16:23:02.303436 [TestReconcile_Prop_FaultSchedules] [rapid] draw kind3: 0
+# 2026/11/19 16:23:02.303437 [TestReconcile_Prop_FaultSchedules] [rapid] draw nfaults3: 2
+# 2026/11/19 16:23:02.303437 [TestReconcile_Prop_FaultSchedules] [rapid] draw fidx3_0: 14
+# 2026/11/19 16:23:02.303439 [TestReconcile_Prop_FaultSchedules] [rapid] draw fkind3_0: "after"
+# 2026/11/19 16:23:02.303440 [TestReconcile_Prop_FaultSchedules] [rapid] draw fidx3_1: 6
+# 2026/11/19 16:23:02.303440 [TestReconcile_Prop_FaultSchedules] [rapid] draw fkind3_1: "down"
+# 2026/11/19 16:23:04.602867 [TestReconcile_Prop_FaultSchedules] run 3 (inband=true rotate=false faults=map[6:down 14:after] stored="THM3c#b12lsH"): in-band succeeded but the monitor a run created (slot 3) holds a password global does not have (stored "THM3c#b12lsH")
+# BMC before: [{Name: Priv:4 Enabled:false Password: PwSize:0 History:[] LAN:false} {Name:ADMIN Priv:4 Enabled:true Password:Adm1n!Secret PwSize:16 History:[] LAN:true} {Name:monitor Priv:2 Enabled:true Password:8d%y5O#J!CqY PwSize:16 History:[Mon1tor!Alpha] LAN:true} {Name:slagworks Priv:3 Enabled:false Password:Mon1tor!Alpha PwSize:16 History:[] LAN:false}]
+# BMC after: [{Name: Priv:4 Enabled:false Password: PwSize:0 History:[] LAN:false} {Name:ADMIN Priv:4 Enabled:true Password:Adm1n!Secret PwSize:16 History:[] LAN:true} {Name:monitor Priv:2 Enabled:true Password:8d%y5O#J!CqY PwSize:16 History:[Mon1tor!Alpha] LAN:true} {Name:slagworks Priv:3 Enabled:false Password:Mon1tor!Alpha PwSize:16 History:[] LAN:false}]
+# log: ["user list 1" "user disable 4" "user set name 4 " "user list 1" "chassis bootparam set bootflag force_pxe options=PEF,timestamp,reset_persistence"]
+# 
+v0.4.8#10222666054907343802
+0x0
+0x1
+0x1
+0x1
+0x211eddc029554
+0x43fbc573e19c
+0x0
+0xe1120565fa4bb
+0x0
+0x4ce50575f8e76
+0x1
+0x185c856f75ad6f
+0x0
+0x1dc747651edcb
+0x1
+0xa8355616c31dc
+0x0
+0x1
+0x5508fdf2d2ef7
+0x3
+0x159a83eeb8a74
+0x1
+0x92eece741f35c
+0x7
+0x6
+0x0
+0x0
+0x4c3a10aef9625
+0x1
+0xdf4458ef891f1
+0x164de431142326
+0x3
+0x126f6bac745b2b
+0x1f8b76f5908279
+0xffffffffffffffff
+0x1c02742aeb5731
+0x1e4b42f0478861
+0x1
+0x157909ddb04676
+0x1870b7c00e1116
+0x1
+0x109f12c164540d
+0x26266b0462706
+0x1
+0x1d3f89c18eb477
+0x0
+0x1e8d58686ffbff
+0x5988e637de73f
+0x0
+0xd1fbf00ae9a9a
+0xf40ec97acc7b2
+0x0
+0x1deb88e1329a1
+0x27050d160866e
+0x1
+0x259f1bd9e10da
+0x179bdd9e79f2d0
+0x0
+0x341b53566fbda
+0x17eeda0867e2dc
+0x2
+0x1240fcd5a6ff46
+0x12ab7f060e3172
+0x1
+0xf613cd5258188
+0x2
+0x1b89d1b86d102f
+0x180e36e8fe85f
+0x1
+0x13889c8a37d660
+0x3
+0x2
+0xfd4697d274ac0
+0x1bf595bde77b30
+0x0
+0x1f97dd80dc8208
+0x1e68c4821e2aae
+0x2
+0x23872d10bf3b9
+0x1f9408b03f72d5
+0xffffffffffffffff
+0x1138807660b9e2
+0x3
+0x3
+0x3
+0x1
+0xd6dc1b6d08eed
+0x1aa1a45f593442
+0x6
+0xe09c68a29728f
+0x2

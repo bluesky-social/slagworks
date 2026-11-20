@@ -102,6 +102,7 @@ func TestSecretParamPaths_Pinned(t *testing.T) {
 		"amt_runtime.password",
 		"tailscale_runtime.auth_key",
 		"monitor_runtime.password",
+		"monitor_runtime.unconfirmed.[].password",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("secret param paths = %v, want %v", got, want)

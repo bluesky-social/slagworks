@@ -90,7 +90,8 @@ func WipeStaleState(ctx *agent.Context, layout storage.Layout) {
 // (leading slash → references a container) is a subarray member.
 type mdDevice struct {
 	name        string
-	isContainer bool // external-metadata container (DDF/IMSM), not a member subarray
+	status      string // the rest of the device's line: "active raid1 sdb[1] sda[0]"
+	isContainer bool   // external-metadata container (DDF/IMSM), not a member subarray
 }
 
 // parseMdstat extracts md devices from /proc/mdstat contents, classifying
@@ -100,8 +101,8 @@ func parseMdstat(out string) []mdDevice {
 	var devs []mdDevice
 	var cur *mdDevice
 	for line := range strings.SplitSeq(out, "\n") {
-		if name, _, ok := strings.Cut(line, " : "); ok && strings.HasPrefix(name, "md") {
-			devs = append(devs, mdDevice{name: strings.TrimSpace(name)})
+		if name, status, ok := strings.Cut(line, " : "); ok && strings.HasPrefix(name, "md") {
+			devs = append(devs, mdDevice{name: strings.TrimSpace(name), status: strings.TrimSpace(status)})
 			cur = &devs[len(devs)-1]
 			continue
 		}
@@ -116,6 +117,37 @@ func parseMdstat(out string) []mdDevice {
 		}
 	}
 	return devs
+}
+
+// members returns the kernel names of the devices the array holds, as its
+// /proc/mdstat line lists them: "active raid1 sdb[1] sda[0](S)" holds sdb
+// and sda.
+func (d mdDevice) members() []string {
+	var names []string
+	for f := range strings.FieldsSeq(d.status) {
+		if name, _, ok := strings.Cut(f, "["); ok && name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// assembledArrays returns the md arrays /proc/mdstat lists. /proc/mdstat
+// does not exist until the md driver is loaded, which on a host with no
+// arrays is not until the first mdadm --create or --assemble. A failed read
+// therefore means no arrays when the file is confirmed absent, and only
+// then: a mdstat that exists and cannot be read is an error, since which
+// arrays are assembled is then unknown.
+func assembledArrays(ctx *agent.Context) ([]mdDevice, error) {
+	out, err := ctx.Exec.Output("cat", "/proc/mdstat")
+	if err != nil {
+		if _, absentErr := ctx.Exec.Output("test", "!", "-e", "/proc/mdstat"); absentErr == nil {
+			ctx.Log.Info("no /proc/mdstat: the md driver is not loaded, so no arrays are assembled")
+			return nil, nil
+		}
+		return nil, fmt.Errorf("/proc/mdstat exists but reading it failed: %s", probeError(err))
+	}
+	return parseMdstat(out), nil
 }
 
 // StopResidualMDDevices force-stops every md device still present after
@@ -463,6 +495,112 @@ func wipefsSignatures(out string) []string {
 		sigs = append(sigs, sig)
 	}
 	return sigs
+}
+
+// CheckMDNamesFree is the second safety check of a deploy without
+// --destructive: it refuses, before any disk is touched, when an md array is
+// already assembled at a /dev/mdN node the plan creates a raid device or
+// assembles a preserve device at.
+//
+// Nothing in the agent decides which arrays the deploy environment has
+// assembled by the time it runs: that is up to the boot image's initrd and
+// udev rules and the metadata on the disks (see StopResidualMDDevices and
+// PreflightPreserve for arrays found assembled on real hosts), and an array
+// whose superblock asks for /dev/md0 can be given it. On this path the
+// layout's own disks are blank (CheckDisksClean), so an assembled array's
+// members are all on disks the deploy does not write. `mdadm --create` fails
+// on a node in use, and by then the plan has partitioned the layout's disks:
+// the deploy would fail half applied, and the retry would need --destructive
+// for disks that held nothing.
+//
+// The agent refuses rather than stopping the array or creating the raid at
+// another node:
+//
+//   - Stopping it is what --destructive authorizes (WipeStaleState stops
+//     every assembled array). A deploy without it leaves md state outside
+//     the layout as found.
+//   - The node is not the agent's to choose. /dev/mdN is fixed by the layout
+//     (storage.MDDevMap) and is the node the plan formats and mounts and the
+//     installed system's mdadm.conf names.
+//
+// The one array a deploy without --destructive does stop is one made only
+// of preserve members (StopAutoAssembly), so on a layout with a preserve
+// device such an array does not count as holding its node: PreflightPreserve
+// stops it before the plan runs. The preserve members are resolved only when
+// an array holds a planned node, so a missing member is still reported by
+// PreflightPreserve, which says what to check.
+//
+// A failed read of /proc/mdstat passes only when the file is confirmed absent
+// (assembledArrays): a mdstat that exists and cannot be read leaves the
+// nodes' state unknown, which fails the check as an unprobeable disk fails
+// CheckDisksClean.
+func CheckMDNamesFree(ctx *agent.Context, layout storage.Layout) error {
+	planned := storage.MDDevMap(layout)
+	if len(planned) == 0 {
+		return nil
+	}
+	devs, err := assembledArrays(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot tell whether the /dev/mdN nodes the layout uses are free: "+
+			"%s; refusing to partition any disk. "+
+			"Check the deploy environment from a --recovery boot (cat /proc/mdstat), then redeploy; "+
+			"--destructive skips this check and stops every assembled array", err)
+	}
+	assembled := map[string]mdDevice{}
+	for _, d := range devs {
+		assembled["/dev/"+d.name] = d
+	}
+	names := make([]string, 0, len(planned))
+	for name := range planned {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var held []string
+	for _, name := range names {
+		if _, ok := assembled[planned[name]]; ok {
+			held = append(held, name)
+		}
+	}
+	if len(held) == 0 {
+		return nil
+	}
+	released := map[string]bool{}
+	if HasPreserveDevices(layout) {
+		members, err := preserveMemberKNames(ctx, layout)
+		if err != nil {
+			return fmt.Errorf("%w; cannot tell whether an array at a /dev/mdN node the layout uses is made of preserve "+
+				"members, which the deploy stops, or holds devices outside the layout; "+
+				"check the storage script's preserve member names against lsblk on the target", err)
+		}
+		for _, d := range devs {
+			if madeOfPreserveMembers(d, members) {
+				released[d.name] = true
+			}
+		}
+	}
+	var taken []string
+	for _, name := range held {
+		d := assembled[planned[name]]
+		if released[d.name] {
+			continue
+		}
+		kind, verb := "raid", "created"
+		if layout.Devices[name].Type == "preserve" {
+			kind, verb = "preserve", "assembled"
+		}
+		taken = append(taken, fmt.Sprintf("%s %q is %s at %s, where an array is already assembled (%s : %s)",
+			kind, name, verb, planned[name], d.name, d.status))
+	}
+	if len(taken) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s. The deploy environment assembled it from disks this deploy does not write, and a deploy without "+
+		"--destructive stops no array but one made only of preserve members, so mdadm could not create or assemble the "+
+		"layout's array at that node and the deploy would fail partway; "+
+		"nothing has been changed. Redeploy with --destructive: it stops every assembled array before partitioning and "+
+		"writes only to the disks the layout targets, so the old array's members keep their data. "+
+		"If the old array is no longer needed and its disks are outside the layout, add --wipe-all-disks to zero its superblocks too",
+		strings.Join(taken, "; "))
 }
 
 // CheckStaleArrayMembers refuses the deploy, before any disk is touched,

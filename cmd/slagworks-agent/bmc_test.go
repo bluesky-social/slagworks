@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -34,7 +35,7 @@ func TestInBandReconcileOptions_FromCmdline(t *testing.T) {
 		// Provision-once: no password to assert and no rotation, so a
 		// working monitor password is never rewritten by a redeploy.
 		if opt.IPMIInterface != "open" || len(opt.Desired) != 1 ||
-			opt.Desired[0] != (bmcreconcile.DesiredUser{Name: bmcreconcile.MonitorUser, Privilege: bmcreconcile.PrivUser}) {
+			!reflect.DeepEqual(opt.Desired[0], bmcreconcile.DesiredUser{Name: bmcreconcile.MonitorUser, Privilege: bmcreconcile.PrivUser}) {
 			t.Errorf("in-band options: %+v", opt)
 		}
 	}

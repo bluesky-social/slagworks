@@ -35,11 +35,12 @@ type PowerControllerFactory func(ctx context.Context, m *model.MachineSnapshot, 
 
 // BMCReconcileFunc runs a remote BMC user reconcile over IPMI LAN for a
 // bmc_reconcile op. monitorPassword is the stored monitor password to
-// re-assert; empty generates a fresh one. Production is
+// re-assert; empty generates a fresh one. unconfirmed is the stored entry's
+// unconfirmed passwords (bmcreconcile.DesiredUser.Unconfirmed). Production is
 // bmcreconcile.ReconcileRemote (ipmitool lanplus); tests stub it. Same
 // contract as bmcreconcile.Reconcile: a nil Result means nothing was
 // written.
-type BMCReconcileFunc func(ctx context.Context, t bmcreconcile.LANTarget, monitorPassword string) (*bmcreconcile.Result, error)
+type BMCReconcileFunc func(ctx context.Context, t bmcreconcile.LANTarget, monitorPassword string, unconfirmed []string) (*bmcreconcile.Result, error)
 
 // BMCTimeFunc runs a bmc_reconcile op's time pass (NTP, timezone, clock)
 // over Redfish and IPMI LAN. Production is bmcreconcile.ReconcileTime;
@@ -153,6 +154,15 @@ func (e *Executor) processOps(ctx context.Context) {
 		}
 		e.executeOp(ctx, op)
 	}
+	// Claims that committed on global but whose reply was lost, where
+	// global's claimed row reached the cache after executeOp's rollback and
+	// replaced its pending mark (B4).
+	for _, op := range e.cache.ReclaimableOps(e.workerID) {
+		if ctx.Err() != nil {
+			return
+		}
+		e.executeOp(ctx, op)
+	}
 }
 
 func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
@@ -160,7 +170,8 @@ func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
 
 	// Mark as claimed locally first to prevent PendingPowerOps and
 	// PendingLifecycleOps from returning it on the next tick while
-	// we're still executing.
+	// we're still executing. This also forgets an earlier unanswered
+	// claim: this attempt's outcome decides.
 	e.cache.MarkOpClaimed(op.ID.String())
 
 	// Claim the operation via central API
@@ -181,9 +192,14 @@ func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
 		// the claim actually COMMITTED and only the reply was lost:
 		// ClaimOperation's idempotent re-claim branch hands back an op
 		// this worker already holds (claimed, by us, no phase yet), so
-		// the retry resumes the op instead of stalling it (B4).
+		// the retry resumes the op instead of stalling it (B4). Global's
+		// row for such a claim (the reconnect's op_resync, or the late
+		// claim's op_delta) can reach the cache after this rollback and
+		// replace the pending mark; RollBackClaim records the claim as
+		// unanswered so ReclaimableOps still returns the op for the
+		// retry.
 		log.Warn("failed to claim operation", "err", err)
-		e.cache.MarkOpStatus(op.ID.String(), model.OpPending)
+		e.cache.RollBackClaim(op.ID.String())
 		return
 	}
 
@@ -198,6 +214,13 @@ func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
 }
 
 // runPowerOp executes a power operation after it has been claimed.
+//
+// It records the op type as the op's phase before opening the controller,
+// as runBMCReconcile does: the phase is the execution evidence the
+// orphaned-claim sweep (store.ExpireOrphanedClaims) looks for, and a power
+// op can outlive the sweep's 2-minute claimed-no-phase grace while the
+// worker is still driving it (bmclib calls of up to 30s each on a slow BMC,
+// a PDU cycle's 60s off-window plus up to 150s of polling).
 func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 	log := e.log.With("op_id", op.ID, "type", op.Type, "machine_id", op.MachineID)
 
@@ -207,6 +230,8 @@ func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 		e.cache.RecordOpUpdate(op.ID.String(), "failed", json.RawMessage(`{"error":"machine not in cache"}`))
 		return
 	}
+
+	e.cache.UpdateOpPhase(op.ID.String(), string(op.Type))
 
 	ctrl, ok := e.openController(ctx, log, op, m)
 	if !ok {
@@ -353,6 +378,19 @@ func (e *Executor) openController(ctx context.Context, log *slog.Logger, op mode
 // runLifecycleOp drives a commission or deploy operation: set PXE boot and
 // power cycle the machine. The agent running on the machine reports completion
 // back to the site worker asynchronously; the executor's job ends here.
+//
+// Phases: power_cycle is recorded before the controller is opened and covers
+// every BMC/PDU/AMT call up to and including the cycle; pxe_booting follows
+// once the cycle has returned. power_cycle comes first because the phase is
+// the execution evidence the orphaned-claim sweep (store.ExpireOrphanedClaims)
+// looks for, and the controller calls can outlast its 2-minute
+// claimed-no-phase grace while the worker is still driving the op (bmclib
+// calls of up to 30s each on a slow BMC, a PDU cycle's 60s off-window plus up
+// to 150s of polling). Both deploy and commission boot the machine the same
+// way and share the boot-prefix spine (lifecycle.go: commissionSpine reuses
+// phases 1-6), so both emit these markers. PrepareDeployLogs sets the
+// current-op pointer for stale-insert rejection on the per-machine log ring;
+// it applies to any booting op, not just deploy.
 func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 	log := e.log.With("op_id", op.ID, "type", op.Type, "machine_id", op.MachineID)
 
@@ -362,6 +400,10 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 		e.cache.RecordOpUpdate(op.ID.String(), "failed", json.RawMessage(`{"error":"machine not in cache"}`))
 		return
 	}
+
+	e.cache.PrepareDeployLogs(op.MachineID.String(), op.ID.String())
+	e.cache.UpdateOpPhase(op.ID.String(), "power_cycle")
+
 	ctrl, ok := e.openController(ctx, log, op, m)
 	if !ok {
 		return
@@ -398,19 +440,9 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 
 	// The agent on the machine will report back completion via the reporter.
 	// Mark op as running so the executor doesn't re-drive it on the next tick.
-	// Set the initial boot-prefix phases (power_cycle -> pxe_booting) so the
-	// watch TUI's lifecycle pane animates from the moment we cycle power,
-	// rather than sitting all-pending until the agent's first phone-home.
-	// Both deploy and commission boot the machine the same way and share the
-	// boot-prefix spine (lifecycle.go: commissionSpine reuses phases 1-6), so
-	// both emit these markers. PrepareDeployLogs sets the current-op pointer
-	// for stale-insert rejection on the per-machine log ring; it applies to
-	// any booting op, not just deploy.
-	if op.Type == model.OpDeploy || op.Type == model.OpCommission {
-		e.cache.PrepareDeployLogs(op.MachineID.String(), op.ID.String())
-		e.cache.UpdateOpPhase(op.ID.String(), "power_cycle")
-		e.cache.UpdateOpPhase(op.ID.String(), "pxe_booting")
-	}
+	// pxe_booting keeps the watch TUI's lifecycle pane moving until the
+	// target's first DHCP or the agent's first report.
+	e.cache.UpdateOpPhase(op.ID.String(), "pxe_booting")
 	e.cache.MarkOpStatus(op.ID.String(), model.OpRunning)
 	log.Info("machine booting to PXE, waiting for agent report", "op_type", op.Type)
 }

@@ -48,7 +48,8 @@ const bmcTimeTimeout = 3 * time.Minute
 // does not run (there is no report to carry it). Otherwise the outcome goes
 // ONLY in a bmc_reconcile_report observation, with monitor_rotated,
 // monitor_password_written and any generated monitor password; global
-// stores a generated password in pop/<pop>/bmc-creds-monitor and finalizes
+// stores a generated password in pop/<pop>/bmc-creds-monitor (beside the
+// current one when its write's outcome is unknown) and finalizes
 // the op with non-secret facts. A re-asserted stored password is not copied
 // into the report. Neither password ever rides an op_update (persisted
 // verbatim in the operations table) or a log line.
@@ -88,8 +89,12 @@ func (e *Executor) runBMCReconcile(ctx context.Context, op model.Operation) {
 	}
 	rt := *params.BMCRuntime
 	monitorPassword := ""
+	var unconfirmed []string
 	if params.MonitorRuntime != nil {
 		monitorPassword = params.MonitorRuntime.Password
+		for _, u := range params.MonitorRuntime.Unconfirmed {
+			unconfirmed = append(unconfirmed, u.Password)
+		}
 	}
 
 	e.cache.UpdateOpPhase(op.ID.String(), "bmc_reconcile")
@@ -110,7 +115,7 @@ func (e *Executor) runBMCReconcile(ctx context.Context, op model.Operation) {
 	}
 	rctx, cancel := context.WithTimeout(ctx, bmcReconcileTimeout)
 	defer cancel()
-	res, err := e.bmcReconcile(rctx, lan, monitorPassword)
+	res, err := e.bmcReconcile(rctx, lan, monitorPassword, unconfirmed)
 	if res == nil {
 		if err == nil {
 			err = errors.New("bmc reconcile returned no result")
@@ -123,16 +128,26 @@ func (e *Executor) runBMCReconcile(ctx context.Context, op model.Operation) {
 	for _, u := range res.CreatedOrUpdated {
 		if u.Name == bmcreconcile.MonitorUser {
 			// u.Password is set only when reconcile generated it; a
-			// re-asserted stored password stays out of the report.
-			rep.Monitor = &model.BMCUserCred{Username: u.Name, Password: u.Password, IPMIUserSlot: u.Slot}
-			rep.MonitorRotated = u.Password != ""
-			rep.MonitorPasswordWritten = true
+			// re-asserted stored password stays out of the report. A
+			// generated password the BMC may or may not have applied
+			// (u.PasswordUnconfirmed, always with err) is reported too,
+			// flagged: this report is its only copy, and global keeps it
+			// beside the stored password for the next op to settle.
+			rep.Monitor = &model.BMCUserCred{
+				Username: u.Name, Password: u.Password, IPMIUserSlot: u.Slot,
+				PasswordUnconfirmed: u.PasswordUnconfirmed,
+			}
+			rep.MonitorRotated = u.Password != "" && !u.PasswordUnconfirmed
+			rep.MonitorPasswordWritten = !u.PasswordUnconfirmed
 		}
 	}
 	for _, u := range res.PasswordVerified {
 		if u.Name == bmcreconcile.MonitorUser {
-			// The BMC already held the stored password: nothing written.
-			rep.Monitor = &model.BMCUserCred{Username: u.Name, IPMIUserSlot: u.Slot}
+			// Nothing written. u.Password is empty when the BMC held the
+			// stored password, and otherwise the unconfirmed password it
+			// held instead, which global must now store as the password.
+			rep.Monitor = &model.BMCUserCred{Username: u.Name, Password: u.Password, IPMIUserSlot: u.Slot}
+			rep.MonitorRotated = u.Password != ""
 		}
 	}
 	if err != nil {

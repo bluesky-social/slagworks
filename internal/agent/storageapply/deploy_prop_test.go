@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -311,11 +312,14 @@ func deploy(ctx *agent.Context, h *fakeHost, hc hostCase) (string, error) {
 		if err := CheckDisksClean(ctx, hc.Layout); err != nil {
 			return "safety", err
 		}
+		if err := CheckMDNamesFree(ctx, hc.Layout); err != nil {
+			return "md names", err
+		}
 	}
 	if err := CheckStaleArrayMembers(ctx, hc.Layout, hc.WipeAll); err != nil {
 		return "stale-members", err
 	}
-	if err := PreflightPreserve(ctx, hc.Layout); err != nil {
+	if err := PreflightPreserve(ctx, hc.Layout, hc.Destructive); err != nil {
 		return "preflight", err
 	}
 	if hc.Destructive {
@@ -330,7 +334,9 @@ func deploy(ctx *agent.Context, h *fakeHost, hc hostCase) (string, error) {
 		}
 	}
 	if !hc.Destructive && HasPreserveDevices(hc.Layout) {
-		StopAutoAssembly(ctx)
+		if err := StopAutoAssembly(ctx, hc.Layout); err != nil {
+			return "preserve auto-assembly", err
+		}
 	}
 	mountPhase := len(cmds)
 	for i, c := range cmds {
@@ -507,26 +513,73 @@ func checkHost(hc hostCase, h *fakeHost, stage string) []hostViolation {
 // planMDNameTaken reports whether a deploy without --destructive would find
 // one of the /dev/mdN nodes its plan uses (md0 upward, one per raid or
 // preserve device) held by an auto-assembled array that nothing stops first:
-// only a layout with a preserve array stops auto-assembly on that path.
+// on that path only an array made of preserve members is stopped. Such a
+// deploy is refused by CheckMDNamesFree before it writes anything.
 func planMDNameTaken(hc hostCase, h *fakeHost) bool {
 	if hc.Destructive {
 		return false
 	}
 	planned := 0
 	for _, d := range hc.Layout.Devices {
-		switch d.Type {
-		case "preserve":
-			return false
-		case "raid":
+		if d.Type == "raid" || d.Type == "preserve" {
 			planned++
 		}
 	}
+	preserve := preserveMemberSet(hc, h)
 	for i := 0; i < planned; i++ {
-		if _, active := h.arrays[fmt.Sprintf("md%d", i)]; active {
+		if a, active := h.arrays[fmt.Sprintf("md%d", i)]; active && !onlyMembersOf(a.members, preserve) {
 			return true
 		}
 	}
 	return false
+}
+
+// preserveMemberSet is the kernel name of every preserve member in the
+// layout, resolved through the host's own device table and symlinks.
+func preserveMemberSet(hc hostCase, h *fakeHost) map[string]bool {
+	set := map[string]bool{}
+	for _, d := range hc.Layout.Devices {
+		if d.Type != "preserve" {
+			continue
+		}
+		for _, m := range d.Members {
+			p := m
+			if !strings.HasPrefix(p, "/dev/") {
+				p = "/dev/" + p
+			}
+			if r, _, ok := h.resolve(p); ok {
+				set[r.kname()] = true
+			}
+		}
+	}
+	return set
+}
+
+// onlyMembersOf reports whether an array holds at least one device and
+// every device it holds is in set.
+func onlyMembersOf(members []string, set map[string]bool) bool {
+	if len(members) == 0 {
+		return false
+	}
+	for _, m := range members {
+		if !set[m] {
+			return false
+		}
+	}
+	return true
+}
+
+// arraysOutsidePreserve returns, by md name, the members of every assembled
+// array a deploy without --destructive must leave as found: every array but
+// one made only of preserve members.
+func arraysOutsidePreserve(h *fakeHost, preserve map[string]bool) map[string][]string {
+	out := map[string][]string{}
+	for n, a := range h.arrays {
+		if !onlyMembersOf(a.members, preserve) {
+			out[n] = append([]string(nil), a.members...)
+		}
+	}
+	return out
 }
 
 // initialDirty reports whether a disk-type target carries any signature
@@ -573,8 +626,14 @@ func quietCtx(h *fakeHost) *agent.Context {
 //     bystanders under --destructive --wipe-all-disks;
 //   - retained disks and disks holding preserve members are never written,
 //     and a preserved array's member superblocks always survive;
-//   - a host whose targets are clean (or --destructive) and whose preserved
-//     array is present deploys to completion.
+//   - without --destructive, a deploy whose plan creates or assembles an
+//     array at a /dev/mdN an auto-assembled array outside the preserve
+//     members holds is refused before it writes anything;
+//   - without --destructive, no array is stopped but one made only of
+//     preserve members: every other array is still assembled as found,
+//     however the deploy ended;
+//   - every other host whose targets are clean (or --destructive) and whose
+//     preserved array is present deploys to completion.
 func TestDeploy_Property_StorageSafety(t *testing.T) {
 	k := allHostKnobs
 	st := &hostStats{stages: map[string]int{}, priors: map[string]int{}}
@@ -582,6 +641,7 @@ func TestDeploy_Property_StorageSafety(t *testing.T) {
 		hc := genHostCase(rt, k)
 		h := hc.build()
 		mdNameTaken := planMDNameTaken(hc, h)
+		outside := arraysOutsidePreserve(h, preserveMemberSet(hc, h))
 		stage, err := deploy(quietCtx(h), h, hc)
 		st.mu.Lock()
 		st.stages[fmt.Sprintf("stage=%s destructive=%v wipeAll=%v", firstField(stage), hc.Destructive, hc.WipeAll)]++
@@ -613,11 +673,32 @@ func TestDeploy_Property_StorageSafety(t *testing.T) {
 			collides = collides || ds.Prior == "preserve-p3"
 		}
 		flagsValid := hc.Destructive || !hc.WipeAll
-		// Not expected to complete: a deploy without --destructive whose
-		// layout has no preserve array never stops the arrays the initrd
-		// auto-assembled, so when one of them sits on a /dev/mdN the plan
-		// creates an array at, mdadm --create fails after the target disks
-		// were partitioned. The safety checks above still cover that case.
+		// A deploy without --destructive stops no array the initrd
+		// auto-assembled but one made of preserve members, so when another
+		// sits on a /dev/mdN the plan creates or assembles an array at, the
+		// deploy cannot complete. It must say so before it writes anything.
+		if mdNameTaken && len(h.writes) > 0 {
+			fail("non-destructive deploy wrote %v although an auto-assembled array holds an md node its plan creates", keys(h.writes))
+		}
+		if mdNameTaken && len(dirty) == 0 && !hc.NoWipefs && flagsValid && stage != "md names" {
+			fail("deploy stopped at %q, want the md name check to refuse it", stage)
+		}
+		// On that path every array but one made of preserve members is left
+		// as found, whether the deploy completed or refused: stopping it is
+		// what --destructive authorizes. A layout with no preserve array
+		// stops nothing at all.
+		if !hc.Destructive {
+			for n, members := range outside {
+				if a, ok := h.arrays[n]; !ok || !slices.Equal(a.members, members) {
+					fail("non-destructive deploy stopped or changed array %s %v, which holds a device that is not a preserve member", n, members)
+				}
+			}
+			for _, c := range h.calls {
+				if c == "mdadm --stop --scan" || (!HasPreserveDevices(hc.Layout) && strings.HasPrefix(c, "mdadm --stop")) {
+					fail("non-destructive deploy ran %q", c)
+				}
+			}
+		}
 		expectDone := (hc.Destructive || len(dirty) == 0) && flagsValid && !hc.NoWipefs && !collides && !mdNameTaken
 		if expectDone && stage != "done" {
 			fail("deploy should have completed but stopped at %q: %v", stage, err)

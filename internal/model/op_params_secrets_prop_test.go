@@ -104,6 +104,9 @@ func credentialsOf(p OpParams) []string {
 	}
 	if p.MonitorRuntime != nil {
 		add(p.MonitorRuntime.Password)
+		for _, u := range p.MonitorRuntime.Unconfirmed {
+			add(u.Password)
+		}
 	}
 	return out
 }
@@ -331,6 +334,9 @@ func TestProp_RedactParams_RoundTripsTypedParams(t *testing.T) {
 		}
 		if rapid.Bool().Draw(t, "mon") {
 			p.MonitorRuntime = &MonitorRuntime{Password: secret("monpw")}
+			for range rapid.IntRange(0, 3).Draw(t, "unconfirmed") {
+				p.MonitorRuntime.Unconfirmed = append(p.MonitorRuntime.Unconfirmed, UnconfirmedPassword{Password: secret("unconfpw")})
+			}
 		}
 		raw, err := json.Marshal(p)
 		if err != nil {
@@ -373,6 +379,9 @@ func TestProp_RedactParams_RoundTripsTypedParams(t *testing.T) {
 		}
 		if want.MonitorRuntime != nil {
 			mark(&want.MonitorRuntime.Password)
+			for i := range want.MonitorRuntime.Unconfirmed {
+				mark(&want.MonitorRuntime.Unconfirmed[i].Password)
+			}
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("redaction changed a non-credential field\n  in %s\n out %s\n got %+v\nwant %+v", raw, out, got, want)

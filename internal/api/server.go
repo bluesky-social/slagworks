@@ -103,9 +103,10 @@ type Config struct {
 	// OrphanedClaimGrace bounds ops in status=claimed with NO phase
 	// from claimed_at (B4: the claiming worker died between the claim
 	// commit and its first actuation). Default 2m — a healthy claim
-	// records phase power_cycle within seconds, and a lost-reply
-	// worker re-claims within one executor tick (5s), so 2m of
-	// claimed-no-phase means the worker is gone.
+	// records its first phase within seconds, before the worker's first
+	// BMC/PDU/AMT call, and a lost-reply worker re-claims within one
+	// executor tick (5s), so 2m of claimed-no-phase means the worker is
+	// gone.
 	OrphanedClaimGrace time.Duration
 	// PhoneHomeTimeout bounds deploy ops in phase=awaiting_phone_home
 	// from phase_entered_at. Default 30m.
@@ -299,7 +300,9 @@ func (s *Server) invalidateSite(slug string) {
 
 // invalidateAllSites fans out Invalidate across every configured
 // site. Used by machine mutations where we don't have the slug to
-// hand — machines carry NetBoxDeviceID, not a site binding. The
+// hand — machines carry NetBoxDeviceID, not a site binding — and by
+// mutations of global snapshot inputs (images, storage and network
+// scripts, SSH keys), which every site's snapshot carries. The
 // dispatcher's content-hash skip makes per-site rebuilds cheap on
 // unrelated slugs, so fanning out is safe.
 func (s *Server) invalidateAllSites() {
@@ -1549,8 +1552,9 @@ func (s *Server) bmcReconcileMachine(c *echo.Context) error {
 // runtime that carries its password to the worker: nil when there is no
 // entry (a new BMC) or the op rotates. It refuses (as an HTTP error) when
 // the pop's monitor secret is missing, since a generated password could not
-// be stored, and when a stored entry cannot be re-asserted. The password is
-// never logged or put in an error.
+// be stored, and when a stored entry cannot be re-asserted. The entry's
+// unconfirmed passwords ride along for the worker to test. No password is
+// ever logged or put in an error.
 func (s *Server) resolveMonitorRuntime(ctx context.Context, dev *netbox.Device, rotate bool) (*model.MonitorRuntime, error) {
 	pop := dev.Site.Slug
 	path := "pop/" + pop + "/bmc-creds-monitor"
@@ -1570,7 +1574,11 @@ func (s *Server) resolveMonitorRuntime(ctx context.Context, dev *netbox.Device, 
 				"(its username is %q, its password is %s); fix the entry, or pass --rotate-monitor to replace it with a freshly generated password",
 			path, dev.Serial, dev.Name, bmcreconcile.MonitorUser, entry.Username, presence(entry.Password)))
 	}
-	return &model.MonitorRuntime{Password: entry.Password}, nil
+	rt := &model.MonitorRuntime{Password: entry.Password}
+	for _, pw := range entry.UnconfirmedPasswords {
+		rt.Unconfirmed = append(rt.Unconfirmed, model.UnconfirmedPassword{Password: pw})
+	}
+	return rt, nil
 }
 
 // presence describes whether a secret value is set, without revealing it.
@@ -1994,6 +2002,14 @@ func (s *Server) createStorageScript(c *echo.Context) error {
 	if err := s.store.CreateStorageScript(&script); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
+	// A deploying agent fetches its matched storage and network scripts
+	// from the site worker's cached snapshot, and neither op create nor
+	// claim rebuilds that snapshot. Every script create, update and delete
+	// therefore pushes a fresh snapshot to all sites; without it the worker
+	// keeps serving the superseded (or deleted) script until an unrelated
+	// rebuild, while preflight, which builds fresh, already reports the new
+	// one.
+	s.invalidateAllSites()
 	return c.JSON(http.StatusCreated, script)
 }
 
@@ -2011,9 +2027,7 @@ type networkScriptWithVersion struct {
 
 // updateStorageScript inserts a new immutable version (head+1) with content
 // re-parsed for priority, and advances the script's head pointer. Old
-// versions are never touched. No snapshot invalidation here, matching
-// createStorageScript/deleteStorageScript: matching picks the change up on
-// the next rebuild rather than forcing one.
+// versions are never touched.
 func (s *Server) updateStorageScript(c *echo.Context) error {
 	name := c.Param("name")
 	var body struct {
@@ -2036,6 +2050,7 @@ func (s *Server) updateStorageScript(c *echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "updating storage script")
 	}
+	s.invalidateAllSites() // serve the new head; see createStorageScript
 	return c.JSON(http.StatusOK, scriptWithVersion{StorageScript: *script, Version: version})
 }
 
@@ -2047,6 +2062,7 @@ func (s *Server) deleteStorageScript(c *echo.Context) error {
 	if err := s.store.DeleteStorageScript(id); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
+	s.invalidateAllSites() // stop serving it; see createStorageScript
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -2092,6 +2108,7 @@ func (s *Server) createNetworkScript(c *echo.Context) error {
 	if err := s.store.CreateNetworkScript(&script); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
+	s.invalidateAllSites() // serve it; see createStorageScript
 	return c.JSON(http.StatusCreated, script)
 }
 
@@ -2118,6 +2135,7 @@ func (s *Server) updateNetworkScript(c *echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "updating network script")
 	}
+	s.invalidateAllSites() // serve the new head; see createStorageScript
 	return c.JSON(http.StatusOK, networkScriptWithVersion{NetworkScript: *script, Version: version})
 }
 
@@ -2129,6 +2147,7 @@ func (s *Server) deleteNetworkScript(c *echo.Context) error {
 	if err := s.store.DeleteNetworkScript(id); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
+	s.invalidateAllSites() // stop serving it; see createStorageScript
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -2332,10 +2351,14 @@ func (s *Server) createSiteConfig(c *echo.Context) error {
 	if cfg.NetBoxSite == "" {
 		cfg.NetBoxSite = cfg.Slug
 	}
-	if herr := s.validateSiteConfigNetBox(c, &cfg); herr != nil {
+	admit, herr := s.validateSiteConfigNetBox(c, &cfg)
+	if herr != nil {
 		return herr
 	}
-	if err := s.store.CreateSiteConfig(&cfg); err != nil {
+	if err := s.store.CreateSiteConfigIfAdmitted(&cfg, admit); err != nil {
+		if herr, ok := errors.AsType[*echo.HTTPError](err); ok {
+			return herr
+		}
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}
 
@@ -2368,27 +2391,38 @@ func (s *Server) createSiteConfig(c *echo.Context) error {
 // create or update: the netbox_site must exist; the config's scope
 // (whole-site or its location) must have a slagworks-production prefix
 // so the first snapshot build can't fail with "no production prefix";
-// a location-scoped config's location must belong to the site; and the
-// config must not overlap an existing config on the same site (ruling 2
-// create/update half). Returns a *echo.HTTPError on failure, nil on
-// success. No-op when NetBox isn't wired (tests).
-func (s *Server) validateSiteConfigNetBox(c *echo.Context, cfg *model.SiteConfig) *echo.HTTPError {
+// and a location-scoped config's location must belong to the site. Returns
+// a *echo.HTTPError when one of those fails.
+//
+// The last precondition, that the config must not overlap an existing
+// config on the same site (ruling 2 create/update half), is returned as a
+// store.SiteConfigAdmit for the caller to pass to the store write rather
+// than checked here: the store runs it against the rows as they stand at
+// the write, with every other site-config write held off, so two requests
+// cannot each pass the check against rows that predate the other's write.
+// The admit refuses with a 409 *echo.HTTPError. It closes over the
+// locations fetched here; NetBox is not re-read while the store's lock is
+// held, and CheckOverlap fails closed on a config whose location is
+// missing from that list.
+//
+// Both results are nil when NetBox isn't wired (tests).
+func (s *Server) validateSiteConfigNetBox(c *echo.Context, cfg *model.SiteConfig) (store.SiteConfigAdmit, *echo.HTTPError) {
 	if s.netbox == nil {
-		return nil
+		return nil, nil
 	}
 	ctx := c.Request().Context()
 	site, err := s.netbox.GetSiteBySlug(ctx, cfg.NetBoxSite)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
+		return nil, echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
 	}
 	if site == nil {
-		return echo.NewHTTPError(http.StatusPreconditionFailed,
+		return nil, echo.NewHTTPError(http.StatusPreconditionFailed,
 			fmt.Sprintf("netbox site %q not found; create the site in NetBox first", cfg.NetBoxSite))
 	}
 
 	locations, err := s.netbox.ListLocationsForSite(ctx, cfg.NetBoxSite)
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
+		return nil, echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
 	}
 	// Belongs-to: a location-scoped config's location must be in the site.
 	if cfg.LocationScoped() {
@@ -2401,38 +2435,37 @@ func (s *Server) validateSiteConfigNetBox(c *echo.Context, cfg *model.SiteConfig
 			}
 		}
 		if !found {
-			return echo.NewHTTPError(http.StatusPreconditionFailed,
+			return nil, echo.NewHTTPError(http.StatusPreconditionFailed,
 				fmt.Sprintf("netbox location %q not found in site %q", cfg.NetBoxLocation, cfg.NetBoxSite))
 		}
 		prefixes, err := s.netbox.ListLocationPrefixes(ctx, locID, "slagworks-production")
 		if err != nil {
-			return echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
+			return nil, echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
 		}
 		if len(prefixes) == 0 {
-			return echo.NewHTTPError(http.StatusPreconditionFailed,
+			return nil, echo.NewHTTPError(http.StatusPreconditionFailed,
 				fmt.Sprintf("netbox location %q has no prefix tagged 'slagworks-production' scoped to it; tag+scope one before site-config create", cfg.NetBoxLocation))
 		}
 	} else {
 		prefixes, err := s.netbox.ListSitePrefixes(ctx, cfg.NetBoxSite, "slagworks-production")
 		if err != nil {
-			return echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
+			return nil, echo.NewHTTPError(http.StatusBadGateway, "netbox: "+err.Error())
 		}
 		if len(prefixes) == 0 {
-			return echo.NewHTTPError(http.StatusPreconditionFailed,
+			return nil, echo.NewHTTPError(http.StatusPreconditionFailed,
 				fmt.Sprintf("netbox site %q has no prefix tagged 'slagworks-production'; create one (with gateway_ip custom field) before site-config create", cfg.NetBoxSite))
 		}
 	}
 
 	// Overlap: reject a config that could claim the same devices as an
 	// existing one on this site.
-	existing, err := s.store.ListSiteConfigs()
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-	if err := snapshot.CheckOverlap(*cfg, existing, locations); err != nil {
-		return echo.NewHTTPError(http.StatusConflict, err.Error())
-	}
-	return nil
+	candidate := *cfg
+	return func(existing []model.SiteConfig) error {
+		if err := snapshot.CheckOverlap(candidate, existing, locations); err != nil {
+			return echo.NewHTTPError(http.StatusConflict, err.Error())
+		}
+		return nil
+	}, nil
 }
 
 func (s *Server) updateSiteConfig(c *echo.Context) error {
@@ -2477,12 +2510,18 @@ func (s *Server) updateSiteConfig(c *echo.Context) error {
 	// the merged config — an update that changes netbox_site/location
 	// must satisfy the same invariants a create does. CheckOverlap skips
 	// this config's own row by slug, so a no-scope-change update passes.
-	if herr := s.validateSiteConfigNetBox(c, cfg); herr != nil {
+	// The overlap half runs inside the store write (see
+	// validateSiteConfigNetBox).
+	admit, herr := s.validateSiteConfigNetBox(c, cfg)
+	if herr != nil {
 		return herr
 	}
-	if err := s.store.UpdateSiteConfig(cfg); err != nil {
+	if err := s.store.UpdateSiteConfigIfAdmitted(cfg, admit); err != nil {
 		if errors.Is(err, store.ErrSiteConfigNotFound) {
 			return echo.NewHTTPError(http.StatusNotFound, "site_config not found")
+		}
+		if herr, ok := errors.AsType[*echo.HTTPError](err); ok {
+			return herr
 		}
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 	}

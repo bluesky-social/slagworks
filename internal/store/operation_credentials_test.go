@@ -26,13 +26,15 @@ func credentialParams() model.OpParams {
 		}, DownstreamSerial: "SN-DOWN", Outlet: true},
 		AMTRuntime:       &model.AMTRuntime{Host: "10.252.240.23", Username: "admin", Password: "fixture-amt-pw"},
 		TailscaleRuntime: &model.TailscaleRuntime{AuthKey: "fixture-tskey", Hostname: "h-pop1", Tags: []string{"tag:pop1"}},
-		MonitorRuntime:   &model.MonitorRuntime{Password: "fixture-monitor-pw"},
-		RotateMonitor:    true,
+		MonitorRuntime: &model.MonitorRuntime{Password: "fixture-monitor-pw",
+			Unconfirmed: []model.UnconfirmedPassword{{Password: "fixture-unconfirmed-pw"}}},
+		RotateMonitor: true,
 	}
 }
 
 var credentialFixtures = []string{
 	"fixture-bmc-pw", "fixture-pdu-pw-1", "fixture-pdu-pw-2", "fixture-amt-pw", "fixture-tskey", "fixture-monitor-pw",
+	"fixture-unconfirmed-pw",
 }
 
 // heldCredentials counts the fixture credentials in raw, so failure
@@ -103,6 +105,7 @@ func TestScrubTerminalOperationCredentials_StripsTerminalKeepsActive(t *testing.
 	bmc, pdu, amt, ts, mon := *full.BMCRuntime, *full.PDURuntime, *full.AMTRuntime, *full.TailscaleRuntime, *full.MonitorRuntime
 	pdu.Outlets = []model.PDUOutlet{full.PDURuntime.Outlets[0], full.PDURuntime.Outlets[1]}
 	bmc.Password, amt.Password, ts.AuthKey, mon.Password = "", "", "", ""
+	mon.Unconfirmed = []model.UnconfirmedPassword{{}}
 	for i := range pdu.Outlets {
 		pdu.Outlets[i].Password = ""
 	}

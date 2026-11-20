@@ -1028,6 +1028,10 @@ func TestHandleDeployComplete_NilMonitorWriter_Warns(t *testing.T) {
 // errorMonitorWriter always errors.
 type errorMonitorWriter struct{ err error }
 
+func (e *errorMonitorWriter) GetMonitorEntry(context.Context, string, string) (*awssecrets.BMCMonitorEntry, error) {
+	return nil, e.err
+}
+
 func (e *errorMonitorWriter) UpsertMonitorEntry(_ context.Context, _, _ string, _ awssecrets.BMCMonitorEntry) error {
 	return e.err
 }
@@ -1038,6 +1042,10 @@ func (e *errorMonitorWriter) UpsertMonitorEntry(_ context.Context, _, _ string, 
 type blockingMonitorWriter struct {
 	entered chan struct{}
 	release chan struct{}
+}
+
+func (b *blockingMonitorWriter) GetMonitorEntry(context.Context, string, string) (*awssecrets.BMCMonitorEntry, error) {
+	return nil, nil
 }
 
 func (b *blockingMonitorWriter) UpsertMonitorEntry(_ context.Context, _, _ string, _ awssecrets.BMCMonitorEntry) error {

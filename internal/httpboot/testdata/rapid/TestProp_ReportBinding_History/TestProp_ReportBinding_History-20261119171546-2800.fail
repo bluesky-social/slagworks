@@ -1,0 +1,86 @@
+# 2026/11/19 17:15:46.968125 [TestProp_ReportBinding_History] [rapid] draw steps: 5
+# 2026/11/19 17:15:46.968128 [TestProp_ReportBinding_History] [rapid] draw mac_only: 1
+# 2026/11/19 17:15:46.968130 [TestProp_ReportBinding_History] [rapid] draw action: "new_op"
+# 2026/11/19 17:15:46.968130 [TestProp_ReportBinding_History] [rapid] draw m: 0
+# 2026/11/19 17:15:46.968131 [TestProp_ReportBinding_History] [rapid] draw type: "deploy"
+# 2026/11/19 17:15:46.968135 [TestProp_ReportBinding_History] [rapid] draw mac_only: 1
+# 2026/11/19 17:15:46.968136 [TestProp_ReportBinding_History] [rapid] draw action: "report"
+# 2026/11/19 17:15:46.968136 [TestProp_ReportBinding_History] [rapid] draw report_machine: 0
+# 2026/11/19 17:15:46.968136 [TestProp_ReportBinding_History] [rapid] draw report_op_kind: 0
+# 2026/11/19 17:15:46.968137 [TestProp_ReportBinding_History] [rapid] draw report_kind: "deploy_complete"
+# 2026/11/19 17:15:46.968156 [TestProp_ReportBinding_History] [rapid] draw mac_only: 1
+# 2026/11/19 17:15:46.968157 [TestProp_ReportBinding_History] [rapid] draw action: "report"
+# 2026/11/19 17:15:46.968157 [TestProp_ReportBinding_History] [rapid] draw report_machine: 0
+# 2026/11/19 17:15:46.968157 [TestProp_ReportBinding_History] [rapid] draw report_op_kind: 0
+# 2026/11/19 17:15:46.968158 [TestProp_ReportBinding_History] [rapid] draw report_kind: "phone_home"
+# 2026/11/19 17:15:46.968171 [TestProp_ReportBinding_History] [rapid] draw mac_only: 1
+# 2026/11/19 17:15:46.968171 [TestProp_ReportBinding_History] [rapid] draw action: "claim"
+# 2026/11/19 17:15:46.968172 [TestProp_ReportBinding_History] [rapid] draw m: 0
+# 2026/11/19 17:15:46.968172 [TestProp_ReportBinding_History] [rapid] draw mac_only: 1
+# 2026/11/19 17:15:46.968173 [TestProp_ReportBinding_History] [rapid] draw action: "report"
+# 2026/11/19 17:15:46.968173 [TestProp_ReportBinding_History] [rapid] draw report_machine: 0
+# 2026/11/19 17:15:46.968173 [TestProp_ReportBinding_History] [rapid] draw report_op_kind: 0
+# 2026/11/19 17:15:46.968174 [TestProp_ReportBinding_History] [rapid] draw report_kind: "failed"
+# 2026/11/19 17:15:46.968186 [TestProp_ReportBinding_History] report failed (machine=0 op=&{id:[170 170 170 170 170 170 74 170 138 170 0 0 0 0 0 1] machine:0 typ:deploy claimed:true version:1 awaiting:true failed:false completed:true removed:false}) -> HTTP 200 "", model says accept=false
+# 
+v0.4.8#8831661083348021401
+0x0
+0x6b74f03291620
+0x4
+0x0
+0x0
+0x1
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1
+0x6b74f03291620
+0x5
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x38e38e38e38e4
+0x3
+0x0
+0x0
+0x1
+0x6b74f03291620
+0x5
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x6b74f03291620
+0x5
+0x0
+0x0
+0x1
+0x38e38e38e38e4
+0x2
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1
+0x6b74f03291620
+0x5
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x38e38e38e38e4
+0x2

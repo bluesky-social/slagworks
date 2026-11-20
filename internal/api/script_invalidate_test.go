@@ -18,9 +18,9 @@ import (
 // snapshot (MachineSnapshot.StorageScript / NetworkScript). Op create and op
 // claim do not rebuild the snapshot, so nothing between "operator changes a
 // script" and "agent fetches it" forces a rebuild unless the handler
-// invalidates: the change otherwise waits for the periodic reconcile or an
-// unrelated invalidation, and a deploy started right after `slagctl
-// storage-script update` runs the superseded version, although
+// invalidates: the change would otherwise wait for the periodic reconcile or
+// an unrelated invalidation, and a deploy started right after `slagctl
+// storage-script update` would run the superseded version, although
 // ScriptVersion documents Head as "the version currently served". Image and
 // SSH key mutations invalidate every site for exactly this reason
 // (TestImageUpsert_InvalidatesAllSites,
@@ -87,8 +87,6 @@ func requireInvalidatedAll(t *testing.T, inv *fakeInvalidator, step string) {
 }
 
 func TestScriptMutationsInvalidateAllSites(t *testing.T) {
-	t.Skip("script create, update and delete handlers do not invalidate site snapshots, " +
-		"so workers keep serving the superseded script until the next periodic reconcile")
 	srv, inv, _ := scriptInvalidateServer(t)
 	storage := "#!/bin/sh\n# slagworks:match system_product=X1\n# slagworks:priority 100\necho '{}'\n"
 	network := "#!/bin/sh\n# slagworks:match hostname=h1\n# slagworks:priority 100\necho '{}'\n"
