@@ -211,6 +211,9 @@ the first image or to move to another bucket;
 For manual rollback or a curated pin (staging a specific SHA that isn't
 `latest-sha.txt`), use `slagctl image create` with `--name`, `--version`,
 `--sha256`, and `--url` pointing at the known-good per-SHA tarball URL.
+A row created under a new name boots once it is the site's only row:
+while a row named by the worker's `SLAGWORKS_DEFAULT_IMAGE` exists, boots
+keep using that one.
 "Follow latest" and "manually pin" are the only two authoritative flows
 for changing what the fleet runs; they both terminate in the same DB
 row change.
@@ -312,6 +315,12 @@ Notes:
   `/files/images/noble-pxe@<sha16>/`, which is where iPXE fetches
   `vmlinuz` + `initrd`, the initrd fetches `root.squashfs`, and the
   agent fetches `vmlinuz` + `initrd-local` for a UEFI ESP.
+  Each boot uses the row named by the worker's `SLAGWORKS_DEFAULT_IMAGE`
+  (default `noble-pxe`) if there is one, and otherwise the site's only
+  row, whatever its name. With several rows and none of them named
+  `SLAGWORKS_DEFAULT_IMAGE`, the boot stops at an iPXE shell with an error
+  naming the rows. A deleted row's link and version directories stay on
+  disk, which is why a boot follows the rows rather than a name on disk.
 - `slagctl image sync --dir <path>` runs the same code path
   interactively — useful for verifying an image works on a specific
   host or for pre-populating a new site worker. Pointed at a running
