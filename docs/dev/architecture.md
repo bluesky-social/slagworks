@@ -636,14 +636,21 @@ first in line again.
 The executor (`Executor`, line 47) is the drive loop for pending
 operations. `Run` (85) ticks every 5 seconds and calls `processOps`
 (99): first `PendingPowerOps` from the cache, then
-`PendingLifecycleOps`. Per-op:
+`PendingLifecycleOps`, then `ReclaimableOps` (claims that went
+unanswered, see below). Per-op:
 
 - `MarkOpClaimed` locally in the cache first (line 120) to prevent
   the next tick re-driving.
 - WS `claimOp` RPC (`Claimer` interface, implemented by
   `WSConn.ClaimOp`).
 - On lost race: keep the local claimed mark, do nothing more.
-- On transport failure: roll back to `OpPending` in the cache.
+- On transport failure: roll back to `OpPending` in the cache and
+  record the claim as unanswered (`RollBackClaim`). If the claim
+  committed and only the reply was lost, global's claimed row can
+  replace the pending mark before the next tick; `ReclaimableOps`
+  returns such an op (claimed by this worker, no phase) so the
+  executor re-claims it. In memory only, so a restart leaves it to
+  the orphaned-claim sweep.
 - On success: dispatch to `runLifecycleOp` (288) for deploy /
   commission, or `runPowerOp` (151) for power ops.
 

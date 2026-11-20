@@ -799,6 +799,13 @@ func (c *Cache) PendingLifecycleOps() []model.Operation {
 	return c.opState.pendingLifecycleOps()
 }
 
+// ReclaimableOps returns the ops whose last claim went unanswered and that
+// global's row now shows as claimed by workerID with no phase: the claim
+// committed and only its reply was lost, so the executor claims them again.
+func (c *Cache) ReclaimableOps(workerID string) []model.Operation {
+	return c.opState.reclaimableOps(workerID)
+}
+
 // --- Machine lookups ---
 
 // MachineByID returns a copy of the machine snapshot by ID, or nil. The
@@ -1018,9 +1025,19 @@ func (c *Cache) IsOOBManagedNonMachine(mac string) bool {
 // --- Operation state mutations ---
 
 // MarkOpClaimed marks an operation as claimed in the local cache to prevent
-// duplicate pickup by PendingPowerOps on the next executor tick.
+// duplicate pickup by PendingPowerOps on the next executor tick. The executor
+// calls it as it sends a claim, so it also forgets an earlier unanswered
+// claim for the op (see RollBackClaim).
 func (c *Cache) MarkOpClaimed(opID string) {
-	c.MarkOpStatus(opID, model.OpClaimed)
+	c.opState.markClaimAttempt(opID)
+}
+
+// RollBackClaim handles a claim that got no answer (transport error, RPC
+// timeout): the local mark goes back to pending so the next executor tick
+// retries, and the claim is recorded as unanswered so the retry still happens
+// if global's claimed row replaces that mark first (ReclaimableOps).
+func (c *Cache) RollBackClaim(opID string) {
+	c.opState.rollBackClaim(opID)
 }
 
 func (c *Cache) MarkOpStatus(opID string, status model.OperationStatus) {
