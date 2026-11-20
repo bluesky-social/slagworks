@@ -173,8 +173,10 @@ type propPipe struct {
 	// which reads live NetBox: anything it enrolls must be claimed now.
 	// (A webhook step may legitimately enroll from a stale payload.)
 	liveOnly bool
-	// pendingUpdate is a site_config row loaded by an in-flight PATCH.
+	// pendingUpdate is a site_config row loaded by an in-flight PATCH, and
+	// pendingLocs the site's locations as its NetBox validation read them.
 	pendingUpdate *model.SiteConfig
+	pendingLocs   []netbox.Location
 }
 
 func newPropPipe(rt *rapid.T, k propKnobs, st *propStats) *propPipe {
@@ -1189,11 +1191,7 @@ func (p *propPipe) admitConfig(cfg model.SiteConfig) bool {
 	if p.modelScopeError(cfg) != "" {
 		return false
 	}
-	saveIn := p.nb.failIn
-	p.nb.failIn = 0
-	defer func() { p.nb.failIn = saveIn }()
-	locs, _ := p.nb.ListLocationsForSite(context.Background(), cfg.NetBoxSite)
-	err := CheckOverlap(cfg, p.db.sortedConfigs(), locs)
+	err := CheckOverlap(cfg, p.db.sortedConfigs(), p.locations(cfg.NetBoxSite))
 	if want := p.modelOverlap(cfg); (err != nil) != (want != "") {
 		p.rt.Fatalf("CheckOverlap(%s site=%s loc=%q) = %v, brute force says %q", cfg.Slug, cfg.NetBoxSite, cfg.NetBoxLocation, err, want)
 	}
@@ -1202,6 +1200,16 @@ func (p *propPipe) admitConfig(cfg model.SiteConfig) bool {
 		return false
 	}
 	return true
+}
+
+// locations is the site's NetBox locations as the API's validation reads
+// them, with fault injection off.
+func (p *propPipe) locations(site string) []netbox.Location {
+	saveIn := p.nb.failIn
+	p.nb.failIn = 0
+	defer func() { p.nb.failIn = saveIn }()
+	locs, _ := p.nb.ListLocationsForSite(context.Background(), site)
+	return locs
 }
 
 // modelOverlap says why a candidate config could claim a device some other
@@ -1241,14 +1249,6 @@ func (p *propPipe) opCfgCreate() {
 	if _, exists := p.db.configs[slug]; exists {
 		return
 	}
-	if p.pendingUpdate != nil {
-		// No create while a PATCH sits between its overlap check and its
-		// write: the API holds nothing across the two, so a create (or a
-		// second PATCH) admitted in that window and the PATCH can each
-		// pass CheckOverlap and together leave two configs claiming the
-		// same devices.
-		return
-	}
 	site, loc := p.drawScope("cfg")
 	cfg := model.SiteConfig{Slug: slug, NetBoxSite: site, NetBoxLocation: loc, EphemeralPoolStart: "10.1.0.100", EphemeralPoolEnd: "10.1.0.200"}
 	if !p.admitConfig(cfg) {
@@ -1280,12 +1280,19 @@ func (p *propPipe) opCfgDelete() {
 func (p *propPipe) opCfgUpdate() {
 	// PATCH /site-configs/:slug loads the row, validates against NetBox,
 	// then writes; other steps can land in between. This is the second
-	// half of an in-flight PATCH: store.UpdateSiteConfig writes the
-	// operator-owned columns of the row loaded earlier (never the snapshot
-	// seq and hash, which the dispatcher owns), then the handler
-	// invalidates. A row deleted in between stays deleted.
+	// half of an in-flight PATCH: store.UpdateSiteConfig re-runs the
+	// overlap check against the rows as they now stand (with the locations
+	// read earlier), atomically with writing the operator-owned columns of
+	// the row loaded earlier (never the snapshot seq and hash, which the
+	// dispatcher owns), then the handler invalidates. A row deleted in
+	// between stays deleted.
 	if u := p.pendingUpdate; u != nil {
-		p.pendingUpdate = nil
+		locs := p.pendingLocs
+		p.pendingUpdate, p.pendingLocs = nil, nil
+		if err := CheckOverlap(*u, p.db.sortedConfigs(), locs); err != nil {
+			p.st.cfgReject.Add(1)
+			return
+		}
 		if cur, ok := p.db.configs[u.Slug]; ok {
 			cur.NetBoxSite, cur.NetBoxLocation, cur.Promiscuous = u.NetBoxSite, u.NetBoxLocation, u.Promiscuous
 			cur.EphemeralPoolStart, cur.EphemeralPoolEnd, cur.RelayPools = u.EphemeralPoolStart, u.EphemeralPoolEnd, u.RelayPools
@@ -1308,7 +1315,9 @@ func (p *propPipe) opCfgUpdate() {
 		return
 	}
 	if rapid.Bool().Draw(p.rt, "updSlow") {
-		p.pendingUpdate = &cfg // loaded and validated; the write comes later
+		// Loaded and validated; the write comes later.
+		p.pendingUpdate = &cfg
+		p.pendingLocs = p.locations(cfg.NetBoxSite)
 		return
 	}
 	*p.db.configs[cfg.Slug] = cfg

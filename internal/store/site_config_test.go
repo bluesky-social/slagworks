@@ -224,3 +224,53 @@ func TestListSiteConfigs(t *testing.T) {
 		t.Fatalf("got %d, want 3", len(got))
 	}
 }
+
+// The admit callback sees every row as it stands at the write, and a
+// refusal is returned unchanged and writes nothing.
+func TestSiteConfigAdmitRunsAgainstCurrentRowsAndRefusalWritesNothing(t *testing.T) {
+	st := testStore(t)
+	mk := func(slug, site string) *model.SiteConfig {
+		return &model.SiteConfig{Slug: slug, NetBoxSite: site, EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}
+	}
+	if err := st.CreateSiteConfig(mk("c1", "s1")); err != nil {
+		t.Fatal(err)
+	}
+	errRefused := errors.New("refused")
+	var saw []string
+	refuse := func(existing []model.SiteConfig) error {
+		saw = saw[:0]
+		for _, e := range existing {
+			saw = append(saw, e.Slug+"@"+e.NetBoxSite)
+		}
+		return errRefused
+	}
+
+	if err := st.CreateSiteConfigIfAdmitted(mk("c2", "s1"), refuse); !errors.Is(err, errRefused) {
+		t.Fatalf("refused create: err=%v, want the admit error", err)
+	}
+	if len(saw) != 1 || saw[0] != "c1@s1" {
+		t.Errorf("create admit saw %v, want [c1@s1]", saw)
+	}
+	if _, err := st.GetSiteConfig("c2"); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Errorf("refused create left a row (GetSiteConfig err=%v)", err)
+	}
+
+	if err := st.UpdateSiteConfigIfAdmitted(mk("c1", "s2"), refuse); !errors.Is(err, errRefused) {
+		t.Fatalf("refused update: err=%v, want the admit error", err)
+	}
+	got, err := st.GetSiteConfig("c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NetBoxSite != "s1" {
+		t.Errorf("refused update changed netbox_site to %q", got.NetBoxSite)
+	}
+
+	admit := func([]model.SiteConfig) error { return nil }
+	if err := st.UpdateSiteConfigIfAdmitted(mk("c1", "s2"), admit); err != nil {
+		t.Fatalf("admitted update: %v", err)
+	}
+	if err := st.CreateSiteConfigIfAdmitted(mk("c2", "s1"), admit); err != nil {
+		t.Fatalf("admitted create: %v", err)
+	}
+}
