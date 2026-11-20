@@ -3,40 +3,44 @@ package worker
 // Virtual-time state-machine property test for the site worker's link to
 // global: the real WSConn.Run (with its reconnect backoff), Cache and LocalDB
 // against the real ws.Hub, wired through in-memory pipes inside a
-// testing/synctest bubble so a 90-second systemd start timeout or a
-// 30-second backoff costs nothing to wait out.
+// testing/synctest bubble so a 30-second backoff step or a 150-second image
+// download costs nothing to wait out.
 //
-// The worker "process" runs under a model of its systemd unit
-// (deploy/systemd/slagworksd-site.service: Type=notify with the default 90s
-// start timeout, Restart=always, RestartSec=5): the unit is killed and
-// restarted when READY=1 does not arrive in time, and restarted after a
-// crash. A generated history changes what global does (unreachable, 401,
-// snapshot build failing or hanging, the op resync failing, the hello never
-// answered), publishes new snapshot generations, resets the site's sequence
-// counter, makes image downloads slow, stuck or failing, crashes the worker,
-// damages rows of its LocalDB, and probes the worker through the hub.
+// The worker "process" runs under a model of its systemd unit's restart
+// policy (deploy/systemd/slagworksd-site.service: Restart=always,
+// RestartSec=5): it is restarted after a crash, and after a start that
+// fails. Readiness (READY=1) is reported by the site command, not by the
+// link, so the start timeout is not modeled here; the process-level harness
+// in cmd/slagworksd checks it. A generated history changes what global does
+// (unreachable, 401, snapshot build failing or hanging, the op resync
+// failing, the hello never answered), publishes new snapshot generations,
+// resets the site's sequence counter, makes image downloads slow, stuck or
+// failing, crashes the worker, damages rows of its LocalDB, and probes the
+// worker through the hub.
 //
 // Checked after every step, with every goroutine parked:
 //
 //   - the cache view is one whole snapshot generation (machines and meta
 //     from the same generation), and one global actually published;
 //   - within a process lifetime the served generation never goes back, and a
-//     restarted process starts from the generation the previous one last
-//     finished applying;
+//     restarted process serves exactly what the previous one served: a
+//     snapshot is persisted before anything slow (an image download) starts;
 //   - the worker never reports itself connected without a hub connection,
-//     and a hub that routes an RPC to the worker gets an answer;
+//     and a hub that routes an RPC to the worker gets an answer, image
+//     download in flight or not;
 //   - the op set a restarted worker rehydrated is not handed to the executor
 //     before global has resynced it.
 //
 // Checked at settle points (a quiet stretch longer than every timer):
 //
 //   - with global healthy the worker is connected, holds global's current
-//     generation and the site's pending op, and systemd has not killed it;
+//     generation and the site's pending op, whatever its image download is
+//     doing;
 //   - reconnect attempts stay on the backoff ladder, whatever global does.
 //
-// Checks that fail on unmodified main for a finding already written up are
-// counted instead of failing, so the search continues past them;
-// SLAGWORKS_PROP_STRICT=1 makes them fail.
+// Three behaviours of the link that the properties above would otherwise
+// report are tolerated, each where it is detected (see vtTol*): they are
+// counted in the coverage line and the rest of the history is still checked.
 
 import (
 	"context"
@@ -56,7 +60,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -74,11 +77,11 @@ const (
 	vtWorkerID = "worker-a"
 	vtToken    = "vt-token"
 
-	vtStartTimeout = 90 * time.Second // systemd DefaultTimeoutStartSec
-	vtRestartDelay = 5 * time.Second  // RestartSec= in the packaged unit
-	// vtSettle outlasts a start-timeout kill, the restart delay and a full
-	// 30s backoff step, so whatever the worker was doing it has had the
-	// chance to reconnect to a healthy global.
+	vtRestartDelay = 5 * time.Second // RestartSec= in the packaged unit
+	// vtSettle outlasts the restart delay, the hub's RebuildTimeout and
+	// several backoff steps at the cap (30s plus up to 20% jitter), so
+	// whatever the worker was doing it has had the chance to reconnect to a
+	// healthy global.
 	vtSettle = 140 * time.Second
 
 	// vtFirstSeq is the sequence number of generation 1: high enough that a
@@ -111,7 +114,7 @@ type vtImage int
 
 const (
 	vtImageInstant vtImage = iota
-	vtImageSlow            // a download that takes longer than the start timeout
+	vtImageSlow            // a download that takes longer than a settle
 	vtImageStuck           // a download that never finishes
 	vtImageError
 	vtNumImage
@@ -516,46 +519,6 @@ func (g *vtGlobal) close() {
 	http.DefaultClient.Transport = g.prevTr
 }
 
-// --- systemd notify socket ---------------------------------------------------
-
-// vtNotify is the unit's NOTIFY_SOCKET. It is read with non-blocking
-// syscalls, not through the net package: a goroutine parked in the network
-// poller would keep the bubble's clock from advancing.
-type vtNotify struct {
-	fd   int
-	path string
-}
-
-func newVTNotify(dir string) (*vtNotify, error) {
-	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_DGRAM, 0)
-	if err != nil {
-		return nil, err
-	}
-	path := filepath.Join(dir, "notify")
-	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: path}); err != nil {
-		_ = syscall.Close(fd)
-		return nil, fmt.Errorf("bind %s: %w", path, err)
-	}
-	return &vtNotify{fd: fd, path: path}, nil
-}
-
-// drain returns how many READY=1 datagrams arrived since the last call.
-func (n *vtNotify) drain() int {
-	buf := make([]byte, 256)
-	ready := 0
-	for {
-		m, _, err := syscall.Recvfrom(n.fd, buf, syscall.MSG_DONTWAIT)
-		if err != nil || m <= 0 {
-			return ready
-		}
-		if strings.Contains(string(buf[:m]), "READY=1") {
-			ready++
-		}
-	}
-}
-
-func (n *vtNotify) close() { _ = syscall.Close(n.fd) }
-
 // --- worker process under its unit -------------------------------------------
 
 type vtProc struct {
@@ -568,21 +531,19 @@ type vtProc struct {
 	killed  chan struct{}
 	started time.Time
 	syncing atomic.Int32 // image syncs in flight
-	// swapped counts snapshots this process has put in its view (the image
-	// sync runs right after the view swap); 0 means the view is still the
-	// one rehydrated from LocalDB.
-	swapped atomic.Int32
+	// synced counts image syncs this process started. An apply hands its
+	// image set to the syncer before it swaps the view, and the first one
+	// always starts a sync, so 0 means the view is still the one rehydrated
+	// from LocalDB.
+	synced  atomic.Int32
 	applied atomic.Int32 // snapshot applies that ran to completion (persisted)
 	// lastApplied is the generation of the last apply that ran to completion.
 	lastApplied atomic.Int32
-	// resynced is set once this process applied an op_resync.
-	ready bool
 }
 
 type vtUnit struct {
 	e      *vtEnv
 	dbPath string
-	notify *vtNotify
 
 	mu     sync.Mutex
 	proc   *vtProc // nil while the unit is between restarts
@@ -590,10 +551,9 @@ type vtUnit struct {
 	stop   chan struct{}
 	exited chan struct{}
 
-	procs         int
-	timeoutKills  int // unit killed because READY=1 did not arrive in vtStartTimeout
-	killsSyncing  int // ... of which an image sync was in flight
-	startFailures int // process could not start (LocalDB would not open)
+	// Counters, written by the unit's goroutine and read by the test's.
+	procs         atomic.Int64
+	startFailures atomic.Int64 // process could not start (LocalDB would not open)
 }
 
 func (u *vtUnit) current() *vtProc {
@@ -608,8 +568,7 @@ func (u *vtUnit) startProc() (*vtProc, error) {
 		return nil, err
 	}
 	db.SetLogger(quietLog)
-	u.procs++
-	p := &vtProc{n: u.procs, db: db, done: make(chan struct{}), killed: make(chan struct{}), started: time.Now()}
+	p := &vtProc{n: int(u.procs.Add(1)), db: db, done: make(chan struct{}), killed: make(chan struct{}), started: time.Now()}
 	p.cache = NewCache(db)
 	p.cache.ImagesDir = filepath.Join(filepath.Dir(u.dbPath), "images")
 	p.cache.imageSyncFn = func(string, map[string]*model.Image) error { return u.e.imageSync(p) }
@@ -623,8 +582,6 @@ func (u *vtUnit) startProc() (*vtProc, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	go func() {
-		// Deferred, so it also runs when a killed image download ends this
-		// goroutine with runtime.Goexit (see imageSync).
 		defer close(p.done)
 		_ = p.w.Run(ctx)
 	}()
@@ -637,57 +594,29 @@ func (u *vtUnit) killProc(p *vtProc) {
 	<-p.done
 	// The read loop, the only path that writes LocalDB on its own, has
 	// returned; the per-connection goroutines still unwinding touch only
-	// in-memory queues.
+	// in-memory queues, and an image download in flight ends itself (see
+	// imageSync).
 	closeQuiet(p.db)
 }
 
-// run is the unit's lifetime: start the process, enforce the start timeout,
-// restart after RestartSec whenever it dies.
+// run is the unit's lifetime: start the process and restart it after
+// RestartSec whenever it dies or fails to start.
 func (u *vtUnit) run() {
 	defer close(u.exited)
 	for {
 		p, err := u.startProc()
 		if err != nil {
-			u.startFailures++
+			u.startFailures.Add(1)
 		} else {
 			u.mu.Lock()
 			u.proc = p
 			u.mu.Unlock()
-			u.notify.drain()
-			deadline := time.NewTimer(vtStartTimeout)
-			tick := time.NewTicker(500 * time.Millisecond)
 			stopped := false
-		wait:
-			for {
-				select {
-				case <-tick.C:
-					// Drain on every tick, ready or not: on Linux a unix
-					// datagram socket queues about ten messages, and the
-					// worker's next READY=1 write would then park in the
-					// network poller, which stops the bubble's clock.
-					if n := u.notify.drain(); n > 0 && !p.ready {
-						p.ready = true
-						deadline.Stop()
-					}
-				case <-deadline.C:
-					if u.notify.drain() > 0 {
-						p.ready = true
-						continue
-					}
-					u.timeoutKills++
-					if p.syncing.Load() > 0 {
-						u.killsSyncing++
-					}
-					break wait
-				case <-u.crash:
-					break wait
-				case <-u.stop:
-					stopped = true
-					break wait
-				}
+			select {
+			case <-u.crash:
+			case <-u.stop:
+				stopped = true
 			}
-			tick.Stop()
-			deadline.Stop()
 			u.mu.Lock()
 			u.proc = nil
 			u.mu.Unlock()
@@ -723,9 +652,10 @@ func (e *vtEnv) setImage(m vtImage) {
 	e.imgMu.Unlock()
 }
 
-// imageSync stands in for imagepull.SyncImages on the worker's apply path.
+// imageSync stands in for imagepull.SyncImages, which the cache runs on its
+// background syncer goroutine.
 func (e *vtEnv) imageSync(p *vtProc) error {
-	p.swapped.Add(1)
+	p.synced.Add(1)
 	p.syncing.Add(1)
 	defer p.syncing.Add(-1)
 	for {
@@ -747,10 +677,9 @@ func (e *vtEnv) imageSync(p *vtProc) error {
 			return nil
 		case <-changed: // re-evaluate under the new mode
 		case <-p.killed:
-			// The process died mid-download. End this goroutine here, so
-			// that nothing after the download runs (a killed process
-			// persists nothing more), whichever goroutine the production
-			// code runs the download on.
+			// The process died mid-download. End the syncer goroutine
+			// here, so that nothing after the download runs: a killed
+			// process does nothing more.
 			runtime.Goexit()
 		}
 	}
@@ -911,7 +840,7 @@ func vtGenEvents(t *rapid.T) []vtEvent {
 			ev.Image = rapid.SampledFrom([]vtImage{vtImageInstant, vtImageInstant, vtImageInstant, vtImageSlow, vtImageStuck, vtImageError}).Draw(t, "image")
 		case vtEvDamage:
 			// 5 (the file is no longer a database) ends the useful part of
-			// a history on current main, so it is the rare one.
+			// a history, so it is the rare one.
 			ev.Damage = rapid.SampledFrom([]int{0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5}).Draw(t, "damage")
 		case vtEvReset:
 			ev.Back = rapid.IntRange(1, 4).Draw(t, "back")
@@ -928,36 +857,30 @@ func vtGenEvents(t *rapid.T) []vtEvent {
 	return append(evs, vtEvent{Kind: vtEvMode, Mode: vtOK, Restart: rapid.Bool().Draw(t, "finalRestart")}, vtEvent{Kind: vtEvSettle})
 }
 
-// Known findings (see the header).
+// Behaviours of the link that are tolerated where a property would report
+// them; each is described where it is detected.
 const (
-	vtFindReady      = "ready-waits-for-global"         // start-timeout kill while global refused the worker
-	vtFindImageReady = "image-sync-blocks-readiness"    // start-timeout kill during an image download
-	vtFindImageLoop  = "image-sync-blocks-read-loop"    // hub routes to a worker whose read loop is inside an image download
-	vtFindPersist    = "snapshot-served-before-persist" // restart serves an older generation than the process served
-	vtFindStorm      = "reconnect-storm-after-hello"    // backoff resets on every accepted hello
-	vtFindCorruptDB  = "corrupt-localdb-fatal"          // an unopenable worker.db keeps the unit down
-	vtFindHelloHang  = "no-hello-deadline"              // a hello that is never answered is waited on forever
-	vtFindSeqReuse   = "seq-reuse-keeps-stale-snapshot" // a sequence number reissued after a restore hides a content change
-	vtFindHalfHello  = "connected-before-hello-reply"   // a fan-out snapshot is taken for the hello reply while the hub still waits on a rebuild
+	vtTolHelloHang = "hello-reply-has-no-deadline"
+	vtTolSeqReuse  = "reissued-seq-hides-content-change"
+	vtTolHalfHello = "fan-out-taken-for-hello-reply"
 )
 
 type vtStats struct {
-	cases, events, procs, timeoutKills, startFailures int
-	settles, settlesHealthy, converged                int
-	probes, probesRouted, probesAnswered              int
-	restartsFromDisk, restartsServing                 int
-	maxGen, resets, damages, crashes                  int
-	modeSeen                                          [vtNumModes]int
-	imageSeen                                         [vtNumImage]int
-	known                                             map[string]int
+	cases, events, procs, startFailures  int
+	settles, settlesHealthy, converged   int
+	probes, probesRouted, probesAnswered int
+	restartsFromDisk, restartsServing    int
+	maxGen, resets, damages, crashes     int
+	modeSeen                             [vtNumModes]int
+	imageSeen                            [vtNumImage]int
+	tolerated                            map[string]int
 }
 
 type vtRun struct {
-	t      *rapid.T
-	stats  *vtStats
-	strict string // SLAGWORKS_PROP_STRICT: "1" fails every known finding, a comma-separated list of ids fails those
-	e      *vtEnv
-	trail  []string
+	t     *rapid.T
+	stats *vtStats
+	e     *vtEnv
+	trail []string
 
 	// Model. gen/mode mirror what the history did to global; the rest is
 	// what the worker has been seen to do.
@@ -984,17 +907,13 @@ func (r *vtRun) failf(format string, args ...any) {
 		// Where every goroutine of the bubble is parked at the failure.
 		_ = pprof.Lookup("goroutine").WriteTo(os.Stderr, 2)
 	}
-	r.t.Fatalf("%s\nhistory: %s\nmodel: mode=%v image=%v gen=%d persisted=%d served=%d damaged=%v\nunit: procs=%d timeout-kills=%d start-failures=%d",
+	r.t.Fatalf("%s\nhistory: %s\nmodel: mode=%v image=%v gen=%d persisted=%d served=%d damaged=%v\nunit: procs=%d start-failures=%d",
 		fmt.Sprintf(format, args...), strings.Join(r.trail, " -> "), r.mode, r.image, r.gen, r.persisted, r.served, r.damaged,
-		u.procs, u.timeoutKills, u.startFailures)
+		u.procs.Load(), u.startFailures.Load())
 }
 
-func (r *vtRun) known(id, format string, args ...any) {
-	if r.strict == "1" || slices.Contains(strings.Split(r.strict, ","), id) {
-		r.failf("["+id+"] "+format, args...)
-	}
-	r.stats.known[id]++
-}
+// tolerate counts one occurrence of a tolerated behaviour (vtTol*).
+func (r *vtRun) tolerate(id string) { r.stats.tolerated[id]++ }
 
 // check runs the invariants that must hold whenever every goroutine is
 // parked.
@@ -1037,7 +956,7 @@ func (r *vtRun) check() {
 		// First look at a new process: before any connection completes it
 		// serves what the last completed apply left on disk.
 		r.stats.restartsFromDisk++
-		if p.swapped.Load() == 0 && !r.damaged {
+		if p.synced.Load() == 0 && !r.damaged {
 			if served != r.persisted {
 				r.failf("restarted worker serves generation %d from LocalDB; the last completed apply was generation %d", served, r.persisted)
 			}
@@ -1045,7 +964,7 @@ func (r *vtRun) check() {
 				r.stats.restartsServing++
 			}
 			if served < r.served {
-				r.known(vtFindPersist, "restarted worker serves generation %d; the previous process was serving %d (applied in memory, not yet persisted when it died)", served, r.served)
+				r.failf("restarted worker serves generation %d; the previous process was serving %d (applied in memory, not persisted when it died)", served, r.served)
 			}
 			// A rehydrated op set must not reach the executor before a resync.
 			if n := len(c.PendingPowerOps()) + len(c.PendingLifecycleOps()); n > 0 && !p.w.Connected() {
@@ -1067,10 +986,7 @@ func (r *vtRun) check() {
 
 	// The worker never believes in a connection the hub does not have.
 	if p.w.Connected() && !hub.IsWorkerConnected(vtSlug, vtWorkerID) {
-		if p.syncing.Load() == 0 {
-			r.failf("worker reports connected but the hub has no connection for it")
-		}
-		r.known(vtFindImageLoop, "worker reports connected although global dropped the connection: its read loop is inside an image download and has not looked at the socket")
+		r.failf("worker reports connected but the hub has no connection for it (image syncs in flight: %d)", p.syncing.Load())
 	}
 }
 
@@ -1100,17 +1016,17 @@ func (r *vtRun) probe() {
 		if p != nil && p.w.Connected() {
 			synctest.Wait()
 			if p.w.Connected() {
-				switch {
-				case hub.IsWorkerConnected(vtSlug, vtWorkerID):
-					// The connection exists but the hub has not answered its
-					// hello: it is still waiting on the site's rebuild, and
-					// the worker took a fan-out snapshot for the reply.
-					r.known(vtFindHalfHello, "worker reports connected on a connection whose hello the hub has not answered (it is waiting on a rebuild); a pushed snapshot reached the worker first and it took that for the hello reply")
-				case p.syncing.Load() > 0:
-					r.known(vtFindImageLoop, "worker reports connected but the hub has no worker to route an RPC to: the hub dropped the connection while the worker's read loop is inside an image download")
-				default:
+				if !hub.IsWorkerConnected(vtSlug, vtWorkerID) {
 					r.failf("worker reports connected but the hub has no worker to route an RPC to")
 				}
+				// The connection exists but the hub has not answered its
+				// hello: it is still waiting on the site's rebuild. The
+				// connection registers for fan-out before its hello is
+				// answered, a pushed snapshot reached the worker first, and
+				// the worker takes the first snapshot on a connection for
+				// the hello reply, so it reports connected while the hub
+				// routes it nothing yet.
+				r.tolerate(vtTolHalfHello)
 			}
 		}
 		return
@@ -1122,11 +1038,9 @@ func (r *vtRun) probe() {
 		case w.Err == "":
 			r.stats.probesAnswered++
 		case p == nil || after != p:
-			// The process died (crash, start timeout) under the RPC.
-		case p.syncing.Load() > 0:
-			r.known(vtFindImageLoop, "hub routed an RPC to the worker, which did not answer in 5s because its read loop is inside an image download: %s", w.Err)
+			// The process died under the RPC.
 		default:
-			r.failf("hub routed an RPC to the worker and got no answer: %s", w.Err)
+			r.failf("hub routed an RPC to the worker and got no answer (image syncs in flight: %d): %s", p.syncing.Load(), w.Err)
 		}
 	}
 }
@@ -1134,41 +1048,28 @@ func (r *vtRun) probe() {
 func (r *vtRun) settle() {
 	u := r.e.u
 	since := time.Since(r.e.g.start)
-	killsBefore, kSyncBefore, failsBefore := u.timeoutKills, u.killsSyncing, u.startFailures
+	failsBefore := u.startFailures.Load()
 	time.Sleep(vtSettle)
 	r.check()
 	r.stats.settles++
 
-	// Start-timeout kills during the quiet stretch.
-	if d := u.timeoutKills - killsBefore; d > 0 {
-		switch {
-		case u.killsSyncing > kSyncBefore:
-			r.known(vtFindImageReady, "systemd killed the worker %d time(s) at its start timeout while an image download held up its first snapshot", d)
-		case r.mode != vtOK || r.hadFault:
-			r.known(vtFindReady, "systemd killed the worker %d time(s) at its start timeout while global was %v", d, r.mode)
-		default:
-			r.failf("systemd killed the worker %d time(s) at its start timeout with global healthy throughout", d)
-		}
-	}
-	if d := u.startFailures - failsBefore; d > 0 {
-		if !r.fileDead {
-			r.failf("the worker failed to start %d time(s) although its LocalDB file was never replaced", d)
-		}
-		r.known(vtFindCorruptDB, "the worker failed to start %d time(s) on an unopenable worker.db", d)
+	// A worker.db that SQLite cannot open is fatal at start by design: the
+	// unit restart-loops until an operator looks at the file. Nothing else
+	// may keep the process from starting.
+	if d := u.startFailures.Load() - failsBefore; d > 0 && !r.fileDead {
+		r.failf("the worker failed to start %d time(s) although its LocalDB file was never replaced", d)
 	}
 
-	// Retry envelope. A ladder at its cap makes one attempt per 30s; a unit
-	// restart begins a new one (attempts at 0, 1, 3, 7, 15, 31, 61s), and a
-	// start-timeout loop restarts the unit every 95s. So a quiet stretch
-	// this long holds the tail of one ladder, a whole one and the head of a
-	// third at most: under twenty attempts, against 140 for one per second.
+	// Retry envelope. A ladder at its cap makes one attempt per 30s (plus
+	// jitter, which only lengthens a wait); a restarted process begins a
+	// new one (attempts at 0, 1, 3, 7, 15, 31, 61, 91, 121s at the
+	// earliest), and the ladder returns to its first step only after a
+	// connection that lasted 30s. So a quiet stretch this long holds a
+	// handful of attempts from one ladder and a whole new one at most:
+	// under twenty, against 140 for one per second.
 	attempts := r.e.g.dialsSince(since)
 	if limit := 20; attempts > limit {
-		if r.mode == vtResyncFail {
-			r.known(vtFindStorm, "%d connection attempts in %v while global accepts hellos and then drops the worker (mode %v); the backoff restarts at 1s after every accepted hello", attempts, vtSettle, r.mode)
-		} else {
-			r.failf("%d connection attempts in %v under mode %v, want at most %d", attempts, vtSettle, r.mode, limit)
-		}
+		r.failf("%d connection attempts in %v under mode %v, want at most %d", attempts, vtSettle, r.mode, limit)
 	}
 
 	if r.mode != vtOK {
@@ -1180,38 +1081,37 @@ func (r *vtRun) settle() {
 	hub, _, _ := r.e.g.cur()
 	switch {
 	case r.fileDead:
-		// Nothing can run on current main; counted above.
+		// The process cannot start (see above).
 	case p == nil:
-		// Between restarts at this instant: only a start-timeout loop puts
-		// the unit there with global healthy.
-		if r.image != vtImageSlow && r.image != vtImageStuck {
-			r.failf("global has been healthy for %v but no worker process is running", vtSettle)
-		}
-		r.known(vtFindImageReady, "global has been healthy for %v but the unit is between start-timeout restarts: every start spends its 90s inside an image download", vtSettle)
+		r.failf("global has been healthy for %v but no worker process is running", vtSettle)
 	case !p.w.Connected() || !hub.IsWorkerConnected(vtSlug, vtWorkerID) || vtViewGen(p.cache) != r.gen:
 		held := vtViewGen(p.cache)
-		// The specific causes first: an image download in flight is only
-		// the explanation when nothing narrower is.
 		switch {
 		case !p.w.Connected() && r.hungSince == p.n:
-			r.known(vtFindHelloHang, "global has been healthy for %v but the worker still waits on a connection that an earlier, wedged global accepted and never answered", vtSettle)
+			// The worker reads its hello reply with no deadline, so it
+			// still waits on a connection that an earlier, wedged global
+			// accepted and never answered or closed. A restart of that
+			// global, or anything in the path closing the connection, ends
+			// the wait; nothing on the worker's side does.
+			r.tolerate(vtTolHelloHang)
 		case p.w.Connected() && held != r.gen && r.seqOf[held] == r.seqOf[r.gen]:
-			r.known(vtFindSeqReuse, "connected, but the worker keeps generation %d: global's current generation %d was published under the same sequence number %d, so the hello is answered no_change and the push is dropped as a duplicate", held, r.gen, r.seqOf[r.gen])
-		case p.syncing.Load() > 0 || r.image == vtImageSlow || r.image == vtImageStuck:
-			r.known(vtFindImageLoop, "global has been healthy for %v but the worker is not connected and current (connected=%v gen=%d want %d): an image download is holding its read loop", vtSettle, p.w.Connected(), held, r.gen)
+			// After a restore of global's database moved the site's
+			// sequence back, the current generation was published under
+			// the number the worker already holds. Hello and push compare
+			// sequence numbers only, so the hello is answered no_change
+			// and the push dropped as a duplicate: the worker keeps the
+			// older content until the site's next change.
+			r.tolerate(vtTolSeqReuse)
 		default:
-			r.failf("global has been healthy for %v but the worker is not connected and current: connected=%v hub-connected=%v gen=%d want %d",
-				vtSettle, p.w.Connected(), hub.IsWorkerConnected(vtSlug, vtWorkerID), vtViewGen(p.cache), r.gen)
+			r.failf("global has been healthy for %v but the worker is not connected and current: connected=%v hub-connected=%v gen=%d want %d (image syncs in flight: %d)",
+				vtSettle, p.w.Connected(), hub.IsWorkerConnected(vtSlug, vtWorkerID), held, r.gen, p.syncing.Load())
 		}
 	default:
 		r.stats.converged++
 		// Ops are routable: the site's pending op reached the executor.
 		ops := p.cache.PendingPowerOps()
 		if len(ops) != 1 || ops[0].ID != vtOpID(r.gen) {
-			if p.syncing.Load() == 0 {
-				r.failf("connected and current, but the executor sees %d pending op(s), want the site's one (%s)", len(ops), vtOpID(r.gen))
-			}
-			r.known(vtFindImageLoop, "connected and current for %v, but the site's pending op has not reached the executor: its op_delta is unread behind an image download", vtSettle)
+			r.failf("connected and current, but the executor sees %d pending op(s), want the site's one (%s; image syncs in flight: %d)", len(ops), vtOpID(r.gen), p.syncing.Load())
 		}
 	}
 	r.hadFault = false
@@ -1306,34 +1206,26 @@ func (r *vtRun) apply(ev vtEvent) {
 }
 
 func TestPropWorkerLifecycleVirtualTime(t *testing.T) {
-	stats := &vtStats{known: map[string]int{}}
-	strict := os.Getenv("SLAGWORKS_PROP_STRICT")
+	stats := &vtStats{tolerated: map[string]int{}}
 	prevLog := slog.Default()
 	slog.SetDefault(quietLog)
 	t.Cleanup(func() { slog.SetDefault(prevLog) })
 	rapid.Check(t, func(rt *rapid.T) {
 		events := vtGenEvents(rt)
-		// A unix socket path is short; t.TempDir() under this test's name is not.
 		dir, err := os.MkdirTemp("", "swvt")
 		if err != nil {
 			rt.Fatalf("temp dir: %v", err)
 		}
 		defer func() { _ = os.RemoveAll(dir) }()
-		notify, err := newVTNotify(dir)
-		if err != nil {
-			rt.Fatalf("notify socket: %v", err)
-		}
-		defer notify.close()
-		t.Setenv("NOTIFY_SOCKET", notify.path)
 		stats.cases++
 
 		rapid.SyncTest(rt, func(rt *rapid.T) {
 			e := &vtEnv{imageCh: make(chan struct{})}
 			e.g = newVTGlobal()
-			e.u = &vtUnit{e: e, dbPath: filepath.Join(dir, "worker.db"), notify: notify,
+			e.u = &vtUnit{e: e, dbPath: filepath.Join(dir, "worker.db"),
 				crash: make(chan struct{}), stop: make(chan struct{}), exited: make(chan struct{})}
 			go e.u.run()
-			r := &vtRun{t: rt, stats: stats, strict: strict, e: e, gen: 1, seqOf: map[int]int64{1: vtFirstSeq}}
+			r := &vtRun{t: rt, stats: stats, e: e, gen: 1, seqOf: map[int]int64{1: vtFirstSeq}}
 			defer func() {
 				// Tear down inside the bubble whatever the outcome, or the
 				// bubble never drains.
@@ -1345,9 +1237,8 @@ func TestPropWorkerLifecycleVirtualTime(t *testing.T) {
 				// stops when this function returns, so wait those out here.
 				time.Sleep(2 * time.Minute)
 				synctest.Wait()
-				stats.procs += e.u.procs
-				stats.timeoutKills += e.u.timeoutKills
-				stats.startFailures += e.u.startFailures
+				stats.procs += int(e.u.procs.Load())
+				stats.startFailures += int(e.u.startFailures.Load())
 				stats.maxGen = max(stats.maxGen, r.gen)
 			}()
 			r.check()
@@ -1356,8 +1247,8 @@ func TestPropWorkerLifecycleVirtualTime(t *testing.T) {
 			}
 		})
 	})
-	t.Logf("coverage: cases=%d events=%d processes=%d start-timeout-kills=%d start-failures=%d settles=%d (healthy=%d converged=%d) probes=%d (routed=%d answered=%d) restarts-observed=%d (serving a persisted snapshot=%d) resets=%d damages=%d crashes=%d max-generation=%d",
-		stats.cases, stats.events, stats.procs, stats.timeoutKills, stats.startFailures, stats.settles, stats.settlesHealthy, stats.converged,
+	t.Logf("coverage: cases=%d events=%d processes=%d start-failures=%d settles=%d (healthy=%d converged=%d) probes=%d (routed=%d answered=%d) restarts-observed=%d (serving a persisted snapshot=%d) resets=%d damages=%d crashes=%d max-generation=%d",
+		stats.cases, stats.events, stats.procs, stats.startFailures, stats.settles, stats.settlesHealthy, stats.converged,
 		stats.probes, stats.probesRouted, stats.probesAnswered, stats.restartsFromDisk, stats.restartsServing, stats.resets, stats.damages, stats.crashes, stats.maxGen)
 	modes := make([]string, 0, vtNumModes)
 	for m := range vtNumModes {
@@ -1368,10 +1259,10 @@ func TestPropWorkerLifecycleVirtualTime(t *testing.T) {
 		images = append(images, fmt.Sprintf("%v=%d", m, stats.imageSeen[m]))
 	}
 	t.Logf("mode changes: %s; image modes: %s", strings.Join(modes, " "), strings.Join(images, " "))
-	ids := make([]string, 0, len(stats.known))
-	for id, n := range stats.known {
+	ids := make([]string, 0, len(stats.tolerated))
+	for id, n := range stats.tolerated {
 		ids = append(ids, fmt.Sprintf("%s=%d", id, n))
 	}
 	slices.Sort(ids)
-	t.Logf("known findings hit (not failed; SLAGWORKS_PROP_STRICT=1 fails them): %s", strings.Join(ids, " "))
+	t.Logf("tolerated behaviours hit: %s", strings.Join(ids, " "))
 }

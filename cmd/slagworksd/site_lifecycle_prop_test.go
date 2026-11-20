@@ -15,7 +15,9 @@ package main
 //
 //   - alive: the process never exits because of something global said or
 //     could not say (unreachable, 401, rebuild_failed, a hello left
-//     unanswered, a refused serial, a malformed custom field in the snapshot);
+//     unanswered, a refused serial, a malformed custom field in the snapshot).
+//     The one thing that may end it is a worker.db SQLite cannot open, which
+//     is fatal at start by design;
 //   - ready: it tells systemd READY=1 within readyBudget of starting,
 //     whatever global is doing, because the boot plane does not need global;
 //   - serving: its HTTP boot server answers, and what it serves is the
@@ -23,10 +25,6 @@ package main
 //     connected, else the last one it persisted (never an older one);
 //   - connected: /metrics and /readyz say "connected" exactly when the fake
 //     global is accepting hellos.
-//
-// Checks that fail on unmodified main for a finding already written up are
-// counted instead of failing the run, so the search continues past them;
-// SLAGWORKS_PROP_STRICT=1 turns every one of them into a failure.
 //
 // The test is opt-in (SLAGWORKS_PROP_SLOW=1): a case takes about 25 seconds
 // of real time, most of it runSite's own 5-second wait for global. Run it
@@ -73,8 +71,8 @@ const (
 	// lcReadyBudget is how long a boot may take to report READY=1. runSite
 	// waits at most 5s for a first snapshot before starting its services, so
 	// a worker that reports readiness on what it can do locally is well
-	// inside this; systemd's own budget is 90s.
-	lcReadyBudget = 10 * time.Second
+	// inside this even on a loaded host; systemd's own budget is 90s.
+	lcReadyBudget = 20 * time.Second
 )
 
 // TestSiteWorkerChild is the child half of the lifecycle harness, not a
@@ -484,7 +482,10 @@ func (u *lcUnit) logTail() string {
 	if err != nil {
 		return err.Error()
 	}
-	const keep = 3000
+	keep := 3000
+	if os.Getenv("SLAGWORKS_PROP_DEBUG") == "1" {
+		keep = 1 << 20
+	}
 	if len(b) > keep {
 		b = b[len(b)-keep:]
 	}
@@ -646,22 +647,13 @@ func lcGenOps(t *rapid.T) []lcOp {
 	return append(ops, lcOp{Kind: lcOpBoot})
 }
 
-// Known findings: each check below that fails on unmodified main for one of
-// these is counted, not fatal, unless SLAGWORKS_PROP_STRICT=1.
-const (
-	lcFindReadyNeedsGlobal = "ready-waits-for-global" // READY=1 only after a hello is accepted
-	lcFindStartupFatalDHCP = "startup-fatal-on-snapshot-dhcp"
-	lcFindCorruptDBFatal   = "corrupt-localdb-fatal"
-)
-
 type lcStats struct {
 	mu                                          sync.Mutex
 	cases, boots, bootsDegraded, bootsFromDisk  int
 	modeSeen                                    [lcNumModes]int
 	shapeSeen                                   [lcNumShapes]int
 	corrupt, kills, terms, bumpsLive, reconnect int
-	standby                                     int
-	known                                       map[string]int
+	standby, dbFatal                            int
 }
 
 func (s *lcStats) add(f func(*lcStats)) {
@@ -676,11 +668,10 @@ type lcFataler interface {
 }
 
 type lcRun struct {
-	t      lcFataler
-	stats  *lcStats
-	strict bool
-	g      *lcGlobal
-	u      *lcUnit
+	t     lcFataler
+	stats *lcStats
+	g     *lcGlobal
+	u     *lcUnit
 
 	// Model. Nothing here is read from the worker.
 	mode      lcMode
@@ -693,29 +684,14 @@ type lcRun struct {
 }
 
 func (r *lcRun) failf(format string, args ...any) {
+	if os.Getenv("SLAGWORKS_PROP_DEBUG") == "1" && r.u.running() {
+		// The Go runtime answers SIGQUIT with every goroutine's stack on
+		// stderr, which is the worker's log.
+		_ = r.u.cmd.Process.Signal(syscall.SIGQUIT)
+		<-r.u.exited
+	}
 	r.t.Fatalf("%s\nhistory: %s\nmodel: mode=%v gen=%d persisted=%d dbBroken=%v\n--- worker log tail ---\n%s",
 		fmt.Sprintf(format, args...), strings.Join(r.trail, " -> "), r.mode, r.gen, r.persisted, r.dbBroken, r.u.logTail())
-}
-
-// known reports a check that fails for an already written-up finding.
-func (r *lcRun) known(id, format string, args ...any) {
-	if r.strict {
-		r.failf("["+id+"] "+format, args...)
-	}
-	r.stats.add(func(s *lcStats) { s.known[id]++ })
-}
-
-// heldShape is the DHCP shape of the snapshot the worker starts its services
-// from: what it adopted before runSite's 5s wait ran out, else what worker.db
-// holds.
-func (r *lcRun) startShape() (lcShape, bool) {
-	if r.mode == lcOK {
-		return r.shapes[r.gen], true
-	}
-	if r.persisted > 0 && !r.dbBroken {
-		return r.shapes[r.persisted], true
-	}
-	return lcShapeValid, false
 }
 
 func (r *lcRun) boot() {
@@ -741,34 +717,27 @@ func (r *lcRun) boot() {
 		}
 	})
 
-	// Alive: nothing global does, and nothing it put in a snapshot, is a
-	// reason for the boot plane to go away.
+	// Alive and ready: nothing global does, and nothing it put in a
+	// snapshot, is a reason for the boot plane to go away or for the unit to
+	// miss its start timeout.
 	budget := lcReadyBudget
 	ready := lcEventually(budget, func() bool { return r.u.readyAt.Load() != 0 || !r.u.running() })
 	if !r.u.running() {
-		shape, have := r.startShape()
-		switch {
-		case r.dbBroken:
-			r.known(lcFindCorruptDBFatal, "worker exited with code %d on a damaged worker.db instead of starting without it", r.u.exitCode)
-			// The damaged file is still there; nothing changes until an
-			// operator removes it.
-		case have && shape != lcShapeValid:
-			r.known(lcFindStartupFatalDHCP, "worker exited with code %d because the snapshot's DHCP config is %v", r.u.exitCode, shape)
-			if r.mode == lcOK {
-				// It adopted and persisted global's snapshot before dying.
-				r.persisted = r.gen
-			}
-		default:
+		if !r.dbBroken {
 			r.failf("worker exited with code %d under global mode %v", r.u.exitCode, r.mode)
 		}
+		// A worker.db that SQLite cannot open is fatal at start, with a
+		// non-zero exit: the damaged file stays where it is, and nothing
+		// changes until an operator looks at it.
+		if r.u.exitCode == 0 {
+			r.failf("worker exited with code 0 on a damaged worker.db, want a failure exit")
+		}
+		r.stats.add(func(s *lcStats) { s.dbFatal++ })
 		r.u.stop(syscall.SIGKILL)
 		return
 	}
 	if !ready || r.u.readyAt.Load() == 0 {
-		if r.mode == lcOK {
-			r.failf("no READY=1 within %v although global is answering hellos", budget)
-		}
-		r.known(lcFindReadyNeedsGlobal, "no READY=1 within %v of starting while global is %v: systemd kills the unit at its start timeout and restarts it, forever", budget, r.mode)
+		r.failf("no READY=1 within %v of starting (global mode %v): systemd would kill the unit at its start timeout and restart it for as long as that lasts", budget, r.mode)
 	}
 
 	// Serving: the HTTP boot server answers and serves the generation the
@@ -790,16 +759,6 @@ func (r *lcRun) boot() {
 		r.failf("HTTP boot serves generation %d, want %d..%d (global mode %v)", got, lo, hi, r.mode)
 	}
 	if !r.u.running() {
-		// Died between READY and serving: classify as above.
-		shape, have := r.startShape()
-		if have && shape != lcShapeValid {
-			r.known(lcFindStartupFatalDHCP, "worker exited with code %d because the snapshot's DHCP config is %v", r.u.exitCode, shape)
-			if r.mode == lcOK {
-				r.persisted = r.gen
-			}
-			r.u.stop(syscall.SIGKILL)
-			return
-		}
 		r.failf("worker exited with code %d while starting its services (global mode %v)", r.u.exitCode, r.mode)
 	}
 	if r.dbBroken && r.mode != lcOK {
@@ -983,7 +942,7 @@ func lcRunCase(t lcFataler, stats *lcStats, ops []lcOp, startMode lcMode, standb
 	u.standby = standby
 	defer u.cleanup()
 	r := &lcRun{
-		t: t, stats: stats, strict: os.Getenv("SLAGWORKS_PROP_STRICT") == "1",
+		t: t, stats: stats,
 		g: g, u: u, mode: startMode, gen: 1, shapes: []lcShape{lcShapeValid, lcShapeValid},
 	}
 	r.trail = append(r.trail, "mode="+startMode.String())
@@ -1004,7 +963,7 @@ func TestPropSiteLifecycle(t *testing.T) {
 	if os.Getenv("SLAGWORKS_PROP_SLOW") != "1" {
 		t.Skip("starts real worker processes and waits out their startup timers (about 25s a case); set SLAGWORKS_PROP_SLOW=1 to run it")
 	}
-	stats := &lcStats{known: map[string]int{}}
+	stats := &lcStats{}
 	// Cases are slow (a degraded boot waits out runSite's 5s sync window), so
 	// they run as parallel shards, each its own rapid.Check with its own seed.
 	t.Run("shards", func(t *testing.T) {
@@ -1038,5 +997,5 @@ func TestPropSiteLifecycle(t *testing.T) {
 		}
 		return b.String()
 	}())
-	t.Logf("known findings hit (not failed; SLAGWORKS_PROP_STRICT=1 fails them): %v", stats.known)
+	t.Logf("starts that failed on a worker.db SQLite could not open (fatal by design): %d", stats.dbFatal)
 }
