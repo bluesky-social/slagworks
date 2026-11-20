@@ -348,6 +348,7 @@ func propPinnedCases() map[string]propCase {
 	for _, seed := range []string{"ext4", "luks", "dos", "ambiv"} {
 		cases = append(cases, propSafetyCase(seed))
 	}
+	cases = append(cases, propWideCases()...)
 	byName := make(map[string]propCase, len(cases))
 	for _, c := range cases {
 		if _, dup := byName[c.Name]; dup {

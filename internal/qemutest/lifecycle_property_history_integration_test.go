@@ -1455,11 +1455,11 @@ type propGenConfig struct {
 	AllFamilies bool
 	// Families restricts the subset to these fault families (nil = all).
 	Families []string
-	// UEFI lets the generator pick UEFI firmware for the subject. Off for
-	// the VM tier's generated histories: after a UEFI install the
-	// firmware boots the disk entry the agent registered, and the test
-	// power controller has no way to arm OVMF's next boot for PXE the way
-	// a BMC's one-time override does, so a second deploy cannot start.
+	// UEFI lets the generator pick UEFI firmware for the subject. The VM
+	// tier pins a UEFI subject's NIC first in the boot order
+	// (VMConfig.NetworkBootFirst) so a second deploy can start after an
+	// install registered its own boot entry; generated VM histories draw
+	// UEFI only with SLAGWORKS_LIFECYCLE_PROP_VM_UEFI=1.
 	UEFI bool
 }
 
