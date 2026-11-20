@@ -5,22 +5,22 @@ package skewtest
 // While global is down a site worker keeps serving: every DHCP lease it
 // grants or renews queues a dhcp_lease observation, and a deploy whose
 // installed OS phones home queues a phone_home. When global comes back the
-// worker reconnects and sends the whole outbox in one burst. The hub starts
-// one handler goroutine per observation, and each handler needs a database
+// worker reconnects and sends the whole outbox in one burst, with the op
+// updates it held in memory right behind; every handler needs a database
 // connection.
 //
 // TestReplayAfterGlobalRestart builds that burst against a database login
 // that may hold only a few connections (a stand-in for whatever bounds new
 // connections in a deployment: max_connections, a per-role limit, or the
-// rate at which a managed database accepts TLS logins) and checks what the
-// outbox contract promises: nothing queued is lost. It runs global twice,
-// once with the pool as slagworksd global opens it and once with the pool
-// bounded below the login's limit, and reports how many handler runs failed
-// for want of a connection in each.
+// rate at which a managed database accepts TLS logins), with global's pool
+// bounded below that limit the way slagworksd global bounds its own
+// (TestOpenGlobalDB_BurstQueuesWithinConnectionLimit in cmd/slagworksd pins
+// that the daemon does). It checks what the outbox contract promises, that
+// nothing queued is lost, and that no handler fails for want of a
+// connection, which is what loses the messages a worker sends only once.
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -33,18 +33,14 @@ import (
 
 func TestReplayAfterGlobalRestart(t *testing.T) {
 	const (
-		leases    = 150 // the production burst this reproduces was 142 from one worker
+		leases    = 150 // a few minutes of renewals at a site with about a hundred hosts
 		roleLimit = 12
 	)
 	for _, tc := range []struct {
-		name         string
-		maxOpen      int
-		wantNoFailed bool
+		name    string
+		maxOpen int
 	}{
-		// slagworksd global leaves database/sql's defaults: no bound on
-		// open connections.
-		{name: "pool_as_shipped", maxOpen: 0, wantNoFailed: os.Getenv("SKEW_FINDINGS") != ""},
-		{name: "pool_bounded", maxOpen: 6, wantNoFailed: true},
+		{name: "pool_bounded", maxOpen: 6},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			name, adminDSN := freshDatabase(t, t, "")
@@ -212,10 +208,10 @@ func TestReplayAfterGlobalRestart(t *testing.T) {
 			}
 			t.Logf("replay of %d observations against a %d-connection login, pool max_open=%d: drained in %s; observation handler failures=%d, op_update handler failures=%d, handler runs that could not get a connection=%d; the installing deploy's phase at global is %q (the agent last reported %q)",
 				leases+1, roleLimit, tc.maxOpen, drained.Round(time.Millisecond), obsFailed, updFailed, connFailed, phase2, "finalizing")
-			if tc.wantNoFailed && phase2 != "finalizing" {
+			if phase2 != "finalizing" {
 				w.fail("the op updates the worker queued while global was down were dropped: the installing deploy is at phase %q at global, the agent's last accepted report said %q", phase2, "finalizing")
 			}
-			if tc.wantNoFailed && connFailed > 0 {
+			if connFailed > 0 {
 				w.fail("%d handler runs failed because global could not open a database connection: the replay burst opened more connections than the database accepts", connFailed)
 			}
 		})

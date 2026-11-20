@@ -4,9 +4,9 @@
 // upstream connection, executor and the HTTP boot/report surface), and takes
 // commands as JSON lines on stdin.
 //
-// It deliberately uses only the part of the internal API that v0.5.0 and
-// later releases share, so the same source compiles against an older
-// checkout of the repository. The harness builds it twice, once per release,
+// It deliberately uses only the part of the internal API that the tree and
+// the old release under test share (v0.5.0 when this was written), so the
+// same source compiles against an older checkout of the repository. The harness builds it twice, once per release,
 // and runs the two builds against the same Postgres database and the same
 // worker.db: that is what makes an upgrade, a rollback, or a mixed fleet an
 // executable scenario instead of a reading exercise.
@@ -192,8 +192,7 @@ type globalStartArgs struct {
 	Version string            `json:"version"`
 	MACs    map[string]string `json:"macs"`
 	// MaxOpenConns and MaxIdleConns, when non-zero, bound the pool. Zero
-	// leaves database/sql's defaults, which is what slagworksd global runs
-	// with.
+	// leaves database/sql's defaults (no bound on open connections).
 	MaxOpenConns int `json:"max_open_conns"`
 	MaxIdleConns int `json:"max_idle_conns"`
 }
@@ -469,7 +468,7 @@ func (g *global) createOp(a createOpArgs) (any, error) {
 			return nil, fmt.Errorf("unlock: %w", err)
 		}
 	}
-	// Params in the shape production deploys carry (a BMC runtime block and
+	// Params in the shape a real deploy carries (a BMC runtime block and
 	// the destructive flag), with a recognisable secret so a harness can
 	// look for it where it must not be.
 	params := json.RawMessage(`{"destructive":true,"bmc_runtime":{"username":"admin","password":"skew-secret","extra_config":{}}}`)

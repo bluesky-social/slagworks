@@ -40,6 +40,28 @@ Linux is native. Tests that need a real Postgres go through
 `internal/testpg` (see `docs/dev/database.md`); tests that need SQLite
 open a temp `LocalDB` directly.
 
+### Upgrade and restart scenarios
+
+`internal/skewtest` runs a global and a site worker as separate
+processes (the driver in `internal/skewtest/skewtool`) against one
+Postgres database and one `worker.db`, and restarts, kills and upgrades
+them in the middle of generated deploy histories. By default both sides
+are built from the working tree. The cross-release tests (upgrade from
+an old release, rollback to it, what a refused peer logs) build the
+driver a second time inside a checkout of that release and are opt-in:
+
+```
+SKEW_OLD_REF=v0.5.0 go test ./internal/skewtest/ -count=1
+```
+
+They take several minutes and need the tag in the local clone
+(`SKEW_OLD_TREE=<dir>` names an existing checkout instead). The driver
+has to compile against both trees, so when an internal API it uses
+changes, move `SKEW_OLD_REF` forward to a release that has the new
+shape. The generated properties run a fraction of `-rapid.checks`;
+raise it, and set `SKEW_SHARDS=<n>` for parallel shards, for a deep
+run.
+
 ## Integration tests
 
 Marked with `//go:build integration` and live under `internal/netboxtest/`

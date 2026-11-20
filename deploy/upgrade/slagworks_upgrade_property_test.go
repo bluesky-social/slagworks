@@ -33,7 +33,7 @@ func isLowerHex(s string) bool {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
@@ -111,7 +111,7 @@ func mutate(t *rapid.T, s, label string) string {
 	}
 }
 
-func TestProp_HelperArgumentGate(t *testing.T) {
+func TestHelper_Property_ArgumentGate(t *testing.T) {
 	var accepted, rejected, nearValid int
 	rapid.Check(t, func(rt *rapid.T) {
 		sha := mutate(rt, genSHA(rt), "sha")

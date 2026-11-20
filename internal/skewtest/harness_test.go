@@ -8,14 +8,21 @@
 // Postgres database and the same worker.db, the way an operator's upgrade
 // does.
 //
-// The old release comes from, in order:
+// The cross-release tests are opt-in, because they need a second source
+// tree and several minutes. The old release comes from, in order:
 //
 //	SKEW_OLD_TREE  a directory holding a checkout of the old release
-//	SKEW_OLD_REF   a git ref to extract with git archive (default v0.5.0)
+//	SKEW_OLD_REF   a git ref to extract with git archive (for example v0.5.0)
 //
-// With neither available (no git metadata, as on a host the tree was
-// rsynced to) the cross-release properties skip and the same-release ones
-// still run.
+// With neither set the cross-release tests skip and the same-release ones
+// still run. The driver has to compile inside the old tree, so the oldest
+// usable release is the oldest one whose internal API it still fits.
+//
+// Other knobs: SKEW_SHARDS=<n> runs each generated property as n parallel
+// rapid checks; SKEW_TRACE=1 logs every case's history; SKEW_STDERR_DIR=<dir>
+// keeps every driver process's log; SKEW_PORT_BASE=<n> moves the loopback
+// port range. The generated properties run a fraction of -rapid.checks (a
+// case starts four or more processes), so raise that flag for a deep run.
 package skewtest
 
 import (
@@ -76,12 +83,17 @@ func TestMain(m *testing.M) {
 		}
 		oldRef = os.Getenv("SKEW_OLD_REF")
 		if oldRef == "" {
-			oldRef = "v0.5.0"
+			oldRef = "old"
 		}
-		oldTree, err := resolveOldTree(root, dir, oldRef)
-		if err != nil {
-			oldMissing = err.Error()
+		if os.Getenv("SKEW_OLD_TREE") == "" && os.Getenv("SKEW_OLD_REF") == "" {
+			oldMissing = "set SKEW_OLD_REF to a release tag (or SKEW_OLD_TREE to a checkout of one) to run it"
 		} else {
+			oldTree, err := resolveOldTree(root, dir, oldRef)
+			if err != nil {
+				// Asked for and not available: fail, do not skip.
+				fmt.Fprintln(os.Stderr, "skewtest:", err)
+				return 1
+			}
 			dst := filepath.Join(oldTree, "internal", "skewtest", "skewtool")
 			if err := os.MkdirAll(dst, 0o755); err != nil {
 				fmt.Fprintln(os.Stderr, "skewtest:", err)
@@ -148,7 +160,7 @@ func resolveOldTree(root, tmp, ref string) (string, error) {
 	}
 	tarball := filepath.Join(tmp, "old.tar")
 	if out, err := run(root, "git", "archive", "--format=tar", "-o", tarball, ref); err != nil {
-		return "", fmt.Errorf("no old release to test against: git archive %s failed (%v: %s); set SKEW_OLD_TREE to a checkout of it", ref, err, strings.TrimSpace(out))
+		return "", fmt.Errorf("no old release to test against: git archive %s failed (%v: %s); fetch the tag or set SKEW_OLD_TREE to a checkout of it", ref, err, strings.TrimSpace(out))
 	}
 	if out, err := run(dst, "tar", "-xf", tarball); err != nil {
 		return "", fmt.Errorf("extracting %s: %v: %s", ref, err, out)
@@ -160,7 +172,7 @@ func resolveOldTree(root, tmp, ref string) (string, error) {
 func needOld(t *testing.T) {
 	t.Helper()
 	if toolOld == "" {
-		t.Skipf("cross-release property skipped: %s", oldMissing)
+		t.Skipf("cross-release test skipped: %s", oldMissing)
 	}
 }
 
@@ -318,15 +330,6 @@ func (p *proc) quit() {
 	}
 }
 
-func (p *proc) alive() bool {
-	select {
-	case <-p.exited:
-		return false
-	default:
-		return true
-	}
-}
-
 // ---------------------------------------------------------------- postgres
 
 var (
@@ -347,9 +350,9 @@ func freshDatabase(t *testing.T, f fataler, template string) (name, dsn string) 
 		pgDSN = testpg.DSN()
 		pgAdmin, pgErr = gorm.Open(postgres.Open(pgDSN), &gorm.Config{Logger: logger.Discard})
 	})
-	if pgErr != nil {
+	if pgErr != nil || pgAdmin == nil {
 		pgMu.Unlock()
-		f.Fatalf("harness: admin connection: %v", pgErr)
+		f.Fatalf("harness: no Postgres to run against (the test database helper needs Docker): %v", pgErr)
 	}
 	pgSerial++
 	name = fmt.Sprintf("skew_%d_%d", os.Getpid(), pgSerial)

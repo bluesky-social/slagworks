@@ -12,12 +12,15 @@ package skewtest
 //
 // TestPartitionedPartnerWorker builds the case where that matters: a deploy
 // in flight when one worker is cut off, finished through the other worker,
-// and then a reboot of the installed host that lands on the cut-off one.
+// and then a reboot of the installed host that lands on the cut-off one. It
+// checks the half two real processes can show in seconds: the connected
+// worker follows global (boot-local after the abort and after the install),
+// the deploy completes through it, and the cut-off worker keeps answering
+// without disturbing what global recorded.
 
 import (
 	"io"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -221,32 +224,36 @@ func TestPartitionedPartnerWorker(t *testing.T) {
 		t.Fatalf("harness: machine is %s (locked=%v) at global, want running and locked", m.State, m.Locked)
 	}
 
-	// Time passes. A fix that bounds how long a cut-off worker trusts an
-	// op it has seen nothing of needs the bound to elapse; the test honors
-	// the knob such a fix would read (see the worker regression test).
-	if v := os.Getenv("SLAGWORKS_OP_TRUST_WINDOW"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			time.Sleep(3 * d)
-		}
-	}
-
 	// The installed host reboots, and this time worker B answers its DHCP.
-	_, script := get("http://" + bHTTP + "/boot/ipxe?mac=" + mac)
-	got := classify(script)
+	// B was cut off seconds ago, and a worker trusts the op set it held when
+	// its connection ended for as long as the operation timeout (it serves
+	// boot-local for those hosts only once the outage outlasts that window;
+	// TestBootAction_LongDisconnectedWorkerDoesNotServeInstaller in
+	// internal/worker covers that with the clock moved). So inside the
+	// window B still answers from what it last knew. What must hold here is
+	// that B keeps answering at all, and that nothing it does reaches
+	// global: the finished deploy stays completed and its machine running
+	// and locked.
+	code, script := get("http://" + bHTTP + "/boot/ipxe?mac=" + mac)
+	if code != 200 {
+		t.Fatalf("worker B, cut off from global, answered HTTP %d to a boot request: boot serving must not depend on the connection", code)
+	}
 	accepted := report(bHTTP, "partitioning", "")
-	t.Logf("the cut-off partner serves the completed, running, locked host: %s; it answers %d to the installer agent's first report", got, accepted)
-	_, script2 := get("http://" + bHTTP + "/boot/ipxe?mac=" + mac2)
-	got2 := classify(script2)
-	t.Logf("the cut-off partner serves the host whose deploy the operator aborted: %s (destructive flag on the kernel line: %v)", got2, strings.Contains(script2, "slagworks.destructive"))
-	if os.Getenv("SKEW_FINDINGS") == "" {
-		// Reported as a finding with its own regression test; this test
-		// documents the behavior and fails on it under SKEW_FINDINGS=1.
-		return
+	t.Logf("inside the trust window the cut-off partner serves the completed host: %s; it answers %d to an installer agent's report", classify(script), accepted)
+	code2, script2 := get("http://" + bHTTP + "/boot/ipxe?mac=" + mac2)
+	if code2 != 200 {
+		t.Fatalf("worker B, cut off from global, answered HTTP %d to a boot request for the second host", code2)
 	}
-	if got2 == "deploy" {
-		t.Errorf("worker B, cut off from global, served the installer to a host whose deploy the operator aborted at global: nothing tells B the op is over, and its copy of the op never expires")
+	t.Logf("inside the trust window the cut-off partner serves the host whose deploy was aborted: %s (destructive flag on the kernel line: %v)", classify(script2), strings.Contains(script2, "slagworks.destructive"))
+	time.Sleep(500 * time.Millisecond)
+	must("g.dump", g.call("g.dump", struct{}{}, &d))
+	if o := d.op(op); o == nil || o.Status != "completed" {
+		t.Fatalf("the completed deploy changed at global after the cut-off partner took a report for it: %+v", o)
 	}
-	if got == "deploy" {
-		t.Fatalf("worker B, cut off from global since before the deploy finished, served the installer to a host whose deploy global completed through worker A: the host is running and locked at global, and its next reboot through B wipes it")
+	if m := d.machine(machine); m.State != "running" || !m.Locked {
+		t.Fatalf("machine is %s (locked=%v) at global after the cut-off partner took a report, want running and locked", m.State, m.Locked)
+	}
+	if o := d.op(wrong.OpID); o == nil || o.Status != "failed" {
+		t.Fatalf("the aborted deploy is not failed at global: %+v", o)
 	}
 }

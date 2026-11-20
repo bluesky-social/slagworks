@@ -34,9 +34,9 @@ package skewtest
 //	health     No process exits, hangs, or refuses to start on the state the
 //	           other build left.
 //
-// TestProp_RollingRestart runs it with from == to (this tree): a release
-// that changes no protocol. TestProp_UpgradeFromOldRelease runs it from the
-// old release (see harness_prop_test.go) to this tree.
+// TestSkew_Property_RollingRestart runs it with from == to (this tree): a release
+// that changes no protocol. TestSkew_Property_UpgradeFromOldRelease runs it from the
+// old release (see harness_test.go) to this tree.
 
 import (
 	"encoding/json"
@@ -207,21 +207,20 @@ type world struct {
 	verFrom string
 	verTo   string
 
-	g      *proc
-	gVer   string // "from" or "to"; meaningful while g != nil or between restarts
-	w      *proc
-	wVer   string
-	wHTTP  string
-	wGen   int
-	gDown  bool
-	wDown  bool
-	strict bool // the "from" build is the tree under test too
+	g     *proc
+	gVer  string // "from" or "to"; meaningful while g != nil or between restarts
+	w     *proc
+	wVer  string
+	wHTTP string
+	wGen  int
+	gDown bool
+	wDown bool
 
 	machines []*mach
 	trace    []string
 	sql      *gorm.DB
 
-	tolerateFromLatch bool
+	fromLatchInMemory bool
 	// refuses is true when the two builds refuse each other's worker
 	// connections.
 	refuses bool
@@ -557,8 +556,8 @@ func (w *world) boot(m *mach) string {
 		w.fail("boot: %s was served the %s installer but its current op %s is a %s", m.serial, class, o.id, o.typ)
 	case w.healthOnly:
 		// The boot decision is the "to" build's business.
-	case (o.completeAck || o.phoneAck) && w.tolerateFromLatch && (o.completeBy == "from" || o.phoneAckBy == "from"):
-		// See scenarioConfig.tolerateFromLatch.
+	case (o.completeAck || o.phoneAck) && w.fromLatchInMemory && (o.completeBy == "from" || o.phoneAckBy == "from"):
+		// See scenarioConfig.fromLatchInMemory.
 		w.st.fromLatchLost++
 	case o.completeAck || o.phoneAck:
 		w.fail("boot: %s was served the %s installer although the agent's deploy_complete for its current op %s was accepted (complete=%v by the %s worker, phone_home=%v): the installed system would be wiped again",
@@ -838,20 +837,21 @@ type scenarioConfig struct {
 	binFrom, binTo string
 	verFrom, verTo string
 	refuses        bool
-	// tolerateFromPhoneHome exempts, from the completion check, a deploy
-	// whose phone-home was accepted by the "from" build. v0.5.0 queued its
-	// phone_home observation without the op ID, so a completion that had
-	// not reached global when the upgrade began is not recoverable from the
-	// outbox (TestPhoneHomeObservationWithoutOpID in
-	// internal/commission pins what the new global does with such a row).
-	// The property counts these instead of stopping at the first one.
-	tolerateFromPhoneHome bool
-	// tolerateFromLatch exempts, from the boot check, a deploy whose
-	// deploy_complete was accepted by the "from" build. v0.5.0 kept the
-	// awaiting_phone_home latch in memory until global echoed the phase
-	// back, so a worker stopped before that echo restarts without it
-	// (TestProp_RollingRestart checks that this tree's worker does not).
-	tolerateFromLatch bool
+	// fromPhoneHomeUnbound exempts, from the completion check, a deploy
+	// whose phone-home was accepted by the "from" build. A pre-0.6 worker
+	// queued its phone_home observation without the op ID, and global
+	// deliberately does not bind such a row to whatever deploy the machine
+	// has open (TestPhoneHomeObservationWithoutOpID in internal/commission
+	// pins that), so a completion that had not reached global when the
+	// upgrade began ends at the phone-home timeout. That is the old
+	// release's behavior, not this tree's; the property counts these.
+	fromPhoneHomeUnbound bool
+	// fromLatchInMemory exempts, from the boot check, a deploy whose
+	// deploy_complete was accepted by the "from" build. A pre-0.6 worker
+	// kept the awaiting_phone_home latch in memory until global echoed the
+	// phase back, so one stopped before that echo restarts without it
+	// (TestSkew_Property_RollingRestart checks that this tree's worker does not).
+	fromLatchInMemory bool
 	// healthOnly keeps the checks that do not depend on how the "to" build
 	// handles a deploy: every process starts on the state the other build
 	// left, Migrate loses no row, nothing crashes or hangs, and the two
@@ -866,7 +866,7 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 	w := &world{
 		t: t, f: rt, st: st, slug: "site-a", worker: "worker-1",
 		binFrom: cfg.binFrom, binTo: cfg.binTo, verFrom: cfg.verFrom, verTo: cfg.verTo,
-		strict: cfg.binFrom == cfg.binTo, tolerateFromLatch: cfg.tolerateFromLatch, refuses: cfg.refuses, healthOnly: cfg.healthOnly,
+		fromLatchInMemory: cfg.fromLatchInMemory, refuses: cfg.refuses, healthOnly: cfg.healthOnly,
 	}
 	w.dbName, w.dsn = freshDatabase(t, rt, "")
 	defer dropDatabase(w.dbName)
@@ -1153,7 +1153,6 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 	// Finish the upgrade and let the fleet settle on the "to" build.
 	if w.gVer == "from" {
 		if firstUpgrade == "" {
-			firstUpgrade = "global"
 			st.upgradeGFirst++
 		}
 		w.upgradeGlobal()
@@ -1199,7 +1198,7 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 				if g == nil {
 					return fmt.Sprintf("op %s is missing from the operations table", o.id)
 				}
-				if cfg.tolerateFromPhoneHome && o.phoneAckBy == "from" && g.Status != "completed" {
+				if cfg.fromPhoneHomeUnbound && o.phoneAckBy == "from" && g.Status != "completed" {
 					continue
 				}
 				if g.Status != "completed" {
@@ -1297,8 +1296,9 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 	}
 }
 
-// skewCheck is rapid.Check with a fraction of the configured checks: a case
-// here starts four or more processes and runs real migrations.
+// skewCheck is rapid.Check with a fraction of the configured checks (ten
+// cases at rapid's default of 100): a case here starts four or more
+// processes and runs real migrations.
 func skewCheck(t *testing.T, div int, prop func(*rapid.T)) {
 	t.Helper()
 	checksOnce.Do(func() {
@@ -1347,7 +1347,7 @@ func shards(t *testing.T, cfg scenarioConfig) {
 		st := &stats{boots: map[string]int{}}
 		dir := t.TempDir()
 		defer logStats(t, st)
-		skewCheck(t, 5, func(rt *rapid.T) { runScenario(t, rt, cfg, st, dir) })
+		skewCheck(t, 10, func(rt *rapid.T) { runScenario(t, rt, cfg, st, dir) })
 	}
 	if n == 1 {
 		run(t)
@@ -1361,32 +1361,31 @@ func shards(t *testing.T, cfg scenarioConfig) {
 	}
 }
 
-// TestProp_RollingRestart is the scenario with both builds from this tree:
+// TestSkew_Property_RollingRestart is the scenario with both builds from this tree:
 // every restart, crash and reconnection an upgrade causes, with no protocol
 // or schema change in the way.
-func TestProp_RollingRestart(t *testing.T) {
+func TestSkew_Property_RollingRestart(t *testing.T) {
 	shards(t, scenarioConfig{binFrom: toolNew, binTo: toolNew, verFrom: "aaaaaaa", verTo: "bbbbbbb"})
 }
 
-// TestProp_UpgradeFromOldRelease is the scenario from the old release to
+// TestSkew_Property_UpgradeFromOldRelease is the scenario from the old release to
 // this tree. The two builds refuse each other's worker connections (the
 // v0.6.0 breaking change), so every case has a window in which the worker
-// serves boots and reports on its own. SKEW_STRICT=1 turns the two
-// tolerances off, which makes the property stop at the first deploy the old
-// release's worker could not carry across its own restart.
-func TestProp_UpgradeFromOldRelease(t *testing.T) {
+// serves boots and reports on its own. A deploy the old worker carried only
+// in memory is exempt from the completion and boot checks (see
+// scenarioConfig); everything this tree's builds accepted is not.
+func TestSkew_Property_UpgradeFromOldRelease(t *testing.T) {
 	needOld(t)
-	strict := os.Getenv("SKEW_STRICT") != ""
 	shards(t, scenarioConfig{binFrom: toolOld, binTo: toolNew, verFrom: oldRef, verTo: "main", refuses: true,
-		tolerateFromPhoneHome: !strict, tolerateFromLatch: !strict})
+		fromPhoneHomeUnbound: true, fromLatchInMemory: true})
 }
 
-// TestProp_RollbackToOldRelease is the scenario backwards: the fleet starts
+// TestSkew_Property_RollbackToOldRelease is the scenario backwards: the fleet starts
 // on this tree and both sides go back to the old release, global onto a
 // database this tree migrated and the worker onto a worker.db this tree
 // wrote. docs/user/installation.md says rolling global back rolls the
 // workers back; this checks the old release can start on what it finds.
-func TestProp_RollbackToOldRelease(t *testing.T) {
+func TestSkew_Property_RollbackToOldRelease(t *testing.T) {
 	needOld(t)
 	shards(t, scenarioConfig{binFrom: toolNew, binTo: toolOld, verFrom: "main", verTo: oldRef, refuses: true, healthOnly: true})
 }
