@@ -790,6 +790,141 @@ func TestDeployBootScript_RefusesValuesThatSplitTheKernelLine(t *testing.T) {
 	}
 }
 
+// scriptCmdlineLen is the longest command line the kernel can receive from
+// a served boot script: what follows the kernel URL, with each iPXE setting
+// at its longest expansion (${next-server} a 15-byte IPv4 address,
+// ${netX/mac:hexhyp} 17 bytes), behind the image name iPXE puts in front of
+// it when it starts the kernel as an EFI image ("vmlinuz ").
+func scriptCmdlineLen(t *testing.T, script string) int {
+	t.Helper()
+	for _, line := range strings.Split(script, "\n") {
+		if rest, ok := strings.CutPrefix(line, "kernel "); ok {
+			_, args, _ := strings.Cut(rest, " ")
+			args = strings.ReplaceAll(args, "${next-server}", "255.255.255.255")
+			args = strings.ReplaceAll(args, "${netX/mac:hexhyp}", "00-00-00-00-00-00")
+			// iPXE joins the words of the line back with single spaces.
+			return len("vmlinuz ") + len(strings.Join(strings.Fields(args), " "))
+		}
+	}
+	t.Fatalf("no kernel line in:\n%s", script)
+	return 0
+}
+
+// TestDeployBootScript_RefusesAnOverlongKernelLine: the kernel keeps 2047
+// bytes of command line (COMMAND_LINE_SIZE 2048) and silently drops the
+// rest. The deploy line ends in slagworks.expect-uuid, so a line one byte
+// over loses the identity check's argument and the agent refuses the deploy
+// after the host already rebooted into the installer. The handler refuses
+// such a boot up front; a line of exactly 2047 bytes is still served, whole.
+func TestDeployBootScript_RefusesAnOverlongKernelLine(t *testing.T) {
+	const goodUUID = "550e8400-e29b-41d4-a716-446655440000"
+	script := func(markerLen int) string {
+		raw, err := json.Marshal(model.OpParams{DataMarker: strings.Repeat("m", markerLen)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return deployScriptFor(t, string(raw), func(p *model.InMemoryProvider, id uuid.UUID) {
+			p.SetSystemUUID(id, goodUUID)
+		})
+	}
+	// The marker that brings the line to exactly the limit.
+	fits := 1 + 2047 - scriptCmdlineLen(t, script(1))
+
+	body := script(fits)
+	if got := scriptCmdlineLen(t, body); got != 2047 {
+		t.Fatalf("a line of %d bytes, at the limit, must be served; got:\n%s", got, body)
+	}
+	if !strings.HasSuffix(strings.Split(body, "\n")[2], " slagworks.expect-uuid="+goodUUID) {
+		t.Errorf("the served line must still end in the identity check's argument:\n%s", body)
+	}
+
+	body = script(fits + 1)
+	if strings.Contains(body, "\nkernel ") {
+		t.Fatalf("a 2048-byte kernel line was served; the kernel would drop its last byte")
+	}
+	for _, want := range []string{"ERROR:", "2048 bytes", "2047", "slagworks_kernel_params", "shell"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in the refusal script, got:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "mmmm") {
+		t.Errorf("refusal script echoes an op value:\n%s", body)
+	}
+}
+
+// TestCommissionBootScript_RefusesAnOverlongKernelLine: the commission line
+// carries the device-type's kernel params too, and ends in the machine/op
+// binding the agent needs; it is held to the same limit.
+func TestCommissionBootScript_RefusesAnOverlongKernelLine(t *testing.T) {
+	script := func(kernelParams string) string {
+		p := newTestProviderKnownMAC()
+		machineID, _ := p.MachineIDForMAC(testMAC)
+		p.SetCommissioning(machineID)
+		p.SetKernelParams(machineID, kernelParams)
+		p.SetCommissionOp(machineID, &model.Operation{
+			ID: uuid.New(), MachineID: machineID, Type: model.OpCommission, Status: model.OpClaimed,
+			Params: json.RawMessage(`{}`),
+		})
+		h := NewHandler(HandlerConfig{DefaultImage: "noble", HTTPPort: 8080, DeployMode: true}, p)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", "/boot/ipxe?mac="+testMAC, nil))
+		return w.Body.String()
+	}
+	const base = "console=ttyS1,115200n8 x="
+	fits := 2047 - scriptCmdlineLen(t, script(base))
+
+	body := script(base + strings.Repeat("y", fits))
+	if got := scriptCmdlineLen(t, body); got != 2047 {
+		t.Fatalf("a line of %d bytes, at the limit, must be served; got:\n%s", got, body)
+	}
+	// Padding between the words of the field does not reach the kernel
+	// (iPXE joins the words with single spaces), so it does not count.
+	body = script("console=ttyS1,115200n8" + strings.Repeat(" ", 500) + "x=" + strings.Repeat("y", fits))
+	if !strings.Contains(body, "\nkernel ") {
+		t.Fatalf("padding between kernel params was counted against the limit:\n%s", body)
+	}
+	body = script(base + strings.Repeat("y", fits+1))
+	if strings.Contains(body, "\nkernel ") {
+		t.Fatalf("a 2048-byte kernel line was served; the kernel would drop its last byte")
+	}
+	for _, want := range []string{"ERROR:", "2048 bytes", "2047", "shell"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in the refusal script, got:\n%s", want, body)
+		}
+	}
+}
+
+// TestKernelBootScript_RefusesAnOverlongKernelLine: the kernel-only boot
+// (DeployMode off) ends in slagworks.server and slagworks.image, without
+// which the BOOT hook panics; it is held to the same limit.
+func TestKernelBootScript_RefusesAnOverlongKernelLine(t *testing.T) {
+	script := func(kernelParams string) string {
+		p := newTestProviderKnownMAC()
+		machineID, _ := p.MachineIDForMAC(testMAC)
+		p.SetKernelParams(machineID, kernelParams)
+		h := NewHandler(HandlerConfig{DefaultImage: "noble", HTTPPort: 8080}, p)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", "/boot/ipxe?mac="+testMAC, nil))
+		return w.Body.String()
+	}
+	const base = "console=ttyS1,115200n8 x="
+	fits := 2047 - scriptCmdlineLen(t, script(base))
+
+	body := script(base + strings.Repeat("y", fits))
+	if got := scriptCmdlineLen(t, body); got != 2047 {
+		t.Fatalf("a line of %d bytes, at the limit, must be served; got:\n%s", got, body)
+	}
+	body = script(base + strings.Repeat("y", fits+1))
+	if strings.Contains(body, "\nkernel ") {
+		t.Fatalf("a 2048-byte kernel line was served; the kernel would drop its last byte")
+	}
+	for _, want := range []string{"ERROR:", "2048 bytes", "2047", "shell"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in the refusal script, got:\n%s", want, body)
+		}
+	}
+}
+
 func TestCommissionBootScript_ContainsTraceID(t *testing.T) {
 	p := newTestProviderKnownMAC()
 	machineID, _ := p.MachineIDForMAC(testMAC)

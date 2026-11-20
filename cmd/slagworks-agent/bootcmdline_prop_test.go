@@ -575,20 +575,9 @@ func genOptText(t *rapid.T, label string, benign *rapid.Generator[string], allow
 		return textValue{benign.Draw(t, label), true}
 	default:
 		v := hostile(t, label, benign.Draw(t, label+"_base"))
-		// The handler puts no bound on the kernel command line: a
-		// single-token value long enough to push the line past the
-		// kernel's 2047 bytes is served, the kernel drops the tail, and
-		// the agent then refuses the deploy for want of
-		// slagworks.expect-uuid. A value that long is therefore not
-		// counted as one the boot path must deliver.
-		return textValue{v, isSingleSafeToken(v) && len(v) <= maxDeliverableValue}
+		return textValue{v, isSingleSafeToken(v)}
 	}
 }
-
-// maxDeliverableValue is the longest free-text value checkBootCase requires
-// the boot path to deliver. The longest value a generator draws on purpose
-// (an auth key) is 68 bytes.
-const maxDeliverableValue = 256
 
 var (
 	genAuthKey = rapid.Custom(func(t *rapid.T) string {
@@ -985,6 +974,21 @@ func (c bootCase) expect() expectation {
 	return e
 }
 
+// kernelKeeps is the command line length the kernel keeps.
+const kernelKeeps = 2047
+
+// intendedCmdlineLen is the length of the command line the case intends,
+// as the kernel can receive it at worst: the intended arguments (and the
+// encoded BMC admin account name, when there is one) joined by single
+// spaces, with a 15-byte next-server address, behind "vmlinuz ".
+func (c bootCase) intendedCmdlineLen(exp expectation) int {
+	toks := exp.tokens
+	if c.bmcUser != "" && c.action == model.BootDeploy {
+		toks = append(append([]string(nil), toks...), "slagworks.bmc_admin_user="+url.QueryEscape(c.bmcUser))
+	}
+	return len("vmlinuz ") + len(strings.Join(toks, " ")) + len("255.255.255.255") - len(propNextServer)
+}
+
 func consoleArgs(tokens []string) []string {
 	var out []string
 	for _, tok := range tokens {
@@ -1072,13 +1076,27 @@ func checkBootCase(c bootCase, realHook bool, stats *propStats) error {
 		return nil
 	}
 
+	// The kernel keeps 2047 bytes of command line (COMMAND_LINE_SIZE 2048
+	// with its NUL) and silently drops the rest, which on a deploy is the
+	// trailing expect-uuid. Counted the way the kernel can receive it at
+	// worst: behind the "vmlinuz " iPXE puts in front for an EFI kernel,
+	// with a 15-byte next-server address. A line that long must be refused,
+	// whatever its values; any other benign line must be served.
+	intended := c.intendedCmdlineLen(exp)
 	if !served {
-		if exp.mustServe {
+		if exp.mustServe && intended <= kernelKeeps {
 			return fmt.Errorf("installer refused for a case that satisfies every documented precondition (kp=%q uuid=%q):\n%q",
 				c.kp.v, c.sysUUID.v, script)
 		}
-		stats.inc("refused_hostile")
+		if exp.mustServe {
+			stats.inc("refused_overlong")
+		} else {
+			stats.inc("refused_hostile")
+		}
 		return nil
+	}
+	if booted := len("vmlinuz ") + len(cmdline) + len("255.255.255.255") - len(propNextServer); booted > kernelKeeps {
+		return fmt.Errorf("served a kernel cmdline the kernel can receive as %d bytes (> %d, it truncates the line)", booted, kernelKeeps)
 	}
 	stats.inc("served")
 	if exp.mustServe {
@@ -1226,11 +1244,6 @@ func checkBootCase(c bootCase, realHook bool, stats *propStats) error {
 	// The BMC password must never reach the script.
 	if strings.Contains(script, "hunter2-not-on-cmdline") {
 		return fmt.Errorf("BMC password leaked into the boot script:\n%q", script)
-	}
-	// x86 COMMAND_LINE_SIZE is 2048 including the NUL: a longer line is
-	// silently truncated by the kernel, dropping the trailing expect-uuid.
-	if exp.mustServe && len(cmdline) > 2047 {
-		return fmt.Errorf("benign case produced a %d-byte kernel cmdline (> 2047, the kernel truncates it)", len(cmdline))
 	}
 	if c.params.Destructive {
 		stats.inc("destructive")

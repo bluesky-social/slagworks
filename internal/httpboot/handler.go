@@ -316,6 +316,45 @@ func checkKernelArgValue(v string) error {
 	return nil
 }
 
+// kernelCmdlineMax is the longest command line the kernel keeps:
+// COMMAND_LINE_SIZE is 2048 on x86 and arm64, one byte of it the NUL. The
+// kernel drops whatever follows without failing the boot.
+const kernelCmdlineMax = 2047
+
+// bootedCmdlineLen returns the longest command line the kernel can receive
+// from a kernel line whose arguments are args: each iPXE setting the
+// handler writes counted at its longest expansion (${next-server} a 15-byte
+// IPv4 address, ${netX/mac:hexhyp} 17 bytes), behind the image name and
+// space iPXE puts in front of the arguments when it starts the kernel as an
+// EFI image (efi_image_cmdline). No other "${" can be in args:
+// checkKernelParams and checkKernelArgValue refuse it. iPXE splits the
+// script line into words and joins the arguments back with single spaces,
+// so padding in slagworks_kernel_params, and the leading space its "none"
+// sentinel leaves, do not reach the kernel and are not counted.
+func bootedCmdlineLen(args string) int {
+	args = strings.ReplaceAll(args, "${next-server}", "255.255.255.255")
+	args = strings.ReplaceAll(args, "${netX/mac:hexhyp}", "00-00-00-00-00-00")
+	return len("vmlinuz ") + len(strings.Join(strings.Fields(args), " "))
+}
+
+// overlongCmdlineScript is served instead of a kernel boot whose command
+// line the kernel would truncate. The arguments the boot cannot do without
+// sit at the end of the line (slagworks.expect-uuid on a deploy, the
+// machine and op binding on a commission, slagworks.server and
+// slagworks.image on a kernel-only boot), so a truncated line boots an
+// installer that then refuses to run. Only the length is echoed and logged:
+// the line can carry the tailnet auth key.
+func (h *Handler) overlongCmdlineScript(mac string, length int) string {
+	h.log.Error("refusing boot: the kernel command line is longer than the kernel keeps",
+		"mac", mac, "bytes", length, "max", kernelCmdlineMax)
+	return fmt.Sprintf(`#!ipxe
+echo slagworks: ERROR: the kernel command line for mac %s would be %d bytes; the kernel keeps %d and drops the rest
+echo slagworks: the dropped end holds arguments the installer cannot run without
+echo slagworks: shorten the NetBox device-type custom field slagworks_kernel_params, or the long value in the operation, then retry
+shell
+`, mac, length, kernelCmdlineMax)
+}
+
 // badKernelParamsScript is served instead of any kernel boot when the
 // device-type's slagworks_kernel_params fails checkKernelParams. The value
 // is logged (err quotes it), never echoed: it is exactly what can't be
@@ -420,12 +459,17 @@ func (h *Handler) kernelBootScript(mac string) string {
 	// initrd waited for DHCP on the wrong port forever (router1.pop3,
 	// 2026-10-19; also the July "IPv4 didn't apply" deploy). Same reasoning as
 	// embed.ipxe's ${mac}. All three boot templates below follow this.
+	cmdline := fmt.Sprintf("%s BOOTIF=01-${netX/mac:hexhyp} boot=slagworks ip=dhcp slagworks.server=%s slagworks.image=%s",
+		console, server, h.cfg.DefaultImage)
+	if n := bootedCmdlineLen(cmdline); n > kernelCmdlineMax {
+		return h.overlongCmdlineScript(mac, n)
+	}
 	return fmt.Sprintf(`#!ipxe
 echo slagworks: booting kernel for mac %s
-kernel %s/vmlinuz %s BOOTIF=01-${netX/mac:hexhyp} boot=slagworks ip=dhcp slagworks.server=%s slagworks.image=%s
+kernel %s/vmlinuz %s
 initrd %s/initrd
 boot
-`, mac, base, console, server, h.cfg.DefaultImage, base)
+`, mac, base, cmdline, base)
 }
 
 // oobKernelArg returns the " slagworks.oob=amt" cmdline token for a machine
@@ -496,12 +540,17 @@ func (h *Handler) commissionBootScript(mac string) string {
 	// then tells configure_networking which NIC iPXE chainloaded on, so it
 	// DHCPs on the right (cabled-to-the-serving-leaf) port instead of
 	// guessing. Pxelinux convention, recognized by initramfs-tools.
+	cmdline := fmt.Sprintf("%s BOOTIF=01-${netX/mac:hexhyp} boot=slagworks ip=dhcp slagworks.server=%s slagworks.image=%s slagworks.mode=commission%s",
+		console, server, imageName, extras)
+	if n := bootedCmdlineLen(cmdline); n > kernelCmdlineMax {
+		return h.overlongCmdlineScript(mac, n)
+	}
 	return fmt.Sprintf(`#!ipxe
 echo slagworks: commission boot for mac %s
-kernel %s/vmlinuz %s BOOTIF=01-${netX/mac:hexhyp} boot=slagworks ip=dhcp slagworks.server=%s slagworks.image=%s slagworks.mode=commission%s
+kernel %s/vmlinuz %s
 initrd %s/initrd
 boot
-`, mac, base, console, server, imageName, extras, base)
+`, mac, base, cmdline, base)
 }
 
 func (h *Handler) deployBootScript(mac string) string {
@@ -653,6 +702,9 @@ func (h *Handler) deployBootScript(mac string) string {
 	}
 	cmdline += oobKernelArg(machine)
 	cmdline += extra
+	if n := bootedCmdlineLen(cmdline); n > kernelCmdlineMax {
+		return h.overlongCmdlineScript(mac, n)
+	}
 
 	return fmt.Sprintf(`#!ipxe
 echo slagworks: deploy boot for mac %s
