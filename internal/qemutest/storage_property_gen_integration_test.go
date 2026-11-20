@@ -245,6 +245,22 @@ func (g *propGen) genLayout(attach []string, keep []propArray, prev *propLayout)
 	}
 	g.rng.Shuffle(len(rest), func(i, j int) { rest[i], rest[j] = rest[j], rest[i] })
 	rootDisks = append(rootDisks, rest[:tp.n-1]...)
+	if bios && tp.level >= 0 && tp.level != 1 {
+		// GRUB reads the root array through the firmware's disk services,
+		// and SeaBIOS (like most legacy BIOSes) cannot read a 4Kn disk. A
+		// mirror boots from its 512-byte member alone; a striped or parity
+		// root needs every 4Kn member it spans, so it is kept to 512-byte
+		// disks (g2060: a BIOS RAID10 over two 512-byte and two 4Kn disks
+		// stopped at "Entering rescue mode"). A limit of the firmware, not
+		// a contract of the system under test.
+		for _, id := range rootDisks {
+			if g.c.disk(id).LBS == 4096 {
+				tp = topo{1, 2, 0}
+				rootDisks = rootDisks[:2]
+				break
+			}
+		}
+	}
 
 	sch := propRootScheme{
 		grub:      bios || g.chance(60),
