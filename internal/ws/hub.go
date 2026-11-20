@@ -328,6 +328,14 @@ type HubConfig struct {
 	// insert against pg log_envelopes; 10s is ample. Zero means 10s.
 	LogBatchTimeout time.Duration
 
+	// HeartbeatInterval is how often the hub sends each connected worker a
+	// heartbeat, and IdleTimeout how long it waits for bytes from a worker
+	// before dropping its connection as dead. Zero means the package's
+	// HeartbeatInterval and IdleTimeout, which the worker uses too; tests
+	// shorten them.
+	HeartbeatInterval time.Duration
+	IdleTimeout       time.Duration
+
 	// Version is the global daemon's own build SHA. The hub compares
 	// it against each connecting worker's Hello.Version and logs a
 	// WARN on mismatch — phase 1 of the version-pin rollout. Empty
@@ -400,6 +408,12 @@ func NewHub(cfg HubConfig) *Hub {
 	}
 	if cfg.LogBatchTimeout == 0 {
 		cfg.LogBatchTimeout = 10 * time.Second
+	}
+	if cfg.HeartbeatInterval == 0 {
+		cfg.HeartbeatInterval = HeartbeatInterval
+	}
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = IdleTimeout
 	}
 	if cfg.ObsHandler == nil {
 		cfg.ObsHandler = noopObservationHandler{}
@@ -1241,17 +1255,61 @@ func (c *workerConn) serve(ctx context.Context) error {
 		return err
 	}
 
+	// The hello reply is on the wire, so a heartbeat is a valid next
+	// message for the worker.
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+	go c.heartbeatLoop(heartbeatCtx)
+
 	// Steady-state read loop. For Plan 2 we accept hello only once
 	// per connection; subsequent messages are heartbeat / observation /
 	// op_update / log_lines / claim_op. A second hello is a protocol
 	// violation.
 	for {
-		env, err := c.conn.ReadMessage(ctx)
+		env, err := c.conn.ReadMessageIdle(ctx, c.hub.cfg.IdleTimeout)
+		if errors.Is(err, ErrPeerSilent) {
+			return fmt.Errorf("worker sent nothing for %s though it heartbeats every %s; dropping its connection, and it reconnects once its path to global delivers again: %w",
+				c.hub.cfg.IdleTimeout, HeartbeatInterval, err)
+		}
 		if err != nil {
 			return err
 		}
 		if err := c.dispatch(ctx, env); err != nil {
 			return err
+		}
+	}
+}
+
+// heartbeatLoop sends the worker a heartbeat every HeartbeatInterval until
+// ctx ends. Nothing else is guaranteed to flow from global to an idle site,
+// and without it the worker's ReadMessageIdle could not tell a quiet link
+// from a dead one. It writes directly rather than through outbound, so a
+// queued fan-out waiting on a slow database read cannot hold it up, and
+// its 10s write budget starts once it holds writeMu, so waiting behind a
+// message still being written does not count. A failed write force-closes
+// the connection, as a failed op-stream write does.
+func (c *workerConn) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(c.hub.cfg.HeartbeatInterval)
+	defer ticker.Stop()
+	write := func() error {
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return c.conn.WriteTyped(wctx, TypeHeartbeat, "", HeartbeatMsg{WorkerID: c.workerID})
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if err := write(); err != nil {
+			if ctx.Err() == nil {
+				c.log.Warn("heartbeat write failed; forcing reconnect", "err", err)
+				_ = c.conn.CloseNow()
+			}
+			return
 		}
 	}
 }
@@ -1514,7 +1572,9 @@ func (c *workerConn) dispatch(ctx context.Context, env Envelope) error {
 	switch env.Type {
 	case TypeHeartbeat:
 		// Heartbeat is fire-and-forget; refreshes last_seen_at. serial=nil
-		// leaves the stored serial (set at hello time) untouched.
+		// leaves the stored serial (set at hello time) untouched. Its
+		// arrival is what keeps an idle worker's connection up
+		// (ReadMessageIdle in serve).
 		if _, err := c.hub.cfg.Auth.TouchSiteWorker(c.slug, c.workerID, "", nil); err != nil {
 			c.log.Warn("heartbeat touch failed", "err", err)
 		}

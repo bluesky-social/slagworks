@@ -1,8 +1,10 @@
 package worker
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -134,6 +136,13 @@ type WSConn struct {
 	// while the WS read loop is already live answering RPCs
 	// concurrently on other goroutines (roast finding, 2026-07-13).
 	dhcpLeaseSource atomic.Pointer[func() []dhcp.LeaseInfo]
+
+	// heartbeatInterval and idleTimeout override ws.HeartbeatInterval
+	// (how often heartbeatLoop sends) and ws.IdleTimeout (how long the
+	// read loop waits for anything from global) when non-zero. Tests
+	// shorten them.
+	heartbeatInterval time.Duration
+	idleTimeout       time.Duration
 }
 
 // WSConnConfig carries the site worker identity + global endpoint.
@@ -425,6 +434,12 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 	if err := conn.WriteTyped(ctx, ws.TypeHello, "", hello); err != nil {
 		return false, fmt.Errorf("send hello: %w", err)
 	}
+	// Heartbeat from here on, for the life of the connection. Global drops
+	// a worker it hears nothing from for ws.IdleTimeout once it has
+	// replied to the hello, and applying that reply can take longer: a
+	// snapshot that brings a new boot image downloads it before this
+	// function reaches its read loop.
+	go w.heartbeatLoop(connCtx, conn)
 
 	// Read the hello reply — must be snapshot or no_change, and it MUST
 	// carry an op-stream Proto >= ours. A reply with an absent/lower Proto
@@ -506,14 +521,22 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 	}
 	w.drainMu.Unlock()
 
-	// Start heartbeat and outbox drain goroutines scoped to the
-	// per-connection context so they exit on disconnect.
-	go w.heartbeatLoop(connCtx, conn)
+	// Start the outbox drain goroutine scoped to the per-connection
+	// context so it exits on disconnect.
 	go w.drainLoop(connCtx, conn)
 
-	// Enter read loop.
+	// Enter read loop. Global heartbeats every ws.HeartbeatInterval, so
+	// silence for idleTimeout means the path to it stopped delivering:
+	// TCP gives no sign of that while something in the path keeps
+	// acknowledging what this worker writes, and every op_update written
+	// in the meantime is lost.
+	idle := cmp.Or(w.idleTimeout, ws.IdleTimeout)
 	for {
-		env, err := conn.ReadMessage(ctx)
+		env, err := conn.ReadMessageIdle(ctx, idle)
+		if errors.Is(err, ws.ErrPeerSilent) {
+			return true, fmt.Errorf("global sent nothing for %s though it heartbeats every %s; dropping the connection to reconnect: %w",
+				idle, ws.HeartbeatInterval, err)
+		}
 		if err != nil {
 			return true, fmt.Errorf("read: %w", err)
 		}
@@ -523,6 +546,9 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 			if err := w.applySnapshot(env.Data, false); err != nil {
 				return true, err
 			}
+		case ws.TypeHeartbeat:
+			// Global's keepalive. Its arrival is the point
+			// (ReadMessageIdle above); it carries nothing to act on.
 		case ws.TypeNoChange:
 			// No-op. Hub may send these during reconciliation as an
 			// explicit ack; we don't currently generate such a path
@@ -959,8 +985,14 @@ func (w *WSConn) drainOnce(ctx context.Context, conn *ws.Conn) {
 	}
 }
 
+// heartbeatLoop sends global a heartbeat every ws.HeartbeatInterval. Global
+// drops a connection it has heard nothing on for ws.IdleTimeout, so these
+// are what keep an idle site connected. The write has no deadline of its
+// own: it waits behind any message being written (a large observation on a
+// slow link can take minutes), and that message's bytes keep global's idle
+// timer running meanwhile.
 func (w *WSConn) heartbeatLoop(ctx context.Context, conn *ws.Conn) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(cmp.Or(w.heartbeatInterval, ws.HeartbeatInterval))
 	defer ticker.Stop()
 
 	for {

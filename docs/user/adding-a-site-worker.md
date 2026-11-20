@@ -116,6 +116,17 @@ Before the worker will function, the site needs:
 - **worker_id ↔ token binding is strict.** If `SLAGWORKS_WORKER_ID` in
   `site.env` doesn't match the id the token was registered for, the hub
   rejects the connection.
+- **Proxies and load balancers on the path.** Once connected, the worker
+  and global each send a heartbeat every 30 seconds, so the connection
+  carries traffic in both directions at least that often and an idle
+  timeout of 60 seconds or more on anything in between is fine. Either end
+  drops a connection it has heard nothing on for 90 seconds, so a path
+  that stops delivering without closing the connection (a load balancer
+  or NAT that lost its state) costs at most that long before the worker
+  reconnects; the worker's log says `global sent nothing for 1m30s` and
+  global's says `worker sent nothing for 1m30s`. Repeated drops like that
+  on an otherwise healthy site point at something in the path discarding
+  traffic.
 - **HA pairs.** A redundant gateway pair each runs its own worker with its
   own token and bind address; DHCP authority follows the externally-managed
   VIP (`SLAGWORKS_VIP` is watched, not managed — run keepalived or

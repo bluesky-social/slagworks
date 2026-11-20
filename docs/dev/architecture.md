@@ -491,6 +491,20 @@ Global to site:
   ops.
 - `power_status_request` / `boot_status_request` (`131`, `150`) —
   synchronous RPCs invoked by the API for operator reads.
+- `heartbeat` (`HeartbeatMsg`) — every 30 seconds, so an idle site still
+  hears from global.
+
+Both ends heartbeat every `ws.HeartbeatInterval` (30s) and read with
+`Conn.ReadMessageIdle`, which drops the connection when nothing has
+arrived for `ws.IdleTimeout` (90s). That is how either end notices a path
+that stopped delivering without a FIN or RST; TCP alone reports it only
+when retransmission gives up, or never when something in the path keeps
+acknowledging. The timer restarts on each 32 KiB of a message as it
+arrives, so a large message on a slow link is not cut. These are messages
+rather than WebSocket pings because coder/websocket answers a ping from
+inside the receiver's read and fails that read when the pong cannot be
+written within 5 seconds, which it cannot while a large message is being
+written ahead of it.
 
 There is a generic `rpc_response` envelope (line 319) with a
 `Terminal` flag, and the slagctl-side stream types
@@ -523,6 +537,9 @@ cast pipeline, and the `SourceSOL` constant no longer exists.
   is still answered from a snapshot cached meanwhile (by a push, or by
   another worker's hello); it is refused with `rebuild_failed` only when
   the cache is still empty.
+- After the hello reply, heartbeats the worker every 30 seconds
+  (`workerConn.heartbeatLoop`) and drops a connection that has sent
+  nothing for 90 seconds.
 - Dispatches inbound envelopes per type (`dispatch`, 701) to
   handlers implemented in `internal/hubhandlers`:
   `handleObservation` (789), `handleOpUpdate` (837),
@@ -584,6 +601,10 @@ polling loop.
 - Outbound drain loops: `drainLoop` (579) for observations and op
   updates, `logRingDrainLoop` (601), `castDrainLoop` (701),
   `heartbeatLoop` (670).
+- `heartbeatLoop` starts as soon as the hello is sent, because applying
+  the hello reply can download a boot image for longer than global waits
+  for a silent worker. The read loop drops the connection and reconnects
+  when global has sent nothing for 90 seconds; global heartbeats every 30.
 - RPC surface: `handlePowerStatus` (760) and `handleBootStatus`
   (840) are called on the receive path when the hub asks for a
   synchronous power or boot read; the controller is built by the
