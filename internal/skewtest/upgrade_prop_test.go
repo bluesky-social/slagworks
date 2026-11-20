@@ -160,7 +160,6 @@ type mach struct {
 	id, mac, serial string
 	ops             []*opRec // lifecycle ops, oldest first
 	powerOps        []*opRec
-	actSeen         int // lifecycle actuations counted in the current worker process
 }
 
 func (m *mach) cur() *opRec {
@@ -226,6 +225,9 @@ type world struct {
 	// refuses is true when the two builds refuse each other's worker
 	// connections.
 	refuses bool
+	// logScanned is how much of the current worker's log checkActuations
+	// has read.
+	logScanned int
 	// noWait makes createOp return without waiting for the claim.
 	noWait     bool
 	healthOnly bool
@@ -294,6 +296,14 @@ func (w *world) startGlobal(ver string) {
 		p.kill()
 		time.Sleep(250 * time.Millisecond)
 	}
+	if err != nil && strings.Contains(err.Error(), "address already in use") {
+		// Something outside this test took the port while global was
+		// down. That says nothing about slagworks: drop the case.
+		p.kill()
+		if sk, ok := w.f.(interface{ Skipf(string, ...any) }); ok {
+			sk.Skipf("harness: the global's port %s was taken by another process: %v", w.gAddr, err)
+		}
+	}
 	if err != nil {
 		w.g = p
 		w.fail("health: global (%s build) did not start on this database: %v", w.tag(ver), err)
@@ -315,24 +325,29 @@ func (w *world) stopGlobal(kill bool) {
 }
 
 func (w *world) startWorker(ver string) {
-	p := startProc(w.f, w.bin(ver), "worker-"+w.tag(ver))
-	w.wHTTP = freePort(w.f)
-	var info struct {
-		Outbox int `json:"rehydrated_outbox"`
+	var p *proc
+	var err error
+	// The worker's HTTP port can be any port; if another process on the
+	// host takes the one picked before the tool binds it, pick again.
+	for attempt := 0; attempt < 20; attempt++ {
+		p = startProc(w.f, w.bin(ver), "worker-"+w.tag(ver))
+		w.wHTTP = freePort(w.f)
+		err = p.call("w.start", map[string]any{
+			"db": w.dbPath, "url": "http://" + w.gAddr, "token": w.token, "worker_id": w.worker,
+			"serial": "SKEWWORKER1", "http_addr": w.wHTTP, "version": w.tag(ver),
+		}, nil)
+		if err == nil || !strings.Contains(err.Error(), "address already in use") {
+			break
+		}
+		p.kill()
 	}
-	err := p.call("w.start", map[string]any{
-		"db": w.dbPath, "url": "http://" + w.gAddr, "token": w.token, "worker_id": w.worker,
-		"serial": "SKEWWORKER1", "http_addr": w.wHTTP, "version": w.tag(ver),
-	}, &info)
 	if err != nil {
 		w.w = p
 		w.fail("health: worker (%s build) did not start on this worker.db: %v", w.tag(ver), err)
 	}
 	w.w, w.wVer, w.wDown = p, ver, false
 	w.wGen++
-	for _, m := range w.machines {
-		m.actSeen = 0
-	}
+	w.logScanned = 0
 }
 
 func (w *world) stopWorker(kill bool) {
@@ -560,31 +575,53 @@ func (w *world) checkActuations() {
 	if w.w == nil {
 		return
 	}
-	s := w.status()
-	for _, m := range w.machines {
-		n := s.Actuations[m.id]["power_cycle"] + s.Actuations[m.id]["power_on"]
-		if n <= m.actSeen {
+	// The executor logs each lifecycle power write with the op it is for
+	// ("PXE boot set, cycling power" or "powering on", the same line in
+	// every release so far). Reading that, not the fake BMC's per-machine
+	// counter, is what tells an aborted op's late power cycle from the
+	// next op's first.
+	log := w.w.stderr.String()
+	fresh := log[w.logScanned:]
+	if cut := strings.LastIndexByte(fresh, '\n'); cut >= 0 {
+		fresh = fresh[:cut+1]
+	} else {
+		fresh = ""
+	}
+	w.logScanned += len(fresh)
+	for _, line := range strings.Split(fresh, "\n") {
+		if !strings.Contains(line, `"msg":"PXE boot set, `) {
 			continue
 		}
-		delta := n - m.actSeen
-		m.actSeen = n
-		w.st.actuations += delta
-		w.note("executor actuated %s (%d power writes)", m.serial, delta)
-		if len(m.powerOps) > 0 {
-			// A power op actuates by design; with one in play for this
-			// machine the counter cannot tell the two apart.
-			continue
+		var entry struct {
+			OpID      string `json:"op_id"`
+			MachineID string `json:"machine_id"`
 		}
-		o := m.cur()
+		if err := json.Unmarshal([]byte(line), &entry); err != nil || entry.OpID == "" {
+			w.fail("harness: cannot read the executor's power-write log line: %v: %s", err, line)
+		}
+		var m *mach
+		var o *opRec
+		for _, cand := range w.machines {
+			for _, rec := range cand.ops {
+				if rec.id == entry.OpID {
+					m, o = cand, rec
+				}
+			}
+		}
+		w.st.actuations++
+		if o == nil {
+			w.fail("actuate: the executor power-cycled machine %s for op %s, which the harness never created as a lifecycle op", entry.MachineID, entry.OpID)
+		}
+		w.note("executor actuated %s for op %s", m.serial, short(o.id))
 		switch {
-		case o == nil:
-			w.fail("actuate: the executor power-cycled %s with no op created for it", m.serial)
 		case w.healthOnly:
 		case (o.completeAck || o.phoneAck) && o.selfBooted:
 			w.st.lateClaimActuations++
 		case o.completeAck || o.phoneAck:
-			w.fail("actuate: the executor power-cycled %s into PXE a second time for op %s, after the agent reported it complete (complete=%v phone_home=%v)",
+			w.fail("actuate: the executor power-cycled %s into PXE for op %s after the agent reported that op complete (complete=%v phone_home=%v), and the host had not booted on its own before the claim",
 				m.serial, o.id, o.completeAck, o.phoneAck)
+		case o.actuated && o.reports > 0:
+			w.fail("actuate: the executor power-cycled %s into PXE a second time for op %s, after its agent had started reporting", m.serial, o.id)
 		case o.reports == 0:
 			o.actuated = true
 		}
