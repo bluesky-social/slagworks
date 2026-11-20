@@ -1025,6 +1025,121 @@ func TestHub_ObservationHandlerError_RepliesWithError(t *testing.T) {
 	}
 }
 
+// leaseOrderProbe is an ObservationHandler that records when the handling
+// of each dhcp_lease observation starts and ends. The first one it gets
+// holds on for a while, as the ledger handler does while it waits for a
+// database connection, and lets go early if a second one starts meanwhile.
+type leaseOrderProbe struct {
+	mu      sync.Mutex
+	events  []string
+	calls   int
+	second  chan struct{} // closed when a second handler starts
+	holdFor time.Duration
+}
+
+func (p *leaseOrderProbe) HandleObservation(_ context.Context, obs model.Observation) error {
+	var ev model.DHCPLeaseEvent
+	if err := json.Unmarshal(obs.Data, &ev); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.calls++
+	first := p.calls == 1
+	if p.calls == 2 {
+		close(p.second)
+	}
+	p.events = append(p.events, "start "+ev.Event)
+	p.mu.Unlock()
+	if first {
+		select {
+		case <-p.second:
+		case <-time.After(p.holdFor):
+		}
+	}
+	p.mu.Lock()
+	p.events = append(p.events, "end "+ev.Event)
+	p.mu.Unlock()
+	return nil
+}
+
+// TestHub_HandlesAWorkersDHCPLeaseObservationsOneAtATimeInArrivalOrder: the
+// lease ledger (store.RecordDHCPLeaseEvent) folds a worker's allocate,
+// renew and delete events, and the fold depends on their order: a delete
+// applied before the allocate it follows finds no open row and does
+// nothing, and the allocate then opens a row for a lease the worker no
+// longer holds. The worker sends its outbox in order on one connection,
+// without waiting for each ack, and after an outage sends the backlog in
+// one burst, so the hub must finish one dhcp_lease observation before it
+// starts the next.
+func TestHub_HandlesAWorkersDHCPLeaseObservationsOneAtATimeInArrivalOrder(t *testing.T) {
+	h, auth, _ := newTestHub(t)
+	auth.register("tok-1", "pop3", "worker-1")
+	probe := &leaseOrderProbe{second: make(chan struct{}), holdFor: 300 * time.Millisecond}
+	h.cfg.ObsHandler = probe
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// One lease, granted and then released: two outbox rows, sent back
+	// to back as the worker's drain sends them.
+	reqIDs := map[string]string{}
+	for _, event := range []string{"allocate", "delete"} {
+		data, err := json.Marshal(model.DHCPLeaseEvent{
+			Event: event, MAC: "02:00:00:00:00:01", IP: "192.0.2.20",
+			Kind: "dynamic", Pool: "ephemeral",
+			ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reqID := "req-lease-" + event
+		reqIDs[reqID] = event
+		if err := conn.WriteTyped(ctx, TypeObservation, reqID, ObservationMsg{
+			Event: "dhcp_lease", Timestamp: time.Now().UTC().Format(time.RFC3339), Data: data,
+		}); err != nil {
+			t.Fatalf("send %s: %v", event, err)
+		}
+	}
+
+	var acked []string
+	for len(acked) < 2 {
+		env, err := conn.ReadMessage(ctx)
+		if err != nil {
+			t.Fatalf("waiting for both acks (got %v): %v", acked, err)
+		}
+		if env.Type != TypeRPCResponse {
+			continue
+		}
+		event, ok := reqIDs[env.RequestID]
+		if !ok {
+			t.Fatalf("rpc_response for unknown request_id %q", env.RequestID)
+		}
+		acked = append(acked, event)
+	}
+
+	probe.mu.Lock()
+	got := append([]string(nil), probe.events...)
+	probe.mu.Unlock()
+	want := []string{"start allocate", "end allocate", "start delete", "end delete"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("the hub handled one worker's dhcp_lease observations as %v, want %v: "+
+			"a later lease event ran while an earlier one was still being handled, "+
+			"so the ledger can apply the delete before the allocate and leave the lease open", got, want)
+	}
+	if fmt.Sprint(acked) != "[allocate delete]" {
+		t.Fatalf("acks arrived as %v, want [allocate delete]", acked)
+	}
+}
+
 func waitUntil(t *testing.T, cond func() bool, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

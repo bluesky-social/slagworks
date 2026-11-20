@@ -63,6 +63,11 @@ type Rebuilder interface {
 // rpc_response{error:"..."} and the worker leaves the outbox row for
 // the next reconnect to replay. Handlers MUST be idempotent — see
 // internal/commission for the commission-report path.
+//
+// The hub calls the handler from a goroutine per observation, so calls
+// overlap and can finish in any order, except for dhcp_lease: those it
+// handles on the connection's read loop, one at a time, in the order the
+// worker sent them (see workerConn.dispatch).
 type ObservationHandler interface {
 	HandleObservation(ctx context.Context, obs model.Observation) error
 }
@@ -1515,12 +1520,37 @@ func (c *workerConn) dispatch(ctx context.Context, env Envelope) error {
 		}
 		return nil
 	case TypeObservation:
-		// Run handler in a goroutine so one slow observation (e.g.
+		var msg ObservationMsg
+		if err := unmarshalData(env.Data, &msg); err != nil {
+			c.log.Warn("malformed observation", "req_id", env.RequestID, "err", err)
+			c.replyObservation(env.RequestID, fmt.Errorf("decode observation: %w", err))
+			return nil
+		}
+		if msg.Event == "dhcp_lease" {
+			// Process synchronously, in arrival order. The lease ledger
+			// folds a worker's allocate, renew and delete events and the
+			// fold is order-dependent: a delete handled before the
+			// allocate it follows finds no open row and does nothing,
+			// and the allocate then opens a row nothing closes. The
+			// worker sends its outbox in order without waiting for acks
+			// (a reconnect replays the whole backlog in one burst), so a
+			// goroutine per event races them, and concurrent upserts for
+			// one MAC or IP also collide on the ledger's open-row unique
+			// indexes. The handler is one short transaction with no
+			// NetBox call, the same shape as op_update below.
+			//
+			// This orders what arrives on one connection. A row the
+			// worker re-sends, after global rejected it or after a
+			// reconnect, can still arrive behind newer rows.
+			c.handleObservation(ctx, env.RequestID, msg)
+			return nil
+		}
+		// Run other handlers in a goroutine so one slow observation (e.g.
 		// commission_report hitting a sluggish NetBox) doesn't block
 		// the read loop. Each observation carries its own request_id;
 		// responses can arrive out of order and the worker tracks the
 		// mapping on its side.
-		go c.handleObservation(ctx, env)
+		go c.handleObservation(ctx, env.RequestID, msg)
 		return nil
 	case TypeOpUpdate:
 		// Process synchronously. Spawning a goroutine would break
@@ -1598,14 +1628,13 @@ func (c *workerConn) dispatch(ctx context.Context, env Envelope) error {
 	}
 }
 
-// handleObservation decodes an observation envelope and dispatches to
-// the configured ObservationHandler, then sends an rpc_response
-// carrying the handler's outcome. The worker's ackPending map keys
-// on request_id, so we must ALWAYS reply with the same request_id
-// the worker sent — even on decode error — or the outbox row will
+// handleObservation dispatches a decoded observation to the configured
+// ObservationHandler, then sends an rpc_response carrying the handler's
+// outcome. The worker's ackPending map keys on request_id, so we must
+// ALWAYS reply with the same request_id the worker sent (dispatch does
+// so for an observation it cannot decode, too) or the outbox row will
 // never ack and the worker will replay forever.
-func (c *workerConn) handleObservation(parent context.Context, env Envelope) {
-	reqID := env.RequestID
+func (c *workerConn) handleObservation(parent context.Context, reqID string, msg ObservationMsg) {
 	if reqID == "" {
 		// No request_id means the worker doesn't want an ack. Still
 		// run the handler so the side effects happen, but don't send
@@ -1613,12 +1642,6 @@ func (c *workerConn) handleObservation(parent context.Context, env Envelope) {
 		c.log.Debug("observation without request_id, running handler without ack")
 	}
 
-	var msg ObservationMsg
-	if err := unmarshalData(env.Data, &msg); err != nil {
-		c.log.Warn("malformed observation", "req_id", reqID, "err", err)
-		c.replyObservation(reqID, fmt.Errorf("decode observation: %w", err))
-		return
-	}
 	obs := model.Observation{
 		MachineID:   msg.MachineID,
 		OperationID: msg.OperationID,

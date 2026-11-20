@@ -287,7 +287,7 @@ Worker to global:
 |---|---|
 | `hello` | `{"worker_id","fqdn","last_seq_num","version","proto","serial","smcipmitool"}`. |
 | `heartbeat` | `{"worker_id"}`. Refreshes `site_workers.last_seen_at`. No reply. |
-| `observation` | An outbox entry: `{"machine_id","op_id","event","timestamp","data"}`. Events: `commission_report`, `deploy_complete`, `bmc_reconcile_report`, `dhcp_lease`, `phone_home`, `inventory_import`. Acknowledged with `rpc_response`. |
+| `observation` | An outbox entry: `{"machine_id","op_id","event","timestamp","data"}`. Events: `commission_report`, `deploy_complete`, `bmc_reconcile_report`, `dhcp_lease`, `phone_home`, `inventory_import`. Acknowledged with `rpc_response`. Global handles a connection's `dhcp_lease` observations one at a time, in the order they arrive, because the lease ledger folds them in order; other events are handled concurrently and can be acknowledged out of order. |
 | `op_update` | `{"op_id","status","phase","result"}`. Processed in order; no reply. |
 | `log_batch` | `{"envelopes":[...]}`. The site worker sends at most 256 envelopes per batch whose encoded envelopes total at most 4 MiB (the array and message wrapper add a little), and drops a single envelope over 4 MiB, counting it in `slagworks_site_logring_dropped_total`; global enforces only the 16 MiB message limit. Persisted to `log_envelopes` and re-emitted on global's stdout. Every envelope must be `source=agent` or `site`; a batch carrying any other source (`global` is global's own op-lifecycle events) is dropped whole. |
 | `claim_op` | `{"op_id"}`. Global replies with `claim_op_response`. |
