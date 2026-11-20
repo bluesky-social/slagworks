@@ -283,7 +283,8 @@ this command (or run it on a cron).`,
 var sha256Pattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // shortSHA256 returns the first 12 characters of an image row's sha256, the
-// prefix operators compare against a worker's on-disk <name>.sha256 marker.
+// prefix operators compare against the version directory a worker's on-disk
+// <name> link names (<name>@<first 16 hex digits>).
 // Rows are normally written with a 64-char hex digest, but the API checks
 // only that sha256 is non-empty, so a hand-registered value can be shorter;
 // that is returned whole rather than panicking on the slice.

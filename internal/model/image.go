@@ -9,8 +9,8 @@ import (
 )
 
 // imageNameRE is what an image name may look like. The name becomes the
-// image's directory under the site worker's images dir (and its
-// <name>.sha256 marker beside it), so it must be one plain path element:
+// image's link under the site worker's images dir (and the prefix of its
+// <name>@<sha16> version directories), so it must be one plain path element:
 // starting with a letter or digit rules out "", ".", "..", and hidden
 // names, and the character set rules out separators. Lowercase only, so
 // two names cannot share a directory on a case-insensitive filesystem
