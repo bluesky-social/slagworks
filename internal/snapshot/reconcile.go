@@ -129,6 +129,7 @@ func (r *Reconciler) tick(ctx context.Context) {
 		r.log.Error("list site_configs", "err", err)
 		return
 	}
+	r.forgetDeletedStale(cfgs)
 
 	// Phase 1: per-site ListDevicesForSite + OnDeviceUpdated, collecting
 	// the union of device IDs seen anywhere. Missing-device detection is
@@ -142,7 +143,7 @@ func (r *Reconciler) tick(ctx context.Context) {
 	}
 	var processed []siteCtx
 	for _, cfg := range cfgs {
-		seen, ok := r.reconcileSiteDevices(ctx, cfg)
+		seen, ok := r.reconcileSiteDevices(ctx, cfg, cfgs)
 		if !ok {
 			continue
 		}
@@ -192,7 +193,10 @@ func (r *Reconciler) tick(ctx context.Context) {
 // scoped to the config's claim (location subtree for a location-scoped
 // config) BEFORE mirroring, so a dual-cage site's two configs each
 // mirror only their own cage's devices — no cross-cage double-mirror.
-func (r *Reconciler) reconcileSiteDevices(ctx context.Context, cfg model.SiteConfig) (map[int]bool, bool) {
+// all is every site_config; a config whose claim now overlaps another
+// one's on the same site is flagged stale like a config whose location
+// is gone.
+func (r *Reconciler) reconcileSiteDevices(ctx context.Context, cfg model.SiteConfig, all []model.SiteConfig) (map[int]bool, bool) {
 	slug := cfg.Slug
 	nbSite := cfg.NetBoxSite
 	siteRef, err := r.nb.GetSiteBySlug(ctx, nbSite)
@@ -206,15 +210,16 @@ func (r *Reconciler) reconcileSiteDevices(ctx context.Context, cfg model.SiteCon
 		return nil, false
 	}
 
-	// Resolve scope (and enforce the belongs-to invariant). A
-	// location-scoped config whose location is gone / re-parented is
-	// stale, not silently empty.
+	// Resolve scope (and enforce the belongs-to and partition invariants).
+	// A location-scoped config whose location is gone / re-parented to
+	// another site is stale, not silently empty; so is one whose location
+	// now nests with a sibling config's.
 	locations, err := r.nb.ListLocationsForSite(ctx, nbSite)
 	if err != nil {
 		r.log.Error("list locations", "config", slug, "netbox_site", nbSite, "err", err)
 		return nil, false
 	}
-	scope, err := resolveScope(cfg, nbSite, locations)
+	scope, err := resolveClaimScope(cfg, all, locations)
 	if err != nil {
 		r.markStale(slug, err.Error())
 		return nil, false
@@ -358,5 +363,28 @@ func (r *Reconciler) clearStale(slug string) {
 	delete(r.stale, slug)
 	if r.metrics != nil {
 		r.metrics.SiteStale.WithLabelValues(slug).Set(0)
+	}
+}
+
+// forgetDeletedStale drops the stale flag and gauge series of every slug
+// that is no longer a site_config. A tick visits only current configs, so
+// without this a config deleted while stale (one way to repair an overlap
+// or a gone location) would stay in /healthz stale_sites and keep
+// slagworks_site_stale at 1 for the life of the process.
+func (r *Reconciler) forgetDeletedStale(cfgs []model.SiteConfig) {
+	current := make(map[string]bool, len(cfgs))
+	for _, c := range cfgs {
+		current[c.Slug] = true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for slug := range r.stale {
+		if current[slug] {
+			continue
+		}
+		delete(r.stale, slug)
+		if r.metrics != nil {
+			r.metrics.SiteStale.DeleteLabelValues(slug)
+		}
 	}
 }
