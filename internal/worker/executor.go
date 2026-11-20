@@ -199,6 +199,13 @@ func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
 }
 
 // runPowerOp executes a power operation after it has been claimed.
+//
+// It records the op type as the op's phase before opening the controller,
+// as runBMCReconcile does: the phase is the execution evidence the
+// orphaned-claim sweep (store.ExpireOrphanedClaims) looks for, and a power
+// op can outlive the sweep's 2-minute claimed-no-phase grace while the
+// worker is still driving it (bmclib calls of up to 30s each on a slow BMC,
+// a PDU cycle's 60s off-window plus up to 150s of polling).
 func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 	log := e.log.With("op_id", op.ID, "type", op.Type, "machine_id", op.MachineID)
 
@@ -208,6 +215,8 @@ func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 		e.cache.RecordOpUpdate(op.ID.String(), "failed", json.RawMessage(`{"error":"machine not in cache"}`))
 		return
 	}
+
+	e.cache.UpdateOpPhase(op.ID.String(), string(op.Type))
 
 	ctrl, ok := e.openController(ctx, log, op, m)
 	if !ok {
@@ -354,6 +363,19 @@ func (e *Executor) openController(ctx context.Context, log *slog.Logger, op mode
 // runLifecycleOp drives a commission or deploy operation: set PXE boot and
 // power cycle the machine. The agent running on the machine reports completion
 // back to the site worker asynchronously; the executor's job ends here.
+//
+// Phases: power_cycle is recorded before the controller is opened and covers
+// every BMC/PDU/AMT call up to and including the cycle; pxe_booting follows
+// once the cycle has returned. power_cycle comes first because the phase is
+// the execution evidence the orphaned-claim sweep (store.ExpireOrphanedClaims)
+// looks for, and the controller calls can outlast its 2-minute
+// claimed-no-phase grace while the worker is still driving the op (bmclib
+// calls of up to 30s each on a slow BMC, a PDU cycle's 60s off-window plus up
+// to 150s of polling). Both deploy and commission boot the machine the same
+// way and share the boot-prefix spine (lifecycle.go: commissionSpine reuses
+// phases 1-6), so both emit these markers. PrepareDeployLogs sets the
+// current-op pointer for stale-insert rejection on the per-machine log ring;
+// it applies to any booting op, not just deploy.
 func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 	log := e.log.With("op_id", op.ID, "type", op.Type, "machine_id", op.MachineID)
 
@@ -363,6 +385,10 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 		e.cache.RecordOpUpdate(op.ID.String(), "failed", json.RawMessage(`{"error":"machine not in cache"}`))
 		return
 	}
+
+	e.cache.PrepareDeployLogs(op.MachineID.String(), op.ID.String())
+	e.cache.UpdateOpPhase(op.ID.String(), "power_cycle")
+
 	ctrl, ok := e.openController(ctx, log, op, m)
 	if !ok {
 		return
@@ -399,19 +425,9 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 
 	// The agent on the machine will report back completion via the reporter.
 	// Mark op as running so the executor doesn't re-drive it on the next tick.
-	// Set the initial boot-prefix phases (power_cycle -> pxe_booting) so the
-	// watch TUI's lifecycle pane animates from the moment we cycle power,
-	// rather than sitting all-pending until the agent's first phone-home.
-	// Both deploy and commission boot the machine the same way and share the
-	// boot-prefix spine (lifecycle.go: commissionSpine reuses phases 1-6), so
-	// both emit these markers. PrepareDeployLogs sets the current-op pointer
-	// for stale-insert rejection on the per-machine log ring; it applies to
-	// any booting op, not just deploy.
-	if op.Type == model.OpDeploy || op.Type == model.OpCommission {
-		e.cache.PrepareDeployLogs(op.MachineID.String(), op.ID.String())
-		e.cache.UpdateOpPhase(op.ID.String(), "power_cycle")
-		e.cache.UpdateOpPhase(op.ID.String(), "pxe_booting")
-	}
+	// pxe_booting keeps the watch TUI's lifecycle pane moving until the
+	// target's first DHCP or the agent's first report.
+	e.cache.UpdateOpPhase(op.ID.String(), "pxe_booting")
 	e.cache.MarkOpStatus(op.ID.String(), model.OpRunning)
 	log.Info("machine booting to PXE, waiting for agent report", "op_type", op.Type)
 }

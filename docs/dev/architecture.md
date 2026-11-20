@@ -647,10 +647,14 @@ operations. `Run` (85) ticks every 5 seconds and calls `processOps`
 - On success: dispatch to `runLifecycleOp` (288) for deploy /
   commission, or `runPowerOp` (151) for power ops.
 
-`runLifecycleOp` sets the BMC PXE boot device, power-cycles (or powers
-on if off), emits phases `power_cycle` and `pxe_booting`, and marks
-the op running. The agent's phone-home is what eventually completes
-the op — the executor exits early and does not block on the deploy.
+`runLifecycleOp` emits phase `power_cycle`, sets the BMC PXE boot
+device, power-cycles (or powers on if off), emits phase `pxe_booting`,
+and marks the op running. The agent's phone-home is what eventually
+completes the op — the executor exits early and does not block on the
+deploy. `runPowerOp` emits the op type as its phase before it opens the
+controller. Each records its first phase before any BMC, PDU or AMT
+call, because global's orphaned-claim sweep fails an op still claimed
+with no phase 2 minutes after the claim.
 
 Power ops decode the runtime blob out of `op.Params`. The
 `PowerControllerFactory` (`cmd/slagworksd/site.go:1123`) picks:
