@@ -190,9 +190,10 @@ func (w *cliWorld) writeCacheFile(t *rapid.T, v any) {
 
 // advance moves the virtual clock forward by d and, as the client half of
 // that, moves the cached expiry and the cached access token's exp claim back
-// by d under the cache lock.
+// by d. Both happen under the cache lock, which every refresh holds: a
+// command running alongside (a watch, a follow) cannot refresh in between
+// and have its new token aged by an advance that came before it.
 func (w *cliWorld) advance(t *rapid.T, d time.Duration) {
-	w.clock.Advance(d)
 	if err := os.MkdirAll(filepath.Dir(w.tokenPath()), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +202,7 @@ func (w *cliWorld) advance(t *rapid.T, d time.Duration) {
 		t.Fatal(err)
 	}
 	defer func() { _ = lk.Unlock() }()
+	w.clock.Advance(d)
 	s := w.session()
 	if s == nil {
 		return
@@ -285,10 +287,17 @@ func (m *cliModel) newSession(n string) {
 }
 
 // sync notices a rotated or replaced token in the cache: its access token is
-// new, so its age starts over and it is signed with the server's current key.
+// new, so its age is the virtual time since the provider issued it (a watch
+// can refresh and then sleep through an advance before the model looks), and
+// it is signed with the server's current key.
 func (m *cliModel) sync(w *cliWorld) {
-	if s := w.session(); s != nil && s.Token.RefreshToken != m.rt {
-		m.rt, m.born, m.virt, m.retired = s.Token.RefreshToken, time.Now(), 0, false
+	s := w.session()
+	if s == nil || s.Token.RefreshToken == m.rt {
+		return
+	}
+	m.rt, m.born, m.virt, m.retired = s.Token.RefreshToken, time.Now(), 0, false
+	if info, ok := w.reg.Lookup(s.Token.AccessToken); ok {
+		m.virt = w.clock.Now().Sub(info.Issued)
 	}
 }
 
@@ -710,6 +719,7 @@ func (w *cliWorld) watch(t *rapid.T, stats *cliStats, m *cliModel, i int, op cli
 	for _, s := range op.sub {
 		switch s {
 		case "advance":
+			m.sync(w) // the watch may have refreshed since the model last looked
 			w.advance(t, 11*time.Minute)
 			m.virt += 11 * time.Minute
 		case "drop":
@@ -769,9 +779,11 @@ func (w *cliWorld) follow(t *rapid.T, stats *cliStats, m *cliModel, i int, op cl
 	for _, s := range op.sub {
 		switch s {
 		case "advance":
+			m.sync(w) // the follow may have refreshed since the model last looked
 			w.advance(t, 11*time.Minute)
 			m.virt += 11 * time.Minute
 		case "retire":
+			m.sync(w)
 			w.api[n].RotateKeys()
 			m.retired = true
 		case "drop":
