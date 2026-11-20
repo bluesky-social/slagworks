@@ -29,6 +29,7 @@ import (
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/power"
 	"github.com/bluesky-social/slagworks/internal/power/smcipmitool"
+	"github.com/bluesky-social/slagworks/internal/sdnotify"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/tftp"
 	"github.com/bluesky-social/slagworks/internal/worker"
@@ -502,6 +503,20 @@ func runSite(cmd *cobra.Command, args []string) error {
 			"site_slug", siteInfo.Slug,
 			"server_ip", cfg.serverIP,
 		)
+	}
+
+	// Report readiness for what this process does on its own: its site
+	// services are running (a standby is watching for its VIP), from the
+	// cached snapshot if global has not answered within the wait above.
+	// It deliberately does not wait for global: the unit is Type=notify
+	// with systemd's start timeout, so tying READY=1 to an accepted hello
+	// would have systemd kill and restart a serving worker for as long as
+	// global is unreachable or refuses it. Sent only after the start-up
+	// error returns above, so a worker that cannot start its services
+	// still fails its start. The connection to global is reported by
+	// /readyz and slagworks_site_ws_connected.
+	if err := sdnotify.Send(sdnotify.Ready); err != nil {
+		log.Warn("sd_notify READY=1 failed", "err", err)
 	}
 
 	<-ctx.Done()

@@ -103,7 +103,8 @@ Two systemd units ship (`deploy/systemd/`):
   `PrivateTmp=yes`, `NoNewPrivileges=yes`). `Restart=on-failure`.
 - `slagworksd-site.service` — runs `/usr/bin/slagworksd site` as
   **root** with env from `/etc/slagworks/site.env`. `Type=notify` (the
-  worker signals readiness once connected) and `Restart=always`. It runs
+  worker signals readiness once its boot services are running, whether or
+  not global is reachable) and `Restart=always`. It runs
   as root because it binds raw DHCP sockets and ports 67/69, reads the
   host's SMBIOS serial, and replaces its own package during auto-upgrade.
 
@@ -234,10 +235,13 @@ State:
 - **SQLite** at `SLAGWORKS_DATA_DIR/worker.db` (default
   `/var/lib/slagworks/worker.db`): the last snapshot, the worker
   identity, DHCP leases and the observation outbox. A worker that starts
-  while global is unreachable serves from the cached snapshot. The
-  packaged unit is `Type=notify` and the worker reports ready only after
-  its first successful connection, so while global stays unreachable
-  systemd's start timeout (90 seconds by default) applies to it.
+  while global is unreachable, or refuses it, serves from the cached
+  snapshot. It waits up to 5 seconds for global's first snapshot, starts
+  its services, and then reports ready to systemd (`Type=notify`) whether
+  or not it is connected, so systemd's start timeout never depends on
+  global. A worker with no cached snapshot and no connection is therefore
+  `active` while serving nothing; `/readyz` and the
+  `slagworks_site_ws_connected` metric say whether it is connected.
 - **Image cache** in `SLAGWORKS_IMAGES_DIR` (default `/srv/images`; set it
   to `/var/lib/slagworks/images` for package installs, see
   [configuration](configuration.md#slagworksd-site)). On every snapshot apply

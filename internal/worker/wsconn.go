@@ -422,7 +422,6 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 
 	w.connected.Store(true)
 	w.syncedOnce.Do(func() { close(w.syncedCh) })
-	_ = sdnotify.Send(sdnotify.Ready)
 	w.log.Info("WebSocket connected",
 		"seq", w.cache.LastSeqNum(),
 		"machines", w.cache.MachineCount(),

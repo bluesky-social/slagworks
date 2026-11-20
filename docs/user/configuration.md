@@ -284,7 +284,9 @@ executor, so that worker never claims operations.
 ### Other inputs
 
 - **`NOTIFY_SOCKET`** — set by systemd for the `Type=notify` site unit;
-  the worker reports readiness through it.
+  the worker reports readiness through it once its boot services are
+  running. That does not wait for global; `/readyz` reports the
+  connection.
 - The worker shells out to `ipmitool` (SOL console capture, BMC user
   reconcile, the chassis-serial fallback) and `dmidecode` (hardware
   serial). Both are looked up on `PATH`.
