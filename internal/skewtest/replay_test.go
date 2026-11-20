@@ -193,7 +193,9 @@ func TestReplayAfterGlobalRestart(t *testing.T) {
 			}
 
 			// What the burst cost.
-			time.Sleep(500 * time.Millisecond) // let the op updates behind the observations be handled
+			// The op updates travel behind the observations and are not
+			// acknowledged: give them a bounded time to be handled.
+			eventually(10*time.Second, func() bool { return w.dump().op(o2.id).Phase == "finalizing" })
 			glog := w.g.stderr.String()
 			obsFailed := strings.Count(glog, `"msg":"observation handler failed"`)
 			updFailed := strings.Count(glog, `"msg":"op_update handler failed"`)

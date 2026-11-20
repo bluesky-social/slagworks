@@ -104,7 +104,20 @@ func TestMain(m *testing.M) {
 				fmt.Fprintln(os.Stderr, "skewtest:", err)
 				return 1
 			}
-			if err := os.WriteFile(filepath.Join(dst, "main.go"), src, 0o644); err != nil {
+			// With SKEW_OLD_TREE the tree is the caller's: leave it as it
+			// was found.
+			driver := filepath.Join(dst, "main.go")
+			previous, readErr := os.ReadFile(driver)
+			switch {
+			case readErr == nil:
+				defer func() { _ = os.WriteFile(driver, previous, 0o644) }()
+			case errors.Is(readErr, os.ErrNotExist):
+				defer func() { _ = os.Remove(driver) }()
+			default:
+				fmt.Fprintln(os.Stderr, "skewtest:", readErr)
+				return 1
+			}
+			if err := os.WriteFile(driver, src, 0o644); err != nil {
 				fmt.Fprintln(os.Stderr, "skewtest:", err)
 				return 1
 			}
@@ -236,6 +249,10 @@ func startProc(t fataler, bin, name string) *proc {
 	if d := os.Getenv("SKEW_STDERR_DIR"); d != "" {
 		if f, err := os.Create(filepath.Join(d, fmt.Sprintf("%04d-%s.log", procSerial.Add(1), name))); err == nil {
 			cmd.Stderr = io.MultiWriter(p.stderr, f)
+			go func() {
+				<-p.exited
+				_ = f.Close()
+			}()
 		}
 	}
 	// GOTRACEBACK=all: a SIGQUIT sent to a hung tool prints every goroutine.
