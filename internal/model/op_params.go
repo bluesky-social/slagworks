@@ -104,6 +104,19 @@ type OpParams struct {
 // the op rotates (RotateMonitor); the worker then generates a password.
 type MonitorRuntime struct {
 	Password string `json:"password" secret:"true"`
+	// Unconfirmed is the entry's unconfirmed passwords, oldest first:
+	// generated passwords an earlier reconcile may have written without
+	// learning the outcome (BMCUserCred.PasswordUnconfirmed). The worker
+	// tests them when the BMC does not hold Password, and reports the one
+	// it holds for global to store as the password.
+	Unconfirmed []UnconfirmedPassword `json:"unconfirmed,omitempty"`
+}
+
+// UnconfirmedPassword is one MonitorRuntime.Unconfirmed element. A struct,
+// not a bare string, so the password is a secret:"true" field like every
+// other credential in an op's params.
+type UnconfirmedPassword struct {
+	Password string `json:"password" secret:"true"`
 }
 
 // BMCRuntime is the per-op block carrying the BMC credential, the

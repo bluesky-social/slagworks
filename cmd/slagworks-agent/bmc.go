@@ -104,7 +104,8 @@ func reconcileInBand(ctx context.Context, log *slog.Logger, opt bmcreconcile.Opt
 				"admin_user", gate.User, "admin_slot", gate.Slot, "slot2_user", gate.Slot2User)
 		}
 		// A partial failure may still have WRITTEN passwords to the BMC
-		// (Reconcile returns whatever it provisioned before erroring).
+		// (Reconcile returns whatever it provisioned before erroring, and a
+		// generated password whose write may have been applied).
 		// Those live creds must reach phone-home even on the soft-fail
 		// path, or the BMC silently drifts from slagworksd's stored
 		// creds. Build the creds payload from the partial result and
@@ -149,6 +150,7 @@ func credsFromResult(res *bmcreconcile.Result) *model.BMCCreds {
 		if u.Name == bmcreconcile.MonitorUser {
 			creds.Monitor = &model.BMCUserCred{
 				Username: u.Name, Password: u.Password, IPMIUserSlot: u.Slot,
+				PasswordUnconfirmed: u.PasswordUnconfirmed,
 			}
 		}
 	}

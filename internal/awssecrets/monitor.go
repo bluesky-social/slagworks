@@ -48,13 +48,20 @@ type monitorVersion struct {
 // stay in memory only for the duration of the read-modify-write
 // transaction, which is bounded by the per-pop advisory lock window, or of
 // the op-creation request that reads one entry.
+//
+// UnconfirmedPasswords holds generated passwords a reconcile may have
+// written to the account without learning the outcome, oldest first. While
+// it is non-empty the BMC holds either Password or one of them; the next
+// bmc_reconcile op finds out which and the list is dropped. Consumers of
+// the entry keep using Password.
 type BMCMonitorEntry struct {
-	Kind              string         `json:"kind"`
-	Username          string         `json:"username"`
-	Password          string         `json:"password"`
-	ExtraConfig       map[string]any `json:"extra_config"`
-	LastKnownHostname string         `json:"last_known_hostname"`
-	LastKnownIP       string         `json:"last_known_ip"`
+	Kind                 string         `json:"kind"`
+	Username             string         `json:"username"`
+	Password             string         `json:"password"`
+	UnconfirmedPasswords []string       `json:"unconfirmed_passwords,omitempty"`
+	ExtraConfig          map[string]any `json:"extra_config"`
+	LastKnownHostname    string         `json:"last_known_hostname"`
+	LastKnownIP          string         `json:"last_known_ip"`
 }
 
 // MonitorWriter is the slagworksd-facing interface for the per-pop
@@ -521,6 +528,14 @@ func (f *FakeMonitorWriter) EnsureMonitorSecret(_ context.Context, pop string) e
 		f.Secrets[pop] = map[string]BMCMonitorEntry{}
 	}
 	return nil
+}
+
+// GetMonitorEntry returns the serial's entry, or nil when there is none.
+func (f *FakeMonitorWriter) GetMonitorEntry(_ context.Context, pop, serial string) (*BMCMonitorEntry, error) {
+	if e, ok := f.Secrets[pop][serial]; ok {
+		return &e, nil
+	}
+	return nil, nil
 }
 
 // UpsertMonitorEntry implements MonitorWriter.

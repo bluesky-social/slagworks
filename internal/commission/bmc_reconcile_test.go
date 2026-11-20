@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -131,6 +132,10 @@ func TestHandleBMCReconcileReport_Success(t *testing.T) {
 // countingMonitorWriter is a MonitorWriter that counts upserts, so a test
 // can assert global wrote no secret version at all.
 type countingMonitorWriter struct{ upserts int }
+
+func (w *countingMonitorWriter) GetMonitorEntry(context.Context, string, string) (*awssecrets.BMCMonitorEntry, error) {
+	return nil, nil
+}
 
 func (w *countingMonitorWriter) UpsertMonitorEntry(context.Context, string, string, awssecrets.BMCMonitorEntry) error {
 	w.upserts++
@@ -419,5 +424,157 @@ func TestHandleBMCReconcileReport_MalformedData(t *testing.T) {
 	})
 	if !errors.Is(err, ws.ErrTerminal) {
 		t.Fatalf("malformed report must be terminal, got %v", err)
+	}
+}
+
+// unconfirmedReport is a failed rotation's report: a generated password
+// whose write may or may not have been applied.
+func unconfirmedReport(pw string) model.BMCReconcileReport {
+	return model.BMCReconcileReport{
+		Monitor: &model.BMCUserCred{Username: "monitor", Password: pw, IPMIUserSlot: 4, PasswordUnconfirmed: true},
+		Error:   "bmcreconcile: set password slot 4: exit status 1; the BMC may have applied the generated password all the same",
+	}
+}
+
+// TestHandleBMCReconcileReport_Unconfirmed_KeptBesideStored: an unconfirmed
+// password must not replace the stored one, which is still the BMC's
+// password if the write was never applied, and must not be dropped, since
+// it is the BMC's password if it was. It is appended to the entry's
+// unconfirmed passwords (once, however often the report is replayed), and
+// the op fails with the reconcile error.
+func TestHandleBMCReconcileReport_Unconfirmed_KeptBesideStored(t *testing.T) {
+	h, st, id, w, _, logs := bmcReconcileFixture(t)
+	const storedPW, olderPW = "St0red!Monitor", "0lder!Unconf"
+	w.Secrets = map[string]map[string]awssecrets.BMCMonitorEntry{"pop1": {"SN-X": {
+		Kind: awssecrets.KindBMC, Username: "monitor", Password: storedPW,
+		UnconfirmedPasswords: []string{olderPW},
+		ExtraConfig:          map[string]any{"ipmi_user_slot": 3},
+	}}}
+	for range 2 { // the worker replays a report whose ack it lost
+		obs := reportObs(t, id, uuid.New(), unconfirmedReport(reconcileMonitorPW))
+		if err := h.HandleObservation(context.Background(), obs); err != nil {
+			t.Fatalf("HandleObservation: %v", err)
+		}
+	}
+	got := w.Secrets["pop1"]["SN-X"]
+	if got.Password != storedPW || got.ExtraConfig["ipmi_user_slot"] != 3 {
+		t.Errorf("the stored password and its slot must be kept; kept=%v slot=%v", got.Password == storedPW, got.ExtraConfig["ipmi_user_slot"])
+	}
+	if !slices.Equal(got.UnconfirmedPasswords, []string{olderPW, reconcileMonitorPW}) {
+		t.Errorf("want the unconfirmed password appended once after the older one; have %d", len(got.UnconfirmedPasswords))
+	}
+	if got.LastKnownHostname != "host1.pop1" {
+		t.Errorf("last_known fields must be refreshed: %q", got.LastKnownHostname)
+	}
+	if len(st.finalized) != 2 || st.finalized[0].Status != model.OpFailed {
+		t.Fatalf("expected the op failed, got %+v", st.finalized)
+	}
+	res := decodeFinalResult(t, st.finalized[0])
+	if !strings.Contains(res.Error, "may have applied") || res.BMCReconcile == nil || res.BMCReconcile.MonitorRotated || res.BMCReconcile.MonitorPasswordWritten {
+		t.Errorf("result: %s", st.finalized[0].Result)
+	}
+	assertNoSecret(t, st, logs)
+}
+
+// TestHandleBMCReconcileReport_Unconfirmed_NothingStored: with no password
+// stored for the device there is nothing to keep, so the unconfirmed one is
+// stored as the password; the next op confirms it or writes it.
+func TestHandleBMCReconcileReport_Unconfirmed_NothingStored(t *testing.T) {
+	h, st, id, w, _, logs := bmcReconcileFixture(t)
+	obs := reportObs(t, id, uuid.New(), unconfirmedReport(reconcileMonitorPW))
+	if err := h.HandleObservation(context.Background(), obs); err != nil {
+		t.Fatalf("HandleObservation: %v", err)
+	}
+	got := w.Secrets["pop1"]["SN-X"]
+	if got.Password != reconcileMonitorPW || len(got.UnconfirmedPasswords) != 0 || got.Username != "monitor" {
+		t.Errorf("want the unconfirmed password stored as the device's password")
+	}
+	if len(st.finalized) != 1 || st.finalized[0].Status != model.OpFailed {
+		t.Fatalf("expected the op failed, got %+v", st.finalized)
+	}
+	assertNoSecret(t, st, logs)
+}
+
+// TestHandleBMCReconcileReport_Success_DropsUnconfirmed: a compliance op
+// that succeeded without reporting a password left the BMC holding the
+// stored one, so the entry's unconfirmed passwords are dropped and the
+// password kept. One that reports a password (a rotation, or an adopted
+// unconfirmed password) replaces the entry, which drops them too.
+func TestHandleBMCReconcileReport_Success_DropsUnconfirmed(t *testing.T) {
+	const storedPW = "St0red!Monitor"
+	for name, tc := range map[string]struct {
+		rep    model.BMCReconcileReport
+		wantPW string
+	}{
+		"stored password verified": {
+			model.BMCReconcileReport{Monitor: &model.BMCUserCred{Username: "monitor", IPMIUserSlot: 4}}, storedPW,
+		},
+		"unconfirmed password adopted": {
+			model.BMCReconcileReport{
+				Monitor:        &model.BMCUserCred{Username: "monitor", Password: reconcileMonitorPW, IPMIUserSlot: 4},
+				MonitorRotated: true,
+			}, reconcileMonitorPW,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, st, id, w, _, logs := bmcReconcileFixture(t)
+			w.Secrets = map[string]map[string]awssecrets.BMCMonitorEntry{"pop1": {"SN-X": {
+				Kind: awssecrets.KindBMC, Username: "monitor", Password: storedPW,
+				UnconfirmedPasswords: []string{reconcileMonitorPW},
+			}}}
+			if err := h.HandleObservation(context.Background(), reportObs(t, id, uuid.New(), tc.rep)); err != nil {
+				t.Fatalf("HandleObservation: %v", err)
+			}
+			got := w.Secrets["pop1"]["SN-X"]
+			if got.Password != tc.wantPW || len(got.UnconfirmedPasswords) != 0 {
+				t.Errorf("want the right password stored and no unconfirmed ones left; right password=%v, unconfirmed left=%d",
+					got.Password == tc.wantPW, len(got.UnconfirmedPasswords))
+			}
+			if len(st.finalized) != 1 || st.finalized[0].Status != model.OpCompleted {
+				t.Fatalf("expected the op completed, got %+v", st.finalized)
+			}
+			assertNoSecret(t, st, logs)
+		})
+	}
+}
+
+// TestHandleBMCReconcileReport_Failure_KeepsUnconfirmed: a failed op that
+// reports no password settles nothing, so the unconfirmed passwords stay.
+func TestHandleBMCReconcileReport_Failure_KeepsUnconfirmed(t *testing.T) {
+	h, _, id, w, _, _ := bmcReconcileFixture(t)
+	w.Secrets = map[string]map[string]awssecrets.BMCMonitorEntry{"pop1": {"SN-X": {
+		Kind: awssecrets.KindBMC, Username: "monitor", Password: "St0red!Monitor",
+		UnconfirmedPasswords: []string{reconcileMonitorPW},
+	}}}
+	obs := reportObs(t, id, uuid.New(), model.BMCReconcileReport{Error: "bmcreconcile: could not test the password of slot 4"})
+	if err := h.HandleObservation(context.Background(), obs); err != nil {
+		t.Fatalf("HandleObservation: %v", err)
+	}
+	if got := w.Secrets["pop1"]["SN-X"]; len(got.UnconfirmedPasswords) != 1 || got.Password != "St0red!Monitor" {
+		t.Errorf("a failed op must leave the entry alone")
+	}
+}
+
+// TestHandleDeployComplete_UnconfirmedMonitor_KeptBesideStored: the in-band
+// reconcile reports through deploy_complete, and an unconfirmed password
+// from it is kept beside the stored one the same way.
+func TestHandleDeployComplete_UnconfirmedMonitor_KeptBesideStored(t *testing.T) {
+	h, _, id, w := deployCompleteFixture(t)
+	w.Secrets = map[string]map[string]awssecrets.BMCMonitorEntry{"pop1": {"SN-X": {
+		Kind: awssecrets.KindBMC, Username: "monitor", Password: "St0red!Monitor",
+	}}}
+	data, err := json.Marshal(model.BMCCreds{Monitor: &model.BMCUserCred{
+		Username: "monitor", Password: reconcileMonitorPW, IPMIUserSlot: 3, PasswordUnconfirmed: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	obs := model.Observation{MachineID: id, OperationID: uuid.New(), Event: "deploy_complete", Data: data}
+	if err := h.HandleObservation(context.Background(), obs); err != nil {
+		t.Fatalf("HandleObservation: %v", err)
+	}
+	got := w.Secrets["pop1"]["SN-X"]
+	if got.Password != "St0red!Monitor" || !slices.Equal(got.UnconfirmedPasswords, []string{reconcileMonitorPW}) {
+		t.Errorf("want the stored password kept and the unconfirmed one beside it")
 	}
 }

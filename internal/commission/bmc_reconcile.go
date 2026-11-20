@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/bluesky-social/slagworks/internal/awssecrets"
@@ -16,7 +17,12 @@ import (
 // handleBMCReconcileReport persists the outcome of a remote bmc_reconcile
 // op and finalizes the op. A report that carries a monitor password
 // generated one; this is the only place it is written, and only to
-// pop/<pop>/bmc-creds-monitor. Storage keys on the password being present,
+// pop/<pop>/bmc-creds-monitor: as the device's password, or, when the
+// worker could not learn whether the BMC applied it
+// (BMCUserCred.PasswordUnconfirmed), beside the password already stored
+// (upsertMonitorCred). A report of success that carries none drops the
+// entry's unconfirmed passwords: the BMC holds the stored password, so none
+// of them is live. Storage keys on the password being present,
 // not on monitor_rotated, so a worker still on the previous release (which
 // always rotates and has no such field) is stored during the minute or two
 // workers lag global on a rollout. A report without one re-asserted the
@@ -69,6 +75,10 @@ func (h *Handler) handleBMCReconcileReport(ctx context.Context, obs model.Observ
 			if rep.Error != "" {
 				result.Error = rep.Error + "; " + result.Error
 			}
+		}
+	case rep.Error == "":
+		if err := h.dropUnconfirmedMonitor(ctx, obs); err != nil {
+			return err // transient: the worker retries, the op stays open
 		}
 	}
 
@@ -131,7 +141,7 @@ func (h *Handler) failOp(obs model.Observation, result []byte) (*opOutcome, erro
 type monitorNotStoredError struct{ reason string }
 
 func (e *monitorNotStoredError) Error() string {
-	return "the BMC's monitor password was rotated but could not be stored: " + e.reason +
+	return "the BMC's monitor password was (or may have been) rotated but could not be stored: " + e.reason +
 		"; ipmi_exporter scrapes of this BMC fail until you fix that and re-run `slagctl machine bmc-reconcile`"
 }
 
@@ -165,6 +175,39 @@ func (h *Handler) storeReconciledMonitor(ctx context.Context, obs model.Observat
 	}
 }
 
+// dropUnconfirmedMonitor removes the unconfirmed passwords from the
+// machine's monitor entry after a bmc_reconcile op that succeeded without
+// reporting a password: the BMC holds the stored one. It writes nothing
+// when the entry has none. A device or entry that cannot be found has
+// nothing to drop; only a failure worth retrying is returned.
+func (h *Handler) dropUnconfirmedMonitor(ctx context.Context, obs model.Observation) error {
+	if h.monitorAWS == nil {
+		return nil
+	}
+	dev, err := h.machineDevice(ctx, obs.MachineID)
+	switch {
+	case errors.Is(err, ErrMachineNotFound), errors.Is(err, ErrDeviceNotBound):
+		return nil
+	case err != nil:
+		return err
+	case dev == nil || dev.Serial == "" || dev.Site == nil || dev.Site.Slug == "":
+		return nil
+	}
+	pop := dev.Site.Slug
+	err = h.store.WithPopAdvisoryLock(ctx, pop, func(ctx context.Context) error {
+		entry, err := h.monitorAWS.GetMonitorEntry(ctx, pop, dev.Serial)
+		if err != nil || entry == nil || len(entry.UnconfirmedPasswords) == 0 {
+			return err
+		}
+		entry.UnconfirmedPasswords = nil
+		return h.monitorAWS.UpsertMonitorEntry(ctx, pop, dev.Serial, *entry)
+	})
+	if err != nil && !errors.Is(err, awssecrets.ErrMonitorSecretMissing) {
+		return fmt.Errorf("drop unconfirmed monitor passwords for %s: %w", dev.Name, err)
+	}
+	return nil
+}
+
 // errMonitorKey marks a device that cannot be keyed into the monitor
 // secret (no NetBox serial or site). Operator-fixable in NetBox.
 var errMonitorKey = errors.New("cannot key the monitor secret entry")
@@ -175,6 +218,14 @@ var errMonitorKey = errors.New("cannot key the monitor secret entry")
 // BMC IP (oob_ip) as last_known_hostname / last_known_ip. Serialized per
 // pop because Secrets Manager has no compare-and-swap. Requires
 // h.monitorAWS to be non-nil.
+//
+// A confirmed password replaces the entry, unconfirmed passwords included:
+// it is what the account holds now. An unconfirmed one
+// (cred.PasswordUnconfirmed) is appended to the entry's unconfirmed
+// passwords and the stored password stays, because the BMC may hold either
+// and the store must not lose the one that is live. With no stored password
+// to keep, it is stored as the password: no password the store knew is at
+// stake, and the next bmc_reconcile op confirms it or writes it.
 func (h *Handler) upsertMonitorCred(ctx context.Context, dev *netbox.Device, cred model.BMCUserCred) error {
 	if dev.Serial == "" {
 		return fmt.Errorf("%w: NetBox device %d (%q) has no serial, and pop/<pop>/bmc-creds-monitor is keyed by NetBox device serial; set the device's serial in NetBox",
@@ -198,6 +249,20 @@ func (h *Handler) upsertMonitorCred(ctx context.Context, dev *netbox.Device, cre
 		LastKnownIP:       lastIP,
 	}
 	return h.store.WithPopAdvisoryLock(ctx, pop, func(ctx context.Context) error {
+		if cred.PasswordUnconfirmed {
+			cur, err := h.monitorAWS.GetMonitorEntry(ctx, pop, dev.Serial)
+			if err != nil {
+				return err
+			}
+			if cur != nil && cur.Password != "" {
+				kept := *cur
+				kept.LastKnownHostname, kept.LastKnownIP = entry.LastKnownHostname, entry.LastKnownIP
+				if cred.Password != cur.Password && !slices.Contains(cur.UnconfirmedPasswords, cred.Password) {
+					kept.UnconfirmedPasswords = append(slices.Clone(cur.UnconfirmedPasswords), cred.Password)
+				}
+				entry = kept
+			}
+		}
 		return h.monitorAWS.UpsertMonitorEntry(ctx, pop, dev.Serial, entry)
 	})
 }

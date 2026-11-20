@@ -176,7 +176,13 @@ against NetBox, then:
   same reason a password write that ipmitool reports as failed (its
   response lost, for example), stored or freshly generated, is followed by
   a test before any retry, and counts as written when the BMC holds the
-  password. If the
+  password. When a freshly generated password's write fails and no test
+  after it can run (the BMC stopped answering), the BMC holds either the
+  old password or the new one, and slagworks cannot tell which. The op
+  fails, the stored password stays, and the new one is kept beside it in
+  the entry's `unconfirmed_passwords`. Re-run `bmc-reconcile` (without
+  `--rotate-monitor`): it asks the BMC which of them it holds, stores that
+  one as the password, and drops the rest. If the
   BMC holds a different password and also refuses the stored one (for
   example because it is in MegaRAC's reuse history), the op fails saying
   so; set the password on the BMC by hand, or use `--rotate-monitor`.
@@ -197,7 +203,8 @@ monitor secret doesn't exist, or the device's stored monitor entry can't
 be re-asserted (it names an account other than `monitor`, or has no
 password). Prints the op id; follow it with
 `slagctl operation watch <op-id>`. The op result lists the monitor slot,
-`monitor_rotated` (false unless a password was generated),
+`monitor_rotated` (true when the stored password changed to a generated
+one: a rotation, or an unconfirmed password the BMC turned out to hold),
 `monitor_password_written` (false when the BMC already held the stored
 password), the disabled
 usernames and the time-compliance outcome; the password is never shown.
