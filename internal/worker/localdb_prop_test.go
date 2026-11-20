@@ -464,7 +464,7 @@ func TestLocalDBLeases_Model_Prop(t *testing.T) {
 // --- corrupt / truncated files ---
 
 type corruptStats struct {
-	cases, openErr, openOK, silentLoss, panics atomic.Int64
+	cases, openErr, openOK, listErr, silentLoss, panics atomic.Int64
 }
 
 // TestLocalDBCorruption_Prop writes a populated DB, closes it, damages the
@@ -472,11 +472,14 @@ type corruptStats struct {
 // with garbage), and reopens. Property: neither OpenLocalDB nor any read
 // path panics.
 //
-// Not asserted, only counted and logged: when the reopen succeeds, fewer
-// outbox rows can come back than were persisted. SQLite accepts some
-// damaged files as valid smaller databases, and ListPendingOutbox ignores
-// the error of its table read, so a damaged outbox table reads as empty
-// with nothing logged.
+// When the reopen succeeds, ListPendingOutbox may return fewer rows than
+// were persisted only by saying so: if SQLite reports an error reading the
+// outbox table, ListPendingOutbox must return an error too, never a short
+// or empty list.
+//
+// Not asserted, only counted and logged: a short read SQLite itself reports
+// no error for. SQLite accepts some damaged files as valid smaller
+// databases, and nothing in the file says rows are missing.
 func TestLocalDBCorruption_Prop(t *testing.T) {
 	dirs := &caseDirs{root: t.TempDir()}
 	st := &corruptStats{}
@@ -547,6 +550,7 @@ func TestLocalDBCorruption_Prop(t *testing.T) {
 		reopened.SetLogger(quietLog)
 		defer closeQuiet(reopened)
 		var pending []PendingOutbox
+		var listErr error
 		func() {
 			defer func() {
 				if p := recover(); p != nil {
@@ -554,7 +558,7 @@ func TestLocalDBCorruption_Prop(t *testing.T) {
 					rt.Fatalf("read path panicked on %s-damaged file: %v", mode, p)
 				}
 			}()
-			pending = reopened.ListPendingOutbox()
+			pending, listErr = reopened.ListPendingOutbox()
 			_ = reopened.LoadOpState()
 			_ = reopened.LoadMachineCache()
 			_ = reopened.LoadSnapshotMeta()
@@ -563,6 +567,10 @@ func TestLocalDBCorruption_Prop(t *testing.T) {
 			_, _ = reopened.GetWorkerIdentity()
 			_ = NewCache(reopened)
 		}()
+		if listErr != nil {
+			st.listErr.Add(1)
+			return
+		}
 		if len(pending) < nRows {
 			// Classify: a zero-length file is a valid empty DB;
 			// otherwise ask SQLite directly whether the table is readable.
@@ -570,12 +578,13 @@ func TestLocalDBCorruption_Prop(t *testing.T) {
 			qerr := reopened.db.Raw("SELECT count(*) FROM outbox").Scan(&n).Error
 			var ic string
 			_ = reopened.db.Raw("PRAGMA integrity_check").Scan(&ic).Error
+			if qerr != nil {
+				rt.Fatalf("ListPendingOutbox returned %d of %d rows and no error from a %s-damaged file whose outbox table SQLite cannot read (count(*): %v): a damaged outbox reads as a short or empty one",
+					len(pending), nRows, mode, qerr)
+			}
 			kind := "decoded-fewer"
-			switch {
-			case len(raw) == 0:
+			if len(raw) == 0 {
 				kind = "empty-file"
-			case qerr != nil:
-				kind = "query-error-swallowed"
 			}
 			if kind != "empty-file" {
 				st.silentLoss.Add(1)
@@ -584,8 +593,8 @@ func TestLocalDBCorruption_Prop(t *testing.T) {
 				mode, kind, len(pending), nRows, n, qerr, ic))
 		}
 	})
-	t.Logf("corruption coverage: cases=%d openErr=%d openOK=%d silentLoss=%d panics=%d",
-		st.cases.Load(), st.openErr.Load(), st.openOK.Load(), st.silentLoss.Load(), st.panics.Load())
+	t.Logf("corruption coverage: cases=%d openErr=%d openOK=%d listErr=%d silentLoss=%d panics=%d",
+		st.cases.Load(), st.openErr.Load(), st.openOK.Load(), st.listErr.Load(), st.silentLoss.Load(), st.panics.Load())
 	sort.Strings(silent)
 	if len(silent) > 0 {
 		for _, l := range silent {

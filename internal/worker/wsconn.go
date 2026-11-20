@@ -448,7 +448,21 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 	// exists, but it's no longer in the in-memory outbox because
 	// DrainOutbox removed it for the previous send. Without reload,
 	// we'd wait for worker restart to retry.
-	w.cache.ReloadOutboxFromDisk()
+	//
+	// A failed read ends this connection attempt. Carrying on would treat
+	// the outbox as empty for as long as the connection lasts, and a
+	// stranded phone_home or commission report then fails a healthy
+	// operation at its timeout. Run reconnects with backoff, so the read is
+	// retried until it succeeds; a table that never reads again keeps the
+	// worker off global, with this error on every attempt, until the
+	// operator repairs the local database. Boot and DHCP serving do not
+	// depend on the connection and continue from the cache.
+	if err := w.cache.ReloadOutboxFromDisk(); err != nil {
+		w.drainMu.Unlock()
+		w.log.Error("cannot read the persisted outbox; dropping this connection and retrying. If this repeats, the outbox table of the worker's local database is damaged and needs repair (sqlite3 PRAGMA integrity_check on the file named in err)",
+			"err", err)
+		return false, fmt.Errorf("reload outbox: %w", err)
+	}
 	w.drainMu.Unlock()
 
 	// Start heartbeat and outbox drain goroutines scoped to the
