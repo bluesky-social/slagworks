@@ -1032,17 +1032,20 @@ func (o *opState) markClaimAttempt(opID string) {
 // rollBackClaim handles a claim that got no answer: it sets the local mark
 // back to pending so the pending readers return the op for a retry, and
 // records the claim as unanswered so reclaimableOps returns the op if
-// global's claimed row replaces that mark first. A no-op for an op the
-// stream removed while the claim was in flight.
+// global's claimed row replaces that mark first. A no-op for an op that
+// ended while the claim was in flight (op_removed left its tombstone). An op
+// a resync merely omitted meanwhile (its machine left the site's scope) has
+// no row to roll back but keeps the record, for when the row comes back.
 func (o *opState) rollBackClaim(opID string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	op, ok := o.ops[opID]
-	if !ok {
+	if _, ended := o.tombstones[opID]; ended {
 		return
 	}
-	op.Status = model.OpPending
 	o.claimUnanswered[opID] = true
+	if op, ok := o.ops[opID]; ok {
+		op.Status = model.OpPending
+	}
 }
 
 // markFailed marks an op failed, clears its phase timing, and (if present)

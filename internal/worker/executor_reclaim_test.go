@@ -73,19 +73,23 @@ func TestExecutor_ClaimCommittedReplyLost_IsReclaimed(t *testing.T) {
 		rowFirst bool // global's row lands while the claim RPC is still waiting
 		asDelta  bool // the row comes as an op_delta, not a reconnect's op_resync
 		dropped  bool // an op_resync without the op lands after the rollback, before the row
+		midRPC   bool // an op_resync without the op lands while the claim RPC is still waiting
 	}{
 		// The reconnect's op_resync lands while the claim RPC is still
 		// waiting out its deadline; the rollback then rewrites that row.
-		{"resync before the rollback", true, false, false},
+		{"resync before the rollback", true, false, false, false},
 		// The reconnect takes longer than the claim RPC's 30s deadline.
-		{"resync after the rollback", false, false, false},
+		{"resync after the rollback", false, false, false, false},
 		// Global commits the claim after the RPC deadline (a stalled hub
 		// or database) and publishes its op_delta after the rollback.
-		{"late op_delta after the rollback", false, true, false},
+		{"late op_delta after the rollback", false, true, false, false},
 		// The op's machine leaves the site's scope while the worker is
 		// reconnecting, so the resync leaves the op out; it comes back
 		// still claimed by this worker when the machine returns.
-		{"op left a resync and came back", false, true, true},
+		{"op left a resync and came back", false, true, true, false},
+		// The same, with the resync that leaves the op out landing while
+		// the claim RPC is still waiting: the rollback finds no row.
+		{"op left a resync during the claim RPC and came back", false, true, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cache := NewCache(nil)
@@ -104,6 +108,9 @@ func TestExecutor_ClaimCommittedReplyLost_IsReclaimed(t *testing.T) {
 			}
 			if tc.rowFirst {
 				claimer.onCommit = globalRowArrives
+			}
+			if tc.midRPC {
+				claimer.onCommit = func() { seedOpsResync(cache) }
 			}
 			ctrl := &cycleCountingController{}
 			exec := NewExecutor(ExecutorConfig{
