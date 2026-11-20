@@ -36,7 +36,9 @@ type PoolConfig struct {
 
 	// RelaySubnets defines additional pools for clients behind DHCP relays.
 	// When a request arrives with giaddr set, the handler finds the relay
-	// subnet containing giaddr and allocates from that pool.
+	// subnet containing giaddr and allocates from that pool. A renew the
+	// client unicasts straight to the server carries no giaddr and is
+	// matched by its ciaddr instead (see poolForRequest).
 	RelaySubnets []RelaySubnet
 
 	// Promiscuous disables the KnownMACs filter: every MAC is served.
@@ -334,6 +336,22 @@ func relayPoolForRequest(rs *RelaySubnet, giaddr net.IP) *pool {
 	return p
 }
 
+// relayPoolForClient resolves the relay pool for a request that came from a
+// client behind a relay without passing through it (a RENEWING unicast; see
+// poolForRequest), keyed by ciaddr, the client's own address. On a /31 the
+// relay is the other endpoint, so the pool is the one relayPoolForRequest
+// derives from that endpoint as giaddr.
+func relayPoolForClient(rs *RelaySubnet, ciaddr net.IP) *pool {
+	ones, bits := rs.Subnet.Mask.Size()
+	client := ciaddr.To4()
+	if ones != 31 || bits != 32 || client == nil {
+		return relayPoolForRequest(rs, rs.Gateway)
+	}
+	relay := append(net.IP(nil), client...)
+	relay[3] ^= 1
+	return relayPoolForRequest(rs, relay)
+}
+
 func NewHandler(cfg Config) *Handler {
 	h := &Handler{
 		cfg:               cfg,
@@ -593,7 +611,12 @@ func (h *Handler) HandlePacketOn(req *dhcpv4.DHCPv4, iface string) *dhcpv4.DHCPv
 //  3. Neither: drop the packet — we don't know how to allocate from a subnet
 //     we aren't responsible for.
 //
-// Direct (non-relayed) requests always get the direct pool.
+// A packet without giaddr gets the direct pool, unless it is a REQUEST whose
+// ciaddr lies in one of the RelaySubnets (and not in the worker's own
+// Subnet). That is a RENEWING client behind a relay: RFC 2131 4.3.2 has it
+// unicast the renew straight to the server, so no relay stamps giaddr, and
+// the server trusts ciaddr instead. Resolving the direct pool would NAK the
+// renew, since the lease lies outside that pool's range.
 func poolForRequest(req *dhcpv4.DHCPv4, pools PoolConfig) *pool {
 	// Truly-unconfigured segment (cold start before the first snapshot):
 	// serve nothing. We key this on the SUBNET being unset, NOT the dynamic
@@ -624,6 +647,15 @@ func poolForRequest(req *dhcpv4.DHCPv4, pools PoolConfig) *pool {
 			}
 		}
 		return nil
+	}
+	if ci := req.ClientIPAddr; req.MessageType() == dhcpv4.MessageTypeRequest &&
+		ci != nil && !ci.IsUnspecified() && !pools.Subnet.Contains(ci) {
+		for i := range pools.RelaySubnets {
+			rs := &pools.RelaySubnets[i]
+			if rs.Subnet.Contains(ci) {
+				return relayPoolForClient(rs, ci)
+			}
+		}
 	}
 	return &pool{
 		rangeStart: pools.RangeStart,

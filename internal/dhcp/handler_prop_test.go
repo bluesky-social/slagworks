@@ -202,12 +202,32 @@ func (w *propWorld) view(iface string) mView {
 // servingPool is the documented poolForRequest resolution: nil pool when the
 // segment is unconfigured or a relayed packet's giaddr matches nothing; a
 // giaddr inside the direct subnet uses the direct pool; a /31 relay subnet
-// derives gateway=giaddr and the single client address from the packet.
-func servingPool(pc mPoolCfg, giaddr pIP) *mPool {
+// derives gateway=giaddr and the single client address from the packet. A
+// packet without giaddr uses the direct pool, unless renewCiaddr (a
+// REQUEST's ciaddr; pass 0 for any other packet) lies in a relay subnet and
+// not the direct one: a renew unicast from behind a relay, served from that
+// relay subnet, whose relay on a /31 is the client's peer address.
+func servingPool(pc mPoolCfg, giaddr, renewCiaddr pIP) *mPool {
 	if !pc.configured {
 		return nil
 	}
+	relayPool := func(r mPool, relay pIP) *mPool {
+		p := r
+		if r.bits == 31 {
+			p.gateway = relay
+			p.hasRange = true
+			p.lo, p.hi = relay^1, relay^1
+		}
+		return &p
+	}
 	if giaddr == 0 {
+		if renewCiaddr != 0 && !pc.direct.has(renewCiaddr) {
+			for _, r := range pc.relays {
+				if r.has(renewCiaddr) {
+					return relayPool(r, renewCiaddr^1)
+				}
+			}
+		}
 		p := pc.direct
 		return &p
 	}
@@ -217,16 +237,19 @@ func servingPool(pc mPoolCfg, giaddr pIP) *mPool {
 	}
 	for _, r := range pc.relays {
 		if r.has(giaddr) {
-			p := r
-			if r.bits == 31 {
-				p.gateway = giaddr
-				p.hasRange = true
-				p.lo, p.hi = giaddr^1, giaddr^1
-			}
-			return &p
+			return relayPool(r, giaddr)
 		}
 	}
 	return nil
+}
+
+// renewCiaddr is the ciaddr poolForRequest resolves a pool by: a REQUEST's,
+// and nothing for any other packet.
+func (pk propPacket) renewCiaddr() pIP {
+	if pk.typ == dhcpv4.MessageTypeRequest {
+		return pk.ciaddr
+	}
+	return 0
 }
 
 func (w *propWorld) label(ip pIP) string {
@@ -375,7 +398,7 @@ func (m *propModel) discover(mac int, a propArrival) mReply {
 	if !m.admitted(mac, v) {
 		return mReply{kind: "none"}
 	}
-	p := servingPool(v.pools, a.giaddr)
+	p := servingPool(v.pools, a.giaddr, 0)
 	if p == nil {
 		return mReply{kind: "none"}
 	}
@@ -399,7 +422,7 @@ func (m *propModel) request(mac int, a propArrival, sid, opt50, ciaddr pIP) mRep
 	if sid != 0 && sid != v.serverIP {
 		return mReply{kind: "none"}
 	}
-	p := servingPool(v.pools, a.giaddr)
+	p := servingPool(v.pools, a.giaddr, ciaddr)
 	if p == nil {
 		return mReply{kind: "none"}
 	}
@@ -1169,7 +1192,7 @@ func propExchange(t *rapid.T, s *propSUT, m *propModel, pk propPacket, lastOffer
 	if gotKind == "offer" || gotKind == "ack" {
 		yi := toPIP(got.YourIPAddr)
 		v := w.view(pk.arrival.iface)
-		p := servingPool(v.pools, pk.arrival.giaddr)
+		p := servingPool(v.pools, pk.arrival.giaddr, pk.renewCiaddr())
 		if p == nil {
 			fail("granted %s on a path with no serving pool", yi)
 		}
@@ -1231,7 +1254,7 @@ func propExchange(t *rapid.T, s *propSUT, m *propModel, pk propPacket, lastOffer
 		// (a reservations-only pool included).
 		if l, ok := before[pk.mac]; ok && now < l.exp && (pk.opt50 == l.ip || pk.opt50 == 0 && pk.ciaddr == l.ip) {
 			v := w.view(pk.arrival.iface)
-			if p := servingPool(v.pools, pk.arrival.giaddr); p != nil && (pk.sid == 0 || pk.sid == v.serverIP) && (!w.gateKnown || v.pools.promiscuous || w.known[pk.mac]) {
+			if p := servingPool(v.pools, pk.arrival.giaddr, pk.renewCiaddr()); p != nil && (pk.sid == 0 || pk.sid == v.serverIP) && (!w.gateKnown || v.pools.promiscuous || w.known[pk.mac]) {
 				fail("REQUEST for the MAC's own live lease %s got no answer", l.ip)
 			}
 		}
@@ -1364,7 +1387,7 @@ func propExchange(t *rapid.T, s *propSUT, m *propModel, pk propPacket, lastOffer
 	}
 	if want.kind == "none" && pk.typ == dhcpv4.MessageTypeDiscover {
 		v := w.view(pk.arrival.iface)
-		if p := servingPool(v.pools, pk.arrival.giaddr); p != nil && m.admitted(pk.mac, v) {
+		if p := servingPool(v.pools, pk.arrival.giaddr, pk.renewCiaddr()); p != nil && m.admitted(pk.mac, v) {
 			cov.inc("pattern: pool exhausted / reservations-only")
 		}
 	}

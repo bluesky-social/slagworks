@@ -368,7 +368,10 @@ Fields:
 - **`ephemeral_pool_start`**, **`ephemeral_pool_end`** — the fabric DHCP
   pool. Required, IPv4, start no greater than end.
 - **`relay_pools`** — pools for subnets reached through a DHCP relay,
-  selected by the relay's `giaddr`. Each is
+  selected by the relay's `giaddr`. A client renewing its lease sends the
+  renew straight to the worker rather than through the relay, so the
+  packet carries no `giaddr` and the pool is chosen by the client's own
+  address (`ciaddr`). Each is
   `{"subnet","range_start","range_end","gateway"}`. The subnet must be an
   IPv4 CIDR in dotted-quad form (`10.254.27.0/24`, not IPv6 or
   IPv4-mapped notation such as `::ffff:10.254.27.0/120`); the range and

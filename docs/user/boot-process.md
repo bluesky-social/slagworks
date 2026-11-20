@@ -281,7 +281,14 @@ what stock `/init` calls; the slagworks version does exactly this:
    `BOOTIF=` / `ip=dhcp` and DHCPs via dhcpcd on the right NIC. Discover
    the leased interface either from the exported `DEVICE` or by scanning
    `/sys/class/net` for a global IPv4 lease. Missing lease drops to
-   recovery.
+   recovery. `configure_networking` runs dhcpcd in oneshot mode, which
+   exits once it has the lease, and the kernel deletes the address when
+   the lease runs out (5 minutes by default). So the hook then starts
+   `dhcpcd -4 -b -K -L` on the leased interface to renew the lease for as
+   long as the environment runs: the agent's whole run and any hold in
+   recovery afterwards. If dhcpcd will not start, the hook prints a
+   warning and carries on, and the address lasts only until the lease
+   ends.
 3. Mount efivarfs at `/sys/firmware/efi/efivars` when present, so the
    agent's `efibootmgr -c` can write UEFI Boot#### entries later. On BIOS
    hosts this is a no-op. `slagworks.efivarfs=skip` is a test-only knob
@@ -322,7 +329,9 @@ pubkeys baked into the initrd (the image build's
 `SLAGWORKS_RECOVERY_AUTHORIZED_KEYS` input) into
 the overlay root, generates ephemeral host keys on tmpfs, writes a
 key-only sshd config, prints the leased IP to the SOL console, and execs
-`sshd -D -e` in the foreground so an operator can `ssh root@<ip>`.
+`sshd -D -e` in the foreground so an operator can `ssh root@<ip>`. The
+dhcpcd started in step 2 keeps renewing the lease, so the address stays
+up for as long as the host waits there.
 If no keys were baked in, the hook drops straight to a serial shell
 instead of starting a permission-denying sshd.
 

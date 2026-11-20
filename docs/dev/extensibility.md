@@ -298,8 +298,9 @@ its end of the link collapses into the host's pool; with both ends
 present the higher address is taken as the host side. Pools are sorted
 by subnet so the snapshot hash does not depend on NetBox's list order
 (`netplan.go:45-105`). The site worker derives both ends of a `/31`
-pool from the relayed packet's giaddr, so the recorded host side never
-changes a DHCP answer.
+pool from the relayed packet's giaddr (or, for a renew the client
+unicasts to the worker, from its ciaddr), so the recorded host side
+never changes a DHCP answer.
 
 ### Test expectation
 
