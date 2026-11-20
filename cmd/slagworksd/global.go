@@ -71,10 +71,32 @@ type globalConfig struct {
 // cancellation mechanism.
 const globalStatementTimeout = 30 * time.Second
 
-// openGlobalDB returns a GORM database backed by a pgx database/sql pool.
-// The caller owns the returned pool. Failed setup closes it before returning.
-// A DSN with an RDS host and no password logs in with RDS IAM tokens
-// (internal/rdsiam); migrations share the pool, so they do too.
+// globalMaxConns bounds global's database connections: a burst of work
+// queues for one of them instead of opening a connection of its own. The
+// largest burst follows a global restart, when every reconnecting site
+// worker replays its outbox at once and the WebSocket hub runs one handler
+// per observation. A pool without a bound opens a connection per handler and
+// runs into the database's connection limit. Every refused connection fails
+// a handler, and a failed log_batch or op_update handler loses its data,
+// because workers send those messages once.
+//
+// Sixteen sits between two limits. Handler statements take milliseconds, so
+// sixteen connections drain a replay of hundreds of observations well inside
+// the hub's 10-second log_batch and op_update timeouts; global needs about
+// two in steady state. And sixteen per process leaves most of even a small
+// managed instance's connection allowance for a second process during a
+// rollout and for operator sessions.
+const globalMaxConns = 16
+
+// globalConnMaxIdleTime closes a connection that has sat idle this long, so
+// the pool shrinks back toward its steady-state size after a burst.
+const globalConnMaxIdleTime = 5 * time.Minute
+
+// openGlobalDB returns a GORM database backed by a pgx database/sql pool of
+// at most globalMaxConns connections. The caller owns the returned pool.
+// Failed setup closes it before returning. A DSN with an RDS host and no
+// password logs in with RDS IAM tokens (internal/rdsiam); migrations share
+// the pool, so they do too.
 func openGlobalDB(ctx context.Context, dsn string, stmtTimeout time.Duration) (*gorm.DB, *sql.DB, error) {
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
@@ -91,6 +113,14 @@ func openGlobalDB(ctx context.Context, dsn string, stmtTimeout time.Duration) (*
 		opts = append(opts, stdlib.OptionBeforeConnect(iamLogin))
 	}
 	pool := stdlib.OpenDB(*cfg, opts...)
+	pool.SetMaxOpenConns(globalMaxConns)
+	// database/sql keeps two idle connections by default and closes the rest
+	// as they free up, so load that swings between a few and sixteen
+	// concurrent statements would reopen connections over and over, each
+	// costing a TLS handshake, a login and a new server process. Keep them
+	// all until globalConnMaxIdleTime instead.
+	pool.SetMaxIdleConns(globalMaxConns)
+	pool.SetConnMaxIdleTime(globalConnMaxIdleTime)
 	db, err := gorm.Open(postgres.New(postgres.Config{Conn: pool}), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 		// TranslateError maps driver-specific errors (e.g. Postgres 23505) onto

@@ -33,7 +33,11 @@ variable shown, so a flag on the command line overrides the variable.
   `key=value` form. Default
   `host=localhost user=slagworks password=slagworks dbname=slagworks sslmode=disable`,
   which only suits local development. Migrations run at startup. Every
-  connection gets `statement_timeout=30s`.
+  connection gets `statement_timeout=30s`. Each global process holds at
+  most 16 connections; a burst of work (such as site workers replaying
+  their outboxes after a restart) waits for a free connection rather than
+  opening more, so allow 16 per running global in the database's
+  connection limit.
 - **RDS IAM login.** When the DSN's host ends in `.rds.amazonaws.com` and
   the DSN has no password, global logs in with a fresh RDS IAM token per
   connection, signed with the default AWS credential chain; the region is
@@ -527,3 +531,5 @@ example files are installed mode 0640, group `slagworks`.
   minutes (`internal/api/server.go`, `NewServer`).
 - **NetBox reconcile interval** — 5 minutes.
 - **Postgres statement timeout** — 30 seconds.
+- **Postgres connections** — at most 16 per global process; idle
+  connections close after 5 minutes.
