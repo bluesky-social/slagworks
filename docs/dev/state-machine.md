@@ -558,7 +558,15 @@ absent/lower peer.
 Once an `op_delta`/`op_resync` carrying the new pending op reaches the site
 worker, the executor's pending-op wake fires (or its 5s backstop tick),
 `Executor.processOps` (`internal/worker/executor.go:99`) sees it and calls
-`executeOp` (line 114):
+`executeOp` (line 114).
+
+`executeOp` first re-checks that the op's machine is still in the
+worker's view. A pass ranges over the pending list it built when it
+started, and a snapshot applied while earlier ops held the BMC can drop
+this machine (it moved to another site). The executor leaves such an op
+unclaimed and pending for the site that owns the machine now, rather
+than winning a claim it must then fail or having the hub's membership
+check decline it. Then:
 
 1. `Cache.MarkOpClaimed` locally in the cache first (line 120).
    This prevents the next 5-second tick re-driving the same op.

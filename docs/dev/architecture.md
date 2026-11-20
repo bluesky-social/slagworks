@@ -655,6 +655,9 @@ operations. `Run` (85) ticks every 5 seconds and calls `processOps`
 `PendingLifecycleOps`, then `ReclaimableOps` (claims that went
 unanswered, see below). Per-op:
 
+- Skip the op, unclaimed, if its machine has left the view since the
+  pass built its pending list (a snapshot applied while earlier ops
+  held the BMC).
 - `MarkOpClaimed` locally in the cache first (line 120) to prevent
   the next tick re-driving.
 - WS `claimOp` RPC (`Claimer` interface, implemented by

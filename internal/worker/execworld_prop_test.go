@@ -49,7 +49,6 @@ import (
 // counted, not failed; every other class fails the case.
 var epTolerated = map[string]string{
 	"report-lost":                    "a terminal or phase op_update is in memory and unacknowledged: it is lost on a restart or a dropped write, and the op stays claimed until a sweep fails it",
-	"stale-list-claim":               "the executor claims an op whose machine left the view since the pass built its pending list, then fails it as not in cache",
 	"orphan-sweep-phase-undelivered": "the worker recorded its first phase before actuating, but the op_update had not reached global when the orphaned-claim grace ran out (the worker was disconnected for the whole grace, or its sender had not run): the sweep fails an op that is still being actuated",
 	"double-drive-two-executors":     "two Executor instances of one worker (VIP lost and regained while the first is still inside a claim or a BMC call) both win the same op: the local claimed mark is erased by a hello op_resync or by the other executor's rollback, and the hub re-grants the claim to the same worker ID",
 }
