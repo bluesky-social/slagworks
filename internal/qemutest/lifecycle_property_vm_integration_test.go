@@ -359,6 +359,15 @@ func propVMSetupHistories(t *testing.T) []propHistory {
 			h := propScaleHistory(propNamedHistory(t, name))
 			h.Name = name + "+" + s.tag
 			s.setup(&h.Setup)
+			if h.Setup.UEFI && name == "reset-during-first-disk-boot" {
+				// A UEFI install's first boot follows the agent's BootNext
+				// straight to the disk, so the PXE-observed local boot this
+				// history arms on never happens. Reset instead as soon as
+				// deploy_complete is accepted, before the agent arms
+				// BootNext: that boot goes PXE, then boot-local.
+				h.Name = "reset-after-deploy-complete+" + s.tag
+				h.Steps[0].At = &propMoment{Host: 0, Kind: "report", Event: "deploy_complete"}
+			}
 			hs = append(hs, h)
 		}
 	}

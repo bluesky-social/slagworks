@@ -41,8 +41,29 @@ func propParityRootCase(name, firmware string, level, n int) propCase {
 	return c
 }
 
+// propRootMovesCase: the first deploy installs on d0; the second puts the root
+// on the blank d1 and leaves d0, old install and all, outside its layout.
+// The firmware enumerates d0 first. Every boot of the new install must come
+// up on the new root, the second boot (PXE, then the boot-local script) as
+// much as the first.
+func propRootMovesCase(name, firmware string, destructive, wipeAll bool) propCase {
+	return propCase{
+		Name: name, Firmware: firmware,
+		Disks: []propDisk{propD("d0", "virtio", 8, 0, 512, ""), propD("d1", "virtio", 8, 1, 512, "")},
+		Steps: []propStep{
+			{Attach: propAll("d0", "d1"), Layout: propSingleLayout("d0", "ext4"), Expect: "ok", Why: "blank disks"},
+			{Attach: propAll("d0", "d1"), Layout: propSingleLayout("d1", "ext4"),
+				Destructive: destructive, WipeAll: wipeAll, Reboot: true, Expect: "ok",
+				Why: "d1 is blank; d0 keeps the first install and is outside the layout"},
+		},
+	}
+}
+
 func propWideCases() []propCase {
 	return []propCase{
+		propRootMovesCase("uefi-root-moves-off-old-install", "uefi", false, false),
+		propRootMovesCase("bios-root-moves-off-old-install", "bios", false, false),
+		propRootMovesCase("uefi-root-moves-wipe-all", "uefi", true, true),
 		propParityRootCase("uefi-root-raid5", "uefi", 5, 3),
 		propParityRootCase("bios-root-raid5", "bios", 5, 3),
 		propParityRootCase("uefi-root-raid6", "uefi", 6, 4),

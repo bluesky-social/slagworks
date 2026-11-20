@@ -35,10 +35,12 @@ import (
 	"github.com/bluesky-social/slagworks/internal/storage"
 )
 
-// propGenRootRAID456 lets the generator put the root filesystem on RAID5 or
-// RAID6. Data arrays draw those levels regardless. It is off because no run
-// of this suite has booted a parity-RAID root under either firmware, so the
-// model has no established expectation for it.
+// propGenRootRAID456 lets the plain and preserve-heavy families put the root
+// filesystem on RAID5 or RAID6. Data arrays draw those levels regardless, and
+// the wide family (propWideSeed) draws parity roots regardless. It stays off
+// so the seeds of the older families keep generating the cases they always
+// have; the pinned uefi-root-raid5/6 and bios-root-raid5/6 histories have
+// booted parity-RAID roots under both firmwares.
 const propGenRootRAID456 = false
 
 // The model's three-valued knowledge of a fact about a disk or array.
