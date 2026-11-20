@@ -661,7 +661,11 @@ func (u *vtUnit) run() {
 			for {
 				select {
 				case <-tick.C:
-					if !p.ready && u.notify.drain() > 0 {
+					// Drain on every tick, ready or not: on Linux a unix
+					// datagram socket queues about ten messages, and the
+					// worker's next READY=1 write would then park in the
+					// network poller, which stops the bubble's clock.
+					if n := u.notify.drain(); n > 0 && !p.ready {
 						p.ready = true
 						deadline.Stop()
 					}
