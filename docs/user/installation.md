@@ -267,7 +267,10 @@ the packages on every site worker that serves the affected boots
 - On a site worker: `curl -s http://localhost:9090/readyz`. It returns 200
   once the worker is connected to global, its snapshot lists at least one
   image, `systemd-bootx64.efi` is present in the images directory, the
-  agent binary exists, and no foreign OOB DHCP server has been detected.
+  agent binary exists, no foreign OOB DHCP server has been detected, and
+  the fabric DHCP leg is not running without its pool because the
+  snapshot's DHCP config does not parse (see
+  [configuration](configuration.md#site-config-model)).
   Otherwise it returns 503 with the failing condition in `reason`.
 - On an operator machine: `slagctl auth login`, then `slagctl worker list`
   should list every registered site worker.

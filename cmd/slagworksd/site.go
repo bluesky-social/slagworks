@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -92,6 +93,13 @@ type siteServiceConfig struct {
 	// transitions, consumed by startSiteServices (probe interlock) and
 	// by the readiness handler + gauges.
 	oobConflict *oobConflictGate
+
+	// fabricPoolErr is non-nil while the fabric DHCP leg serves no pool
+	// because the snapshot's DHCP config did not parse when the services
+	// started. buildDHCPConfig sets it, reloadFabricPools clears it once
+	// a parseable config is installed, service teardown clears it with
+	// the handler, and readiness reports it.
+	fabricPoolErr atomic.Pointer[string]
 }
 
 // agentBinPath is the path to the slagworks-agent binary placed by
@@ -403,6 +411,9 @@ func runSite(cmd *cobra.Command, args []string) error {
 		if err := oobConflictReadinessError(sc.oobConflict); err != nil {
 			return err
 		}
+		if reason := sc.fabricPoolErr.Load(); reason != nil {
+			return errors.New(*reason)
+		}
 		return nil
 	})
 	healthSrv.SetMetricsRegistry(promReg)
@@ -599,6 +610,13 @@ func logSnapshotSummary(log *slog.Logger, cache *worker.Cache, localDB *worker.L
 // handler's hot-reloadable PoolConfig. Called at service start AND on
 // every snapshot apply (via the OnSnapshotApplied subscription), so
 // pool / relay-pool / promiscuous edits take effect without a restart.
+//
+// An error means the whole pool set is unusable. Neither caller treats
+// it as fatal: the gateway is the gateway_ip custom field on a NetBox
+// prefix, free text global copies without parsing, and the snapshot
+// carrying it is persisted and re-served, so failing the process would
+// fail every restart too. Service start runs without a fabric pool and
+// reload keeps the pools it has.
 func buildPoolConfig(snap model.DHCPConfig) (dhcp.PoolConfig, error) {
 	var pc dhcp.PoolConfig
 	_, subnet, err := net.ParseCIDR(snap.Subnet)
@@ -617,8 +635,8 @@ func buildPoolConfig(snap model.DHCPConfig) (dhcp.PoolConfig, error) {
 
 	// Relay pools: subnets served via dhcp-helper on leaf bridges
 	// (giaddr-selected). Global validated these at site-config write
-	// time; re-parse defensively and fail loudly rather than serving a
-	// half-configured pool set.
+	// time; re-parse defensively and reject the whole pool set rather
+	// than serving a half-configured one.
 	for _, rp := range snap.RelayPools {
 		_, rpNet, err := net.ParseCIDR(rp.Subnet)
 		if err != nil {
@@ -637,6 +655,41 @@ func buildPoolConfig(snap model.DHCPConfig) (dhcp.PoolConfig, error) {
 		})
 	}
 	return pc, nil
+}
+
+// fabricPoolFix names where the values buildPoolConfig rejects come from.
+const fabricPoolFix = "Correct the gateway_ip custom field on the site's slagworks-production prefix in NetBox, " +
+	"or the site config's ephemeral or relay pools."
+
+// fabricPoolReason is the readiness reason while the fabric DHCP leg
+// serves no pool because the snapshot's DHCP config did not parse.
+func fabricPoolReason(err error) string {
+	return fmt.Sprintf("fabric DHCP is serving no pool: %v. %s", err, fabricPoolFix)
+}
+
+// reloadFabricPools is the snapshot-applied hot reload of the fabric
+// DHCP pools, so site-config edits (relay pools, pool ranges,
+// promiscuous) take effect without a service restart. A snapshot with
+// no or invalid DHCP config leaves the handler's pools as they are:
+// losing config mid-flight should degrade to stale-but-working, not to
+// serving nothing. Installing pools clears the fabricPoolErr a start on
+// an invalid config left; a further invalid config refreshes its reason.
+func reloadFabricPools(sc *siteServiceConfig, h *dhcp.Handler) {
+	snap := sc.cache.GetDHCPConfig()
+	if snap.Subnet == "" {
+		return
+	}
+	pc, err := buildPoolConfig(snap)
+	if err != nil {
+		if old := sc.fabricPoolErr.Load(); old != nil {
+			reason := fabricPoolReason(err)
+			sc.fabricPoolErr.CompareAndSwap(old, &reason)
+		}
+		sc.log.Error("snapshot DHCP config invalid; fabric DHCP pools unchanged. "+fabricPoolFix, "err", err)
+		return
+	}
+	h.UpdatePools(pc)
+	sc.fabricPoolErr.Store(nil)
 }
 
 // buildDHCPConfig constructs the DHCP handler configuration from the
@@ -663,17 +716,31 @@ func buildDHCPConfig(sc *siteServiceConfig, serverIP net.IP) (dhcp.Config, error
 	// takes effect on worker restart, not on snapshot hot-reload — same
 	// lifetime as ServerIP. (The OOB segment's DNS/lease DO hot-reload,
 	// via SetIfaceParams.)
+	//
+	// dns_servers is free text global splits on commas without parsing,
+	// so an entry that is not an IP is skipped with an error rather than
+	// failing the start (see buildPoolConfig for why that would loop).
 	if snapCfg := sc.cache.GetDHCPConfig(); len(snapCfg.DNS) > 0 || snapCfg.LeaseSeconds > 0 {
 		if len(snapCfg.DNS) > 0 {
 			var dns []net.IP
 			for _, s := range snapCfg.DNS {
 				ip := net.ParseIP(s)
 				if ip == nil {
-					return dhcp.Config{}, fmt.Errorf("snapshot DHCP dns_servers: invalid IP %q", s)
+					log.Error("snapshot DHCP dns_servers entry is not an IP address; not handing it out. "+
+						"Correct the dns_servers custom field (comma-separated IPs) on the site's "+
+						"slagworks-production prefix in NetBox, then restart the worker: "+
+						"fabric DNS servers are read only at start",
+						"value", s)
+					continue
 				}
 				dns = append(dns, ip)
 			}
-			dhcpCfg.DNS = dns
+			if len(dns) > 0 {
+				dhcpCfg.DNS = dns
+			} else {
+				log.Error("no snapshot DHCP dns_servers entry is an IP address; handing out the default DNS server",
+					"dns", dhcpCfg.DNS)
+			}
 		}
 		if snapCfg.LeaseSeconds > 0 {
 			dhcpCfg.LeaseDuration = time.Duration(snapCfg.LeaseSeconds) * time.Second
@@ -703,14 +770,20 @@ func buildDHCPConfig(sc *siteServiceConfig, serverIP net.IP) (dhcp.Config, error
 		return sc.cache.MachineByMAC(mac) != nil
 	}
 
+	sc.fabricPoolErr.Store(nil)
 	snap := sc.cache.GetDHCPConfig()
 	if snap.Subnet == "" {
 		log.Info("snapshot has no DHCP config, DHCP will not serve leases until one arrives")
+	} else if pc, err := buildPoolConfig(snap); err != nil {
+		// Same outcome as a cold cache: the handler starts with no pool
+		// and reloadFabricPools installs one from the first snapshot that
+		// parses. Everything else (OOB, TFTP, HTTP boot, agent endpoints,
+		// the executor) starts as usual.
+		reason := fabricPoolReason(err)
+		sc.fabricPoolErr.Store(&reason)
+		log.Error("snapshot DHCP config invalid; starting without the fabric DHCP pool, which serves no leases "+
+			"until a snapshot with a valid config arrives. "+fabricPoolFix, "err", err)
 	} else {
-		pc, err := buildPoolConfig(snap)
-		if err != nil {
-			return dhcp.Config{}, err
-		}
 		dhcpCfg.PoolConfig = pc
 
 		log.Info("DHCP configured from snapshot",
@@ -813,11 +886,13 @@ func startSiteServices(ctx context.Context, sc *siteServiceConfig) (<-chan struc
 	dhcpHandler.SetLogger(log)
 	// Expose the live handler to the scrape-time lease collector;
 	// cleared on teardown so a standby period reports no leases
-	// instead of a stale handler's.
+	// instead of a stale handler's. The missing-pool readiness reason
+	// describes this handler, so it goes with it.
 	sc.dhcpHandler.Store(dhcpHandler)
 	wg.Go(func() {
 		<-ctx.Done()
 		sc.dhcpHandler.CompareAndSwap(dhcpHandler, nil)
+		sc.fabricPoolErr.Store(nil)
 	})
 	dhcpServer := dhcp.NewServer(cfg.iface, dhcpHandler)
 	wg.Go(func() {
@@ -844,23 +919,13 @@ func startSiteServices(ctx context.Context, sc *siteServiceConfig) (<-chan struc
 		return h.Leases()
 	})
 
-	// Hot-reload DHCP pool state on every snapshot apply, so
-	// site-config edits (relay pools, pool ranges, promiscuous) take
-	// effect without a service restart. A snapshot with no/invalid
-	// DHCP config keeps the last good pools — losing config mid-flight
-	// should degrade to stale-but-working, not to serving nothing.
-	unsubPools := sc.cache.OnSnapshotApplied(func() {
-		snap := sc.cache.GetDHCPConfig()
-		if snap.Subnet == "" {
-			return
-		}
-		pc, err := buildPoolConfig(snap)
-		if err != nil {
-			log.Error("snapshot DHCP config invalid; keeping previous pools", "err", err)
-			return
-		}
-		dhcpHandler.UpdatePools(pc)
-	})
+	// Hot-reload DHCP pool state on every snapshot apply. The WS client is
+	// already applying snapshots, and one applied after buildDHCPConfig
+	// read the cache but before this subscription has no callback, so
+	// reconcile once after subscribing: a worker that started without a
+	// pool would otherwise wait for the snapshot after the corrected one.
+	unsubPools := sc.cache.OnSnapshotApplied(func() { reloadFabricPools(sc, dhcpHandler) })
+	reloadFabricPools(sc, dhcpHandler)
 	wg.Go(func() {
 		<-ctx.Done()
 		unsubPools()

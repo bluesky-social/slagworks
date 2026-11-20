@@ -12,7 +12,10 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"github.com/bluesky-social/slagworks/internal/dhcp"
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/power"
 	"github.com/bluesky-social/slagworks/internal/power/smcipmitool"
@@ -83,6 +86,9 @@ func TestBuildDHCPConfig_FromSnapshot(t *testing.T) {
 	if cfg.OnACK == nil {
 		t.Error("OnACK callback should be set")
 	}
+	if r := sc.fabricPoolErr.Load(); r != nil {
+		t.Errorf("fabricPoolErr = %q, want unset for a parseable config", *r)
+	}
 }
 
 func TestBuildDHCPConfig_RelayPools(t *testing.T) {
@@ -124,27 +130,169 @@ func TestBuildDHCPConfig_RelayPools(t *testing.T) {
 	}
 }
 
-func TestBuildDHCPConfig_RelayPoolInvalidIPs(t *testing.T) {
+// validDHCP is a fabric DHCP config buildPoolConfig accepts.
+var validDHCP = model.DHCPConfig{
+	Subnet:             "10.99.1.0/24",
+	Gateway:            "10.99.1.1",
+	EphemeralPoolStart: "10.99.1.100",
+	EphemeralPoolEnd:   "10.99.1.200",
+}
+
+func withDHCP(edit func(*model.DHCPConfig)) model.DHCPConfig {
+	c := validDHCP
+	edit(&c)
+	return c
+}
+
+// A snapshot DHCP config that does not parse must not fail the service
+// start: the snapshot is persisted and global re-serves it, so an error
+// here would fail every restart. The handler starts with no pool (as on a
+// cold cache), readiness gets the reason, and everything else is wired.
+func TestBuildDHCPConfig_UnparseablePoolStartsWithoutPool(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		dhcp model.DHCPConfig
+		want string // in the readiness reason
+	}{
+		{"gateway_ip with its mask", withDHCP(func(c *model.DHCPConfig) { c.Gateway = "10.99.1.1/24" }), `gw="10.99.1.1/24"`},
+		{"gateway_ip empty", withDHCP(func(c *model.DHCPConfig) { c.Gateway = "" }), `gw=""`},
+		{"pool start not an IP", withDHCP(func(c *model.DHCPConfig) { c.EphemeralPoolStart = "not-an-ip" }), `start="not-an-ip"`},
+		{"subnet not a CIDR", withDHCP(func(c *model.DHCPConfig) { c.Subnet = "not-a-cidr" }), `"not-a-cidr"`},
+		{"relay pool IP not an IP", withDHCP(func(c *model.DHCPConfig) {
+			c.RelayPools = []model.RelayPool{
+				{Subnet: "10.254.27.0/24", RangeStart: "garbage", RangeEnd: "10.254.27.150", Gateway: "10.254.27.1"},
+			}
+		}), `start="garbage"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cache := worker.NewCache(nil)
+			applyDHCP(cache, tc.dhcp)
+			sc := &siteServiceConfig{
+				cfg:   siteConfig{httpPort: 8080, iface: loopbackIface()},
+				cache: cache,
+				log:   slog.Default(),
+			}
+
+			cfg, err := buildDHCPConfig(sc, net.ParseIP("10.99.1.1"))
+			if err != nil {
+				t.Fatalf("buildDHCPConfig: %v; an unparseable snapshot DHCP config must not fail the start", err)
+			}
+			if cfg.RangeStart != nil || cfg.Gateway != nil || len(cfg.RelaySubnets) != 0 {
+				t.Errorf("PoolConfig = %+v, want empty (no pool from a config that does not parse)", cfg.PoolConfig)
+			}
+			if cfg.KnownMACs == nil || cfg.ReserveIP == nil || cfg.OnACK == nil {
+				t.Error("callbacks must stay wired so pools installed by hot reload are filtered and reported")
+			}
+			reason := sc.fabricPoolErr.Load()
+			if reason == nil {
+				t.Fatal("fabricPoolErr unset; readiness must report a fabric leg serving no pool")
+			}
+			for _, want := range []string{tc.want, "gateway_ip"} {
+				if !strings.Contains(*reason, want) {
+					t.Errorf("readiness reason %q should mention %q", *reason, want)
+				}
+			}
+		})
+	}
+}
+
+// dns_servers is a comma-separated free-text NetBox field. An entry that
+// is not an IP is dropped, not fatal; with none left the default stays.
+func TestBuildDHCPConfig_DNSServers(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		dns  []string
+		want []string
+	}{
+		{"all valid", []string{"10.99.1.2", "10.99.1.3"}, []string{"10.99.1.2", "10.99.1.3"}},
+		{"one unparseable entry dropped", []string{"10.99.1.2", "10.99.1.3; 10.99.1.4"}, []string{"10.99.1.2"}},
+		{"none parse keeps the default", []string{"10.99.1.3; 10.99.1.4"}, []string{"1.1.1.1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cache := worker.NewCache(nil)
+			applyDHCP(cache, withDHCP(func(c *model.DHCPConfig) { c.DNS = tc.dns }))
+			sc := &siteServiceConfig{
+				cfg:   siteConfig{httpPort: 8080, iface: loopbackIface()},
+				cache: cache,
+				log:   slog.Default(),
+			}
+
+			cfg, err := buildDHCPConfig(sc, net.ParseIP("10.99.1.1"))
+			if err != nil {
+				t.Fatalf("buildDHCPConfig: %v", err)
+			}
+			var got []string
+			for _, ip := range cfg.DNS {
+				got = append(got, ip.String())
+			}
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("DNS = %v, want %v", got, tc.want)
+			}
+			if cfg.RangeStart == nil {
+				t.Error("a bad dns_servers entry must not cost the pool")
+			}
+			if r := sc.fabricPoolErr.Load(); r != nil {
+				t.Errorf("fabricPoolErr = %q, want unset: the pool is served", *r)
+			}
+		})
+	}
+}
+
+// A worker that started without a pool picks one up from the first
+// snapshot that parses, and readiness clears; a later unparseable config
+// keeps the installed pools (stale-but-working) without flagging readiness.
+func TestReloadFabricPools_RecoversFromUnparseableStart(t *testing.T) {
 	t.Parallel()
 	cache := worker.NewCache(nil)
-	applyDHCP(cache, model.DHCPConfig{
-		Subnet:             "10.99.1.0/24",
-		Gateway:            "10.99.1.1",
-		EphemeralPoolStart: "10.99.1.100",
-		EphemeralPoolEnd:   "10.99.1.200",
-		RelayPools: []model.RelayPool{
-			{Subnet: "10.254.27.0/24", RangeStart: "garbage", RangeEnd: "10.254.27.150", Gateway: "10.254.27.1"},
-		},
-	})
+	seq := int64(0)
+	apply := func(c model.DHCPConfig) {
+		seq++
+		cache.ApplySnapshot(&model.SiteSnapshot{SeqNum: seq, Site: model.SiteInfo{Slug: "site-a", Name: "site-a"}, DHCP: c})
+	}
+	apply(withDHCP(func(c *model.DHCPConfig) { c.Gateway = "10.99.1.1/24" }))
 
+	metrics := dhcp.NewMetrics(prometheus.NewRegistry())
 	sc := &siteServiceConfig{
-		cfg:   siteConfig{httpPort: 8080, iface: loopbackIface()},
-		cache: cache,
-		log:   slog.Default(),
+		cfg:         siteConfig{httpPort: 8080, iface: loopbackIface()},
+		cache:       cache,
+		log:         slog.Default(),
+		dhcpMetrics: metrics,
+	}
+	cfg, err := buildDHCPConfig(sc, net.ParseIP("10.99.1.1"))
+	if err != nil {
+		t.Fatalf("buildDHCPConfig: %v", err)
+	}
+	h := dhcp.NewHandler(cfg)
+	cache.OnSnapshotApplied(func() { reloadFabricPools(sc, h) })
+	poolSeries := func() int { return testutil.CollectAndCount(metrics.PoolSize) }
+	if n := poolSeries(); n != 0 {
+		t.Fatalf("pool series at start = %d, want 0", n)
 	}
 
-	if _, err := buildDHCPConfig(sc, net.ParseIP("10.99.1.1")); err == nil {
-		t.Fatal("expected error on malformed relay pool IP, got nil")
+	// Still unparseable, differently: the reason follows the latest config.
+	apply(withDHCP(func(c *model.DHCPConfig) { c.Gateway = "" }))
+	if r := sc.fabricPoolErr.Load(); r == nil || !strings.Contains(*r, `gw=""`) {
+		t.Fatalf("fabricPoolErr = %v, want the latest config's error", r)
+	}
+
+	apply(validDHCP)
+	if r := sc.fabricPoolErr.Load(); r != nil {
+		t.Fatalf("fabricPoolErr = %q after a parseable snapshot, want unset", *r)
+	}
+	if got := testutil.ToFloat64(metrics.PoolSize.WithLabelValues("10.99.1.0/24")); got != 101 {
+		t.Fatalf("pool size = %v, want 101 once hot reload installed the pool", got)
+	}
+
+	apply(withDHCP(func(c *model.DHCPConfig) { c.Gateway = "10.99.1.1/24" }))
+	if r := sc.fabricPoolErr.Load(); r != nil {
+		t.Errorf("fabricPoolErr = %q, want unset: the previous pools are still served", *r)
+	}
+	if got := testutil.ToFloat64(metrics.PoolSize.WithLabelValues("10.99.1.0/24")); got != 101 {
+		t.Errorf("pool size = %v, want the previous pool kept", got)
 	}
 }
 
@@ -164,50 +312,6 @@ func TestBuildDHCPConfig_EmptySnapshotIsNoOp(t *testing.T) {
 	}
 	if cfg.RangeStart != nil {
 		t.Errorf("expected nil RangeStart with no snapshot, got %s", cfg.RangeStart)
-	}
-}
-
-func TestBuildDHCPConfig_InvalidSubnetCIDR(t *testing.T) {
-	t.Parallel()
-	cache := worker.NewCache(nil)
-	applyDHCP(cache, model.DHCPConfig{
-		Subnet:             "not-a-cidr",
-		Gateway:            "10.99.1.1",
-		EphemeralPoolStart: "10.99.1.100",
-		EphemeralPoolEnd:   "10.99.1.200",
-	})
-
-	sc := &siteServiceConfig{
-		cfg:   siteConfig{httpPort: 8080, iface: loopbackIface()},
-		cache: cache,
-		log:   slog.Default(),
-	}
-
-	_, err := buildDHCPConfig(sc, net.ParseIP("10.0.0.1"))
-	if err == nil {
-		t.Fatal("expected error for invalid subnet CIDR")
-	}
-}
-
-func TestBuildDHCPConfig_InvalidIPs(t *testing.T) {
-	t.Parallel()
-	cache := worker.NewCache(nil)
-	applyDHCP(cache, model.DHCPConfig{
-		Subnet:             "10.99.1.0/24",
-		Gateway:            "10.99.1.1",
-		EphemeralPoolStart: "not-an-ip",
-		EphemeralPoolEnd:   "10.99.1.200",
-	})
-
-	sc := &siteServiceConfig{
-		cfg:   siteConfig{httpPort: 8080, iface: loopbackIface()},
-		cache: cache,
-		log:   slog.Default(),
-	}
-
-	_, err := buildDHCPConfig(sc, net.ParseIP("10.0.0.1"))
-	if err == nil {
-		t.Fatal("expected error for invalid pool IPs")
 	}
 }
 

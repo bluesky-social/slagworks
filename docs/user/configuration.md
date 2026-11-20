@@ -387,7 +387,17 @@ site config requires a prefix tagged `slagworks-production` scoped to the
 site (or location). The DNS servers and lease time handed out on the
 fabric leg come from that prefix's `dns_servers` and `dhcp_lease_seconds`
 custom fields, defaulting to `1.1.1.1` and 5 minutes; workers read them
-when their services start, so a change takes effect on restart. When
+when their services start, so a change takes effect on restart.
+Global copies `gateway_ip` (a bare address such as `10.0.0.1`, not
+`10.0.0.1/24`) and `dns_servers` (comma-separated addresses) into the
+snapshot without checking them; a worker that cannot parse one logs an
+error naming the field and keeps running. It skips a `dns_servers`
+entry that is not an address, falling back to `1.1.1.1` when none is
+left. When the gateway or a pool does not parse, a running worker keeps
+the pools it has, and a worker that starts on such a snapshot runs
+without the fabric DHCP pool, reporting why on `/readyz`, until a
+snapshot that parses arrives; OOB DHCP, TFTP and HTTP boot keep
+running. When
 child locations of a location-scoped config also carry
 `slagworks-production` prefixes, the prefix scoped to the config's own
 location still supplies the subnet, gateway, DNS servers and lease time.
