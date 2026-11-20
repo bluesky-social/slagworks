@@ -32,8 +32,9 @@ import (
 //   - The purely-immutable snapshot read state lives in a *snapshotView
 //     published behind view (an atomic.Pointer). Pure reads (the DHCP /
 //     TFTP / HTTP-boot serving hot path) load it lock-free and are never
-//     blocked by an apply, including the apply's minutes-long image sync
-//     (which runs AFTER the view swap).
+//     blocked by an apply. The minutes-long image download an apply can
+//     start runs on its own goroutine (requestImageSync), so it blocks
+//     neither readers nor the apply's caller, the WS read loop.
 //   - The mutable op-layer lives in a separate *opState component
 //     (opstate_cache.go) under its OWN RWMutex: the ops map (rebuilt each
 //     apply, with local status/phase mutations layered on top between
@@ -56,14 +57,18 @@ import (
 //   - The durable outbox is a separate *outbox (outbox.go) with its own
 //     lock, persistence, backoff, and wake channel.
 //
-// Lock order inside ApplySnapshot: applyMu (whole body) -> opState.mu (swap
-// view + reset op overlay, release) -> subsMu.RLock (snapshot callbacks,
-// release) -> imageSyncMu (image sync, release). No code acquires applyMu
-// while holding opState.mu/subsMu/outboxMu/imageSyncMu; no reader/mutator
-// holds more than one of opState.mu/subsMu/outboxMu/imageSyncMu; subscriber
-// callbacks run with none of these held. persistMu (persistOpState) is
-// never taken while holding opState.mu; it wraps only opState.mu.RLock and
-// the LocalDB write. Pure readers take no lock.
+// Lock order inside ApplySnapshot: applyMu (whole body) -> imageSyncMu
+// (hand the image set to the syncer, release) -> opState.mu (swap view +
+// reset op overlay, release) -> subsMu.RLock (snapshot callbacks, release).
+// No code acquires applyMu while holding opState.mu/subsMu/outboxMu/
+// imageSyncMu; no reader/mutator holds more than one of
+// opState.mu/subsMu/outboxMu/imageSyncMu, except the readers the image
+// sync gates (PendingLifecycleOps, ReclaimableOps, BootActionForMAC), which
+// hold imageSyncMu across their opState.mu read (the order ApplySnapshot
+// takes them in; nothing takes imageSyncMu under opState.mu); subscriber
+// callbacks and the image download run with none of these held. persistMu
+// (persistOpState) is never taken while holding opState.mu; it wraps only
+// opState.mu.RLock and the LocalDB write. Pure readers take no lock.
 type Cache struct {
 	// applyMu serializes ApplySnapshot end-to-end. Never taken by a reader.
 	applyMu sync.Mutex
@@ -115,13 +120,28 @@ type Cache struct {
 	persistMu sync.Mutex
 
 	// ImagesDir is the on-disk directory for boot images. When set,
-	// ApplySnapshot calls SyncImages after the view swap.
+	// ApplySnapshot hands each applied snapshot's image set to the
+	// background image sync (requestImageSync).
 	ImagesDir string
-	// imageSyncFn runs the image sync; defaults to imagepull.SyncImages.
-	// Tests inject a slow/blocking sync to exercise apply overlap and the
-	// single-fire property.
+	// imageSyncFn runs one image sync; defaults to imagepull.SyncImages.
+	// Tests inject a slow or blocking sync.
 	imageSyncFn func(imagesDir string, images map[string]*model.Image) error
-	imageSyncMu sync.Mutex // serializes image downloads
+	// imageSyncMu guards the image sync hand-off below. Never held across
+	// a download.
+	imageSyncMu sync.Mutex
+	// imageSyncNext is the newest image set waiting for the syncer, nil when
+	// none is waiting. A set requested while a download runs replaces any
+	// set still waiting, so the syncer moves straight on to the newest.
+	imageSyncNext map[string]*model.Image
+	// imageSyncRunning is true while a syncer goroutine is alive. At most
+	// one runs, so downloads never overlap.
+	imageSyncRunning bool
+	// imageSyncRequested counts image sets handed to the syncer;
+	// imageSyncFinished is the count as of the last set the syncer finished
+	// (succeeded or failed). While they differ, the images on disk may be
+	// older than the ones the applied snapshot names, and
+	// PendingLifecycleOps withholds commission and deploy ops.
+	imageSyncRequested, imageSyncFinished uint64
 
 	// snapshotSubs holds callbacks invoked at the end of every successful
 	// ApplySnapshot call (CastManager pump reconcile, DHCP pool refresh).
@@ -323,8 +343,14 @@ func (c *Cache) HelloSeqNum() int64 {
 // the active op come from the op-layer overlay. opState holds opState.mu
 // around the view.Load so the (machine, op) pair is from one generation —
 // a swap can't slip between reading the machine and the op.
+//
+// While an image sync is in flight a pending commission or deploy op does
+// not authorize a boot (BootLocal), for the reason PendingLifecycleOps holds
+// it back: a host that PXEs on its own would install the previous image.
 func (c *Cache) BootActionForMAC(mac string) model.BootAction {
-	return c.opState.bootActionForMAC(mac)
+	c.imageSyncMu.Lock()
+	defer c.imageSyncMu.Unlock()
+	return c.opState.bootActionForMAC(mac, c.imageSyncInFlightLocked())
 }
 
 func (c *Cache) MachineIDForMAC(mac string) (uuid.UUID, bool) {
@@ -529,19 +555,19 @@ func (c *Cache) RecordDHCPLease(machineID uuid.UUID, event, mac, ip, kind, pool 
 //
 //  1. seqnum-gate (reject stale) — no side effect if rejected.
 //  2. build the next immutable snapshotView from snap.
-//  3. opState.replaceFromSnapshot: under opState.mu, swap the view pointer
+//  3. hand the view's image set to the background image sync
+//     (requestImageSync). It returns at once: the download runs on the
+//     syncer's goroutine, never on the caller's, which is the WS read loop.
+//  4. opState.replaceFromSnapshot: under opState.mu, swap the view pointer
 //     AND reset the op overlay (ops rebuilt from snap, machineState
 //     cleared) as one transition, so combined readers never see a torn
 //     (view, op-overlay) pair. failedOps/phaseStart are preserved.
-//  4. snapshot the subscriber callbacks under subsMu.
-//  5. image sync (serialized by imageSyncMu) — with NO other lock held, so
-//     the minutes-long download blocks no reader.
+//  5. snapshot the subscriber callbacks under subsMu.
 //  6. persist to LocalDB.
 //  7. fire subscribers exactly once, with no lock held.
 //
-// Steps 5-7 are the current order (the old code synced, persisted, then
-// fired subscribers last); image-sync and persist failures are non-fatal
-// and leave the freshly-published snapshot visible (see below).
+// Image-sync and persist failures are non-fatal and leave the
+// freshly-published snapshot visible (see below).
 //
 // Machines whose Interfaces slice is empty (soft-decommissioned per the
 // NetBox-SSoT model) simply don't appear in macIndex — so BootActionForMAC
@@ -653,6 +679,19 @@ func (c *Cache) applySnapshot(snap *model.SiteSnapshot, adopt bool) bool {
 		v.images[img.Name] = &img
 	}
 
+	// Start syncing this snapshot's images before publishing the view, so
+	// PendingLifecycleOps already withholds commission and deploy ops when
+	// a reader first sees the new image set. SyncImages is idempotent (it
+	// compares each image's on-disk link with the row's SHA256 and downloads
+	// only versions it does not hold), so a snapshot that changes no image
+	// costs a few file reads. An empty set is
+	// handed over too, so it supersedes a set still waiting.
+	if c.ImagesDir != "" {
+		images := make(map[string]*model.Image, len(v.images))
+		maps.Copy(images, v.images)
+		c.requestImageSync(images)
+	}
+
 	// Publish the identity view under opState.mu, and CONDITIONALLY clear
 	// the machine-state overlay: overlay[id] clears ONLY where the applied
 	// baseline State equals the overlay value (the durable state caught
@@ -677,27 +716,6 @@ func (c *Cache) applySnapshot(snap *model.SiteSnapshot, adopt bool) bool {
 	}
 	c.subsMu.RUnlock()
 
-	// Sync images to disk with NO state lock held. SyncImages is idempotent
-	// — it compares each image's on-disk link with the row's SHA256 and
-	// only downloads versions it does not already hold.
-	// Serialized by imageSyncMu (also held by no reader). Failure is
-	// non-fatal: the published snapshot stays visible; the next apply (or
-	// the next tick, since the row's SHA still mismatches) retries.
-	if c.ImagesDir != "" && len(v.images) > 0 {
-		images := make(map[string]*model.Image, len(v.images))
-		maps.Copy(images, v.images)
-		c.imageSyncMu.Lock()
-		// Wrap in func+defer so a panic doesn't leak imageSyncMu — a
-		// recovered panic upstream would otherwise permanently deadlock
-		// subsequent ApplySnapshot calls.
-		func() {
-			defer c.imageSyncMu.Unlock()
-			if err := c.imageSyncFn(c.ImagesDir, images); err != nil {
-				slog.Error("image sync failed", "err", err)
-			}
-		}()
-	}
-
 	// Persist updated cache. One transactional SaveSnapshot writes machines
 	// + meta atomically — a partial write (machines saved, meta not, or
 	// vice versa) would silently desync the worker against the global on
@@ -717,6 +735,63 @@ func (c *Cache) applySnapshot(snap *model.SiteSnapshot, adopt bool) bool {
 		cb()
 	}
 	return true
+}
+
+// requestImageSync hands images to the background syncer and returns at
+// once, starting the syncer goroutine if none is running. The syncer
+// downloads one set at a time, always moving on to the newest set
+// requested. A failed sync is logged and not retried on its own: the row's
+// SHA still mismatches the on-disk link, so the next applied snapshot
+// retries it, as before.
+func (c *Cache) requestImageSync(images map[string]*model.Image) {
+	c.imageSyncMu.Lock()
+	c.imageSyncRequested++
+	c.imageSyncNext = images
+	start := !c.imageSyncRunning
+	c.imageSyncRunning = true
+	c.imageSyncMu.Unlock()
+	if start {
+		go c.runImageSyncs()
+	}
+}
+
+// runImageSyncs is the syncer goroutine: it syncs the newest waiting image
+// set until none is waiting, then exits. When it has caught up with every
+// request it fires the executor wake, so a commission or deploy op that
+// PendingLifecycleOps held back is driven now rather than on the
+// executor's next 5s tick.
+func (c *Cache) runImageSyncs() {
+	for {
+		c.imageSyncMu.Lock()
+		images, gen := c.imageSyncNext, c.imageSyncRequested
+		if images == nil {
+			c.imageSyncRunning = false
+			c.imageSyncMu.Unlock()
+			return
+		}
+		c.imageSyncNext = nil
+		c.imageSyncMu.Unlock()
+
+		if err := c.imageSyncFn(c.ImagesDir, images); err != nil {
+			slog.Error("image sync failed; the next snapshot apply retries it", "err", err)
+		}
+
+		c.imageSyncMu.Lock()
+		c.imageSyncFinished = gen
+		caughtUp := gen == c.imageSyncRequested
+		c.imageSyncMu.Unlock()
+		if caughtUp {
+			c.opState.fireWake()
+		}
+	}
+}
+
+// imageSyncInFlightLocked reports whether an image set handed to the syncer
+// has not finished syncing yet. The caller holds imageSyncMu, and holds it
+// across the op-layer read the answer gates, so an apply cannot request a
+// sync and publish its view between the check and the read.
+func (c *Cache) imageSyncInFlightLocked() bool {
+	return c.imageSyncFinished != c.imageSyncRequested
 }
 
 // OnSnapshotApplied registers a callback invoked at the end of every
@@ -797,15 +872,38 @@ func (c *Cache) PendingPowerOps() []model.Operation {
 
 // PendingLifecycleOps returns operations in "pending" status with lifecycle
 // types (commission, deploy) that the executor should drive via PXE boot.
+//
+// It returns none while an image sync is in flight. Both op types boot the
+// image on disk, which until the sync finishes can be the previous release
+// under the same name: a deploy created just after an image was replaced
+// would install the old system. Power ops, RPCs and op messages do not
+// wait. A failed sync releases the ops, which then boot whatever image is
+// on disk; imagepull's stall timeout bounds a download that stops
+// delivering.
 func (c *Cache) PendingLifecycleOps() []model.Operation {
+	c.imageSyncMu.Lock()
+	defer c.imageSyncMu.Unlock()
+	if c.imageSyncInFlightLocked() {
+		return nil
+	}
 	return c.opState.pendingLifecycleOps()
 }
 
 // ReclaimableOps returns the ops whose last claim went unanswered and that
 // global's row now shows as claimed by workerID with no phase: the claim
 // committed and only its reply was lost, so the executor claims them again.
+// While an image sync is in flight it leaves out commission and deploy ops,
+// which PendingLifecycleOps holds back for the same reason.
 func (c *Cache) ReclaimableOps(workerID string) []model.Operation {
-	return c.opState.reclaimableOps(workerID)
+	c.imageSyncMu.Lock()
+	defer c.imageSyncMu.Unlock()
+	ops := c.opState.reclaimableOps(workerID)
+	if c.imageSyncInFlightLocked() {
+		ops = slices.DeleteFunc(ops, func(op model.Operation) bool {
+			return op.Type == model.OpCommission || op.Type == model.OpDeploy
+		})
+	}
+	return ops
 }
 
 // --- Machine lookups ---

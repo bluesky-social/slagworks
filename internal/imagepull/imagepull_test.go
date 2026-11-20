@@ -12,10 +12,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 )
@@ -643,5 +645,101 @@ func TestSyncImages_RejectsBADSHA(t *testing.T) {
 	// Should NOT have extracted anything
 	if _, err := os.Stat(filepath.Join(imagesDir, "noble-bad", "vmlinuz")); err == nil {
 		t.Error("expected no extraction on SHA mismatch")
+	}
+}
+
+// shortStallTimeout shortens stallTimeout for one test.
+func shortStallTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := stallTimeout
+	stallTimeout = d
+	t.Cleanup(func() { stallTimeout = old })
+}
+
+// TestSyncImages_AbandonsStalledDownload: a download whose server stops
+// sending, before the response headers or partway through the body, fails
+// once no data has arrived for stallTimeout. Without the timeout it would
+// hold the site worker's image sync, and the commission and deploy ops
+// waiting on it, until the process restarted.
+func TestSyncImages_AbandonsStalledDownload(t *testing.T) {
+	shortStallTimeout(t, 200*time.Millisecond)
+	for _, tc := range []struct {
+		name  string
+		start func(w http.ResponseWriter) // what the server sends before it stops
+	}{
+		{"no response headers", func(http.ResponseWriter) {}},
+		{"body stops", func(w http.ResponseWriter) {
+			w.Header().Set("Content-Length", "1048576")
+			_, _ = w.Write(make([]byte, 4096))
+			w.(http.Flusher).Flush()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stop := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				tc.start(w)
+				select {
+				case <-r.Context().Done():
+				case <-stop:
+				}
+			}))
+			defer srv.Close()
+			defer close(stop)
+
+			imagesDir := t.TempDir()
+			images := map[string]*model.Image{
+				"noble-pxe": {Name: "noble-pxe", SHA256: strings.Repeat("ab", 32), URL: srv.URL + "/noble-pxe.tar.gz"},
+			}
+			errc := make(chan error, 1)
+			go func() { errc <- SyncImages(slog.Default(), imagesDir, images) }()
+			select {
+			case err := <-errc:
+				if err == nil || !strings.Contains(err.Error(), "download stalled") {
+					t.Fatalf("SyncImages = %v, want a download stalled error", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("SyncImages still waiting on a server that stopped sending 5s ago (stall timeout 200ms)")
+			}
+			if v, ok := Installed(imagesDir, "noble-pxe"); ok {
+				t.Errorf("image installed (%s) from an abandoned download", v)
+			}
+		})
+	}
+}
+
+// TestSyncImages_SlowDownloadIsNotAbandoned: the stall timeout measures time
+// without data, not the length of the download. A tarball that arrives in
+// pieces over longer than stallTimeout, each piece (the response headers
+// included) sooner than it, syncs.
+func TestSyncImages_SlowDownloadIsNotAbandoned(t *testing.T) {
+	shortStallTimeout(t, 500*time.Millisecond)
+	tarPath, sha := buildTestTarball(t, "noble-pxe")
+	tarData, _ := os.ReadFile(tarPath)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Headers after 300ms and the first byte 300ms later: together
+		// longer than the stall timeout, each gap shorter.
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Length", strconv.Itoa(len(tarData)))
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		time.Sleep(300 * time.Millisecond)
+		piece := len(tarData)/6 + 1
+		for off := 0; off < len(tarData); off += piece {
+			_, _ = w.Write(tarData[off:min(off+piece, len(tarData))])
+			w.(http.Flusher).Flush()
+			time.Sleep(100 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	imagesDir := t.TempDir()
+	images := map[string]*model.Image{
+		"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: srv.URL + "/noble-pxe.tar.gz"},
+	}
+	if err := SyncImages(slog.Default(), imagesDir, images); err != nil {
+		t.Fatalf("slow but steady download failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); err != nil {
+		t.Errorf("vmlinuz not found: %v", err)
 	}
 }

@@ -253,6 +253,16 @@ fetch fails with a 404 rather than mixing versions; deploy it again.
 
 Notes:
 
+- The download runs in the background. While it runs the worker stays
+  connected to global, answers power, boot and lease reads, applies
+  operations and aborts, and keeps serving boots from the previous image.
+  It holds commission and deploy operations until the download ends, so
+  a deploy created after the row changed installs the new image. A
+  download that fails releases them; they then boot the image already on
+  disk, and the worker retries the download on its next snapshot.
+- A download that receives no data for a minute is abandoned and logged
+  as `download stalled`; a slow download that keeps receiving data is
+  never cut off.
 - The row name is the link name. `SyncImages` skips, with an
   error, any name that fails `model.ValidateImageName` (lowercase
   letters, digits, `.`, `_`, `-`, starting with a letter or digit)

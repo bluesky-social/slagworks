@@ -384,6 +384,10 @@ Notes:
   latch](#the-awaiting_phone_home-latch). It is checked before the
   machine state because the pending-op rows let an install finish
   while the machine is still `commissioned` or `failed`.
+- While the worker syncs an image, every row whose active op is still
+  pending serves `BootLocal`: the image on disk can be the previous
+  release under the same name. A claimed op keeps its row. See [Claim
+  and drive](#claim-and-drive).
 
 ### How the boot action reaches the target
 
@@ -559,6 +563,15 @@ Once an `op_delta`/`op_resync` carrying the new pending op reaches the site
 worker, the executor's pending-op wake fires (or its 5s backstop tick),
 `Executor.processOps` (`internal/worker/executor.go:99`) sees it and calls
 `executeOp` (line 114).
+
+A pending commission or deploy op waits while the worker syncs an
+image: `Cache.PendingLifecycleOps` returns nothing and
+`Cache.ReclaimableOps` leaves lifecycle ops out until the sync ends,
+whether it succeeded or failed, and the syncer then fires the wake. The
+boot decision serves `BootLocal` for a pending lifecycle op meanwhile,
+so a host that PXEs on its own does not start one either. The op would
+otherwise boot the previous image still on disk under the same name.
+Power ops, and a lifecycle op already claimed, do not wait.
 
 `executeOp` first re-checks that the op's machine is still in the
 worker's view. A pass ranges over the pending list it built when it

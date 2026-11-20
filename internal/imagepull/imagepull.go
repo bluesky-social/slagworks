@@ -13,6 +13,7 @@ package imagepull
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 )
@@ -248,6 +250,28 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// stallTimeout is how long a download may go without receiving any data,
+// response headers included, before pullImage abandons it. A slow download
+// that keeps moving is never cut off. Without it, a connection that stopped
+// delivering would hold the site worker's image sync, and with it every
+// later image set and the worker's commission and deploy ops, until the
+// process restarted. A var so tests can shorten it.
+var stallTimeout = time.Minute
+
+// stallReader re-arms the stall timer each time a read returns data.
+type stallReader struct {
+	r     io.Reader
+	timer *time.Timer
+}
+
+func (s *stallReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if n > 0 {
+		s.timer.Reset(stallTimeout)
+	}
+	return n, err
+}
+
 // pullImage downloads img, verifies its SHA256, and extracts it into
 // targetDir, which must not exist yet. On any failure targetDir is not
 // created.
@@ -259,12 +283,33 @@ func pullImage(log *slog.Logger, img *model.Image, targetDir string) error {
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
-	resp, err := http.Get(img.URL) //nolint:gosec // URL comes from trusted global controller
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	stall := time.AfterFunc(stallTimeout, func() {
+		cancel(fmt.Errorf("download stalled: no data received for %s; check that the image URL is reachable from this host", stallTimeout))
+	})
+	defer stall.Stop()
+	// downloadErr reports the stall rather than the context cancellation it
+	// caused.
+	downloadErr := func(err error) error {
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, img.URL, nil)
 	if err != nil {
 		tmpFile.Close()
 		return fmt.Errorf("downloading: %w", err)
 	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("downloading: %w", downloadErr(err))
+	}
 	defer resp.Body.Close()
+	stall.Reset(stallTimeout) // the response headers are data
 	if resp.StatusCode != http.StatusOK {
 		tmpFile.Close()
 		return fmt.Errorf("download returned %d", resp.StatusCode)
@@ -272,9 +317,10 @@ func pullImage(log *slog.Logger, img *model.Image, targetDir string) error {
 
 	hasher := sha256.New()
 	pw := &progressWriter{name: img.Name, total: resp.ContentLength, log: log}
-	if _, err := io.Copy(tmpFile, io.TeeReader(resp.Body, io.MultiWriter(hasher, pw))); err != nil {
+	body := &stallReader{r: resp.Body, timer: stall}
+	if _, err := io.Copy(tmpFile, io.TeeReader(body, io.MultiWriter(hasher, pw))); err != nil {
 		tmpFile.Close()
-		return fmt.Errorf("writing download: %w", err)
+		return fmt.Errorf("writing download: %w", downloadErr(err))
 	}
 	tmpFile.Close()
 

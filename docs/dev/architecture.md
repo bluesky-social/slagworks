@@ -601,11 +601,20 @@ the current), except the first snapshot on each connection, which
 `WSConn` applies with `AdoptSnapshot` whatever its SeqNum: it is
 global's current view, and global's per-site counter can go backwards
 (site config deleted and recreated, database restored, worker pointed
-at another global). It runs `imagepull.SyncImages` synchronously under
-`imageSyncMu` on every apply (`cache.go:578`) — that is what pulls
-images to disk if the snapshot points at a new SHA. `OnSnapshotApplied`
-callbacks fire outside the lock; today the cast manager and DHCP
-handler subscribe.
+at another global). Every apply hands the snapshot's image set to a
+background syncer (`requestImageSync`) that runs `imagepull.SyncImages`
+— that is what pulls images to disk if the snapshot points at a new
+SHA. The download never runs on the WS read loop: the worker keeps
+answering RPCs, applying op messages and completing its hello for the
+whole download. One sync runs at a time, and sets requested meanwhile
+collapse into one sync of the newest. While a sync is in flight a
+pending commission or deploy waits, so it does not start against the
+previous image still on disk: `PendingLifecycleOps` returns nothing,
+`ReclaimableOps` leaves lifecycle ops out, and `BootActionForMAC`
+serves `BootLocal` for a pending one (a claimed op keeps its boot). A
+failed sync releases them, and the next apply retries it.
+`OnSnapshotApplied` callbacks fire outside the lock; today the cast
+manager and DHCP handler subscribe.
 
 Public boot-time reads (called from the DHCP handler, the HTTP-boot
 handler, and the executor):
@@ -657,7 +666,8 @@ first in line again.
 The executor (`Executor`, line 47) is the drive loop for pending
 operations. `Run` (85) ticks every 5 seconds and calls `processOps`
 (99): first `PendingPowerOps` from the cache, then
-`PendingLifecycleOps`, then `ReclaimableOps` (claims that went
+`PendingLifecycleOps` (empty while an image sync is in flight, see the
+Cache section above), then `ReclaimableOps` (claims that went
 unanswered, see below). Per-op:
 
 - Skip the op, unclaimed, if its machine has left the view since the
@@ -738,8 +748,11 @@ Otherwise SyncImages downloads and verifies the tarball, extracts it
 then switches the link by renaming a new symlink over it, so a reader
 never finds the image missing. It keeps the version the link named
 before the switch and deletes older ones; re-pinning that previous
-version switches back without a download. Idempotent and safe under
-concurrent snapshot applies (see `imageSyncMu` in the cache). The image
+version switches back without a download. Idempotent; on a site worker
+it runs on the cache's background syncer, one sync at a time. A
+download that receives no data for a minute (response headers included)
+is abandoned with an error, so a connection that stops delivering
+cannot hold the syncer. The image
 name becomes the link it replaces, so it skips, with an error, a name
 that fails `model.ValidateImageName` before downloading anything, and
 still syncs the other images; the API applies the same rule when the
