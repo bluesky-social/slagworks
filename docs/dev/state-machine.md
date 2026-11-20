@@ -871,10 +871,16 @@ answers it with 410 Gone (`reportRejectionStatus`,
 an op ends: a timeout sweep, a failure the agent or the boot hook
 reported, completion. The worker gives it only when it knows the op is
 over: it holds the op with a terminal status, it holds the op's
-tombstone, or the op is absent from a set that has been resynced since
-the worker started. Every other rejection stays 409 Conflict, including
-"operation state is not synchronized" from a worker that restarted
-mid-deploy, where the op may be healthy.
+tombstone, or the op is absent from the set global resynced on the
+worker's current connection. Every other rejection stays 409 Conflict,
+including "operation state is not synchronized" from a worker that
+restarted mid-deploy, where the op may be healthy, and a report for an
+op the worker does not hold while its connection to global is down
+(`Cache.OpStreamDown`): global may have created that op since, and the
+other worker of a pair may be driving it, as when keepalived moves the
+VIP to a standby that lost its connection before the deploy started.
+The reconnect's `op_resync` restores the final answer for an op that
+ended in the meantime.
 
 The agent acts on 410 on every report path (`agentReporter.send`,
 `cmd/slagworks-agent/reporter.go`): phase reports, log flushes, failure
@@ -902,8 +908,9 @@ is the expected result of that report and is ignored: global completes
 a commission as soon as it has the inventory, while the agent still has
 the console probe and its reboot ahead of it.
 
-Tests: `TestHandleProgressReport_OperationOverIsFinal` and
-`TestHandleProgressReport_UnsynchronizedIsNotFinal`
+Tests: `TestHandleProgressReport_OperationOverIsFinal`,
+`TestHandleProgressReport_UnsynchronizedIsNotFinal` and
+`TestHandleProgressReport_DisconnectedWorkerDoesNotEndUnknownOp`
 (`internal/worker/report_final_test.go`),
 `TestReportEndpoint_OperationOverIsGone` (`internal/httpboot/handler_test.go`),
 `TestRunDeploy_StopsWhenOperationIsNoLongerActive`

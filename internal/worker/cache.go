@@ -246,7 +246,9 @@ func (c *Cache) ApplyOpResync(ops []model.Operation, states map[string]model.Mac
 // OpStreamDown records that the worker's connection to global ended at since,
 // so nothing more of the op stream reaches the cache until the next
 // op_resync. The WS client calls it each time a connection or connection
-// attempt ends; the first call of an outage sets the time. Once the outage
+// attempt ends; the first call of an outage sets the time. Until the next
+// op_resync a report for an operation the cache does not hold is refused as
+// retryable, not as final (see opState.resynced), and once the outage
 // outlasts opStreamTrustWindow the op set no longer actuates a boot (see
 // opState.streamDownSince).
 func (c *Cache) OpStreamDown(since time.Time) {

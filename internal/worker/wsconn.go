@@ -354,15 +354,18 @@ func (w *WSConn) Run(ctx context.Context) error {
 	for {
 		start := time.Now()
 		wasConnected, err := w.connectAndRun(ctx)
+		// The op stream ended with the connection: every op_delta and
+		// op_removed from here on is lost until the next connection's
+		// op_resync. Tell the cache before Connected reports false, so once
+		// the worker reads as disconnected no report is refused as final
+		// merely because its op is absent from the set; the cache also
+		// stops actuating from what it holds once the outage runs long.
+		w.cache.OpStreamDown(time.Now())
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
 		w.connected.Store(false)
-		// Every op_delta and op_removed from here on is lost until the next
-		// connection's op_resync; the cache stops actuating from what it
-		// holds once the outage runs long.
-		w.cache.OpStreamDown(time.Now())
 		if wasConnected && time.Since(start) >= reconnectBackoffMax {
 			backoff = reconnectBackoffMin
 		}

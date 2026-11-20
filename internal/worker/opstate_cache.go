@@ -78,14 +78,19 @@ import (
 //     Reports are still accepted and the executor is not paused (a claim
 //     needs global, which settles it), so an install that finishes during
 //     the outage completes. In memory only: a restart rehydrates untrusted.
-//   - resynced: true once an op_resync has been applied in this process, so
-//     the op set is global's active set and not merely "nothing received
-//     yet". An agent report for an op the set does not hold is refused as
+//   - resynced: true while the op set tracks global's active set: an
+//     op_resync has been applied on the worker's current connection to
+//     global, whose op stream keeps it current (up to the stream's delivery
+//     lag). An agent report for an op the set does not hold is refused as
 //     final (model.ErrOperationNotActive, which stops the agent) only when
 //     the worker knows the op is over: it holds the op's tombstone, or the
-//     set is resynced. A worker started without a persisted op layer is
-//     neither untrusted nor resynced until its first op_resync, and must
-//     not tell a healthy deploy's agent to stop in that window.
+//     set is resynced. Set by applyOpResync, cleared by markStreamDown when
+//     the connection ends: from then on global can create, claim and drive
+//     an op this worker never hears of (the other worker of a pair drives
+//     it), so absence proves nothing until the reconnect's op_resync. A
+//     worker started without a persisted op layer is neither untrusted nor
+//     resynced until its first op_resync, and must not tell a healthy
+//     deploy's agent to stop in that window either.
 //   - claimUnanswered: op IDs whose most recent claim this process sent
 //     without learning the outcome (rollBackClaim: transport error, RPC
 //     timeout). That claim may have COMMITTED on global, and global's row
@@ -159,15 +164,24 @@ type opState struct {
 // earlier than needed.
 const opStreamTrustWindow = 30 * time.Minute
 
-// markStreamDown records that the worker's connection to global ended at
-// since. The first call of an outage wins: the WS client calls it after
-// every failed attempt, and a later time would restart the window.
+// markStreamDown records that the worker's connection to global, and with it
+// the op stream, ended at since.
+//
+// The first call of an outage sets streamDownSince: the WS client calls it
+// after every failed attempt, and a later time would restart the window.
+//
+// It also clears resynced: until the reconnect's op_resync an op absent from
+// the set may be one global created since, so a report for it gets the
+// retryable refusal, not the final one. The op set, its tombstones and
+// terminal statuses stay as they are, so an end this worker did hear about
+// is still final.
 func (o *opState) markStreamDown(since time.Time) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.streamDownSince.IsZero() {
 		o.streamDownSince = since
 	}
+	o.resynced = false
 }
 
 // tombstoneCap bounds the tombstone set (opID -> terminal version). FIFO
@@ -742,10 +756,11 @@ func (e opNotActiveError) Is(target error) bool { return target == model.ErrOper
 //
 // A rejection wraps model.ErrOperationNotActive only when the op is known to
 // be over: it is held with a terminal status, its tombstone is held, or it is
-// absent from a resynced set. That answer stops the agent, so every rejection
-// the worker cannot stand behind as final (an unsynchronized op layer, a
-// machine missing from the snapshot, a machine/op or event/type mismatch)
-// stays a plain error.
+// absent from a set resynced on the current connection to global (see the
+// resynced field). That answer stops the agent, so every rejection the worker
+// cannot stand behind as final (an unsynchronized op layer, an op absent
+// while the connection is down, a machine missing from the snapshot, a
+// machine/op or event/type mismatch) stays a plain error.
 func (o *opState) validateReportBinding(machineID, opID uuid.UUID, event string) (*model.MachineSnapshot, *model.Operation, bool, error) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
@@ -780,7 +795,7 @@ func (o *opState) validateReportBinding(machineID, opID uuid.UUID, event string)
 	op, ok := o.ops[opID.String()]
 	if !ok {
 		if _, removed := o.tombstones[opID.String()]; !removed && !o.resynced {
-			return nil, nil, false, fmt.Errorf("operation %s is not known on this site yet: no operation resync since the worker started", opID)
+			return nil, nil, false, fmt.Errorf("operation %s is not known on this site: the worker has not resynced its operations with global since it started or last lost its connection; retry once it has", opID)
 		}
 		return nil, nil, false, opNotActiveError(fmt.Sprintf("operation %s is not active on this site", opID))
 	}
