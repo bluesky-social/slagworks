@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/bmcreconcile"
+	"github.com/bluesky-social/slagworks/internal/imagepull"
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/ws"
@@ -45,8 +46,10 @@ type HandlerConfig struct {
 	// kernel+initrd boot script; when empty, a Phase 0 chainload marker.
 	DefaultImage string
 
-	// ImagesDir is the local directory containing the image subdirectory
-	// (DefaultImage) the boot scripts serve over HTTP.
+	// ImagesDir is the local directory containing the image (DefaultImage)
+	// the boot scripts serve over HTTP: a link to the current version
+	// directory SyncImages wrote, or a plain directory. See
+	// resolveImageName.
 	ImagesDir string
 
 	// HTTPPort is the port used in kernel/initrd URLs. Defaults to 8080.
@@ -445,7 +448,8 @@ func (h *Handler) kernelBootScript(mac string) string {
 		return h.missingConsoleScript(mac)
 	}
 	server := fmt.Sprintf("${next-server}:%d", h.cfg.HTTPPort)
-	base := fmt.Sprintf("http://%s/files/images/%s", server, h.cfg.DefaultImage)
+	imageName := h.resolveImageName()
+	base := fmt.Sprintf("http://%s/files/images/%s", server, imageName)
 	// slagworks.server=/image= are mandatory for the boot=slagworks hook:
 	// scripts/slagworks parse_cmdline panics to a shell if slagworks.server=
 	// is absent (and defaults a missing image to "noble", which would guess
@@ -460,7 +464,7 @@ func (h *Handler) kernelBootScript(mac string) string {
 	// 2026-10-19; also the July "IPv4 didn't apply" deploy). Same reasoning as
 	// embed.ipxe's ${mac}. All three boot templates below follow this.
 	cmdline := fmt.Sprintf("%s BOOTIF=01-${netX/mac:hexhyp} boot=slagworks ip=dhcp slagworks.server=%s slagworks.image=%s",
-		console, server, h.cfg.DefaultImage)
+		console, server, imageName)
 	if n := bootedCmdlineLen(cmdline); n > kernelCmdlineMax {
 		return h.overlongCmdlineScript(mac, n)
 	}
@@ -750,13 +754,26 @@ func (h *Handler) identityErrorScript(err error) string {
 	return fmt.Sprintf("#!ipxe\necho slagworks: ERROR: %s\nshell\n", err)
 }
 
-// resolveImageName returns the single PXE image directory name. deploy and
-// commission boot the SAME image (distinguished only by the slagworks.mode=
-// cmdline, set by the caller), so there is one image dir — h.cfg.DefaultImage
-// (conventionally "noble-pxe"), matching the single Image row's Name and the
-// on-disk dir SyncImages writes. (Before the single-image distribution this took a kind and
-// resolved noble-deploy / noble-commission; those are gone.)
+// resolveImageName returns the image directory one boot script points at.
+// deploy and commission boot the SAME image (distinguished only by the
+// slagworks.mode= cmdline, set by the caller), h.cfg.DefaultImage
+// (conventionally "noble-pxe"), matching the single Image row's Name.
+//
+// SyncImages keeps each version of that image in its own directory and
+// links <ImagesDir>/<DefaultImage> to the current one; this returns the
+// version directory the link names (imagepull.Installed). The script's
+// kernel and initrd URLs and its slagworks.image= all carry it, and the BOOT
+// hook (root.squashfs) and the agent's bootloader step (vmlinuz,
+// initrd-local, minutes later) build their URLs from slagworks.image=, so a
+// re-pin that lands mid-boot cannot hand the boot files from two versions.
+// Resolve it once per script. A DefaultImage that is a plain directory (an
+// images dir populated by hand, as the QEMU tests do) is served by name.
 func (h *Handler) resolveImageName() string {
+	if h.cfg.ImagesDir != "" {
+		if version, ok := imagepull.Installed(h.cfg.ImagesDir, h.cfg.DefaultImage); ok {
+			return version
+		}
+	}
 	return h.cfg.DefaultImage
 }
 

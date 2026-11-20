@@ -18,33 +18,77 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 )
 
-// SyncImages checks cached image metadata against what's on disk and downloads
-// any missing or outdated images. Each image tarball is downloaded,
-// SHA256-verified, extracted, and atomically renamed into place.
+// versionLen is how many hex digits of a tarball's SHA256 name its version
+// directory. 64 bits keeps two pins of one image apart, and the short form
+// keeps slagworks.image= small on the kernel command line.
+const versionLen = 16
+
+// digestRE is the shape of an image row's sha256. Part of it becomes a
+// directory name, so anything else is refused before it reaches a path.
+var digestRE = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+
+// versionDir is the directory name one version of image name is extracted
+// into: <name>@<first 16 hex digits of its tarball's SHA256>. '@' cannot
+// appear in an image name (model.ValidateImageName), so a version directory
+// never collides with an image's name.
+func versionDir(name, sha string) string {
+	return name + "@" + strings.ToLower(sha[:versionLen])
+}
+
+// Installed returns the version directory that <imagesDir>/<name> links to,
+// and false when <name> is not such a link: missing, a plain directory, or a
+// link whose target is not one of name's version directories. The boot
+// handler puts the version directory, not the name, into each boot script,
+// so every file one boot fetches comes from the version that was current
+// when its script was served.
+func Installed(imagesDir, name string) (string, bool) {
+	target, err := os.Readlink(filepath.Join(imagesDir, name))
+	if err != nil || filepath.Base(target) != target || !strings.HasPrefix(target, name+"@") {
+		return "", false
+	}
+	return target, true
+}
+
+// SyncImages checks cached image metadata against what's on disk and
+// downloads any missing or outdated images.
 //
-// The .sha256 marker is written ONLY after the full pipeline succeeds.
-// An earlier version wrote the marker inside pullImage, which would
-// have left a broken image behind with a valid-looking marker on
-// failure. The repack-on-pull step that this comment originally
-// documented is gone: build.sh now bakes the slagworks BOOT hook
-// into the initrd at image-build time, so what we download is what
-// we serve.
+// Each version of an image lives in its own directory,
+// <imagesDir>/<name>@<sha16> (versionDir), and <imagesDir>/<name> is a
+// symlink to the current one. A new version is downloaded,
+// SHA256-verified, extracted and renamed into its version directory, and
+// only then does the link switch to it (activate). The previous version's
+// directory stays on disk, because a boot that started before the switch
+// fetches its remaining files (root.squashfs from the BOOT hook, vmlinuz and
+// initrd-local from the agent's bootloader step) from the version directory
+// its boot script named. Older version directories are removed (prune), so
+// a boot that spans two re-pins finds its files gone and fails instead of
+// mixing versions. The link is the record of what is installed: an image is
+// up to date when its link names the row's version directory and that
+// directory exists. A failure before the switch leaves the link and every
+// version directory as they were.
 //
-// Each name becomes <imagesDir>/<name>, which pullImage removes and
-// replaces, so a name that fails model.ValidateImageName is skipped
-// before anything is downloaded or touched: "." or ".." would otherwise
-// point that removal at imagesDir or its parent. A skipped name does not
-// stop the other images from syncing; it is reported in the returned
-// error.
+// Re-pinning the version the link was switched away from (a rollback) reuses
+// its directory without downloading it again.
+//
+// Each name becomes <imagesDir>/<name>, which SyncImages replaces, so a
+// name that fails model.ValidateImageName is skipped before anything is
+// downloaded or touched: "." or ".." would otherwise point that replacement
+// at imagesDir or its parent. A sha256 that is not 64 hex digits is skipped
+// the same way, since part of it becomes a directory name (no such digest
+// could match a download anyway). A skipped image does not stop the other
+// images from syncing; it is reported in the returned error.
 func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Image) error {
 	var refused []error
 	for name, img := range images {
@@ -55,28 +99,113 @@ func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Ima
 		if img.URL == "" {
 			continue
 		}
-		target := filepath.Join(imagesDir, name)
-		markerPath := filepath.Join(imagesDir, name+".sha256")
+		if !digestRE.MatchString(img.SHA256) {
+			refused = append(refused, fmt.Errorf("image %s not synced: sha256 %q is not 64 hex digits; correct the image row's sha256", name, img.SHA256))
+			continue
+		}
+		version := versionDir(name, img.SHA256)
+		versionPath := filepath.Join(imagesDir, version)
+		current, linked := Installed(imagesDir, name)
+		if linked && current == version && isDir(versionPath) {
+			log.Debug("image up to date", "name", name, "version", version)
+			continue
+		}
 
-		if marker, err := os.ReadFile(markerPath); err == nil {
-			if strings.TrimSpace(string(marker)) == img.SHA256 {
-				log.Debug("image up to date", "name", name)
-				continue
+		if isDir(versionPath) {
+			log.Info("image version already on disk, switching to it", "name", name, "version", version)
+		} else {
+			log.Info("downloading image", "name", name, "url", img.URL)
+			if err := pullImage(log, img, versionPath); err != nil {
+				return errors.Join(append(refused, fmt.Errorf("image %s: %w", name, err))...)
 			}
 		}
-
-		log.Info("downloading image", "name", name, "url", img.URL)
-		if err := pullImage(log, img, target); err != nil {
+		if err := activate(imagesDir, name, version); err != nil {
 			return errors.Join(append(refused, fmt.Errorf("image %s: %w", name, err))...)
 		}
-		// Marker is the last write — a transient failure before this
-		// point leaves the previous (intact) cache for rollback.
-		if err := os.WriteFile(markerPath, []byte(img.SHA256+"\n"), 0644); err != nil {
-			return errors.Join(append(refused, fmt.Errorf("image %s marker: %w", name, err))...)
+		keep := []string{version}
+		if linked {
+			keep = append(keep, current)
 		}
-		log.Info("image ready", "name", name, "sha256", img.SHA256)
+		prune(log, imagesDir, name, keep)
+		log.Info("image ready", "name", name, "sha256", img.SHA256, "version", version)
 	}
 	return errors.Join(refused...)
+}
+
+func isDir(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.IsDir()
+}
+
+// activate points <imagesDir>/<name> at the version directory version by
+// renaming a new symlink over it. rename(2) replaces the link in one step,
+// so a request resolving <name> meanwhile gets the old version or the new
+// one, never a missing directory. A plain directory at <name> (put there by
+// hand, or by a release that extracted images in place) cannot be renamed
+// over, so it is moved aside first and removed once the link is in place.
+func activate(imagesDir, name, version string) error {
+	link := filepath.Join(imagesDir, name)
+	tmp := filepath.Join(imagesDir, ".image-link-"+name)
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("clearing stale link %s: %w", tmp, err)
+	}
+	if err := os.Symlink(version, tmp); err != nil {
+		return fmt.Errorf("creating link to %s: %w", version, err)
+	}
+	var aside string
+	if fi, err := os.Lstat(link); err == nil && fi.Mode()&fs.ModeSymlink == 0 {
+		if aside, err = os.MkdirTemp(imagesDir, ".image-old-*"); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("creating temp dir: %w", err)
+		}
+		if err := os.Rename(link, filepath.Join(aside, name)); err != nil {
+			_ = os.Remove(tmp)
+			_ = os.Remove(aside)
+			return fmt.Errorf("moving aside %s: %w", link, err)
+		}
+	}
+	if err := os.Rename(tmp, link); err != nil {
+		_ = os.Remove(tmp)
+		if aside != "" {
+			_ = os.Rename(filepath.Join(aside, name), link)
+			_ = os.Remove(aside)
+		}
+		return fmt.Errorf("switching %s to %s: %w", link, version, err)
+	}
+	if aside != "" {
+		_ = os.RemoveAll(aside) // best-effort; the link is already switched
+	}
+	return nil
+}
+
+// prune removes name's version directories other than keep. Each is renamed
+// aside before it is deleted, so a version directory is complete or absent
+// and a later pin of that version downloads it again rather than switching
+// to a half-deleted tree. Failures are logged, not returned: the new version
+// is already being served, and the next switch retries.
+func prune(log *slog.Logger, imagesDir, name string, keep []string) {
+	entries, err := os.ReadDir(imagesDir)
+	if err != nil {
+		log.Warn("could not list images dir to remove old image versions", "dir", imagesDir, "err", err)
+		return
+	}
+	for _, e := range entries {
+		old := e.Name()
+		if !strings.HasPrefix(old, name+"@") || slices.Contains(keep, old) {
+			continue
+		}
+		aside, err := os.MkdirTemp(imagesDir, ".image-old-*")
+		if err != nil {
+			log.Warn("could not remove old image version", "name", name, "version", old, "err", err)
+			continue
+		}
+		if err := os.Rename(filepath.Join(imagesDir, old), filepath.Join(aside, old)); err != nil {
+			log.Warn("could not remove old image version", "name", name, "version", old, "err", err)
+		}
+		if err := os.RemoveAll(aside); err != nil {
+			log.Warn("could not delete removed image version", "name", name, "dir", aside, "err", err)
+		}
+	}
 }
 
 // minProgressBytes is the smallest download that emits progress snapshots
@@ -119,8 +248,10 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// pullImage downloads img, verifies its SHA256, and extracts it into
+// targetDir, which must not exist yet. On any failure targetDir is not
+// created.
 func pullImage(log *slog.Logger, img *model.Image, targetDir string) error {
-	markerPath := targetDir + ".sha256"
 	tmpFile, err := os.CreateTemp(filepath.Dir(targetDir), ".image-download-*")
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
@@ -180,17 +311,6 @@ func pullImage(log *slog.Logger, img *model.Image, targetDir string) error {
 		return fmt.Errorf("no directory found in tarball, got: %v", names)
 	}
 
-	// Point of no return: we're about to delete the existing
-	// target dir. Clear the marker at the same moment so a
-	// mid-pipeline failure doesn't leave a stale marker pointing
-	// at a half-overwritten target dir. The caller writes the
-	// marker back at the end of a successful pipeline. Placing
-	// the removal HERE (not at the top of SyncImages) means a
-	// transient download failure before this point leaves the
-	// entire previous cache — marker and target — intact for
-	// rollback.
-	_ = os.Remove(markerPath)
-	_ = os.RemoveAll(targetDir) // best-effort, may not exist
 	if err := os.Rename(extractedDir, targetDir); err != nil {
 		return fmt.Errorf("moving into place: %w", err)
 	}

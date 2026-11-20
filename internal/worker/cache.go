@@ -678,7 +678,8 @@ func (c *Cache) applySnapshot(snap *model.SiteSnapshot, adopt bool) bool {
 	c.subsMu.RUnlock()
 
 	// Sync images to disk with NO state lock held. SyncImages is idempotent
-	// — it compares on-disk .sha256 markers and only downloads mismatches.
+	// — it compares each image's on-disk link with the row's SHA256 and
+	// only downloads versions it does not already hold.
 	// Serialized by imageSyncMu (also held by no reader). Failure is
 	// non-fatal: the published snapshot stays visible; the next apply (or
 	// the next tick, since the row's SHA still mismatches) retries.

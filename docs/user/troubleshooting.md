@@ -254,8 +254,9 @@ Symptoms: a fresh build isn't reflected in what the host boots, or
 
 Slagworks pins exactly one image row per environment. Site workers
 sync on every reconcile tick by comparing the row's `sha256` against
-`.sha256` markers alongside the on-disk artifacts in the images
-directory (`internal/imagepull/`). To roll a new image:
+the version directory the image's link in the images directory names
+(`noble-pxe -> noble-pxe@<first 16 hex digits>`,
+`internal/imagepull/`). To roll a new image:
 
 1. Publishing a build advances `latest-sha.txt` in the image bucket
    ([images.md](images.md#publishing-an-image)). That pointer, by
@@ -269,11 +270,11 @@ Diagnosis order when a new image "isn't on the workers":
 
 - `slagctl image list` — does the row's SHA match the SHA you
   expect? If not, `follow-latest` hasn't been run yet.
-- Site-worker-side: does the on-disk `.sha256` marker in the images
-  directory match `slagctl image list`? If not, the worker hasn't
+- Site-worker-side: does `readlink <images_dir>/noble-pxe` name the
+  version `slagctl image list` pins? If not, the worker hasn't
   synced yet — check the site worker's structured logs for image
   sync events.
-- The image row and disk marker match, but the boot doesn't behave
+- The image row and the link match, but the boot doesn't behave
   like the new image? That's an agent question, not an image
   question — see next section.
 

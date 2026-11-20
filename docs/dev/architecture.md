@@ -728,16 +728,32 @@ GORM over SQLite at `/var/lib/slagworks/worker.db` (unless
 
 ### Image sync — `internal/imagepull`
 
-`SyncImages(log, imagesDir, images)` (`imagepull.go:41`) iterates the
-snapshot's images map. For each image it compares the on-disk
-`<imagesDir>/<name>/.sha256` marker with the snapshot's declared
-`sha256`; on mismatch it downloads the tarball from the URL in the
-image row and calls `extractTarGz` (`imagepull.go:173`). Idempotent
-and safe under concurrent snapshot applies (see
-`imageSyncMu` in the cache). The image name becomes the directory it
-removes and replaces, so it skips, with an error, a name that fails
-`model.ValidateImageName` before downloading anything, and still syncs
-the other images; the API applies the same rule when the row is written.
+`SyncImages(log, imagesDir, images)` iterates the snapshot's images
+map. Each version of an image lives in its own directory,
+`<imagesDir>/<name>@<sha16>` (the first 16 hex digits of the tarball's
+SHA256), and `<imagesDir>/<name>` is a symlink to the current one. An
+image is up to date when its link names the row's version directory.
+Otherwise SyncImages downloads and verifies the tarball, extracts it
+(`extractTarGz`) and renames the result into its version directory,
+then switches the link by renaming a new symlink over it, so a reader
+never finds the image missing. It keeps the version the link named
+before the switch and deletes older ones; re-pinning that previous
+version switches back without a download. Idempotent and safe under
+concurrent snapshot applies (see `imageSyncMu` in the cache). The image
+name becomes the link it replaces, so it skips, with an error, a name
+that fails `model.ValidateImageName` before downloading anything, and
+still syncs the other images; the API applies the same rule when the
+row is written. A `sha256` that is not 64 hex digits is skipped the
+same way.
+
+The boot handler (`resolveImageName` in `internal/httpboot`) reads the
+link once per boot script and puts the version directory into the
+kernel and initrd URLs and `slagworks.image=`. The BOOT hook
+(`root.squashfs`) and the agent's UEFI bootloader step (`vmlinuz`,
+`initrd-local`) build their URLs from `slagworks.image=`, so every file
+one boot fetches comes from one version even if the image is re-pinned
+mid-boot. A boot that spans two re-pins finds its version deleted and
+fails its next fetch.
 
 ## The on-target agent
 
@@ -1209,7 +1225,8 @@ Packages:
   `ws.OpUpdateHandler`, `LogBatchHandler`, `CastBatchHandler`, and
   `CastResumeHandler` interfaces wired in `buildGlobal`.
 - `imagepull` — `SyncImages` fetches missing image tarballs to
-  disk on the site worker and writes `.sha256` markers.
+  per-version directories on the site worker and switches each
+  image's link to the current version.
 - `logring` — Bounded in-process log ring with byte and age budgets
   and drop-oldest under pressure.
 - `logstore` — Postgres `log_envelopes` write, query, and retention.

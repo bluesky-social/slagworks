@@ -2,6 +2,7 @@ package imagepull
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -11,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -245,21 +247,220 @@ func TestSyncImages_Downloads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify files were extracted
-	if _, err := os.Stat(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); err != nil {
-		t.Errorf("vmlinuz not found: %v", err)
+	// The version is extracted into its own directory and the image name
+	// links to it.
+	wantVersion := "noble-pxe@" + sha[:16]
+	if got, ok := Installed(imagesDir, "noble-pxe"); !ok || got != wantVersion {
+		t.Fatalf("Installed = %q, %v; want %q, true", got, ok, wantVersion)
 	}
-	if _, err := os.Stat(filepath.Join(imagesDir, "noble-pxe", "initrd")); err != nil {
-		t.Errorf("initrd not found: %v", err)
+	for _, f := range []string{"vmlinuz", "initrd"} {
+		if _, err := os.Stat(filepath.Join(imagesDir, wantVersion, f)); err != nil {
+			t.Errorf("%s not in the version directory: %v", f, err)
+		}
+		if _, err := os.Stat(filepath.Join(imagesDir, "noble-pxe", f)); err != nil {
+			t.Errorf("%s not reachable through the image name: %v", f, err)
+		}
+	}
+}
+
+// pinServer serves each body in blobs at its key and counts requests.
+func pinServer(t *testing.T, blobs map[string][]byte) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		b, ok := blobs[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write(b)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+// versionTarball builds a noble-pxe tarball whose vmlinuz reads content.
+func versionTarball(t *testing.T, content string) ([]byte, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+	if err := tw.WriteHeader(&tar.Header{Name: "noble-pxe/", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "noble-pxe/vmlinuz", Size: int64(len(content)), Mode: 0o644, Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(buf.Bytes())
+	return buf.Bytes(), hex.EncodeToString(sum[:])
+}
+
+func readOrEmpty(path string) string {
+	b, _ := os.ReadFile(path)
+	return string(b)
+}
+
+// TestSyncImages_RepinKeepsPreviousVersion: a boot that started before a
+// re-pin fetches its remaining files from the version directory its boot
+// script named, so a re-pin must leave the previous version's directory
+// untouched while the image name switches to the new one. Before the fix
+// SyncImages removed the image directory and renamed the new one into its
+// place, so those fetches got the new version's kernel (or a 404 between the
+// two steps). Only the current and previous versions are kept: a third pin
+// removes the first.
+func TestSyncImages_RepinKeepsPreviousVersion(t *testing.T) {
+	v1, sum1 := versionTarball(t, "kernel-v1")
+	v2, sum2 := versionTarball(t, "kernel-v2")
+	v3, sum3 := versionTarball(t, "kernel-v3")
+	srv, _ := pinServer(t, map[string][]byte{"/v1.tar.gz": v1, "/v2.tar.gz": v2, "/v3.tar.gz": v3})
+	imagesDir := t.TempDir()
+	pin := func(sum, path string) {
+		t.Helper()
+		if err := SyncImages(slog.Default(), imagesDir, map[string]*model.Image{
+			"noble-pxe": {Name: "noble-pxe", SHA256: sum, URL: srv.URL + path},
+		}); err != nil {
+			t.Fatalf("SyncImages: %v", err)
+		}
+	}
+	dir1, dir2, dir3 := "noble-pxe@"+sum1[:16], "noble-pxe@"+sum2[:16], "noble-pxe@"+sum3[:16]
+
+	pin(sum1, "/v1.tar.gz")
+	pin(sum2, "/v2.tar.gz")
+	if got := readOrEmpty(filepath.Join(imagesDir, dir1, "vmlinuz")); got != "kernel-v1" {
+		t.Errorf("after re-pin to v2, %s/vmlinuz = %q, want kernel-v1 (a boot that started on v1 still fetches from it)", dir1, got)
+	}
+	if got := readOrEmpty(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); got != "kernel-v2" {
+		t.Errorf("after re-pin to v2, noble-pxe/vmlinuz = %q, want kernel-v2", got)
 	}
 
-	// Verify marker file
-	marker, err := os.ReadFile(filepath.Join(imagesDir, "noble-pxe.sha256"))
-	if err != nil {
-		t.Fatalf("marker not found: %v", err)
+	pin(sum3, "/v3.tar.gz")
+	if _, err := os.Stat(filepath.Join(imagesDir, dir1)); !os.IsNotExist(err) {
+		t.Errorf("after a third pin, %s still exists (err %v); only the current and previous versions are kept", dir1, err)
 	}
-	if got := string(marker); got != sha+"\n" {
-		t.Errorf("marker = %q, want %q", got, sha+"\n")
+	if got := readOrEmpty(filepath.Join(imagesDir, dir2, "vmlinuz")); got != "kernel-v2" {
+		t.Errorf("after re-pin to v3, %s/vmlinuz = %q, want kernel-v2", dir2, got)
+	}
+	if got, ok := Installed(imagesDir, "noble-pxe"); !ok || got != dir3 {
+		t.Errorf("Installed = %q, %v; want %q, true", got, ok, dir3)
+	}
+	entries, err := os.ReadDir(imagesDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".") {
+			t.Errorf("SyncImages left %s behind in the images dir", e.Name())
+		}
+	}
+}
+
+// TestSyncImages_RollbackToPreviousVersionReusesIt: re-pinning the version
+// the image was just switched away from switches back without downloading
+// it again, and without replacing a directory an in-flight boot may be
+// reading.
+func TestSyncImages_RollbackToPreviousVersionReusesIt(t *testing.T) {
+	v1, sum1 := versionTarball(t, "kernel-v1")
+	v2, sum2 := versionTarball(t, "kernel-v2")
+	srv, hits := pinServer(t, map[string][]byte{"/v1.tar.gz": v1, "/v2.tar.gz": v2})
+	imagesDir := t.TempDir()
+	for _, step := range []struct{ sum, path string }{{sum1, "/v1.tar.gz"}, {sum2, "/v2.tar.gz"}, {sum1, "/v1.tar.gz"}} {
+		if err := SyncImages(slog.Default(), imagesDir, map[string]*model.Image{
+			"noble-pxe": {Name: "noble-pxe", SHA256: step.sum, URL: srv.URL + step.path},
+		}); err != nil {
+			t.Fatalf("SyncImages: %v", err)
+		}
+	}
+	if n := hits.Load(); n != 2 {
+		t.Errorf("downloads = %d, want 2 (the rollback to v1 reuses its directory)", n)
+	}
+	if got := readOrEmpty(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); got != "kernel-v1" {
+		t.Errorf("after rollback, noble-pxe/vmlinuz = %q, want kernel-v1", got)
+	}
+	if got := readOrEmpty(filepath.Join(imagesDir, "noble-pxe@"+sum2[:16], "vmlinuz")); got != "kernel-v2" {
+		t.Errorf("after rollback, the v2 directory holds %q, want kernel-v2 (kept as the previous version)", got)
+	}
+}
+
+// TestSyncImages_ReplacesPlainDirectory: an images dir whose image is a
+// plain directory (populated by hand, or extracted in place by a release
+// before version directories) switches to a version directory on the next
+// sync, and the plain directory is removed.
+func TestSyncImages_ReplacesPlainDirectory(t *testing.T) {
+	v1, sum1 := versionTarball(t, "kernel-v1")
+	srv, _ := pinServer(t, map[string][]byte{"/v1.tar.gz": v1})
+	imagesDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(imagesDir, "noble-pxe"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(imagesDir, "noble-pxe", "vmlinuz"), []byte("kernel-old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := SyncImages(slog.Default(), imagesDir, map[string]*model.Image{
+		"noble-pxe": {Name: "noble-pxe", SHA256: sum1, URL: srv.URL + "/v1.tar.gz"},
+	}); err != nil {
+		t.Fatalf("SyncImages: %v", err)
+	}
+	if got, ok := Installed(imagesDir, "noble-pxe"); !ok || got != "noble-pxe@"+sum1[:16] {
+		t.Errorf("Installed = %q, %v; want the v1 version directory", got, ok)
+	}
+	if got := readOrEmpty(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); got != "kernel-v1" {
+		t.Errorf("noble-pxe/vmlinuz = %q, want kernel-v1", got)
+	}
+	entries, err := os.ReadDir(imagesDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("images dir holds %v, want only the link and the v1 version directory", entries)
+	}
+}
+
+// TestSyncImages_RefusesMalformedDigest: part of the row's sha256 becomes a
+// directory name, so a digest that is not 64 hex digits is refused before
+// anything is downloaded or created, and the other images still sync. No
+// such digest could match a download, so nothing that synced before is
+// refused now.
+func TestSyncImages_RefusesMalformedDigest(t *testing.T) {
+	v1, sum1 := versionTarball(t, "kernel-v1")
+	for _, bad := range []string{"", "abc", "../../../../victim/" + strings.Repeat("0", 64), strings.Repeat("g", 64), sum1 + "\n"} {
+		t.Run(bad, func(t *testing.T) {
+			srv, hits := pinServer(t, map[string][]byte{"/v1.tar.gz": v1})
+			base := t.TempDir()
+			imagesDir := filepath.Join(base, "images")
+			if err := os.MkdirAll(imagesDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			err := SyncImages(slog.Default(), imagesDir, map[string]*model.Image{
+				"jammy-pxe": {Name: "jammy-pxe", SHA256: bad, URL: srv.URL + "/v1.tar.gz"},
+				"noble-pxe": {Name: "noble-pxe", SHA256: sum1, URL: srv.URL + "/v1.tar.gz"},
+			})
+			if err == nil {
+				t.Errorf("SyncImages accepted sha256 %q, want an error", bad)
+			}
+			if n := hits.Load(); n != 1 {
+				t.Errorf("downloads = %d, want 1 (the valid image only)", n)
+			}
+			if _, ok := Installed(imagesDir, "noble-pxe"); !ok {
+				t.Error("the valid image did not sync alongside the refused one")
+			}
+			entries, _ := os.ReadDir(base)
+			if len(entries) != 1 {
+				t.Errorf("SyncImages created %v beside the images dir", entries)
+			}
+			if _, err := os.Lstat(filepath.Join(imagesDir, "jammy-pxe")); !os.IsNotExist(err) {
+				t.Errorf("refused image jammy-pxe has an entry on disk (err %v)", err)
+			}
+		})
 	}
 }
 
@@ -291,7 +492,7 @@ func TestSyncImages_SkipsUpToDate(t *testing.T) {
 		t.Fatalf("expected 1 download, got %d", n)
 	}
 
-	// Second sync: should skip (marker matches)
+	// Second sync: should skip (the link already names this version)
 	if err := SyncImages(slog.Default(), imagesDir, images); err != nil {
 		t.Fatal(err)
 	}
@@ -301,11 +502,10 @@ func TestSyncImages_SkipsUpToDate(t *testing.T) {
 }
 
 // TestSyncImages_RollbackSurvivesDownloadFailure: if an attempted
-// upgrade fails BEFORE the point-of-no-return (i.e. before we start
-// mutating the target dir) — e.g. network error, SHA mismatch —
-// the previous marker + target must remain intact. A subsequent
-// rollback to the previous image's SHA should short-circuit on the
-// still-valid marker without re-downloading.
+// upgrade fails before the link is switched (network error, SHA
+// mismatch), the link and the version it names must remain intact. A
+// subsequent rollback to the previous image's SHA should short-circuit
+// on the unchanged link without re-downloading.
 func TestSyncImages_RollbackSurvivesDownloadFailure(t *testing.T) {
 	tarPath, shaA := buildTestTarball(t, "noble-rollback")
 	tarData, _ := os.ReadFile(tarPath)
@@ -341,8 +541,8 @@ func TestSyncImages_RollbackSurvivesDownloadFailure(t *testing.T) {
 		t.Fatal("expected upgrade to fail on SHA mismatch")
 	}
 
-	// Rollback to A. Pre-mutation failure means the marker is
-	// still valid; this sync should short-circuit, NO download.
+	// Rollback to A. The failed upgrade never switched the link,
+	// so this sync should short-circuit, NO download.
 	images["noble-rollback"].SHA256 = shaA
 	downloadsBefore := downloads.Load()
 	if err := SyncImages(slog.Default(), imagesDir, images); err != nil {
