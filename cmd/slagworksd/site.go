@@ -982,8 +982,21 @@ func startSiteServices(ctx context.Context, sc *siteServiceConfig) (<-chan struc
 	// read the cache but before this subscription has no callback, so
 	// reconcile once after subscribing: a worker that started without a
 	// pool would otherwise wait for the snapshot after the corrected one.
-	unsubPools := sc.cache.OnSnapshotApplied(func() { reloadFabricPools(sc, dhcpHandler) })
-	reloadFabricPools(sc, dhcpHandler)
+	//
+	// The two callers run on different goroutines, and a reload reads the
+	// cache and installs the pools in separate steps, so they share a
+	// mutex taken before the read: otherwise the reload below could read
+	// one snapshot, lose the CPU to the callback installing a newer one,
+	// and then install the older pools last. With per-worker shares that
+	// would leave this worker allocating from a share a peer now owns.
+	var reloadMu sync.Mutex
+	reloadPools := func() {
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
+		reloadFabricPools(sc, dhcpHandler)
+	}
+	unsubPools := sc.cache.OnSnapshotApplied(reloadPools)
+	reloadPools()
 	wg.Go(func() {
 		<-ctx.Done()
 		unsubPools()
