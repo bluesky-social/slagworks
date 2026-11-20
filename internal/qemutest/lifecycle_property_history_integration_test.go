@@ -994,15 +994,14 @@ func (r *propRun) Check() {
 	phoneHome := map[string]time.Time{} // op -> first accepted real phone_home
 	// Events are recorded as their handler returns, so a request that
 	// stalled in the handler can be recorded after one that came later;
-	// order is judged by request times. For the first accepted
-	// deploy_complete of each op, dcStarted is when it reached the worker
-	// and dcDone when the worker had answered it (the latch is set
-	// somewhere in between).
+	// order is judged by when handlers ran. For the first accepted
+	// deploy_complete of each op, dcStarted is when its handler started and
+	// dcDone when it returned (the latch is set somewhere in between).
 	dcStarted, dcDone := map[string]time.Time{}, map[string]time.Time{}
 	for _, e := range events {
 		if e.Kind == "report" && e.Event == "deploy_complete" && !e.Synthetic && e.Status >= 200 && e.Status < 300 {
-			if t, ok := dcStarted[e.Op]; !ok || e.At.Before(t) {
-				dcStarted[e.Op], dcDone[e.Op] = e.At, e.At.Add(e.Took)
+			if t, ok := dcStarted[e.Op]; !ok || e.Began.Before(t) {
+				dcStarted[e.Op], dcDone[e.Op] = e.Began, e.Began.Add(e.Took)
 			}
 		}
 	}
@@ -1049,7 +1048,7 @@ func (r *propRun) Check() {
 				r.stat("stale_boot_while_partitioned")
 			}
 			// P2: no deploy boot for an op after its deploy_complete.
-			if dc, ok := dcDone[e.Op]; ok && e.Boot == "deploy" && e.At.After(dc) {
+			if dc, ok := dcDone[e.Op]; ok && e.Boot == "deploy" && e.Began.After(dc) {
 				rewipes[e.Op]++
 				if rewipes[e.Op] > 1 {
 					continue
@@ -1068,7 +1067,7 @@ func (r *propRun) Check() {
 					}
 				}
 				r.violate("P2", "host %d served a DEPLOY boot for operation %s after that operation's deploy_complete was accepted (re-wipe; %s): +%s %s",
-					host, e.Op[:8], how, e.At.Sub(dc).Round(time.Millisecond), e)
+					host, e.Op[:8], how, e.Began.Sub(dc).Round(time.Millisecond), e)
 			}
 		case "report":
 			if e.Status < 200 || e.Status >= 300 {
@@ -1112,7 +1111,7 @@ func (r *propRun) Check() {
 				// P3: the phone-home completes the deploy, so it is valid
 				// only once the agent's deploy_complete has been accepted
 				// (the op is awaiting_phone_home).
-				if dc, ok := dcStarted[e.Op]; !ok || !dc.Before(e.At.Add(e.Took)) {
+				if dc, ok := dcStarted[e.Op]; !ok || !dc.Before(e.Began.Add(e.Took)) {
 					r.violate("P3", "worker accepted a phone-home for operation %s before its agent's deploy_complete was accepted: %s", e.Op[:8], e)
 				}
 				if _, ok := phoneHome[e.Op]; !ok {
@@ -1194,7 +1193,7 @@ func (r *propRun) Check() {
 			// install that phoned home may no longer be what is on it.
 			rewritten := false
 			for _, e := range events {
-				if installed && e.Kind == "boot" && e.Boot == "deploy" && r.hostOfMAC(e.MAC) == host && e.At.After(dc) && e.At.Before(end) {
+				if installed && e.Kind == "boot" && e.Boot == "deploy" && r.hostOfMAC(e.MAC) == host && e.Began.After(dc) && e.Began.Before(end) {
 					rewritten = true
 				}
 			}

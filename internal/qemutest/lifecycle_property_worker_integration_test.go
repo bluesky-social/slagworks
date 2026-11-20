@@ -67,8 +67,10 @@ type propHTTPEvent struct {
 	// machine state, the op it holds): diagnosis only, never an oracle
 	// input.
 	Diag string
-	// Took is how long the worker's handler ran.
-	Took time.Duration
+	// Began is when the worker's handler started (after any "before"
+	// faults armed on this request ran), and Took how long it ran.
+	Began time.Time
+	Took  time.Duration
 }
 
 func (e propHTTPEvent) String() string {
@@ -293,7 +295,7 @@ func (r *propRecorder) wrap(next http.Handler, inc int, connected func() bool, d
 			defer r.inflight.Add(-1)
 			next.ServeHTTP(cw, req)
 		}()
-		ev.Took = time.Since(began)
+		ev.Began, ev.Took = began, time.Since(began)
 		ev.Status = cw.status
 		if ev.Status == 0 {
 			ev.Status = http.StatusOK
