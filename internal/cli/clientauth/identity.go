@@ -24,23 +24,34 @@ type Identity struct {
 // decisions (the resource server does the real verification). Returns an error
 // if the token isn't a decodable JWT.
 func DecodeIdentity(accessToken string) (*Identity, error) {
+	var id Identity
+	if err := decodeClaims(accessToken, &id); err != nil {
+		return nil, err
+	}
+	return &id, nil
+}
+
+// decodeClaims unmarshals a JWT's payload into v WITHOUT verifying its
+// signature. Callers decode only the claims they use (DecodeIdentity for
+// display, readCache for exp), so a claim one of them does not model cannot
+// break the other.
+func decodeClaims(accessToken string, v any) error {
 	parts := strings.Split(accessToken, ".")
 	if len(parts) != 3 {
-		return nil, fmt.Errorf("not a JWT (cannot decode claims locally)")
+		return fmt.Errorf("not a JWT (cannot decode claims locally)")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		// some encoders pad; tolerate standard base64url with padding
 		payload, err = base64.URLEncoding.DecodeString(parts[1])
 		if err != nil {
-			return nil, fmt.Errorf("decoding JWT payload: %w", err)
+			return fmt.Errorf("decoding JWT payload: %w", err)
 		}
 	}
-	var id Identity
-	if err := json.Unmarshal(payload, &id); err != nil {
-		return nil, fmt.Errorf("parsing JWT claims: %w", err)
+	if err := json.Unmarshal(payload, v); err != nil {
+		return fmt.Errorf("parsing JWT claims: %w", err)
 	}
-	return &id, nil
+	return nil
 }
 
 // Logout deletes the cached token for the app. Safe to call when no cache

@@ -22,6 +22,14 @@ import (
 // (~/.config/<AppName>/token.json on all platforms); read/write of the 0600
 // file go through userpath too.
 
+// readCache loads the cached token. A token whose response carried no
+// expires_in (RFC 6749 section 5.1 makes it optional) has a zero Expiry,
+// which oauth2.Token.Valid reads as "never expires": the access token would
+// be handed out after the API stopped accepting it and the refresh token
+// never used. When the access token is a JWT, its exp claim (which the API
+// enforces) fills that gap. Every check of a cached token's expiry reads it
+// here, so a token is stored as the provider sent it; an opaque access token
+// keeps the zero Expiry.
 func readCache(path string) (*oauth2.Token, error) {
 	b, err := userpath.ReadFile(path)
 	if err != nil {
@@ -30,6 +38,16 @@ func readCache(path string) (*oauth2.Token, error) {
 	var tok oauth2.Token
 	if err := json.Unmarshal(b, &tok); err != nil {
 		return nil, fmt.Errorf("parsing token cache %s: %w", path, err)
+	}
+	if tok.Expiry.IsZero() {
+		// exp is a NumericDate, which RFC 7519 lets be fractional; any value
+		// present, even 0, is an expiry the API enforces.
+		var claims struct {
+			Exp *float64 `json:"exp"`
+		}
+		if decodeClaims(tok.AccessToken, &claims) == nil && claims.Exp != nil {
+			tok.Expiry = time.Unix(int64(*claims.Exp), 0)
+		}
 	}
 	return &tok, nil
 }
