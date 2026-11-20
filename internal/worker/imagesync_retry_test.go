@@ -239,3 +239,33 @@ func TestImageSync_NewerSnapshotSupersedesRetry(t *testing.T) {
 		t.Fatalf("the superseded URL was fetched %d more times after the newer snapshot synced", n-settled)
 	}
 }
+
+// Images are independent: when one row's download fails and is retried,
+// a second row whose bytes do not match its digest must not be downloaded
+// again on each retry. It fails the same way every time, after a full
+// download.
+func TestImageSync_RetryLeavesOutTheDigestMismatch(t *testing.T) {
+	var failing atomic.Int64
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		failing.Add(1)
+		http.Error(w, "SlowDown", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(broken.Close)
+	body, _ := imageSyncTarball()
+	mismatched, mismatchRequests := imageBucket(t, body, 0)
+
+	c := NewCache(nil)
+	c.ImagesDir = t.TempDir()
+	fastImageRetry(c)
+	t.Cleanup(func() { waitImageSyncIdle(t, c) })
+	c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 1, Images: []model.Image{
+		{Name: "noble-pxe", SHA256: strings.Repeat("1", 64), URL: broken.URL + "/noble-pxe/x.tar.gz"},
+		{Name: "jammy-pxe", SHA256: strings.Repeat("0", 64), URL: mismatched},
+	}})
+	if !within(5*time.Second, func() bool { return failing.Load() >= 4 }) {
+		t.Fatalf("the failing image was fetched %d times in 5s; want retries", failing.Load())
+	}
+	if n := mismatchRequests.Load(); n != 1 {
+		t.Fatalf("the digest-mismatched image was downloaded %d times across %d retries of the other image, want 1", n, failing.Load()-1)
+	}
+}

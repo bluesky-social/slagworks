@@ -1146,6 +1146,9 @@ func TestSyncImages_RetryableClassifiesFailures(t *testing.T) {
 		{name: "503 beside a refused name", retryable: true, images: map[string]*model.Image{
 			"..":        {Name: "..", SHA256: sha, URL: good},
 			"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: status(http.StatusServiceUnavailable)}}},
+		{name: "503 beside a digest mismatch", retryable: true, images: map[string]*model.Image{
+			"jammy-pxe": {Name: "jammy-pxe", SHA256: strings.Repeat("0", 64), URL: good},
+			"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: status(http.StatusServiceUnavailable)}}},
 		{name: "digest mismatch", retryable: false, images: map[string]*model.Image{
 			"noble-pxe": {Name: "noble-pxe", SHA256: strings.Repeat("0", 64), URL: good}}},
 		{name: "refused name", retryable: false, images: map[string]*model.Image{
@@ -1164,6 +1167,13 @@ func TestSyncImages_RetryableClassifiesFailures(t *testing.T) {
 			}
 			if got := Retryable(err); got != tc.retryable {
 				t.Errorf("Retryable(%v) = %v, want %v", err, got, tc.retryable)
+			}
+			var want []string
+			if tc.retryable {
+				want = []string{"noble-pxe"}
+			}
+			if got := FetchFailed(err); !slices.Equal(got, want) {
+				t.Errorf("FetchFailed(%v) = %v, want %v", err, got, want)
 			}
 		})
 	}

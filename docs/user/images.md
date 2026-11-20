@@ -275,14 +275,15 @@ Notes:
   a deploy created after the row changed installs the new image. A
   download that fails releases them; they then boot the image already on
   disk.
-- A sync that fails to fetch the tarball (a connection error, a
+- A row whose tarball fails to download (a connection error, a
   response other than 200, a body cut short, a stalled download) is
   retried by the site worker itself: 5 seconds after the failure, then
   doubling up to every 5 minutes, until it succeeds or a newer
   snapshot's sync takes over. Nothing else would run it again, because
   global pushes no new snapshot while the site's content is unchanged.
   A digest mismatch, a tarball that does not extract, or a failed write
-  to the images directory is logged and not retried, since another
+  to the images directory is logged and that row is not retried, even
+  while another row is being retried, since another
   attempt would fail the same way (and a digest mismatch costs a full
   download each time): fix the row, which pushes a new snapshot, or fix
   the host and restart the site worker.
@@ -300,9 +301,14 @@ Notes:
 - A plain `noble-pxe/` directory (put there by hand, or extracted in
   place by a release before version directories) is replaced by the
   link on the next sync, which downloads the image once more. Until
-  then the boot handler serves the plain directory by name. A
-  `noble-pxe.sha256` file left by such a release is no longer read and
-  can be deleted.
+  then the boot handler serves the plain directory by name. A boot
+  already in flight at that switch named the plain directory, not a
+  version, so its later fetches follow the new link: if the row pins a
+  different image than the directory held, that boot can mix the two.
+  When upgrading from such a release, do not re-pin the image until
+  each upgraded worker has switched to the link (or let running deploys
+  finish first). A `noble-pxe.sha256` file left by such a release is no
+  longer read and can be deleted.
 - Each row is synced on its own. A failed download, hash mismatch or
   link switch on one row costs only that row: the other rows still
   sync, the site worker logs the failure as "image sync failed", and

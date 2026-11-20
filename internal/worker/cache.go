@@ -828,21 +828,22 @@ const (
 // dropped, a reconnect gets no_change, and re-pinning an unchanged image
 // row does not change the snapshot. So when the sync fails to fetch an
 // image (imagepull.Retryable: a transport error, a non-200 response, a body
-// cut short, a stalled download), this arms a timer to request the same set
-// again on a backoff until it succeeds. Any other failure (bytes that do
-// not match the row's digest, a refused name, an error writing the images
+// cut short, a stalled download), this arms a timer to request those images
+// again on a backoff until they sync. Any other failure (bytes that do not
+// match the row's digest, a refused name, an error writing the images
 // directory) would repeat on every attempt, and for a digest mismatch each
-// attempt downloads the whole tarball again, so it is logged and not
-// retried. Lifecycle ops are held during each attempt and released between
-// attempts, as after any failed sync.
+// attempt downloads the whole tarball again, so it is logged and that image
+// is left out of the retry. Lifecycle ops are held during each attempt and
+// released between attempts, as after any failed sync.
 func (c *Cache) noteImageSyncResultLocked(err error, images map[string]*model.Image, caughtUp bool) {
+	fetchFailed := imagepull.FetchFailed(err)
 	switch {
 	case err == nil:
 		if c.imageSyncFailures > 0 {
 			slog.Info("image sync succeeded after failed attempts", "failed_attempts", c.imageSyncFailures)
 		}
 		c.imageSyncFailures = 0
-	case !imagepull.Retryable(err):
+	case len(fetchFailed) == 0:
 		c.imageSyncFailures = 0
 		slog.Error("image sync failed", "err", err,
 			"hint", "not retried, since another attempt would fail the same way: fix the image row "+
@@ -854,14 +855,20 @@ func (c *Cache) noteImageSyncResultLocked(err error, images map[string]*model.Im
 		delay := applyJitter(nextBackoff(c.imageRetryBase, c.imageRetryMax, c.imageSyncFailures), 0.2)
 		c.imageSyncFailures++
 		gen := c.imageSyncRequested
-		c.imageRetryTimer = time.AfterFunc(delay, func() { c.retryImageSync(gen, images) })
-		slog.Error("image sync failed; retrying", "err", err,
-			"failed_attempts", c.imageSyncFailures, "retry_in", delay.Round(time.Millisecond))
+		retry := make(map[string]*model.Image, len(fetchFailed))
+		for _, name := range fetchFailed {
+			if img, ok := images[name]; ok {
+				retry[name] = img
+			}
+		}
+		c.imageRetryTimer = time.AfterFunc(delay, func() { c.retryImageSync(gen, retry) })
+		slog.Error("image sync failed; retrying the images that failed to download", "err", err,
+			"retrying", fetchFailed, "failed_attempts", c.imageSyncFailures, "retry_in", delay.Round(time.Millisecond))
 	}
 }
 
 // retryImageSync is the retry timer armed by noteImageSyncResultLocked: it
-// requests images, the set whose fetch failed, again. gen is
+// requests images, the ones whose fetch failed, again. gen is
 // imageSyncRequested as of that failure; if a set has been requested since,
 // that request supersedes the retry.
 func (c *Cache) retryImageSync(gen uint64, images map[string]*model.Image) {

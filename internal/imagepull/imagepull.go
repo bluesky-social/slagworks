@@ -149,6 +149,10 @@ func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Ima
 		} else {
 			log.Info("downloading image", "name", name, "url", img.URL)
 			if err := pullImage(log, img, want, versionPath); err != nil {
+				var fe *fetchError
+				if errors.As(err, &fe) {
+					fe.image = name
+				}
 				errs = append(errs, fmt.Errorf("image %s: %w", name, err))
 				continue
 			}
@@ -245,23 +249,49 @@ func prune(log *slog.Logger, imagesDir, name string, keep []string) {
 
 // fetchError is a failure to fetch an image from its URL: a transport error,
 // a response other than 200, a body cut short, or a download abandoned
-// because it stalled.
-type fetchError struct{ err error }
+// because it stalled. image is the name SyncImages was syncing.
+type fetchError struct {
+	image string
+	err   error
+}
 
 func (e *fetchError) Error() string { return e.err.Error() }
 func (e *fetchError) Unwrap() error { return e.err }
 
-// Retryable reports whether a SyncImages error includes a failure to fetch
-// an image from its URL (a transport error, a response other than 200, a
-// body cut short, or a stalled download), which the same URL may not repeat
-// on a later attempt.
+// FetchFailed returns, sorted, the names of the images in a SyncImages error
+// that failed to fetch from their URL (a transport error, a response other
+// than 200, a body cut short, or a stalled download), which the same URL
+// may not repeat on a later attempt. Images are independent, so a caller
+// that retries does so for these images only.
 // Every other failure repeats until the image row or the host changes:
 // bytes that do not match the row's digest or do not extract (a later
 // attempt downloads the same bytes again), a refused name, or an error
 // writing to the images directory.
+func FetchFailed(err error) []string {
+	var names []string
+	var walk func(error)
+	walk = func(err error) {
+		switch e := err.(type) {
+		case nil:
+		case *fetchError:
+			names = append(names, e.image)
+		case interface{ Unwrap() []error }:
+			for _, c := range e.Unwrap() {
+				walk(c)
+			}
+		case interface{ Unwrap() error }:
+			walk(e.Unwrap())
+		}
+	}
+	walk(err)
+	slices.Sort(names)
+	return names
+}
+
+// Retryable reports whether a SyncImages error includes a failure to fetch
+// an image from its URL (see FetchFailed).
 func Retryable(err error) bool {
-	var fe *fetchError
-	return errors.As(err, &fe)
+	return len(FetchFailed(err)) > 0
 }
 
 // readErrRecorder remembers the last non-EOF error its reader returned, so
@@ -468,13 +498,13 @@ func pullImage(log *slog.Logger, img *model.Image, wantSHA256, targetDir string)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		tmpFile.Close()
-		return &fetchError{fmt.Errorf("downloading: %w", downloadErr(err))}
+		return &fetchError{err: fmt.Errorf("downloading: %w", downloadErr(err))}
 	}
 	defer resp.Body.Close()
 	stall.Reset(stallTimeout) // the response headers are data
 	if resp.StatusCode != http.StatusOK {
 		tmpFile.Close()
-		return &fetchError{fmt.Errorf("download returned %d", resp.StatusCode)}
+		return &fetchError{err: fmt.Errorf("download returned %d", resp.StatusCode)}
 	}
 
 	hasher := sha256.New()
@@ -483,7 +513,7 @@ func pullImage(log *slog.Logger, img *model.Image, wantSHA256, targetDir string)
 	if _, err := io.Copy(tmpFile, io.TeeReader(body, io.MultiWriter(hasher, pw))); err != nil {
 		tmpFile.Close()
 		if body.err != nil {
-			return &fetchError{fmt.Errorf("reading download: %w", downloadErr(err))}
+			return &fetchError{err: fmt.Errorf("reading download: %w", downloadErr(err))}
 		}
 		return fmt.Errorf("writing download: %w", err)
 	}

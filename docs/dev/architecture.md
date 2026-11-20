@@ -614,8 +614,8 @@ previous image still on disk: `PendingLifecycleOps` returns nothing,
 serves `BootLocal` for a pending one (a claimed op keeps its boot). A
 failed sync releases them. Nothing else requests a sync while the
 snapshot is unchanged, so when a sync fails to fetch an image
-(`imagepull.Retryable`) a timer requests the same set again until it
-succeeds or a newer request supersedes it: 5s after the failure,
+(`imagepull.FetchFailed`) a timer requests those images again until
+they sync or a newer request supersedes it: 5s after the failure,
 doubling to 5 minutes, each with up to 20% jitter so the workers that
 failed on the same outage do not retry in lockstep. Other failures
 repeat on every attempt and are logged, not retried.
@@ -780,7 +780,7 @@ are independent: a
 refused name, failed download, digest mismatch or failed link switch
 costs only that image, the other images still sync, and every failure
 is joined into the returned error.
-`Retryable(err)` reports whether a sync error includes a failure to
+`FetchFailed(err)` names the images in a sync error that failed to
 fetch from the URL (transport error, non-200 response, body cut
 short, stalled download); the site worker's cache retries only those,
 since a digest mismatch, an unreadable tarball, a refused name or a
