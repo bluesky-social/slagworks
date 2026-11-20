@@ -441,7 +441,9 @@ is the bmc-creds-admin account and is never touched). It runs two ways:
   the agent can refuse, before any write, when that account isn't at
   slot 2. Provision-once: a password is only written for an absent or
   disabled monitor slot, so the stored monitor cred stays aligned with the
-  BMC across redeploys. It also re-asserts the persistent PXE boot order.
+  BMC across redeploys. It also re-asserts the monitor account's enable
+  bit (which `ipmitool user list` does not show) and the persistent PXE
+  boot order.
 - Over the LAN, on demand, via `slagctl machine bmc-reconcile <machine>`
   (any host, including in-service hosts slagworks never deployed). The site
   worker logs in with the admin entry, checks the chassis serial, refuses
