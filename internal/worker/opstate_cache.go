@@ -49,6 +49,14 @@ import (
 //     A resync that brings the op back as claimed-deploying must not
 //     downgrade the running overlay this op earned — see applyOpResync.
 //     Persisted with the op set, so it survives a restart.
+//   - phoneHomeSettled: deploy op ID -> machine ID for every deploy whose
+//     phone-home is settled as far as this worker can prove: it recorded the
+//     phone-home itself (recordPhoneHome, which queues the durable
+//     observation), or global reported that exact op completed. It is the
+//     only thing that lets validateReportBinding answer a phone-home retry
+//     with success and no side effects, and unlike phoneHomed it outlives
+//     the op's removal: a lost 2xx is retried after the op is gone. Bounded
+//     FIFO (tombstoneCap) and persisted with the op set.
 //   - tombstones: opID -> terminal version; a late lower-version delta for
 //     a removed op is discarded so a concurrent-publisher race can't
 //     resurrect a zombie active op (which the fail-closed boot rule would
@@ -76,6 +84,9 @@ type opState struct {
 	failedOps    map[string]bool
 	phaseStart   map[string]phaseState
 	phoneHomed   map[string]bool
+
+	phoneHomeSettled      map[string]uuid.UUID
+	phoneHomeSettledOrder []string
 
 	tombstones     map[string]int
 	tombstoneOrder []string
@@ -172,16 +183,17 @@ func (o *opState) keepLocalFailure(incoming *model.Operation) {
 // op_resync.
 func newOpState(view *atomic.Pointer[snapshotView], wake chan struct{}, untrusted bool, selfSerial string) *opState {
 	return &opState{
-		view:         view,
-		ops:          make(map[string]*model.Operation),
-		machineState: make(map[uuid.UUID]model.MachineState),
-		failedOps:    make(map[string]bool),
-		phaseStart:   make(map[string]phaseState),
-		phoneHomed:   make(map[string]bool),
-		tombstones:   make(map[string]int),
-		wake:         wake,
-		untrusted:    untrusted,
-		selfSerial:   selfSerial,
+		view:             view,
+		ops:              make(map[string]*model.Operation),
+		machineState:     make(map[uuid.UUID]model.MachineState),
+		failedOps:        make(map[string]bool),
+		phaseStart:       make(map[string]phaseState),
+		phoneHomed:       make(map[string]bool),
+		tombstones:       make(map[string]int),
+		phoneHomeSettled: make(map[string]uuid.UUID),
+		wake:             wake,
+		untrusted:        untrusted,
+		selfSerial:       selfSerial,
 	}
 }
 
@@ -312,6 +324,13 @@ func (o *opState) applyOpRemoved(opID, machineIDStr string, version int, machine
 	if machineState != "" {
 		if id, err := uuid.Parse(machineIDStr); err == nil {
 			o.machineState[id] = machineState
+			// Only a deploy's completion removes an op with running (a
+			// failure never writes it, and no other op type completes to
+			// it), so this is global's word that the op completed. The op
+			// need not be held: a removal can overtake the op's delta.
+			if machineState == model.MachineStateRunning {
+				o.settlePhoneHome(opID, id)
+			}
 		}
 	}
 }
@@ -334,6 +353,22 @@ func (o *opState) putTombstone(opID string, version int) {
 	o.tombstoneOrder = append(o.tombstoneOrder, opID)
 }
 
+// settlePhoneHome records that the phone-home of deploy op opID on machineID
+// is settled (see the phoneHomeSettled field), evicting the oldest entry
+// FIFO when at capacity. Caller holds mu.
+func (o *opState) settlePhoneHome(opID string, machineID uuid.UUID) {
+	if _, ok := o.phoneHomeSettled[opID]; ok {
+		return
+	}
+	if len(o.phoneHomeSettledOrder) >= tombstoneCap {
+		oldest := o.phoneHomeSettledOrder[0]
+		o.phoneHomeSettledOrder = o.phoneHomeSettledOrder[1:]
+		delete(o.phoneHomeSettled, oldest)
+	}
+	o.phoneHomeSettled[opID] = machineID
+	o.phoneHomeSettledOrder = append(o.phoneHomeSettledOrder, opID)
+}
+
 // snapshotForPersist returns copies of the op set, overlay and phone-home
 // latch for LocalDB persistence. Caller must NOT hold mu.
 func (o *opState) snapshotForPersist() PersistedOpState {
@@ -351,7 +386,11 @@ func (o *opState) snapshotForPersist() PersistedOpState {
 	for opID := range o.phoneHomed {
 		phoneHomed = append(phoneHomed, opID)
 	}
-	return PersistedOpState{Ops: ops, Overlay: overlay, PhoneHomed: phoneHomed}
+	settled := make([]SettledPhoneHome, 0, len(o.phoneHomeSettledOrder))
+	for _, opID := range o.phoneHomeSettledOrder {
+		settled = append(settled, SettledPhoneHome{OpID: opID, MachineID: o.phoneHomeSettled[opID]})
+	}
+	return PersistedOpState{Ops: ops, Overlay: overlay, PhoneHomed: phoneHomed, PhoneHomeSettled: settled}
 }
 
 // rehydrate loads a persisted op layer into an untrusted opState on cold
@@ -373,6 +412,9 @@ func (o *opState) rehydrate(st PersistedOpState) {
 	}
 	for _, opID := range st.PhoneHomed {
 		o.phoneHomed[opID] = true
+	}
+	for _, e := range st.PhoneHomeSettled {
+		o.settlePhoneHome(e.OpID, e.MachineID)
 	}
 	o.untrusted = true
 }
@@ -589,7 +631,9 @@ func (e opNotActiveError) Is(target error) bool { return target == model.ErrOper
 // agent report. Hardware discovered by the agent is never allowed to select a
 // different machine: the op stream and identity snapshot must agree first.
 // The bool reports an already-acknowledged phone-home retry, which callers
-// return as success without repeating its outbox or state side effects.
+// return as success without repeating its outbox or state side effects. It
+// is true only for a deploy op whose phone-home is settled: this worker
+// recorded it, or global reported that exact op completed.
 //
 // A rejection wraps model.ErrOperationNotActive only when the op is known to
 // be over: it is held with a terminal status, its tombstone is held, or it is
@@ -607,17 +651,26 @@ func (o *opState) validateReportBinding(machineID, opID uuid.UUID, event string)
 	if !ok {
 		return nil, nil, false, fmt.Errorf("machine %s is not in the site snapshot", machineID)
 	}
-	// The installed OS retries phone-home until it receives a 2xx. Once the
-	// first request succeeds, RecordPhoneHome moves the machine to running and
-	// completes the deploy op locally; an op_removed may then delete that op
-	// before a lost response is retried. A running machine makes the retry a
-	// side-effect-free acknowledgement. The first phone-home still arrives
-	// while deploying and must pass the exact active deploy-op checks below,
-	// including the awaiting_phone_home phase.
-	if event == "phone_home" && o.effectiveState(machineID, m.State) == model.MachineStateRunning {
-		mcp := cloneMachineSnapshot(m)
-		mcp.State = model.MachineStateRunning
-		return mcp, nil, true, nil
+	// The installed OS retries phone-home every few seconds until its first
+	// 2xx and never again, so a 2xx must mean the deploy's completion is
+	// already on its way to global or already there. A retry of a lost 2xx
+	// can arrive after the op was completed and removed, hence the settled
+	// set and not the op set. The machine being held as running is no such
+	// evidence: a worker whose view predates a redeploy holds the machine
+	// running from the previous deploy.
+	//
+	// Everything else takes the checks below and is refused unless the op is
+	// held active at awaiting_phone_home. A refused phone-home is retried,
+	// and passes once this worker's op view catches up. Forwarding it to
+	// global instead was rejected: global completes any active deploy op a
+	// phone_home observation names, so the awaiting_phone_home gate exists
+	// only here, and a worker that does not hold the op cannot apply it.
+	if event == "phone_home" {
+		if settledFor, ok := o.phoneHomeSettled[opID.String()]; ok && settledFor == machineID {
+			mcp := cloneMachineSnapshot(m)
+			mcp.State = o.effectiveState(machineID, m.State)
+			return mcp, nil, true, nil
+		}
 	}
 	op, ok := o.ops[opID.String()]
 	if !ok {
@@ -732,6 +785,7 @@ func (o *opState) recordPhoneHome(machineID uuid.UUID) uuid.UUID {
 			// that brings it back as claimed-deploying must not downgrade
 			// the running overlay and re-wipe the fresh disk.
 			o.phoneHomed[op.ID.String()] = true
+			o.settlePhoneHome(op.ID.String(), machineID)
 			return op.ID
 		}
 	}

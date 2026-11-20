@@ -10,8 +10,9 @@ package httpboot_test
 // one active lifecycle op. A report is accepted iff it names a machine in
 // the snapshot and that machine's own active, non-terminal op of the type
 // the event requires. A phone_home is accepted only once that deploy op's
-// deploy_complete was accepted, plus the documented retry on a machine that
-// is already running. Contract sources: opstate_cache.go
+// deploy_complete was accepted, plus the documented retry: a phone_home that
+// names a deploy op whose phone-home was already accepted, on that op's
+// machine, is acknowledged without side effects. Contract sources: opstate_cache.go
 // validateReportBinding ("Hardware discovered by the agent is never allowed
 // to select a different machine", "The first phone-home ... must pass the
 // exact active deploy-op checks"), handler.go boundBootOperation, and
@@ -253,8 +254,8 @@ func (s *bindSim) step() {
 		// A claim delta that lands after the installed OS phoned home is
 		// kept out of the history: it moves the machine's local state from
 		// running back to deploying (an op_resync in the same position
-		// keeps it running), so a retried phone-home is processed in full
-		// and queues a second completion instead of being acknowledged. The
+		// keeps it running) and makes the locally completed op active
+		// again, which the model's one-way op states do not follow. The
 		// boot decision stays local either way.
 		if op == nil || op.removed || op.claimed || op.completed {
 			return
@@ -358,7 +359,10 @@ func (s *bindSim) report() {
 	accept, ackOnly := false, false
 	switch {
 	case m == nil:
-	case kind == "phone_home" && m.running:
+	case kind == "phone_home" && op != nil && op.completed && s.machines[op.machine] == m:
+		// A retry is acknowledged for the op whose phone-home was
+		// recorded, also after global removed it; the machine being
+		// running does not acknowledge a phone-home for any other op.
 		accept, ackOnly = true, true
 	case op == nil || !op.activeForReports() || s.machines[op.machine] != m:
 	case wantType != "" && op.typ != wantType:

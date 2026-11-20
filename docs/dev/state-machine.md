@@ -605,8 +605,11 @@ Path depends on the op type.
   (the agent's `deploy_complete` has latched it); anything else is a
   409, and the unit keeps retrying. A phone-home earlier than that
   would record a deploy as successful over a disk the agent has not
-  finished writing. Once the machine is `running` a retried
-  phone-home is acknowledged without side effects. There is no
+  finished writing. A retried phone-home is acknowledged without side
+  effects only for a deploy op whose phone-home this worker already
+  recorded, or that global removed as completed; the machine being
+  `running` is not enough, because a worker whose view predates a
+  redeploy still holds it `running` from the previous deploy. There is no
   MAC-only phone-home route: a request that names no op cannot
   complete one (`TestPhoneHome_CompletesOnlyTheBoundDeployAwaitingIt`,
   `internal/httpboot/phone_home_test.go`). An accepted report
