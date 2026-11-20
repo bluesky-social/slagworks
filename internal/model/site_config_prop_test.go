@@ -304,9 +304,10 @@ func oracleConfig(c model.SiteConfig) string {
 }
 
 // isMappedSpelling reports whether s is an IPv4-mapped IPv6 spelling of an
-// address or prefix ("::ffff:a.b.c.d[/n]"). Validate's net.ParseIP(..).To4()
-// accepts these; whether that is intended is the ambiguity we track
-// separately rather than fail on.
+// address ("::ffff:a.b.c.d"). Validate's net.ParseIP(..).To4() accepts
+// these for pool and gateway addresses; whether that is intended is left
+// open rather than failed on. A relay subnet spelled that way is not left
+// open: Validate must reject it, as the oracle does.
 func isMappedSpelling(s string) bool {
 	if p, err := netip.ParsePrefix(s); err == nil {
 		return p.Addr().Is4In6()
@@ -322,7 +323,7 @@ func configHasMapped(c model.SiteConfig) bool {
 		return true
 	}
 	for _, p := range c.RelayPools {
-		if isMappedSpelling(p.Subnet) || isMappedSpelling(p.RangeStart) || isMappedSpelling(p.RangeEnd) || isMappedSpelling(p.Gateway) {
+		if isMappedSpelling(p.RangeStart) || isMappedSpelling(p.RangeEnd) || isMappedSpelling(p.Gateway) {
 			return true
 		}
 	}
@@ -330,9 +331,8 @@ func configHasMapped(c model.SiteConfig) bool {
 }
 
 // TestPropSiteConfigValidateMatchesOracle: Validate accepts exactly the
-// configs the documented contract accepts. IPv4-mapped spellings are
-// recorded but not failed here (servedRelay notes what the consumer does
-// with a mapped subnet).
+// configs the documented contract accepts. Configs with an IPv4-mapped
+// address spelling are counted but not compared (see isMappedSpelling).
 func TestPropSiteConfigValidateMatchesOracle(t *testing.T) {
 	var accepted, rejected, mapped atomic.Int64
 	rapid.Check(t, func(t *rapid.T) {
@@ -445,11 +445,6 @@ func offerFor(t *rapid.T, rs dhcp.RelaySubnet, giaddr net.IP) *dhcpv4.DHCPv4 {
 // servedRelay draws relay pools until Validate accepts one (giving up after a
 // few attempts, in which case the offer is nil) and serves one relayed
 // DISCOVER for it with giaddr = the pool's gateway.
-//
-// One accepted pattern is not served: a subnet spelled as an IPv4-mapped
-// IPv6 CIDR ("::ffff:10.0.0.0/104"). Validate accepts it although
-// net.ParseCIDR gives it a 16-byte mask, which the DHCP subnet-mask option
-// truncates to 255.255.255.255.
 func servedRelay(t *rapid.T) (genRelay, *dhcpv4.DHCPv4) {
 	var r genRelay
 	ok := false
@@ -459,7 +454,7 @@ func servedRelay(t *rapid.T) (genRelay, *dhcpv4.DHCPv4) {
 		exoticForms = true
 		cfg := model.SiteConfig{Slug: "s", NetBoxSite: "s", EphemeralPoolStart: "10.200.0.1", EphemeralPoolEnd: "10.200.0.9",
 			RelayPools: []model.RelayPool{r.pool}}
-		if cfg.Validate() == nil && !isMappedSpelling(r.pool.Subnet) {
+		if cfg.Validate() == nil {
 			ok = true
 			break
 		}
