@@ -2,9 +2,9 @@
 // WebSocket client and server and injects the faults a reverse proxy and a
 // load balancer produce in production: idle timeouts (both directions or one),
 // connection drops with FIN or RST, half-closed connections, blackholed
-// connections that stay open but deliver nothing, frozen connections that
-// stop reading, upgrade refusals (429/502/503), proxy restarts, header
-// rewriting, and arbitrary splitting of the byte stream.
+// connections that stay open but deliver nothing in one or both directions,
+// frozen connections that stop reading, upgrade refusals (429/502/503),
+// proxy restarts, and arbitrary splitting of the byte stream.
 //
 // It parses only the first request head on each connection (the WebSocket
 // upgrade), records it, and from then on copies bytes. It is not a general
@@ -32,7 +32,6 @@ type Request struct {
 	RequestURI string // as sent on the request line, path and query
 	Header     http.Header
 	Host       string
-	At         time.Time
 }
 
 // Proxy is a fault-injecting TCP proxy. The zero value is not usable; use New.
@@ -45,6 +44,7 @@ type Proxy struct {
 	pairs   map[*pair]struct{}
 	refuse  []int // status codes for the next upgrades, consumed in order
 	reqs    []Request
+	silence int // the next silence accepted connections go silent after the upgrade
 	closed  bool
 	acceptW sync.WaitGroup
 
@@ -54,7 +54,6 @@ type Proxy struct {
 	idleBoth   atomic.Int64 // nanoseconds; >0: drop a pair idle in both directions this long
 	idleDown   atomic.Int64 // nanoseconds; >0: drop a pair the server has not written to this long
 	maxLife    atomic.Int64 // nanoseconds; >0: drop a pair this long after it opened
-	rewrite    atomic.Pointer[func(h http.Header) http.Header]
 	seed       atomic.Uint64
 
 	accepted atomic.Int64
@@ -72,10 +71,11 @@ type pair struct {
 
 	lastUp   atomic.Int64 // unix nanos of last client->server byte
 	lastDown atomic.Int64 // unix nanos of last server->client byte
-	downN    atomic.Int64 // server->client bytes on this pair
 
-	blackhole atomic.Bool  // read and discard in both directions
+	blackUp   atomic.Bool  // read and discard client->server
+	blackDown atomic.Bool  // read and discard server->client
 	downShut  atomic.Bool  // client got a FIN: discard server->client, keep client->server
+	afterHead atomic.Bool  // go silent both ways once the upgrade response has passed
 	freeze    atomic.Bool  // stop reading in both directions
 	eofs      atomic.Int32 // bit 1: client->server EOF, bit 2: server->client EOF
 
@@ -150,14 +150,13 @@ func (p *Proxy) SetDownstreamIdleTimeout(d time.Duration) { p.idleDown.Store(int
 // reuse or lifetime limit). 0 disables.
 func (p *Proxy) SetMaxLifetime(d time.Duration) { p.maxLife.Store(int64(d)) }
 
-// SetHeaderRewrite installs a function applied to each first request's
-// headers before they are forwarded. nil restores pass-through.
-func (p *Proxy) SetHeaderRewrite(f func(h http.Header) http.Header) {
-	if f == nil {
-		p.rewrite.Store(nil)
-		return
-	}
-	p.rewrite.Store(&f)
+// SilenceNextAfterUpgrade lets the next n connections complete the HTTP
+// upgrade and then deliver nothing in either direction, staying open: a
+// path that dies between the upgrade and the first WebSocket message.
+func (p *Proxy) SilenceNextAfterUpgrade(n int) {
+	p.mu.Lock()
+	p.silence += n
+	p.mu.Unlock()
 }
 
 // RefuseNext answers the next len(codes) connections with those HTTP status
@@ -189,15 +188,6 @@ func (p *Proxy) Stats() Stats {
 		Accepted: p.accepted.Load(), Refused: p.refused.Load(), Dropped: p.dropped.Load(), Open: open,
 		UpBytes: p.up.Load(), DownBytes: p.down.Load(),
 	}
-}
-
-// DownBytesOpen sums server-to-client bytes over the currently open pairs.
-func (p *Proxy) DownBytesOpen() int64 {
-	var n int64
-	for _, pr := range p.snapshot() {
-		n += pr.downN.Load()
-	}
-	return n
 }
 
 func (p *Proxy) snapshot() []*pair {
@@ -249,10 +239,24 @@ func (p *Proxy) HalfCloseDownAll() int {
 // BlackholeAll makes every open connection deliver nothing in either
 // direction while staying open and acknowledging what it reads: a path
 // that silently stopped working with no FIN or RST.
-func (p *Proxy) BlackholeAll() int {
+func (p *Proxy) BlackholeAll() int { return p.blackhole(true, true) }
+
+// BlackholeUpAll is BlackholeAll for the client-to-server direction only:
+// the server hears nothing more, the client still hears the server.
+func (p *Proxy) BlackholeUpAll() int { return p.blackhole(true, false) }
+
+// BlackholeDownAll is BlackholeAll for the server-to-client direction only.
+func (p *Proxy) BlackholeDownAll() int { return p.blackhole(false, true) }
+
+func (p *Proxy) blackhole(up, down bool) int {
 	prs := p.snapshot()
 	for _, pr := range prs {
-		pr.blackhole.Store(true)
+		if up {
+			pr.blackUp.Store(true)
+		}
+		if down {
+			pr.blackDown.Store(true)
+		}
 	}
 	return len(prs)
 }
@@ -323,19 +327,16 @@ func (p *Proxy) handle(client net.Conn) {
 	}
 	hdr := req.Header.Clone()
 	host := req.Host
-	if f := p.rewrite.Load(); f != nil {
-		hdr = (*f)(hdr)
-		if h := hdr.Get("Host"); h != "" {
-			host = h
-			hdr.Del("Host")
-		}
-	}
 	p.mu.Lock()
-	p.reqs = append(p.reqs, Request{Method: req.Method, RequestURI: req.RequestURI, Header: hdr.Clone(), Host: host, At: time.Now()})
+	p.reqs = append(p.reqs, Request{Method: req.Method, RequestURI: req.RequestURI, Header: hdr.Clone(), Host: host})
 	var code int
+	silent := false
 	if len(p.refuse) > 0 {
 		code = p.refuse[0]
 		p.refuse = p.refuse[1:]
+	} else if p.silence > 0 {
+		p.silence--
+		silent = true
 	}
 	p.mu.Unlock()
 	if code != 0 {
@@ -362,6 +363,7 @@ func (p *Proxy) handle(client net.Conn) {
 	pr := &pair{p: p, client: client, upstream: upstream, opened: now, done: make(chan struct{})}
 	pr.lastUp.Store(now.UnixNano())
 	pr.lastDown.Store(now.UnixNano())
+	pr.afterHead.Store(silent)
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -396,10 +398,19 @@ func (pr *pair) rng() *rand.Rand {
 	return rand.New(rand.NewPCG(s, s^0xdeadbeef)) //nolint:gosec // reproducible test chunking, not security
 }
 
+// silenced reports whether the given direction currently delivers nothing.
+func (pr *pair) silenced(down bool) bool {
+	if down {
+		return pr.blackDown.Load() || pr.downShut.Load()
+	}
+	return pr.blackUp.Load()
+}
+
 // pump copies src to dst. down is true for server-to-client.
 func (pr *pair) pump(src, dst net.Conn, down bool) {
 	r := pr.rng()
 	buf := make([]byte, 32<<10)
+	var head []byte // server-to-client bytes so far, until the upgrade response has ended
 	for {
 		for pr.freeze.Load() {
 			select {
@@ -411,7 +422,7 @@ func (pr *pair) pump(src, dst net.Conn, down bool) {
 		n, err := src.Read(buf)
 		if n > 0 {
 			nowN := time.Now().UnixNano()
-			if pr.blackhole.Load() || (down && pr.downShut.Load()) {
+			if pr.silenced(down) {
 				// Read and acknowledge, deliver nothing.
 				continue
 			}
@@ -419,9 +430,19 @@ func (pr *pair) pump(src, dst net.Conn, down bool) {
 				pr.kill(false)
 				return
 			}
+			if down && pr.afterHead.Load() {
+				// The server writes nothing after its upgrade response
+				// until the client's first message arrives, so the
+				// response ends the chunk that completes it.
+				head = append(head, buf[:n]...)
+				if strings.Contains(string(head), "\r\n\r\n") {
+					pr.afterHead.Store(false)
+					pr.blackUp.Store(true)
+					pr.blackDown.Store(true)
+				}
+			}
 			if down {
 				pr.lastDown.Store(nowN)
-				pr.downN.Add(int64(n))
 				pr.p.down.Add(int64(n))
 			} else {
 				pr.lastUp.Store(nowN)
@@ -429,15 +450,11 @@ func (pr *pair) pump(src, dst net.Conn, down bool) {
 			}
 		}
 		if err != nil {
-			if down && pr.downShut.Load() && !pr.blackhole.Load() {
-				// The client already got its FIN; the server's close ends
-				// this direction.
+			if pr.silenced(down) {
+				// A silent direction does not propagate a close either
+				// (and after a half-close the client already has its
+				// FIN). The pair ends once both endpoints have gone.
 				pr.halfDone(down)
-				return
-			}
-			if pr.blackhole.Load() {
-				// A blackholed path does not propagate a close either.
-				<-pr.done
 				return
 			}
 			// Propagate the half-close the endpoint sent, then wait for the

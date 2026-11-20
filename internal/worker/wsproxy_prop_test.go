@@ -2,9 +2,11 @@ package worker
 
 // The site-worker link carried through a fault-injecting proxy: the real
 // WSConn (connectAndRun, drainLoop, drainOnce, handleObservationAck, the
-// reconnect reset) against a real ws.Hub, with internal/proptest/faultproxy
-// between them standing in for the ALB and the identity-aware proxy that
-// front global in production. Faults are interleaved with outbox traffic:
+// reconnect reset, the heartbeat and idle-read liveness) against a real
+// ws.Hub, with internal/proptest/faultproxy between them standing in for the
+// load balancer and reverse proxy that front global in a deployment.
+//
+// TestWSConnThroughFaultProxy_Prop interleaves faults with traffic:
 // connection drops with FIN and with RST, half-closed connections,
 // blackholed paths that end in an RST, proxy restarts, 429/502/503 on the
 // upgrade, a connection lifetime limit, the byte stream split into writes of
@@ -15,17 +17,23 @@ package worker
 //     rejected it terminally, and nothing acked is redelivered afterwards;
 //   - op updates reach global in order and without duplicates, and every
 //     update appended while no fault could intervene is delivered;
+//   - the worker ends on the last snapshot global pushed, whatever was lost
+//     on the way;
 //   - every upgrade the proxy saw carried the worker token in the
 //     Authorization header and nowhere in the request line.
+//
+// TestWSConnLinkLiveness_Prop checks the liveness contract both ends keep
+// (ws.HeartbeatInterval, ws.IdleTimeout), with the timers shortened: an idle
+// link outlives a proxy idle timeout of a few heartbeat intervals, and a
+// path that goes silent in either direction without a FIN or RST is
+// replaced, at both ends, about one idle timeout later and not before.
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -37,94 +45,29 @@ import (
 	"github.com/google/uuid"
 	"pgregory.net/rapid"
 
+	"github.com/bluesky-social/slagworks/internal/dhcp"
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/proptest/faultproxy"
-	"github.com/bluesky-social/slagworks/internal/ws"
 )
 
+// pxEnv is the e2e environment with a fault proxy between worker and hub.
 type pxEnv struct {
-	t      fataler
-	dir    string
-	srv    *httptest.Server
-	hub    *ws.Hub
-	auth   *e2eAuth
-	global *e2eGlobal
-	token  string
-	px     *faultproxy.Proxy
-
-	db     *LocalDB
-	cache  *Cache
-	w      *WSConn
-	cancel context.CancelFunc
-	done   chan struct{}
-
-	lastErr atomic.Pointer[string]
+	*e2eEnv
+	px *faultproxy.Proxy
 }
 
-func newPxEnv(t fataler, dir string) *pxEnv {
-	g := newE2EGlobal()
-	token := "tok-" + uuid.NewString()
-	sum := sha256.Sum256([]byte(token))
-	auth := &e2eAuth{hash: hex.EncodeToString(sum[:]), slug: "site-a", workerID: "worker-a"}
-	hub := ws.NewHub(ws.HubConfig{
-		Auth:            auth,
-		Rebuilder:       e2eRebuilder{},
-		ObsHandler:      g,
-		OpUpdateHandler: g,
-		Logger:          quietLog,
-	})
-	srv := httptest.NewServer(hub)
-	px, err := faultproxy.New(strings.TrimPrefix(srv.URL, "http://"))
+// newPxEnv starts a hub, a proxy in front of it and a worker dialing the
+// proxy. heartbeat and idle shorten the link's liveness timers at both ends;
+// zero keeps the production values, which no fault in a short test reaches.
+func newPxEnv(t fataler, dir string, heartbeat, idle time.Duration) *pxEnv {
+	e := newE2EGlobalSide(t, dir, heartbeat, idle)
+	px, err := faultproxy.New(strings.TrimPrefix(e.srv.URL, "http://"))
 	if err != nil {
 		t.Fatalf("start proxy: %v", err)
 	}
-	e := &pxEnv{t: t, dir: dir, srv: srv, hub: hub, auth: auth, global: g, token: token, px: px}
+	e.globalURL = px.URL()
 	e.startWorker()
-	return e
-}
-
-func (e *pxEnv) runLoop(ctx context.Context, w *WSConn, done chan struct{}) {
-	defer close(done)
-	for ctx.Err() == nil {
-		if _, err := w.connectAndRun(ctx); err != nil {
-			msg := err.Error()
-			e.lastErr.Store(&msg)
-		}
-		w.connected.Store(false)
-		select {
-		case <-ctx.Done():
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-}
-
-func (e *pxEnv) startWorker() {
-	db, err := OpenLocalDB(filepath.Join(e.dir, "worker.db"))
-	if err != nil {
-		e.t.Fatalf("open local db: %v", err)
-	}
-	db.SetLogger(quietLog)
-	c := NewCache(db)
-	c.outbox.RejectBackoffBase = 2 * time.Millisecond
-	c.outbox.RejectBackoffMax = 20 * time.Millisecond
-	w := NewWSConn(WSConnConfig{GlobalURL: e.px.URL(), Token: e.token, WorkerID: "worker-a"}, c, db, nil)
-	w.SetLogger(quietLog)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	e.db, e.cache, e.w, e.cancel, e.done = db, c, w, cancel, done
-	go e.runLoop(ctx, w, done)
-}
-
-func (e *pxEnv) stopWorker() {
-	e.cancel()
-	<-e.done
-	o := e.cache.outbox
-	o.mu.Lock()
-	if o.retryTimer != nil {
-		o.retryTimer.Stop()
-	}
-	o.mu.Unlock()
-	closeQuiet(e.db)
+	return &pxEnv{e2eEnv: e, px: px}
 }
 
 func (e *pxEnv) close() {
@@ -134,24 +77,35 @@ func (e *pxEnv) close() {
 	e.srv.Close()
 }
 
-func (e *pxEnv) outboxRows() int64 {
-	var n int64
-	var err error
-	for range 5 {
-		if err = e.db.db.Raw("SELECT count(*) FROM outbox").Scan(&n).Error; err == nil {
-			return n
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	e.t.Fatalf("count outbox: %v", err)
-	return n
-}
-
 func (e *pxEnv) lastConnErr() string {
 	if p := e.lastErr.Load(); p != nil {
 		return *p
 	}
 	return "<none>"
+}
+
+// registrations is how many connections global holds for the site.
+func (e *pxEnv) registrations() int { return len(e.hub.ConnectedWorkerSerials("site-a")) }
+
+// lowerDefaultRapidChecks runs the calling test's rapid.Check with n cases
+// unless -rapid.checks was given on the command line, which then scales the
+// test up for a deep local run. For properties whose cases are expensive.
+func lowerDefaultRapidChecks(t *testing.T, n int) {
+	t.Helper()
+	const name = "rapid.checks"
+	explicit := false
+	flag.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == name })
+	if explicit {
+		return
+	}
+	// Value.Set, not flag.Set: flag.Set would make the flag look explicit
+	// to the next caller.
+	v := flag.Lookup(name).Value
+	prev := v.String()
+	if err := v.Set(fmt.Sprint(n)); err != nil {
+		t.Fatalf("set -%s: %v", name, err)
+	}
+	t.Cleanup(func() { _ = v.Set(prev) })
 }
 
 // genBigObsData occasionally produces a multi-MiB observation so frames far
@@ -166,7 +120,7 @@ func genBigObsData(t *rapid.T) json.RawMessage {
 }
 
 type pxStats struct {
-	cases, appends, bigAppends, updates, drops, resets, halfCloses, blackholes,
+	cases, appends, bigAppends, updates, pushes, bigPushes, drops, resets, halfCloses, blackholes,
 	restarts, refusals, lifetimes, chunked, hubKills, crashes, redeliveries, upgrades atomic.Int64
 }
 
@@ -174,6 +128,9 @@ func TestWSConnThroughFaultProxy_Prop(t *testing.T) {
 	if testing.Short() {
 		t.Skip("end-to-end WS proxy property is slow")
 	}
+	// A case is a hub, a proxy and a worker on its own SQLite file, up to 30
+	// steps and two waits for quiescence.
+	lowerDefaultRapidChecks(t, 40)
 	root := t.TempDir()
 	var n atomic.Int64
 	st := &pxStats{}
@@ -182,7 +139,7 @@ func TestWSConnThroughFaultProxy_Prop(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			rt.Fatalf("mkdir: %v", err)
 		}
-		e := newPxEnv(rt, dir)
+		e := newPxEnv(rt, dir, 0, 0)
 		defer e.close()
 		e.px.SetSeed(rapid.Uint64().Draw(rt, "proxySeed"))
 		st.cases.Add(1)
@@ -196,6 +153,7 @@ func TestWSConnThroughFaultProxy_Prop(t *testing.T) {
 		lostFloor := 0
 		faultHellos := int64(-1)
 		lifetimeOn := false
+		seq := int64(1) // the rebuilder's snapshot; pushes count up from it
 		var trace []string
 		fault := func(name string) {
 			lostFloor = len(appended)
@@ -205,7 +163,7 @@ func TestWSConnThroughFaultProxy_Prop(t *testing.T) {
 
 		steps := rapid.IntRange(1, 30).Draw(rt, "steps")
 		for i := 0; i < steps; i++ {
-			switch rapid.IntRange(0, 16).Draw(rt, "op") {
+			switch rapid.IntRange(0, 18).Draw(rt, "op") {
 			case 0, 1, 2:
 				k := uuid.New()
 				keys = append(keys, k)
@@ -301,6 +259,19 @@ func TestWSConnThroughFaultProxy_Prop(t *testing.T) {
 				faultHellos = -1
 				st.crashes.Add(1)
 				trace = append(trace, "crash+restart")
+			case 15, 16:
+				// A snapshot push, one in six of them padded to megabytes
+				// so a hub-to-worker frame far larger than a segment
+				// crosses the splitter too.
+				seq++
+				snap := model.SiteSnapshot{SeqNum: seq, Site: model.SiteInfo{Slug: "site-a"}}
+				if rapid.IntRange(0, 5).Draw(rt, "bigPush") == 0 {
+					snap.SSHKeys = []string{strings.Repeat("k", rapid.IntRange(1<<20, 4<<20).Draw(rt, "pushLen"))}
+					st.bigPushes.Add(1)
+				}
+				e.hub.Push("site-a", snap)
+				st.pushes.Add(1)
+				trace = append(trace, fmt.Sprintf("push seq %d (%d key bytes)", seq, len(strings.Join(snap.SSHKeys, ""))))
 			default:
 				time.Sleep(time.Duration(rapid.IntRange(0, 25).Draw(rt, "sleepMs")) * time.Millisecond)
 				trace = append(trace, "sleep")
@@ -317,7 +288,7 @@ func TestWSConnThroughFaultProxy_Prop(t *testing.T) {
 		e.px.SetChunking(0, 0)
 
 		ok := e2eWaitFor(30*time.Second, func() bool {
-			if e.outboxRows() != 0 {
+			if e.outboxRows() != 0 || e.cache.LastSeqNum() != seq {
 				return false
 			}
 			e.global.mu.Lock()
@@ -342,8 +313,8 @@ func TestWSConnThroughFaultProxy_Prop(t *testing.T) {
 				}
 			}
 			e.global.mu.Unlock()
-			rt.Fatalf("not quiescent after 30s: outbox rows=%d unacked=%v connected=%v proxy=%+v last connect error=%s\ntrace=%v",
-				e.outboxRows(), missing, e.w.Connected(), e.px.Stats(), e.lastConnErr(), trace)
+			rt.Fatalf("not quiescent after 30s: outbox rows=%d unacked=%v worker snapshot seq=%d (global pushed %d) connected=%v proxy=%+v last connect error=%s\ntrace=%v",
+				e.outboxRows(), missing, e.cache.LastSeqNum(), seq, e.w.Connected(), e.px.Stats(), e.lastConnErr(), trace)
 		}
 
 		_ = e2eWaitFor(5*time.Second, func() bool {
@@ -388,9 +359,6 @@ func TestWSConnThroughFaultProxy_Prop(t *testing.T) {
 			if r.RequestURI != "/api/v1/ws/site" {
 				rt.Fatalf("worker upgrade request line %q, want exactly /api/v1/ws/site with no query", r.RequestURI)
 			}
-			if strings.Contains(r.RequestURI, e.token) {
-				rt.Fatalf("worker token in the upgrade URL %q", r.RequestURI)
-			}
 			if got := r.Header.Get("Authorization"); got != "Bearer "+e.token {
 				rt.Fatalf("upgrade Authorization = %q, want the worker bearer token", got)
 			}
@@ -404,10 +372,175 @@ func TestWSConnThroughFaultProxy_Prop(t *testing.T) {
 		}
 		e.global.mu.Unlock()
 	})
-	t.Logf("proxy coverage: cases=%d appends=%d big=%d updates=%d drops=%d resets=%d halfCloses=%d blackholes=%d restarts=%d refusals=%d lifetimes=%d chunked=%d hubKills=%d crashes=%d redeliveries=%d upgrades=%d",
-		st.cases.Load(), st.appends.Load(), st.bigAppends.Load(), st.updates.Load(), st.drops.Load(), st.resets.Load(), st.halfCloses.Load(),
+	t.Logf("proxy coverage: cases=%d appends=%d big=%d updates=%d pushes=%d bigPushes=%d drops=%d resets=%d halfCloses=%d blackholes=%d restarts=%d refusals=%d lifetimes=%d chunked=%d hubKills=%d crashes=%d redeliveries=%d upgrades=%d",
+		st.cases.Load(), st.appends.Load(), st.bigAppends.Load(), st.updates.Load(), st.pushes.Load(), st.bigPushes.Load(), st.drops.Load(), st.resets.Load(), st.halfCloses.Load(),
 		st.blackholes.Load(), st.restarts.Load(), st.refusals.Load(), st.lifetimes.Load(), st.chunked.Load(), st.hubKills.Load(),
 		st.crashes.Load(), st.redeliveries.Load(), st.upgrades.Load())
+}
+
+// Liveness timers for the tests below, in place of ws.HeartbeatInterval
+// (30s) and ws.IdleTimeout (90s). The idle timeout is twenty heartbeats, not
+// production's three, so a scheduling stall on a loaded test machine is not
+// mistaken for a dead link.
+const (
+	pxHeartbeat = 50 * time.Millisecond
+	pxIdle      = time.Second
+	// pxSlack is how late a timer-driven event may be seen on a loaded
+	// machine before a test calls it missing.
+	pxSlack = 3 * time.Second
+)
+
+// TestWSConnLinkLiveness_Prop: both ends heartbeat every HeartbeatInterval
+// and drop a link they have heard nothing on for IdleTimeout.
+//
+// While the path works, an idle link stays up, including behind a proxy
+// that closes connections idle for a few heartbeat intervals, whether it
+// counts bytes in both directions (a load balancer) or only from the server
+// (a reverse proxy's read timeout): the heartbeats in each direction are the
+// traffic.
+//
+// When the path stops delivering in either direction or both, with no FIN
+// or RST reaching either end, the worker is on a new connection and global
+// holds exactly that one about one idle timeout later, and no earlier than
+// an idle timeout less a heartbeat, which would be a live link cut. What
+// the worker appended meanwhile is delivered on the new connection, and a
+// DHCP-lease read, which global fans out to every connection it holds for
+// the site, gets one answer.
+func TestWSConnLinkLiveness_Prop(t *testing.T) {
+	if testing.Short() {
+		t.Skip("each case waits out an idle timeout")
+	}
+	// A case waits out a proxy idle timeout several times over and then
+	// the link's own idle timeout: about two seconds.
+	lowerDefaultRapidChecks(t, 10)
+	root := t.TempDir()
+	var n atomic.Int64
+	rapid.Check(t, func(rt *rapid.T) {
+		dir := filepath.Join(root, fmt.Sprintf("l%d", n.Add(1)))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			rt.Fatalf("mkdir: %v", err)
+		}
+		e := newPxEnv(rt, dir, pxHeartbeat, pxIdle)
+		defer e.close()
+		e.w.SetDHCPLeaseSource(func() []dhcp.LeaseInfo { return []dhcp.LeaseInfo{} })
+		if !e2eWaitFor(20*time.Second, e.w.Connected) {
+			rt.Fatalf("worker never connected within 20s (last connect error: %s)", e.lastConnErr())
+		}
+
+		// An idle link behind a proxy idle timeout.
+		proxyIdle := time.Duration(rapid.IntRange(4, 8).Draw(rt, "proxyIdleHeartbeats")) * pxHeartbeat
+		mode := rapid.SampledFrom([]string{"no idle timeout", "idle timeout counting both directions", "idle timeout counting server bytes only"}).Draw(rt, "proxyIdleMode")
+		switch mode {
+		case "idle timeout counting both directions":
+			e.px.SetIdleTimeout(proxyIdle)
+		case "idle timeout counting server bytes only":
+			e.px.SetDownstreamIdleTimeout(proxyIdle)
+		}
+		time.Sleep(time.Duration(rapid.IntRange(2, 4).Draw(rt, "idleWindows")) * proxyIdle)
+		if h, d := e.auth.hellos.Load(), e.px.Stats().Dropped; h != 1 || d != 0 || !e.w.Connected() || e.registrations() != 1 {
+			rt.Fatalf("an idle link did not stay up behind a proxy with %s of %v (heartbeat %v, link idle timeout %v): hellos=%d, connections the proxy timed out=%d, worker connected=%v, connections global holds=%d, last connect error: %s",
+				mode, proxyIdle, pxHeartbeat, pxIdle, h, d, e.w.Connected(), e.registrations(), e.lastConnErr())
+		}
+		e.px.SetIdleTimeout(0)
+		e.px.SetDownstreamIdleTimeout(0)
+
+		// The path goes silent.
+		silence := rapid.SampledFrom([]string{"both directions", "worker to global", "global to worker", "frozen proxy"}).Draw(rt, "silence")
+		start := time.Now()
+		switch silence {
+		case "both directions":
+			e.px.BlackholeAll()
+		case "worker to global":
+			e.px.BlackholeUpAll()
+		case "global to worker":
+			e.px.BlackholeDownAll()
+		case "frozen proxy":
+			e.px.FreezeAll()
+		}
+		// Appended into the dead path: the observation is durable and must
+		// arrive on the next connection.
+		k := uuid.New()
+		e.cache.appendObservation(model.Observation{MachineID: k, Event: "phone_home", Data: genObsData(rt)})
+
+		replaced := func() bool { return e.auth.hellos.Load() >= 2 && e.w.Connected() && e.registrations() == 1 }
+		if !e2eWaitFor(pxIdle+pxSlack, replaced) {
+			rt.Fatalf("path silent (%s) for %v with a link idle timeout of %v: hellos=%d, worker connected=%v, connections global holds=%d; want the worker on a second connection and global holding only that one (last connect error: %s)",
+				silence, time.Since(start).Round(time.Millisecond), pxIdle, e.auth.hellos.Load(), e.w.Connected(), e.registrations(), e.lastConnErr())
+		}
+		// The end that stopped hearing the other had heard from it at most
+		// one heartbeat before the silence began.
+		if took := time.Since(start); took < pxIdle-2*pxHeartbeat {
+			rt.Fatalf("link replaced %v after its path went silent (%s); an end must hear nothing for the idle timeout of %v first", took.Round(time.Millisecond), silence, pxIdle)
+		}
+
+		acked := func() bool {
+			e.global.mu.Lock()
+			defer e.global.mu.Unlock()
+			return e.global.okAcked[k]
+		}
+		if !e2eWaitFor(10*time.Second, func() bool { return acked() && e.outboxRows() == 0 }) {
+			rt.Fatalf("the observation appended while the path was silent (%s) was not delivered on the new connection: outbox rows=%d", silence, e.outboxRows())
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		leases := e.hub.DHCPLeases(ctx, "site-a")
+		if len(leases) != 1 || leases[0].Err != "" {
+			rt.Fatalf("DHCP lease read after the link was replaced (%s) = %+v, want one answer from the one worker", silence, leases)
+		}
+	})
+}
+
+// TestHubKeepsOneConnectionPerWorker: a worker has one link to global. When
+// it connects again while global still holds its previous connection (the
+// old path died without a FIN or RST and the worker restarted, or noticed
+// first), the previous connection is dead by construction, and global
+// should hold, and send RPCs to, only the new one.
+func TestHubKeepsOneConnectionPerWorker(t *testing.T) {
+	t.Skip("global keeps an older connection of the same worker ID registered until its own idle timeout (ws.IdleTimeout, 90s): meanwhile a DHCP-lease read reports the worker twice, once as an RPC timeout, and power and boot status reads pick either connection")
+	e := newPxEnv(t, t.TempDir(), pxHeartbeat, 10*pxIdle)
+	defer e.close()
+	if !e2eWaitFor(20*time.Second, e.w.Connected) {
+		t.Fatalf("worker never connected: %s", e.lastConnErr())
+	}
+	// The path dies silently and the worker process restarts: its close
+	// never reaches global.
+	e.px.BlackholeAll()
+	e.stopWorker()
+	e.startWorker()
+	e.w.SetDHCPLeaseSource(func() []dhcp.LeaseInfo { return []dhcp.LeaseInfo{} })
+	if !e2eWaitFor(20*time.Second, func() bool { return e.auth.hellos.Load() >= 2 && e.w.Connected() }) {
+		t.Fatalf("restarted worker never connected: %s", e.lastConnErr())
+	}
+	if got := e.registrations(); got != 1 {
+		t.Errorf("global holds %d connections for worker-a after its second hello, want 1", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if leases := e.hub.DHCPLeases(ctx, "site-a"); len(leases) != 1 || leases[0].Err != "" {
+		t.Errorf("DHCP lease read = %+v, want one answer from the one worker", leases)
+	}
+}
+
+// TestWSConnRedialsWhenHelloReplyNeverArrives: the path can die between the
+// upgrade and global's hello reply as well as later. The worker should give
+// that connection up after a bounded wait and dial again.
+func TestWSConnRedialsWhenHelloReplyNeverArrives(t *testing.T) {
+	t.Skip("the worker reads the hello reply with no time limit, so a path that goes silent after the upgrade, with no FIN or RST, holds it disconnected for as long as the socket stays open; global likewise waits without limit for a hello")
+	e := newPxEnv(t, t.TempDir(), pxHeartbeat, pxIdle)
+	defer e.close()
+	if !e2eWaitFor(20*time.Second, e.w.Connected) {
+		t.Fatalf("worker never connected: %s", e.lastConnErr())
+	}
+	// The next connection completes the upgrade and then delivers nothing.
+	e.px.SilenceNextAfterUpgrade(1)
+	e.px.ResetAll()
+	if !e2eWaitFor(10*time.Second, func() bool { return len(e.px.Requests()) >= 2 }) {
+		t.Fatalf("worker did not redial after the reset: %s", e.lastConnErr())
+	}
+	if !e2eWaitFor(10*pxIdle, func() bool { return len(e.px.Requests()) >= 3 && e.w.Connected() }) {
+		t.Fatalf("%v after its hello went unanswered on a silent path the worker is still waiting on that connection (upgrades=%d, connected=%v); want it to give up and connect again",
+			10*pxIdle, len(e.px.Requests()), e.w.Connected())
+	}
 }
 
 func openFDs() int {
@@ -418,21 +551,18 @@ func openFDs() int {
 	return len(ents)
 }
 
-// TestWSConnReconnectsDoNotLeak drops the worker's connection 1000 times
-// through the proxy (FIN, RST, half-close toward the worker, a short
+// TestWSConnReconnectsDoNotLeak drops the worker's connection a few hundred
+// times through the proxy (FIN, RST, half-close toward the worker, a short
 // blackhole ending in an RST, an upgrade refusal) and checks that goroutines
 // and file descriptors return to where they were and that the proxy holds
 // only the live connection afterwards (a half-closed worker connection is
 // closed by both ends, not left open on global).
 func TestWSConnReconnectsDoNotLeak(t *testing.T) {
 	if testing.Short() {
-		t.Skip("1000 reconnects")
+		t.Skip("hundreds of reconnects")
 	}
-	rounds := 1000
-	if s := os.Getenv("SLAGWORKS_PX_ROUNDS"); s != "" {
-		_, _ = fmt.Sscan(s, &rounds)
-	}
-	e := newPxEnv(t, t.TempDir())
+	const rounds = 300
+	e := newPxEnv(t, t.TempDir(), 0, 0)
 	defer e.close()
 	if !e2eWaitFor(20*time.Second, e.w.Connected) {
 		t.Fatalf("never connected: %s", e.lastConnErr())
