@@ -17,3 +17,9 @@ regexes = [
     '''0123456789abcdef0123456789abcdef01234567''',
     '''nbt_x7nkTxVLDuGQ\.B499uwAZ8wNLzovGJZN3jhchee6JnUdnbg7okWhj''',
 ]
+
+[[allowlists]]
+description = "The sample Sec-WebSocket-Key nonce from RFC 6455, sent by a test upgrade request"
+regexes = [
+    '''dGhlIHNhbXBsZSBub25jZQ==''',
+]
