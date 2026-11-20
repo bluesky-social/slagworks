@@ -154,3 +154,63 @@ func TestRepoBakeLeavesNoBuildPathsOrDuplicates(t *testing.T) {
 		}
 	}
 }
+
+// TestBakedSourcesHookReplacesBuildMirror pins the split between the mirror
+// the build downloads from and the one the image ships: after the hook, the
+// deployed host's sources.list is exactly the baked mirror's three pockets,
+// with nothing of the build mirror (which bakeRepos writes, as mmdebstrap
+// does) and the third-party repos still in their own files.
+func TestBakedSourcesHookReplacesBuildMirror(t *testing.T) {
+	const suite = "noble"
+	const baked = "https://baked.example/ubuntu"
+	chroot, _, repos := bakeRepos(t, suite)
+
+	lines := aptRepos(t, "ubuntu_mirror_lines", baked, suite)
+	want := "deb " + baked + " noble main restricted universe multiverse\n" +
+		"deb " + baked + " noble-updates main restricted universe multiverse\n" +
+		"deb " + baked + " noble-security main restricted universe multiverse\n"
+	if got := strings.Join(lines, "\n") + "\n"; got != want {
+		t.Fatalf("ubuntu_mirror_lines =\n%s\nwant\n%s", got, want)
+	}
+	// 0600 to prove the hook sets the deployed file's mode itself.
+	src := filepath.Join(t.TempDir(), "baked-sources.list")
+	if err := os.WriteFile(src, []byte(want), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	hooks := aptRepos(t, "baked_sources_hook", src)
+	if len(hooks) != 1 {
+		t.Fatalf("baked_sources_hook emitted %d lines, want 1: %q", len(hooks), hooks)
+	}
+	script, ok := strings.CutPrefix(hooks[0], "--customize-hook=")
+	if !ok {
+		t.Fatalf("hook %q lacks --customize-hook= prefix", hooks[0])
+	}
+	old := syscall.Umask(0o077)
+	out, err := exec.Command("sh", "-c", script, "exec", chroot).CombinedOutput()
+	syscall.Umask(old)
+	if err != nil {
+		t.Fatalf("hook failed: %v\n%s\nhook: %s", err, out, script)
+	}
+
+	slPath := filepath.Join(chroot, "etc/apt/sources.list")
+	got, err := os.ReadFile(slPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Errorf("sources.list =\n%s\nwant only the baked mirror:\n%s", got, want)
+	}
+	st, err := os.Stat(slPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o644 {
+		t.Errorf("sources.list mode = %o, want 644", st.Mode().Perm())
+	}
+	for _, r := range repos {
+		if _, err := os.Stat(filepath.Join(chroot, "etc/apt/sources.list.d", r.list+".list")); err != nil {
+			t.Errorf("%s.list lost: %v", r.list, err)
+		}
+	}
+}

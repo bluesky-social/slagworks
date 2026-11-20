@@ -65,9 +65,12 @@ runs:
       shell: bash
       env:
         # GitHub-hosted runners sit in Azure; its Ubuntu mirror is the fast
-        # one from there. Other mirrors can be slow enough to hit the job
-        # timeout.
-        SLAGWORKS_APT_MIRROR: http://azure.archive.ubuntu.com/ubuntu
+        # one to download from there. Other mirrors can be slow enough to
+        # hit the job timeout. It is the build mirror only: the image's
+        # sources.list gets build.sh's default SLAGWORKS_APT_MIRROR, which
+        # the cache key covers because build.sh is hashed. A caller that
+        # sets SLAGWORKS_APT_MIRROR here must add it to the key.
+        SLAGWORKS_APT_BUILD_MIRROR: http://azure.archive.ubuntu.com/ubuntu
         SLAGWORKS_CACHE_DIR: ${{ github.workspace }}/phase-a-cache
         SLAGWORKS_RECOVERY_AUTHORIZED_KEYS: ${{ github.workspace }}/recovery_authorized_keys
       run: bash scripts/image-build/build.sh
