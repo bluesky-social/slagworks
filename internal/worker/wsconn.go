@@ -315,20 +315,38 @@ func (w *WSConn) WaitForSync(ctx context.Context) error {
 	}
 }
 
+// Reconnect backoff for Run: the wait starts at reconnectBackoffMin and
+// doubles after every attempt up to reconnectBackoffMax.
+const (
+	reconnectBackoffMin = time.Second
+	reconnectBackoffMax = 30 * time.Second
+)
+
 // Run connects to the global API and enters the message loop. It
 // reconnects with exponential backoff on disconnect. Blocks until ctx
 // is cancelled.
+//
+// The backoff returns to its first step only after an attempt that lasted
+// at least reconnectBackoffMax with the hello accepted. A global that
+// accepts each hello and then drops the connection (it cannot read the
+// active operations for the op_resync, say) is therefore retried at the
+// ladder's pace and at most about once per reconnectBackoffMax, not once a
+// second: each attempt costs global a token lookup, a NetBox serial lookup,
+// a site_workers write and a hello reply, from every worker at once. The
+// price is that a connection lost soon after a reconnect that followed a
+// long outage waits up to reconnectBackoffMax before the next attempt.
 func (w *WSConn) Run(ctx context.Context) error {
-	backoff := time.Second
+	backoff := reconnectBackoffMin
 	for {
+		start := time.Now()
 		wasConnected, err := w.connectAndRun(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
 		w.connected.Store(false)
-		if wasConnected {
-			backoff = time.Second
+		if wasConnected && time.Since(start) >= reconnectBackoffMax {
+			backoff = reconnectBackoffMin
 		}
 		w.log.Warn("WebSocket disconnected, reconnecting", "err", err, "backoff", backoff)
 
@@ -337,7 +355,7 @@ func (w *WSConn) Run(ctx context.Context) error {
 			return ctx.Err()
 		case <-time.After(backoff):
 		}
-		backoff = min(backoff*2, 30*time.Second)
+		backoff = min(backoff*2, reconnectBackoffMax)
 	}
 }
 

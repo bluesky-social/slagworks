@@ -564,7 +564,11 @@ polling loop.
 
 `WSConn` (line 31) manages the single upstream connection.
 
-- `Run` (274) drives the connect / read / drain loops with backoff.
+- `Run` (274) drives the connect / read / drain loops with backoff: the
+  wait between attempts starts at 1s and doubles to 30s, and returns to
+  1s only after an attempt that lasted 30s with the hello accepted, so a
+  global that accepts each hello and drops the connection is retried
+  every 30s rather than every second.
 - Snapshot receive path: `applySnapshot` (461) calls
   `cache.ApplySnapshot`, persists the sync cursor
   (`localDB.SetSyncCursor`), and then `checkVersion` (495). If the
