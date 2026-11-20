@@ -1375,7 +1375,23 @@ func propCaseFeatures(c propCase) string {
 			f["ambiv"] = true
 		}
 	}
-	for _, st := range c.Steps {
+	firstSeen := map[string]int{}
+	for i, st := range c.Steps {
+		fresh := len(st.Layout.Disks) > 0
+		for _, id := range st.Attach {
+			if _, ok := firstSeen[id]; !ok {
+				firstSeen[id] = i
+			}
+		}
+		for _, dl := range st.Layout.Disks {
+			fresh = fresh && firstSeen[dl.Disk] == i
+		}
+		if i > 0 && fresh && st.Expect == "ok" {
+			f["move"] = true
+			if st.Reboot {
+				f["move-reboot"] = true
+			}
+		}
 		for _, a := range st.Layout.Arrays {
 			if a.Name == "mdroot" && (a.Level == 5 || a.Level == 6) {
 				f[fmt.Sprintf("root-raid%d", a.Level)] = true
