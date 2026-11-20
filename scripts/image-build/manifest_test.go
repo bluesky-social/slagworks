@@ -29,7 +29,8 @@ import (
 // Source: every distinct `files/images/<image>/<NAME>` URL grepped
 // out of cmd/slagworks-agent and the slagworks BOOT hook. If you add a
 // new download URL, add the filename here AND update build.sh's
-// customize-hook to emit it.
+// customize-hook to emit it AND add it to imageFiles in
+// internal/imagepull, which refuses a tarball that lacks one.
 var expectedImageFiles = map[string]string{
 	"vmlinuz":       "PXE-bootable kernel; downloaded by iPXE during deploy and copied to ESP at install time",
 	"initrd":        "stock Ubuntu initrd carrying the slagworks BOOT hook (/scripts/slagworks); iPXE chains into it, stock /init sources the hook for boot=slagworks",

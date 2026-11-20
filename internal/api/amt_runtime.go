@@ -92,7 +92,9 @@ func (s *Server) oobAdminEntry(ctx context.Context, machineID uuid.UUID) (*awsse
 // stamps params.AMTRuntime. Every gap is a hard error, like the PDU
 // resolver: the transport is amt only because the operator asked for it
 // or the credential store says the box is AMT, so a half-resolved envelope
-// can only fail later at the site worker with a worse message.
+// can only fail later at the site worker with a worse message. As there,
+// a gap in the NetBox record or the admin entry is a transportGapError
+// (422) and a dependency that could not be asked is a plain error (503).
 func (s *Server) resolveAMTRuntime(ctx context.Context, machineID uuid.UUID, params *model.OpParams) error {
 	rt, _, err := s.resolveAMTRuntimeWithDevice(ctx, machineID)
 	if err != nil {
@@ -128,21 +130,21 @@ func (s *Server) resolveAMTRuntimeWithDevice(ctx context.Context, machineID uuid
 		return rt, nil, fmt.Errorf("resolve amt runtime: get machine %s: %w", machineID, err)
 	}
 	if m.NetBoxDeviceID == nil {
-		return rt, nil, fmt.Errorf("resolve amt runtime: machine %s has no NetBox device, so its AMT endpoint (oob_ip) is unknown", machineID)
+		return rt, nil, transportGapf("resolve amt runtime: machine %s has no NetBox device, so its AMT endpoint (oob_ip) is unknown", machineID)
 	}
 	dev, err := s.netbox.GetDevice(ctx, *m.NetBoxDeviceID)
 	if err != nil {
 		return rt, nil, fmt.Errorf("resolve amt runtime: netbox get device %d: %w", *m.NetBoxDeviceID, err)
 	}
 	if dev.OOBIP == nil || dev.OOBIP.Address == "" {
-		return rt, dev, fmt.Errorf("resolve amt runtime: device %q has no oob_ip in NetBox; set it to the AMT address before using --via amt", dev.Name)
+		return rt, dev, transportGapf("resolve amt runtime: device %q has no oob_ip in NetBox; set it to the AMT address before using --via amt", dev.Name)
 	}
 	ip, err := s.netbox.GetIPAddress(ctx, dev.OOBIP.ID)
 	if err != nil {
 		return rt, dev, fmt.Errorf("resolve amt runtime: device %q oob_ip: %w", dev.Name, err)
 	}
 	if !ip.IsActive() {
-		return rt, dev, fmt.Errorf("resolve amt runtime: device %q oob_ip %s has status %q, not active; refusing to dial a non-live address", dev.Name, ip.Address, ip.Status.Value)
+		return rt, dev, transportGapf("resolve amt runtime: device %q oob_ip %s has status %q, not active; refusing to dial a non-live address", dev.Name, ip.Address, ip.Status.Value)
 	}
 	rt.Host, _, _ = strings.Cut(ip.Address, "/")
 
@@ -150,10 +152,10 @@ func (s *Server) resolveAMTRuntimeWithDevice(ctx context.Context, machineID uuid
 		return rt, dev, nil
 	}
 	if dev.Site == nil || dev.Site.Slug == "" {
-		return rt, dev, fmt.Errorf("resolve amt runtime: device %q has no site slug, cannot determine which pop's admin secret to read", dev.Name)
+		return rt, dev, transportGapf("resolve amt runtime: device %q has no site slug, cannot determine which pop's admin secret to read", dev.Name)
 	}
 	if dev.Serial == "" {
-		return rt, dev, fmt.Errorf("resolve amt runtime: device %q has no NetBox serial, and the admin secret is keyed by serial", dev.Name)
+		return rt, dev, transportGapf("resolve amt runtime: device %q has no NetBox serial, and the admin secret is keyed by serial", dev.Name)
 	}
 	secret, err := s.bmcSecrets.GetAdmin(ctx, dev.Site.Slug)
 	if err != nil {
@@ -162,11 +164,11 @@ func (s *Server) resolveAMTRuntimeWithDevice(ctx context.Context, machineID uuid
 	h := secret.Lookup(dev.Serial)
 	switch {
 	case h == nil:
-		return rt, dev, fmt.Errorf("resolve amt runtime: pop %s's bmc-creds-admin secret has no entry for serial %q (device %q); add a kind=amt entry", dev.Site.Slug, dev.Serial, dev.Name)
+		return rt, dev, transportGapf("resolve amt runtime: pop %s's bmc-creds-admin secret has no entry for serial %q (device %q); add a kind=amt entry", dev.Site.Slug, dev.Serial, dev.Name)
 	case h.Kind != awssecrets.KindAMT:
-		return rt, dev, fmt.Errorf("resolve amt runtime: the secret entry for serial %q is kind=%q, not amt; this device is not an AMT host (use --via bmc or omit --via)", dev.Serial, h.Kind)
+		return rt, dev, transportGapf("resolve amt runtime: the secret entry for serial %q is kind=%q, not amt; this device is not an AMT host (use --via bmc or omit --via)", dev.Serial, h.Kind)
 	case h.Username == "" || h.Password == "":
-		return rt, dev, fmt.Errorf("resolve amt runtime: the kind=amt secret entry for serial %q has an incomplete credential", dev.Serial)
+		return rt, dev, transportGapf("resolve amt runtime: the kind=amt secret entry for serial %q has an incomplete credential", dev.Serial)
 	}
 	rt.Username, rt.Password = h.Username, h.Password
 	return rt, dev, nil

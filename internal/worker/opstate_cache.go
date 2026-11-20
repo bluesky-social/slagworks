@@ -595,9 +595,10 @@ type bootAction struct {
 // bootActionForMAC returns the boot action for a MAC. See the doc on
 // Cache.BootActionForMAC for the decision table and the two re-wipe-guard
 // clauses, plus the Tier-2 fail-closed rule and the untrusted and frozen-set
-// rules (actuateLocked).
-func (o *opState) bootActionForMAC(mac string) model.BootAction {
-	r := o.bootActionLocked(mac)
+// rules (actuateLocked). holdPending (an image sync is in flight) makes a
+// pending lifecycle op serve BootLocal.
+func (o *opState) bootActionForMAC(mac string, holdPending bool) model.BootAction {
+	r := o.bootActionLocked(mac, holdPending)
 	if r.warn {
 		slog.Warn("boot fail-closed: transient machine state with no active op (op/identity mismatch); serving BootLocal — resync or next op_delta heals it",
 			"mac", r.mac, "effective_state", string(r.state))
@@ -623,7 +624,7 @@ func (o *opState) actuateLocked(mac string, op *model.Operation, action model.Bo
 	return bootAction{action: action}
 }
 
-func (o *opState) bootActionLocked(mac string) bootAction {
+func (o *opState) bootActionLocked(mac string, holdPending bool) bootAction {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	v := o.view.Load()
@@ -645,6 +646,15 @@ func (o *opState) bootActionLocked(mac string) bootAction {
 	// op_delta moves the machine off commissioned/failed. Serving the
 	// installer here would run it over the disk it just wrote.
 	if activeOp != nil && activeOp.Type == model.OpDeploy && activeOp.Phase == "awaiting_phone_home" {
+		return bootAction{action: model.BootLocal}
+	}
+
+	// An image sync is in flight, so the image on disk can still be the
+	// previous release under the same name: a pending op waits for it, as
+	// in Cache.PendingLifecycleOps. A claimed op is already being driven
+	// (the executor marks the op claimed before it cycles the host) and
+	// keeps its boot.
+	if holdPending && activeOp != nil && activeOp.Status == model.OpPending {
 		return bootAction{action: model.BootLocal}
 	}
 

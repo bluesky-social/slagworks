@@ -167,7 +167,24 @@ func (c *Client) SyncCommissionData(ctx context.Context, sync CommissionSync) er
 	// msn2700 type mid-rebuild (2026-10-23). ResolveDevice still sets a type
 	// when it creates a brand-new device.
 
-	if err := c.UpdateDevice(ctx, sync.DeviceID, deviceFields); err != nil {
+	err = c.UpdateDevice(ctx, sync.DeviceID, deviceFields)
+	if err != nil && sync.AssetTag != "" && rejectsField(err, "asset_tag") {
+		// NetBox requires a device's asset_tag to be unique across every
+		// device and at most 50 characters. The tag is firmware DMI data: a
+		// placeholder missing from the junk list, the same tag programmed on
+		// two hosts, or a board moved between chassis reports a tag another
+		// device already holds. NetBox validates the whole PATCH before
+		// writing any of it, so drop the one field it refused and send the
+		// rest again; the device keeps whatever asset_tag it had. Failing
+		// instead would fail every retry of the commission report the same
+		// way until the operation expired.
+		c.log.Warn("NetBox refused the commissioned asset tag; leaving the device's asset_tag unchanged and writing its other fields. "+
+			"If another device holds this tag, clear it there or correct it in the firmware, then recommission",
+			"device_id", sync.DeviceID, "machine_id", sync.SlagworksID, "asset_tag", sync.AssetTag, "err", err)
+		delete(deviceFields, "asset_tag")
+		err = c.UpdateDevice(ctx, sync.DeviceID, deviceFields)
+	}
+	if err != nil {
 		return fmt.Errorf("updating device: %w", err)
 	}
 
@@ -282,9 +299,14 @@ func CommissionToSync(deviceID int, data json.RawMessage) (*CommissionSync, erro
 		sync.NICs = append(sync.NICs, nd)
 	}
 
-	// DIMMs
+	// DIMMs. The Locator is a firmware string; a placeholder or empty one
+	// cannot name a bay, so it takes an indexed name like the PSU fallback.
 	if cr.Memory != nil {
-		for _, dimm := range cr.Memory.DIMMs {
+		for i, dimm := range cr.Memory.DIMMs {
+			bayName := dimm.Locator
+			if isJunkDMIValue(bayName) {
+				bayName = fmt.Sprintf("DIMM_%d", i)
+			}
 			sizeGB := dimm.SizeMB / 1024
 			model := dimm.Part
 			if model == "" {
@@ -302,7 +324,7 @@ func CommissionToSync(deviceID int, data json.RawMessage) (*CommissionSync, erro
 				mfg = "Unknown"
 			}
 			sync.Modules = append(sync.Modules, ModuleData{
-				BayName:       dimm.Locator,
+				BayName:       bayName,
 				ProfileName:   "Memory",
 				Manufacturer:  mfg,
 				Model:         model,
@@ -424,10 +446,12 @@ func CommissionToSync(deviceID int, data json.RawMessage) (*CommissionSync, erro
 		})
 	}
 
-	// PSUs
+	// PSUs. Many boards leave the dmidecode Location at a placeholder, often
+	// the same one on every PSU ("Not Specified", "Default string"); like an
+	// empty one, it falls back to an indexed name.
 	for i, psu := range cr.PSUs {
 		bayName := psu.Location
-		if bayName == "" {
+		if isJunkDMIValue(bayName) {
 			bayName = fmt.Sprintf("PSU_%d", i)
 		}
 		model := psu.Model
@@ -450,7 +474,40 @@ func CommissionToSync(deviceID int, data json.RawMessage) (*CommissionSync, erro
 		})
 	}
 
+	uniqueBayNames(sync.Modules)
 	return sync, nil
+}
+
+// uniqueBayNames renames each module whose BayName repeats an earlier
+// module's. ReconcileModules keys bays and modules by name, so two modules
+// with one name cannot both be stored, and firmware names do repeat (a
+// board that prints the channel only in Bank Locator reports "DIMM 0" once
+// per channel). The first module keeps the name; each later one gets the
+// lowest "<name>_<n>" (n >= 2) that no module in the report uses. The agent
+// reports components in firmware table order, so the same hardware gets
+// the same names on every commission.
+func uniqueBayNames(modules []ModuleData) {
+	used := make(map[string]bool, len(modules))
+	for _, m := range modules {
+		used[m.BayName] = true
+	}
+	assigned := make(map[string]bool, len(modules))
+	for i := range modules {
+		name := modules[i].BayName
+		if !assigned[name] {
+			assigned[name] = true
+			continue
+		}
+		for n := 2; ; n++ {
+			candidate := fmt.Sprintf("%s_%d", name, n)
+			if !used[candidate] {
+				used[candidate] = true
+				assigned[candidate] = true
+				modules[i].BayName = candidate
+				break
+			}
+		}
+	}
 }
 
 // Internal mirrors of the agent's CommissionResult.

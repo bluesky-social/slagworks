@@ -59,7 +59,7 @@ func (s *Store) ListImages() ([]model.Image, error) {
 
 // DeleteImage deletes the image row by uuid or name. Site workers sync
 // whatever image rows exist (imagepull.SyncImages diffs the row set
-// against on-disk .sha256 markers); deleting a row simply makes workers
+// against each image's on-disk link); deleting a row simply makes workers
 // stop tracking that image on their next snapshot apply. Any file already
 // downloaded under the old name stays on disk (SyncImages only pulls
 // missing/mismatched entries — it does not prune), which is acceptable:

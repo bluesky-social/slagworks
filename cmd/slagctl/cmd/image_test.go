@@ -32,6 +32,51 @@ func TestImageList_Columns(t *testing.T) {
 	}
 }
 
+// docs/user/images.md and troubleshooting.md tell operators to confirm an
+// image roll by comparing the pinned SHA in `slagctl image list` with the
+// version directory the worker's on-disk <name> link names, so the table
+// must show the digest.
+func TestImageList_ShowsPinnedSHA(t *testing.T) {
+	sum := "0123456789ab" + strings.Repeat("c", 52)
+	images := []model.Image{
+		{ID: uuid.New(), Name: "noble-pxe", Version: "24.04", Arch: "amd64", SHA256: sum, CreatedAt: time.Now().Add(-time.Hour)},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/images", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(images)
+	})
+	out, err := execCmd(t, testServer(t, mux), "image", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "SHA256") {
+		t.Errorf("image list has no SHA256 column:\n%s", out)
+	}
+	if !strings.Contains(out, sum[:12]) {
+		t.Errorf("image list does not show the pinned sha256 prefix %q:\n%s", sum[:12], out)
+	}
+}
+
+// The API requires a non-empty sha256 but not its length, so a hand-registered
+// row can carry a short value. The table prints it whole instead of panicking
+// on a fixed-width slice.
+func TestImageList_ShortSHAPrintedWhole(t *testing.T) {
+	images := []model.Image{
+		{ID: uuid.New(), Name: "noble-pxe", Version: "24.04", Arch: "amd64", SHA256: "abc123", CreatedAt: time.Now()},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/images", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(images)
+	})
+	out, err := execCmd(t, testServer(t, mux), "image", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "abc123") {
+		t.Errorf("image list does not show the short sha256 %q:\n%s", "abc123", out)
+	}
+}
+
 func TestImageList_JSON(t *testing.T) {
 	images := []model.Image{
 		{ID: uuid.New(), Name: "noble-pxe", Version: "24.04", Arch: "amd64"},

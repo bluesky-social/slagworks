@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/google/uuid"
@@ -215,9 +216,22 @@ func siteSlug(dev *netbox.Device) string {
 // preflightGapMsg renders the 422 body for a deploy/commission rejected by
 // preflight, listing every gap. The leading line names the host + verb so
 // the operator sees what was refused; each gap is a "- <what>; <fix>" line.
+//
+// A locked machine is refused for the lock, not for its model, so that case
+// leads with the lock and the command that lifts it; any modeling gaps
+// follow under their own heading.
 func preflightGapMsg(opKind, host string, gaps []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "refusing %s: %s has an incomplete NetBox model (%d issue(s)):", opKind, host, len(gaps))
+	if i := slices.Index(gaps, snapshot.GapMachineLocked); i >= 0 {
+		gaps = slices.Delete(slices.Clone(gaps), i, i+1)
+		fmt.Fprintf(&b, "refusing %s: %s is locked (a machine is locked automatically when it enters service). Check that it is safe to %s it, then run `slagctl machine unlock %s` and retry.", opKind, host, opKind, host)
+		if len(gaps) == 0 {
+			return b.String()
+		}
+		fmt.Fprintf(&b, "\nIt also has an incomplete NetBox model (%d issue(s)):", len(gaps))
+	} else {
+		fmt.Fprintf(&b, "refusing %s: %s has an incomplete NetBox model (%d issue(s)):", opKind, host, len(gaps))
+	}
 	for _, g := range gaps {
 		b.WriteString("\n  - ")
 		b.WriteString(g)

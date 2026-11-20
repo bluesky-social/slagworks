@@ -220,8 +220,10 @@ real serial.
   that file is missing, so package installs should set
   `SLAGWORKS_IMAGES_DIR=/var/lib/slagworks/images` (as
   `deploy/site.env.example` does).
-- **`SLAGWORKS_DEFAULT_IMAGE`** — image name used for boots that do not
-  name one. Default `noble-pxe`.
+- **`SLAGWORKS_DEFAULT_IMAGE`** — the image row boots use when the site
+  has a row of this name. Otherwise boots use the site's only image row,
+  whatever its name, and refuse when there are several; with no rows at
+  all they use the directory of this name. Default `noble-pxe`.
 - **`SLAGWORKS_DATA_DIR`** — local state directory. Default
   `/var/lib/slagworks`. The worker's SQLite database is
   `<data-dir>/worker.db`.
@@ -395,7 +397,10 @@ Fields:
 
 The subnet and gateway come from NetBox, not from this table: creating a
 site config requires a prefix tagged `slagworks-production` scoped to the
-site (or location). The DNS servers and lease time handed out on the
+site (or location). A whole-site config reads only the tagged prefixes
+scoped to the site itself, never ones scoped to a location inside it, so a
+location can be given its own `slagworks-production` and `slagworks-oob`
+prefixes while the whole-site config is still serving. The DNS servers and lease time handed out on the
 fabric leg come from that prefix's `dns_servers` and `dhcp_lease_seconds`
 custom fields, defaulting to `1.1.1.1` and 5 minutes; workers read them
 when their services start, so a change takes effect on restart.
@@ -408,10 +413,16 @@ left. When the gateway or a pool does not parse, a running worker keeps
 the pools it has, and a worker that starts on such a snapshot runs
 without the fabric DHCP pool, reporting why on `/readyz`, until a
 snapshot that parses arrives; OOB DHCP, TFTP and HTTP boot keep
-running. When
-child locations of a location-scoped config also carry
+running. When the
+site or location carries more than one `slagworks-production` prefix
+(tagging a prefix is also how hosts in it get a gateway), the most specific
+one containing `ephemeral_pool_start` supplies the subnet, gateway, DNS
+servers and lease time, whatever order NetBox lists them in. When child locations of a location-scoped config also carry
 `slagworks-production` prefixes, the prefix scoped to the config's own
-location still supplies the subnet, gateway, DNS servers and lease time.
+location still supplies them, even if a child's prefix also contains the
+pool. If no candidate prefix contains the pool, the first one NetBox lists
+(the lowest address) is used and the snapshot build logs a warning naming
+the pool and the prefix.
 
 Manage site configs with
 `slagctl site-config {list,show,create,update,delete}`. Creating one also

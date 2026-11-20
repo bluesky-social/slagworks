@@ -43,22 +43,24 @@ func parseOutletIndex(name string) (int, error) {
 // device's power-ports → connected outlets → parent PDU devices, resolves
 // each PDU's mgmt IP and serial-keyed apc cred.
 //
-// Failure modes match resolveBMCRuntime's contract:
+// Every failure is an error. Unlike BMC's soft-fail-on-missing-serial,
+// PDU resolution is only ever invoked on an explicit `--via pdu`, so the
+// operator asked for PDU control specifically: if we can't build a
+// complete outlet set we fail loudly rather than silently degrade to a
+// partial actuation that might cut some feeds and not others. The errors
+// come in two kinds, which httpResolveErr maps to different statuses:
 //
-//   - "hard" failures (NetBox unreachable, a power-port that resolves to
-//     no usable outlet, an unparseable outlet name, a PDU with no mgmt
-//     IP): bubble up. Unlike BMC's soft-fail-on-missing-serial, PDU
-//     resolution is only ever invoked on an explicit `--via pdu`, so the
-//     operator asked for PDU control specifically — if we can't build a
-//     complete outlet set we fail loudly rather than silently degrade to
-//     a partial actuation that might cut some feeds and not others.
+//   - model gaps (transportGapError, 422): NetBox or the admin secret
+//     answered and the answer rules PDU control out until someone fixes
+//     the record. The machine has no NetBox device or no power-ports (you
+//     can't PDU-control a device whose power topology isn't modeled), a
+//     power-port resolves to no single usable outlet, an outlet name does
+//     not parse, a PDU has no mgmt IP or serial, or its credential entry
+//     is missing, of another kind or incomplete.
 //
-//   - secret-fetch transport error: bubble up for the same reason
-//     (operator explicitly wants PDU; a missing cred means the op can't
-//     run, so don't paper over it).
-//
-// Returns an error if the machine has no NetBox device or no power-ports
-// (you can't PDU-control a device whose power topology isn't modeled).
+//   - dependency failures (503): NetBox is not configured, or NetBox, the
+//     secret store or the database could not be asked. Retrying once it
+//     is healthy can succeed.
 func (s *Server) resolvePDURuntime(ctx context.Context, machineID uuid.UUID, params *model.OpParams) error {
 	var rt model.PDURuntime
 
@@ -71,7 +73,7 @@ func (s *Server) resolvePDURuntime(ctx context.Context, machineID uuid.UUID, par
 		return fmt.Errorf("resolve pdu runtime: get machine %s: %w", machineID, err)
 	}
 	if m.NetBoxDeviceID == nil {
-		return fmt.Errorf("resolve pdu runtime: machine %s has no NetBox device, cannot resolve PDU outlets", machineID)
+		return transportGapf("resolve pdu runtime: machine %s has no NetBox device, cannot resolve PDU outlets", machineID)
 	}
 
 	ports, err := s.netbox.ListPowerPortsForDevice(ctx, *m.NetBoxDeviceID)
@@ -79,7 +81,7 @@ func (s *Server) resolvePDURuntime(ctx context.Context, machineID uuid.UUID, par
 		return fmt.Errorf("resolve pdu runtime: list power-ports for device %d: %w", *m.NetBoxDeviceID, err)
 	}
 	if len(ports) == 0 {
-		return fmt.Errorf("resolve pdu runtime: device %d has no power-ports modeled in NetBox", *m.NetBoxDeviceID)
+		return transportGapf("resolve pdu runtime: device %d has no power-ports modeled in NetBox", *m.NetBoxDeviceID)
 	}
 
 	// Resolve the pop's admin secret once (it carries the pdu-kind
@@ -96,7 +98,7 @@ func (s *Server) resolvePDURuntime(ctx context.Context, machineID uuid.UUID, par
 	var secret *awssecrets.AdminSecret
 	if s.bmcSecrets != nil {
 		if dev == nil || dev.Site == nil || dev.Site.Slug == "" {
-			return fmt.Errorf("resolve pdu runtime: device %d has no site slug, cannot determine which pop's admin secret to read", *m.NetBoxDeviceID)
+			return transportGapf("resolve pdu runtime: device %d has no site slug, cannot determine which pop's admin secret to read", *m.NetBoxDeviceID)
 		}
 		secret, err = s.bmcSecrets.GetAdmin(ctx, dev.Site.Slug)
 		if err != nil {
@@ -114,23 +116,23 @@ func (s *Server) resolvePDURuntime(ctx context.Context, machineID uuid.UUID, par
 
 	for _, port := range ports {
 		if !port.ConnectedEndpointsReachable {
-			return fmt.Errorf("resolve pdu runtime: power-port %q (id %d) has no reachable outlet (dangling cable in NetBox)", port.Name, port.ID)
+			return transportGapf("resolve pdu runtime: power-port %q (id %d) has no reachable outlet (dangling cable in NetBox)", port.Name, port.ID)
 		}
 		if len(port.ConnectedEndpoints) == 0 {
-			return fmt.Errorf("resolve pdu runtime: power-port %q (id %d) has no connected outlet", port.Name, port.ID)
+			return transportGapf("resolve pdu runtime: power-port %q (id %d) has no connected outlet", port.Name, port.ID)
 		}
 		// A PSU feed terminates at exactly one outlet. If NetBox somehow
 		// returns more, that's a modeling error we don't want to guess at.
 		if len(port.ConnectedEndpoints) > 1 {
-			return fmt.Errorf("resolve pdu runtime: power-port %q (id %d) connects to %d outlets, expected 1", port.Name, port.ID, len(port.ConnectedEndpoints))
+			return transportGapf("resolve pdu runtime: power-port %q (id %d) connects to %d outlets, expected 1", port.Name, port.ID, len(port.ConnectedEndpoints))
 		}
 		outlet := port.ConnectedEndpoints[0]
 		if outlet.Device == nil {
-			return fmt.Errorf("resolve pdu runtime: outlet %q (id %d) has no parent PDU device", outlet.Name, outlet.ID)
+			return transportGapf("resolve pdu runtime: outlet %q (id %d) has no parent PDU device", outlet.Name, outlet.ID)
 		}
 		idx, err := parseOutletIndex(outlet.Name)
 		if err != nil {
-			return fmt.Errorf("resolve pdu runtime: %w", err)
+			return transportGapf("resolve pdu runtime: %w", err)
 		}
 
 		pduDevID := outlet.Device.ID
@@ -141,14 +143,14 @@ func (s *Server) resolvePDURuntime(ctx context.Context, machineID uuid.UUID, par
 				return fmt.Errorf("resolve pdu runtime: get PDU device %d: %w", pduDevID, err)
 			}
 			if pduDev == nil {
-				return fmt.Errorf("resolve pdu runtime: PDU device %d not found", pduDevID)
+				return transportGapf("resolve pdu runtime: PDU device %d not found", pduDevID)
 			}
 			host, err := s.netboxMgmtIPForDevice(ctx, pduDevID)
 			if err != nil {
 				return fmt.Errorf("resolve pdu runtime: lookup mgmt IP for PDU %d: %w", pduDevID, err)
 			}
 			if host == "" {
-				return fmt.Errorf("resolve pdu runtime: PDU %q (device %d) has no mgmt IP in NetBox", pduDev.Name, pduDevID)
+				return transportGapf("resolve pdu runtime: PDU %q (device %d) has no mgmt IP in NetBox", pduDev.Name, pduDevID)
 			}
 			info = pduInfo{host: host, serial: pduDev.Serial}
 			pduCache[pduDevID] = info
@@ -173,13 +175,13 @@ func (s *Server) resolvePDURuntime(ctx context.Context, machineID uuid.UUID, par
 			h := secret.Lookup(info.serial)
 			switch {
 			case info.serial == "":
-				return fmt.Errorf("resolve pdu runtime: PDU %q (device %d) has no NetBox serial, cannot resolve its credential", info.host, pduDevID)
+				return transportGapf("resolve pdu runtime: PDU %q (device %d) has no NetBox serial, cannot resolve its credential", info.host, pduDevID)
 			case h == nil:
-				return fmt.Errorf("resolve pdu runtime: no admin-secret entry for PDU serial %q (%s)", info.serial, info.host)
+				return transportGapf("resolve pdu runtime: no admin-secret entry for PDU serial %q (%s)", info.serial, info.host)
 			case h.Kind != awssecrets.KindPDU:
-				return fmt.Errorf("resolve pdu runtime: admin-secret entry for serial %q is kind %q, expected pdu", info.serial, h.Kind)
+				return transportGapf("resolve pdu runtime: admin-secret entry for serial %q is kind %q, expected pdu", info.serial, h.Kind)
 			case h.Username == "" || h.Password == "":
-				return fmt.Errorf("resolve pdu runtime: admin-secret entry for PDU serial %q has incomplete credential", info.serial)
+				return transportGapf("resolve pdu runtime: admin-secret entry for PDU serial %q has incomplete credential", info.serial)
 			}
 			o.Username = h.Username
 			o.Password = h.Password

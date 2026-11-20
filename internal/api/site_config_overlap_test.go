@@ -32,7 +32,7 @@ func overlapNetBox(t *testing.T) *netbox.Client {
 		writeJSONList(w, []netbox.Location{})
 	})
 	mux.HandleFunc("/api/ipam/prefixes/", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSONList(w, []netbox.Prefix{{ID: 1, Prefix: "10.0.0.0/24"}})
+		writeJSONList(w, []netbox.Prefix{{ID: 1, Prefix: "10.0.0.0/24", ScopeType: "dcim.site", ScopeID: 1}})
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

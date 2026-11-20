@@ -1050,7 +1050,7 @@ type opCreateSpec struct {
 	// create persists the op with the resolved params. This is the one
 	// genuine behavioral branch: deploy/commission call CreateMachineOp with
 	// their allowed-source states (active-op + lock + state guards), power
-	// calls CreatePowerOp (no state guard, so a power op is always issuable).
+	// calls CreatePowerOp (active-op guard only: no state or lock guard).
 	create func(params json.RawMessage) (*model.Operation, error)
 	// logAttrs are extra structured-log key/value pairs for the "operation
 	// created" line (power's boot_device). nil for deploy/commission.
@@ -1405,8 +1405,9 @@ func (s *Server) powerMachine(c *echo.Context) error {
 		logAttrs:   []any{"boot_device", body.BootDevice},
 		create: func(params json.RawMessage) (*model.Operation, error) {
 			// Power ops (on/off/cycle) go through CreatePowerOp: no state
-			// guard, so a power op is always issuable even with a lifecycle
-			// op pending — that's how an operator recovers a stuck machine.
+			// or lock guard, so they work on an in-service host. With any op
+			// in flight (a deploy included) it refuses with that op's ID;
+			// the operator watches or aborts it first.
 			return s.store.CreatePowerOp(id, opType, params)
 		},
 	})
@@ -1979,15 +1980,20 @@ func (s *Server) upsertImage(c *echo.Context) error {
 }
 
 // deleteImage removes an image row by name (or, if the caller resolved a
-// uuid client-side, that also works since DeleteImage accepts either). No
-// invalidateAllSites call: workers only need to pick this up on their
-// normal snapshot-apply cadence; a delete has no equivalent urgency to
-// createImage's fleet-rollout trigger (nothing to distribute).
+// uuid client-side, that also works since DeleteImage accepts either).
+//
+// It rebuilds every site's snapshot, as createImage and upsertImage do.
+// There is nothing to distribute, but the site worker's boot handler picks
+// the image to boot from the site's image rows: until a snapshot without
+// the deleted row reaches a worker, it keeps booting the image the operator
+// just unpinned, and a boot refused for having several rows keeps being
+// refused after the extra row is deleted.
 func (s *Server) deleteImage(c *echo.Context) error {
 	name := c.Param("name")
 	if err := s.store.DeleteImage(name); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
+	s.invalidateAllSites()
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -2471,7 +2477,7 @@ func (s *Server) validateSiteConfigNetBox(c *echo.Context, cfg *model.SiteConfig
 		}
 		if len(prefixes) == 0 {
 			return nil, echo.NewHTTPError(http.StatusPreconditionFailed,
-				fmt.Sprintf("netbox site %q has no prefix tagged 'slagworks-production'; create one (with gateway_ip custom field) before site-config create", cfg.NetBoxSite))
+				fmt.Sprintf("netbox site %q has no prefix tagged 'slagworks-production' scoped to the site itself (one scoped to a location in the site belongs to a location-scoped config); create one (with gateway_ip custom field) before site-config create", cfg.NetBoxSite))
 		}
 	}
 

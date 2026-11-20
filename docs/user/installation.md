@@ -255,8 +255,10 @@ State:
 - **Image cache** in `SLAGWORKS_IMAGES_DIR` (default `/srv/images`; set it
   to `/var/lib/slagworks/images` for package installs, see
   [configuration](configuration.md#slagworksd-site)). On every snapshot apply
-  the worker compares each image's on-disk SHA-256 marker with the
-  database row and downloads on mismatch.
+  the worker compares each image's on-disk version link with the
+  database row's SHA-256 and downloads on mismatch, in the background: the worker
+  connects and reports ready without waiting for the download, and holds
+  commission and deploy operations until it ends.
 
 ### `slagworks-agent`
 

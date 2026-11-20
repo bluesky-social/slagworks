@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/bmcreconcile"
+	"github.com/bluesky-social/slagworks/internal/imagepull"
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/ws"
@@ -39,14 +41,18 @@ func canonicalMAC(raw string) (string, bool) {
 
 // HandlerConfig configures the boot script handler.
 type HandlerConfig struct {
-	// DefaultImage is the single PXE image dir name to boot (e.g.,
-	// "noble-pxe") — the same dir for deploy and commission (mode is a
-	// cmdline, not a separate image). When set, the handler returns a
-	// kernel+initrd boot script; when empty, a Phase 0 chainload marker.
+	// DefaultImage names the image row to boot (e.g., "noble-pxe") when the
+	// site has more than one; a single row boots whatever its name, and with
+	// no rows this directory boots (resolveImageName). The same image serves
+	// deploy and commission (mode is a cmdline, not a separate image). When
+	// set, the handler returns a kernel+initrd boot script; when empty, a
+	// Phase 0 chainload marker.
 	DefaultImage string
 
-	// ImagesDir is the local directory containing the image subdirectory
-	// (DefaultImage) the boot scripts serve over HTTP.
+	// ImagesDir is the local directory containing the images (one per image
+	// row) the boot scripts serve over HTTP: each a link to the current
+	// version directory SyncImages wrote, or a plain directory. See
+	// resolveImageName.
 	ImagesDir string
 
 	// HTTPPort is the port used in kernel/initrd URLs. Defaults to 8080.
@@ -444,8 +450,12 @@ func (h *Handler) kernelBootScript(mac string) string {
 	if !ok {
 		return h.missingConsoleScript(mac)
 	}
+	imageName, err := h.resolveImageName()
+	if err != nil {
+		return h.noImageScript(mac, err)
+	}
 	server := fmt.Sprintf("${next-server}:%d", h.cfg.HTTPPort)
-	base := fmt.Sprintf("http://%s/files/images/%s", server, h.cfg.DefaultImage)
+	base := fmt.Sprintf("http://%s/files/images/%s", server, imageName)
 	// slagworks.server=/image= are mandatory for the boot=slagworks hook:
 	// scripts/slagworks parse_cmdline panics to a shell if slagworks.server=
 	// is absent (and defaults a missing image to "noble", which would guess
@@ -460,7 +470,7 @@ func (h *Handler) kernelBootScript(mac string) string {
 	// 2026-10-19; also the July "IPv4 didn't apply" deploy). Same reasoning as
 	// embed.ipxe's ${mac}. All three boot templates below follow this.
 	cmdline := fmt.Sprintf("%s BOOTIF=01-${netX/mac:hexhyp} boot=slagworks ip=dhcp slagworks.server=%s slagworks.image=%s",
-		console, server, h.cfg.DefaultImage)
+		console, server, imageName)
 	if n := bootedCmdlineLen(cmdline); n > kernelCmdlineMax {
 		return h.overlongCmdlineScript(mac, n)
 	}
@@ -524,8 +534,11 @@ func (h *Handler) commissionBootScript(mac string) string {
 		// the agent's sweep can discover which port is really wired.
 		console = broadcastConsoleParams()
 	}
+	imageName, err := h.resolveImageName()
+	if err != nil {
+		return h.noImageScript(mac, err)
+	}
 	server := fmt.Sprintf("${next-server}:%d", h.cfg.HTTPPort)
-	imageName := h.resolveImageName()
 	base := fmt.Sprintf("http://%s/files/images/%s", server, imageName)
 
 	extras := fmt.Sprintf(" slagworks.machine=%s slagworks.op=%s", machine.ID, op.ID)
@@ -565,8 +578,11 @@ func (h *Handler) deployBootScript(mac string) string {
 	if !ok {
 		return h.missingConsoleScript(mac)
 	}
+	imageName, err := h.resolveImageName()
+	if err != nil {
+		return h.noImageScript(mac, err)
+	}
 	server := fmt.Sprintf("${next-server}:%d", h.cfg.HTTPPort)
-	imageName := h.resolveImageName()
 	base := fmt.Sprintf("http://%s/files/images/%s", server, imageName)
 	extra := ""
 	// Free-text values ride as one key=value argument each. The first one
@@ -750,14 +766,94 @@ func (h *Handler) identityErrorScript(err error) string {
 	return fmt.Sprintf("#!ipxe\necho slagworks: ERROR: %s\nshell\n", err)
 }
 
-// resolveImageName returns the single PXE image directory name. deploy and
-// commission boot the SAME image (distinguished only by the slagworks.mode=
-// cmdline, set by the caller), so there is one image dir — h.cfg.DefaultImage
-// (conventionally "noble-pxe"), matching the single Image row's Name and the
-// on-disk dir SyncImages writes. (Before the single-image distribution this took a kind and
-// resolved noble-deploy / noble-commission; those are gone.)
-func (h *Handler) resolveImageName() string {
-	return h.cfg.DefaultImage
+// invalidImageRow stands in for a row name that fails model.ValidateImageName
+// in resolveImageName's error, which is echoed on the iPXE console.
+const invalidImageRow = "(invalid name, not synced)"
+
+// resolveImageName returns the image directory one boot script points at.
+// Deploy and commission boot the same image (slagworks.mode= on the cmdline
+// tells them apart), and the site snapshot's image rows say which one:
+// SyncImages installs each row at <ImagesDir>/<row name> and never removes
+// an image whose row is gone, so an entry no row names can still be on disk
+// holding an image an operator unpinned. In order:
+//
+//   - a row named DefaultImage: that row.
+//   - otherwise exactly one row: that row, whatever its name. Rolling back
+//     by pinning a known-good tarball under a new name, then deleting the
+//     old row, leaves the old directory behind under DefaultImage.
+//   - no rows: DefaultImage. No row pins anything then; preflight refuses
+//     to create a PXE-booting op and worker readiness fails until a row
+//     arrives, so only a pre-staged images dir boots this way.
+//   - several rows, none named DefaultImage: an error naming them, since
+//     picking one would be a guess.
+//
+// A row whose name fails model.ValidateImageName is never served: SyncImages
+// does not sync it, and the name would ride the iPXE kernel line.
+//
+// SyncImages keeps each version of an image in its own directory and links
+// <ImagesDir>/<name> to the current one; for the name chosen above this
+// returns the version directory the link names (imagepull.Installed). The
+// script's kernel and initrd URLs and its slagworks.image= all carry it, and
+// the BOOT hook (root.squashfs) and the agent's bootloader step (vmlinuz,
+// initrd-local, minutes later) build their URLs from slagworks.image=, so a
+// re-pin that lands mid-boot cannot hand the boot files from two versions.
+// Resolve it once per script. A name that is a plain directory (an images
+// dir populated by hand, as the QEMU tests do) is served by name.
+func (h *Handler) resolveImageName() (string, error) {
+	name, err := h.imageRowName()
+	if err != nil {
+		return "", err
+	}
+	if h.cfg.ImagesDir != "" {
+		if version, ok := imagepull.Installed(h.cfg.ImagesDir, name); ok {
+			return version, nil
+		}
+	}
+	return name, nil
+}
+
+// imageRowName picks the image the site's rows say to boot; see
+// resolveImageName for the order.
+func (h *Handler) imageRowName() (string, error) {
+	var rows map[string]*model.Image
+	if h.provider != nil {
+		rows = h.provider.GetImages()
+	}
+	if len(rows) == 0 {
+		return h.cfg.DefaultImage, nil
+	}
+	if _, ok := rows[h.cfg.DefaultImage]; ok && model.ValidateImageName(h.cfg.DefaultImage) == nil {
+		return h.cfg.DefaultImage, nil
+	}
+	names := make([]string, 0, len(rows))
+	for name := range rows {
+		if model.ValidateImageName(name) != nil {
+			name = invalidImageRow
+		}
+		names = append(names, name)
+	}
+	if len(names) == 1 && names[0] != invalidImageRow {
+		return names[0], nil
+	}
+	slices.Sort(names)
+	return "", fmt.Errorf("no image row is named %s (SLAGWORKS_DEFAULT_IMAGE), and the site's image rows are %s",
+		h.cfg.DefaultImage, strings.Join(names, ", "))
+}
+
+// noImageScript is served instead of a kernel boot when resolveImageName
+// cannot name a directory an image row pins. The error holds the worker's
+// own SLAGWORKS_DEFAULT_IMAGE and only row names that passed
+// model.ValidateImageName, so no snapshot value reaches the iPXE console
+// unchecked.
+func (h *Handler) noImageScript(mac string, err error) string {
+	h.log.Error("refusing boot: the site's image rows do not say which image to serve",
+		"mac", mac, "err", err)
+	return fmt.Sprintf(`#!ipxe
+echo slagworks: ERROR: no image to boot for mac %s
+echo slagworks: %s
+echo slagworks: delete the image rows that should not boot (slagctl image delete), or set SLAGWORKS_DEFAULT_IMAGE on the site worker to the row that should, then retry
+shell
+`, mac, err)
 }
 
 // ServerConfig configures the HTTP boot server.
@@ -773,7 +869,7 @@ type ServerConfig struct {
 	// Empty disables the HTTP iPXE route.
 	IPXEDir string
 
-	// DefaultImage is the image version to boot. Passed to HandlerConfig.
+	// DefaultImage is passed to HandlerConfig.DefaultImage.
 	DefaultImage string
 
 	// HTTPPort is the port for URL construction. Defaults to 8080.

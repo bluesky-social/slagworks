@@ -264,13 +264,16 @@ func TestProp_OperationCredentials(t *testing.T) {
 					}
 					switch transport {
 					case "pdu":
-						return http.StatusServiceUnavailable // no power-ports are modeled in this world
+						return http.StatusUnprocessableEntity // no power-ports are modeled in this world
 					case "amt":
 						if bootDevice == "disk" {
 							return http.StatusBadRequest
 						}
+						if m.situation == "gone" {
+							return http.StatusServiceUnavailable // NetBox cannot return the device
+						}
 						if m.situation != "amt-ok" {
-							return http.StatusServiceUnavailable
+							return http.StatusUnprocessableEntity // no active oob_ip or no complete kind=amt entry
 						}
 					default:
 						if m.situation == "gone" {

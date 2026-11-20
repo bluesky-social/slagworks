@@ -436,9 +436,9 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 	}
 	// Heartbeat from here on, for the life of the connection. Global drops
 	// a worker it hears nothing from for ws.IdleTimeout once it has
-	// replied to the hello, and applying that reply can take longer: a
-	// snapshot that brings a new boot image downloads it before this
-	// function reaches its read loop.
+	// replied to the hello, and nothing bounds how long this function
+	// takes to apply that reply and reload the outbox before it reaches
+	// its read loop.
 	go w.heartbeatLoop(connCtx, conn)
 
 	// Read the hello reply — must be snapshot or no_change, and it MUST

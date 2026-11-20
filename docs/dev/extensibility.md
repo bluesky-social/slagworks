@@ -592,7 +592,12 @@ can't ride as one `key=value` argument (`checkKernelArgValue`).
 
 `resolveImageName` is deliberately kind-less: deploy and commission
 boot the byte-identical artifact from one Image row (`noble-pxe`)
-and the mode is a cmdline, not a separate image (`handler.go:467-475`).
+and the mode is a cmdline, not a separate image. It picks the row from
+the snapshot's image rows (`MachineProvider.GetImages`): the row named
+`HandlerConfig.DefaultImage`, else the only row, else a refusal script
+naming the rows; only with no rows does it serve `DefaultImage` by name.
+Image directories outlive their rows, so the directory name alone is
+not evidence that a row pins it.
 
 ### The server surface
 
