@@ -76,6 +76,14 @@ func (p RelayPool) Validate() error {
 	if err != nil {
 		return fmt.Errorf("subnet %q: %w", p.Subnet, err)
 	}
+	// ParseCIDR returns a 4-byte mask only for dotted-quad input. Checking
+	// subnet.IP.To4() is not enough: IPv4-mapped IPv6 notation
+	// (::ffff:10.254.27.0/120) converts to IPv4 but carries a 16-byte
+	// mask, which the DHCPv4 subnet-mask option truncates to
+	// 255.255.255.255.
+	if len(subnet.Mask) != net.IPv4len {
+		return fmt.Errorf("subnet %q must be an IPv4 CIDR in dotted-quad form, such as 10.254.27.0/24", p.Subnet)
+	}
 	start := net.ParseIP(p.RangeStart).To4()
 	end := net.ParseIP(p.RangeEnd).To4()
 	gw := net.ParseIP(p.Gateway).To4()
@@ -105,12 +113,9 @@ func (p RelayPool) Validate() error {
 	}
 	// A subnet wider than /31 has a network and a broadcast address, and
 	// neither is a host address; a /31 (RFC 3021) or /32 has neither.
-	// prefixLen is derived from the host-bit count, so it is the IPv4
-	// prefix length whether net.ParseCIDR returned a 4- or 16-byte mask;
-	// subnet.Contains(start) above guarantees an IPv4 network, which
-	// keeps it within 0-32.
-	ones, bits := subnet.Mask.Size()
-	if prefixLen := 32 - (bits - ones); prefixLen <= 30 {
+	// The mask is four bytes (checked above), so its ones count is the
+	// IPv4 prefix length.
+	if prefixLen, _ := subnet.Mask.Size(); prefixLen <= 30 {
 		network := ipToUint32(subnet.IP.To4())
 		broadcast := network | ^uint32(0)>>prefixLen
 		if s == network {
