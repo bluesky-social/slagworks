@@ -384,6 +384,9 @@ func newGatedProvider(t *testing.T) *gatedProvider {
 			"expires_in": 600, "interval": 1,
 		})
 	})
+	mux.HandleFunc("/verify", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("enter your code"))
+	})
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		if r.Form.Get("grant_type") == "refresh_token" {

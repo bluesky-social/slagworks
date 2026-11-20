@@ -326,7 +326,11 @@ operator therefore configures one value, the API URL.
 - The loopback redirect uses a fixed port (`8765`). This port must
   be registered with the IdP as an allowed redirect URI. If a local
   browser flow is not available, `slagctl auth login --device`
-  uses the OIDC device-authorization grant instead.
+  uses the OIDC device-authorization grant instead. That needs the
+  IdP to serve the page where the code is entered (Authentik serves
+  it only when the brand has a device-code flow); when the page
+  answers 404 or 410, the login stops at once and says so instead of
+  waiting for the code to expire.
 
 Cached tokens land at
 `$XDG_CONFIG_HOME/slagctl/token.json` (usually

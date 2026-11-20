@@ -151,19 +151,27 @@ func loginLoopback(ctx context.Context, cfg Config, oc *oauth2.Config) (*oauth2.
 	}
 }
 
-// loginDevice runs the device-authorization grant: request a code, print the
-// URL + user code, poll until approved.
+// loginDevice runs the device-authorization grant: request a code, check the
+// verification page exists, print the URL + user code, poll until approved.
 //
 // Some providers serve the device grant only when it is explicitly enabled
-// (Authentik needs a brand-level device-code flow). Without it this path
-// returns the provider's error; loopback is the working default.
+// (Authentik needs a brand-level device-code flow). Without it the device
+// endpoint may refuse the request, or it may issue a code while the
+// verification page it names answers 404 (Authentik without the brand flow,
+// or a proxy in front of the provider that does not route the page). Polling
+// in the second case can only end when the code expires, so the page is
+// checked first. Every such failure names loopback, the working default.
 func loginDevice(ctx context.Context, cfg Config, oc *oauth2.Config) (*oauth2.Token, error) {
+	wayOut := fmt.Sprintf("log in without --device (`%s auth login`)", cfg.AppName)
 	if oc.Endpoint.DeviceAuthURL == "" {
-		return nil, fmt.Errorf("device flow unavailable: issuer advertises no device endpoint; log in without --device")
+		return nil, fmt.Errorf("the identity provider %s advertises no device-code endpoint; %s", cfg.Issuer, wayOut)
 	}
 	resp, err := oc.DeviceAuth(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("device authorization request: %w (is the device-code flow enabled on the identity provider?)", err)
+		return nil, fmt.Errorf("device authorization request to %s: %w\n  the device-code flow may not be enabled on the identity provider; %s", oc.Endpoint.DeviceAuthURL, err, wayOut)
+	}
+	if status := devicePageMissing(ctx, resp.VerificationURI); status != "" {
+		return nil, fmt.Errorf("the identity provider %s issued a device code, but its device page %s answers %s, so the code cannot be entered there; %s, or ask the identity provider's administrator to serve that page", cfg.Issuer, resp.VerificationURI, status, wayOut)
 	}
 	if resp.VerificationURIComplete != "" {
 		_, _ = fmt.Fprintf(cfg.stderr(), "To authenticate, open:\n  %s\n", resp.VerificationURIComplete)
@@ -175,6 +183,37 @@ func loginDevice(ctx context.Context, cfg Config, oc *oauth2.Config) (*oauth2.To
 		return nil, fmt.Errorf("waiting for device approval: %w", err)
 	}
 	return tok, nil
+}
+
+// devicePageTimeout bounds the check that the device page exists.
+const devicePageTimeout = 10 * time.Second
+
+// devicePageMissing GETs the device page the provider named, following
+// redirects, and returns the final status line when it is 404 or 410: the
+// page does not exist, so no operator can enter the code. Every other outcome
+// returns "" and the flow goes ahead: a page that turns away scripted clients
+// (403, a bot challenge) or that this host cannot reach may still open in the
+// operator's browser on another device. It checks verification_uri, not
+// verification_uri_complete, so the probe does not carry the user code.
+func devicePageMissing(ctx context.Context, page string) string {
+	if page == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, devicePageTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, page, nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		return resp.Status
+	}
+	return ""
 }
 
 func randState() (string, error) {
