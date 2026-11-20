@@ -40,6 +40,14 @@ Linux is native. Tests that need a real Postgres go through
 `internal/testpg` (see `docs/dev/database.md`); tests that need SQLite
 open a temp `LocalDB` directly.
 
+Property tests use `pgregory.net/rapid`; `-rapid.checks=N` raises the
+case count for a deep local run. Two of them need real time and are
+skipped unless `SLAGWORKS_PROP_SLOW=1` is set: `TestProp_SiteLifecycle`
+(`cmd/slagworksd`, starts real `slagworksd site` processes, about 25s a
+case; run it unprivileged, since as root the workers would bind DHCP
+and TFTP on loopback) and `TestProp_HubBrokenSiteDoesNotAffectOthers`
+(`internal/ws`, about 2s a case).
+
 ### Upgrade and restart scenarios
 
 `internal/skewtest` runs a global and a site worker as separate

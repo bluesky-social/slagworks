@@ -21,8 +21,8 @@
 // Other knobs: SKEW_SHARDS=<n> runs each generated property as n parallel
 // rapid checks; SKEW_TRACE=1 logs every case's history; SKEW_STDERR_DIR=<dir>
 // keeps every driver process's log; SKEW_PORT_BASE=<n> moves the loopback
-// port range. The generated properties run a fraction of -rapid.checks (a
-// case starts four or more processes), so raise that flag for a deep run.
+// port range. The generated properties run a twenty-fifth of -rapid.checks
+// (a case starts four or more processes), so raise that flag for a deep run.
 package skewtest
 
 import (
@@ -60,7 +60,24 @@ var (
 	toolOld    string // skewtool built from the old release; "" when unavailable
 	oldMissing string // why toolOld is ""
 	oldRef     string
+	// raceBuild is set when this test binary was built with -race. The
+	// driver is then built with -race as well: under `go test -race ./...`
+	// the build cache already holds race-instrumented objects for
+	// everything the driver imports, and a plain build would compile all of
+	// it a second time while the other packages' tests are compiling.
+	raceBuild bool
 )
+
+// buildDriver builds ./internal/skewtest/skewtool of the tree at dir.
+func buildDriver(dir, out string, extra ...string) (string, error) {
+	args := []string{"build"}
+	if raceBuild {
+		args = append(args, "-race")
+	}
+	args = append(args, extra...)
+	args = append(args, "-o", out, "./internal/skewtest/skewtool")
+	return run(dir, "go", args...)
+}
 
 func TestMain(m *testing.M) {
 	flag.Parse()
@@ -77,7 +94,7 @@ func TestMain(m *testing.M) {
 			return 1
 		}
 		toolNew = filepath.Join(dir, "skewtool-new")
-		if out, err := run(root, "go", "build", "-o", toolNew, "./internal/skewtest/skewtool"); err != nil {
+		if out, err := buildDriver(root, toolNew); err != nil {
 			fmt.Fprintf(os.Stderr, "skewtest: building skewtool from this tree failed: %v\n%s\n", err, out)
 			return 1
 		}
@@ -122,7 +139,7 @@ func TestMain(m *testing.M) {
 				return 1
 			}
 			toolOld = filepath.Join(dir, "skewtool-old")
-			if out, err := run(oldTree, "go", "build", "-mod=vendor", "-o", toolOld, "./internal/skewtest/skewtool"); err != nil {
+			if out, err := buildDriver(oldTree, toolOld, "-mod=vendor"); err != nil {
 				// A release the shared API subset no longer compiles against
 				// is a harness problem to fix, not a reason to pass.
 				fmt.Fprintf(os.Stderr, "skewtest: building skewtool inside the %s tree failed: %v\n%s\n", oldRef, err, out)
