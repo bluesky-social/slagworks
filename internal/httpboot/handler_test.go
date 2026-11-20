@@ -802,7 +802,8 @@ func scriptCmdlineLen(t *testing.T, script string) int {
 			_, args, _ := strings.Cut(rest, " ")
 			args = strings.ReplaceAll(args, "${next-server}", "255.255.255.255")
 			args = strings.ReplaceAll(args, "${netX/mac:hexhyp}", "00-00-00-00-00-00")
-			return len("vmlinuz ") + len(args)
+			// iPXE joins the words of the line back with single spaces.
+			return len("vmlinuz ") + len(strings.Join(strings.Fields(args), " "))
 		}
 	}
 	t.Fatalf("no kernel line in:\n%s", script)
@@ -875,6 +876,12 @@ func TestCommissionBootScript_RefusesAnOverlongKernelLine(t *testing.T) {
 	body := script(base + strings.Repeat("y", fits))
 	if got := scriptCmdlineLen(t, body); got != 2047 {
 		t.Fatalf("a line of %d bytes, at the limit, must be served; got:\n%s", got, body)
+	}
+	// Padding between the words of the field does not reach the kernel
+	// (iPXE joins the words with single spaces), so it does not count.
+	body = script("console=ttyS1,115200n8" + strings.Repeat(" ", 500) + "x=" + strings.Repeat("y", fits))
+	if !strings.Contains(body, "\nkernel ") {
+		t.Fatalf("padding between kernel params was counted against the limit:\n%s", body)
 	}
 	body = script(base + strings.Repeat("y", fits+1))
 	if strings.Contains(body, "\nkernel ") {

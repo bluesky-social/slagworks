@@ -327,11 +327,14 @@ const kernelCmdlineMax = 2047
 // IPv4 address, ${netX/mac:hexhyp} 17 bytes), behind the image name and
 // space iPXE puts in front of the arguments when it starts the kernel as an
 // EFI image (efi_image_cmdline). No other "${" can be in args:
-// checkKernelParams and checkKernelArgValue refuse it.
+// checkKernelParams and checkKernelArgValue refuse it. iPXE splits the
+// script line into words and joins the arguments back with single spaces,
+// so padding in slagworks_kernel_params, and the leading space its "none"
+// sentinel leaves, do not reach the kernel and are not counted.
 func bootedCmdlineLen(args string) int {
 	args = strings.ReplaceAll(args, "${next-server}", "255.255.255.255")
 	args = strings.ReplaceAll(args, "${netX/mac:hexhyp}", "00-00-00-00-00-00")
-	return len("vmlinuz ") + len(args)
+	return len("vmlinuz ") + len(strings.Join(strings.Fields(args), " "))
 }
 
 // overlongCmdlineScript is served instead of a kernel boot whose command
