@@ -810,12 +810,14 @@ func (o *opState) recordPhoneHome(machineID uuid.UUID) uuid.UUID {
 // snapshot knows a machine this worker's APPLIED view doesn't yet. The
 // executor must never claim an op whose machine isn't in the view — it
 // would win the claim, find the machine absent locally (MachineByID
-// nil), and fail a live op. Filtering happens HERE at the read site,
-// deliberately NOT at apply time: a delta can arrive before the identity
-// snapshot that adds its machine, and dropping it at apply would strand
-// the op until reconnect. Storing not-yet-in-view ops is cheap (the
-// active set is dozens); they stay invisible to the executor until the
-// view knows the machine.
+// nil), and fail a live op. This filter holds when the executor's pass
+// builds its list; executeOp re-checks membership before each claim, since
+// a snapshot can drop a machine while earlier ops in the pass run.
+// Filtering happens HERE at the read site, deliberately NOT at apply time:
+// a delta can arrive before the identity snapshot that adds its machine,
+// and dropping it at apply would strand the op until reconnect. Storing
+// not-yet-in-view ops is cheap (the active set is dozens); they stay
+// invisible to the executor until the view knows the machine.
 func (o *opState) pendingPowerOps() []model.Operation {
 	o.mu.RLock()
 	defer o.mu.RUnlock()

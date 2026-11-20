@@ -168,6 +168,21 @@ func (e *Executor) processOps(ctx context.Context) {
 func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
 	log := e.log.With("op_id", op.ID, "type", op.Type, "machine_id", op.MachineID)
 
+	// Re-check view membership before claiming. processOps ranges over a
+	// pending list filtered when the pass began, and driving the ops ahead
+	// of this one can hold BMC sessions for seconds; a snapshot applied
+	// meanwhile may have dropped this machine (moved to another site, or
+	// this site's scope narrowed). Claiming would either win the op, find
+	// MachineByID nil and fail it, or be declined by the hub's membership
+	// check and leave the local mark at claimed for an op that is still
+	// pending (see pendingPowerOps). Leave it pending and unclaimed: the
+	// next pass filters it out, and the site that owns the machine now
+	// drives it.
+	if e.cache.MachineByID(op.MachineID) == nil {
+		log.Info("machine left this site's view since the pass began; leaving the op unclaimed")
+		return
+	}
+
 	// Mark as claimed locally first to prevent PendingPowerOps and
 	// PendingLifecycleOps from returning it on the next tick while
 	// we're still executing. This also forgets an earlier unanswered
