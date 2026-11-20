@@ -299,7 +299,9 @@ func (s *Server) invalidateSite(slug string) {
 
 // invalidateAllSites fans out Invalidate across every configured
 // site. Used by machine mutations where we don't have the slug to
-// hand — machines carry NetBoxDeviceID, not a site binding. The
+// hand — machines carry NetBoxDeviceID, not a site binding — and by
+// mutations of global snapshot inputs (images, storage and network
+// scripts, SSH keys), which every site's snapshot carries. The
 // dispatcher's content-hash skip makes per-site rebuilds cheap on
 // unrelated slugs, so fanning out is safe.
 func (s *Server) invalidateAllSites() {
@@ -1999,6 +2001,14 @@ func (s *Server) createStorageScript(c *echo.Context) error {
 	if err := s.store.CreateStorageScript(&script); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
+	// A deploying agent fetches its matched storage and network scripts
+	// from the site worker's cached snapshot, and neither op create nor
+	// claim rebuilds that snapshot. Every script create, update and delete
+	// therefore pushes a fresh snapshot to all sites; without it the worker
+	// keeps serving the superseded (or deleted) script until an unrelated
+	// rebuild, while preflight, which builds fresh, already reports the new
+	// one.
+	s.invalidateAllSites()
 	return c.JSON(http.StatusCreated, script)
 }
 
@@ -2016,9 +2026,7 @@ type networkScriptWithVersion struct {
 
 // updateStorageScript inserts a new immutable version (head+1) with content
 // re-parsed for priority, and advances the script's head pointer. Old
-// versions are never touched. No snapshot invalidation here, matching
-// createStorageScript/deleteStorageScript: matching picks the change up on
-// the next rebuild rather than forcing one.
+// versions are never touched.
 func (s *Server) updateStorageScript(c *echo.Context) error {
 	name := c.Param("name")
 	var body struct {
@@ -2041,6 +2049,7 @@ func (s *Server) updateStorageScript(c *echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "updating storage script")
 	}
+	s.invalidateAllSites() // serve the new head; see createStorageScript
 	return c.JSON(http.StatusOK, scriptWithVersion{StorageScript: *script, Version: version})
 }
 
@@ -2052,6 +2061,7 @@ func (s *Server) deleteStorageScript(c *echo.Context) error {
 	if err := s.store.DeleteStorageScript(id); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
+	s.invalidateAllSites() // stop serving it; see createStorageScript
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -2097,6 +2107,7 @@ func (s *Server) createNetworkScript(c *echo.Context) error {
 	if err := s.store.CreateNetworkScript(&script); err != nil {
 		return echo.NewHTTPError(http.StatusConflict, err.Error())
 	}
+	s.invalidateAllSites() // serve it; see createStorageScript
 	return c.JSON(http.StatusCreated, script)
 }
 
@@ -2123,6 +2134,7 @@ func (s *Server) updateNetworkScript(c *echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "updating network script")
 	}
+	s.invalidateAllSites() // serve the new head; see createStorageScript
 	return c.JSON(http.StatusOK, networkScriptWithVersion{NetworkScript: *script, Version: version})
 }
 
@@ -2134,6 +2146,7 @@ func (s *Server) deleteNetworkScript(c *echo.Context) error {
 	if err := s.store.DeleteNetworkScript(id); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
+	s.invalidateAllSites() // stop serving it; see createStorageScript
 	return c.NoContent(http.StatusNoContent)
 }
 

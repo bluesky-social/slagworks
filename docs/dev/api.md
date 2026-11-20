@@ -191,8 +191,11 @@ The two script families have identical routes.
 | DELETE | `/network-scripts/:id` | admin | |
 | GET | `/network-scripts/:name/history` | read | |
 
-Script mutations do not push snapshots; the change is picked up on the next
-snapshot build for each site.
+Every successful script create, update and delete rebuilds every site's
+snapshot. The deploy agent fetches its matched scripts from the site worker's
+cached snapshot, and creating or claiming an op does not rebuild it, so
+without that rebuild a deploy started right after an update would run the
+superseded script.
 
 ## SSH keys
 
