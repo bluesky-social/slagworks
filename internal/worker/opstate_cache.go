@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/bluesky-social/slagworks/internal/model"
+	"github.com/bluesky-social/slagworks/internal/opstate"
 )
 
 // opState is the mutable op-layer of the site cache. Post-Tier-2 it is fed
@@ -66,6 +67,23 @@ import (
 //     set is resynced. A worker started without a persisted op layer is
 //     neither untrusted nor resynced until its first op_resync, and must
 //     not tell a healthy deploy's agent to stop in that window.
+//   - claimUnanswered: op IDs whose most recent claim this process sent
+//     without learning the outcome (rollBackClaim: transport error, RPC
+//     timeout). That claim may have COMMITTED on global, and global's row
+//     for the op (claimed by this worker, no phase) can then reach the cache
+//     after the rollback and replace its pending mark; reclaimableOps keeps
+//     such an op in front of the executor so it re-claims it (B4). Cleared
+//     when the next claim attempt starts (markClaimAttempt) and on
+//     op_removed. Deliberately not pruned by op_resync: an op whose machine
+//     briefly leaves the site's scope drops out of a resync and comes back
+//     still claimed by this worker. An entry outlives its op only when the
+//     worker misses that op's op_removed while disconnected; entries come
+//     only from claims lost to transport failures, so the set stays small,
+//     and a stale entry is harmless: it matches only its own op ID, which
+//     global never reuses. In memory only, never persisted: after a restart
+//     the worker cannot tell an unanswered claim from one it won and acted
+//     on, so such an op is ExpireOrphanedClaims' to fail, not this worker's
+//     to drive again.
 type opState struct {
 	mu sync.RWMutex
 
@@ -76,6 +94,8 @@ type opState struct {
 	failedOps    map[string]bool
 	phaseStart   map[string]phaseState
 	phoneHomed   map[string]bool
+
+	claimUnanswered map[string]bool
 
 	tombstones     map[string]int
 	tombstoneOrder []string
@@ -179,9 +199,12 @@ func newOpState(view *atomic.Pointer[snapshotView], wake chan struct{}, untruste
 		phaseStart:   make(map[string]phaseState),
 		phoneHomed:   make(map[string]bool),
 		tombstones:   make(map[string]int),
-		wake:         wake,
-		untrusted:    untrusted,
-		selfSerial:   selfSerial,
+
+		claimUnanswered: make(map[string]bool),
+
+		wake:       wake,
+		untrusted:  untrusted,
+		selfSerial: selfSerial,
 	}
 }
 
@@ -308,6 +331,7 @@ func (o *opState) applyOpRemoved(opID, machineIDStr string, version int, machine
 	delete(o.failedOps, opID)
 	delete(o.phaseStart, opID)
 	delete(o.phoneHomed, opID)
+	delete(o.claimUnanswered, opID)
 
 	if machineState != "" {
 		if id, err := uuid.Parse(machineIDStr); err == nil {
@@ -863,6 +887,37 @@ func (o *opState) pendingLifecycleOps() []model.Operation {
 	return ops
 }
 
+// reclaimableOps returns copies of the ops whose most recent claim went
+// unanswered (claimUnanswered) and whose row global has since delivered as
+// claimed by workerID with no phase (opstate.CanReclaim): the claim committed
+// and only its reply was lost. The executor re-claims them, which
+// ClaimOperation's idempotent re-claim branch grants (B4). While the
+// rollback's pending mark still stands the op is pending and the pending
+// readers return it instead. Same untrusted and view-membership gates as
+// pendingPowerOps. The executor sent the lost claim for an op a pending
+// reader returned, so the op already passed their type bucketing and
+// self-outlet skip.
+func (o *opState) reclaimableOps(workerID string) []model.Operation {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if o.untrusted {
+		return nil
+	}
+	v := o.view.Load()
+	var ops []model.Operation
+	for opID := range o.claimUnanswered {
+		op, ok := o.ops[opID]
+		if !ok || !opstate.CanReclaim(op, workerID) {
+			continue
+		}
+		if _, ok := v.machines[op.MachineID]; !ok {
+			continue
+		}
+		ops = append(ops, *op)
+	}
+	return ops
+}
+
 // activeOpCount returns the number of non-terminal operations.
 func (o *opState) activeOpCount() int {
 	o.mu.RLock()
@@ -959,6 +1014,35 @@ func (o *opState) setStatus(opID string, status model.OperationStatus) {
 	if op, ok := o.ops[opID]; ok {
 		op.Status = status
 	}
+}
+
+// markClaimAttempt marks an op claimed locally as the executor sends a claim
+// for it, so the pending readers stop returning it, and forgets any earlier
+// unanswered claim: this attempt's outcome now decides, and rollBackClaim
+// records it again if it goes unanswered too.
+func (o *opState) markClaimAttempt(opID string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.claimUnanswered, opID)
+	if op, ok := o.ops[opID]; ok {
+		op.Status = model.OpClaimed
+	}
+}
+
+// rollBackClaim handles a claim that got no answer: it sets the local mark
+// back to pending so the pending readers return the op for a retry, and
+// records the claim as unanswered so reclaimableOps returns the op if
+// global's claimed row replaces that mark first. A no-op for an op the
+// stream removed while the claim was in flight.
+func (o *opState) rollBackClaim(opID string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	op, ok := o.ops[opID]
+	if !ok {
+		return
+	}
+	op.Status = model.OpPending
+	o.claimUnanswered[opID] = true
 }
 
 // markFailed marks an op failed, clears its phase timing, and (if present)

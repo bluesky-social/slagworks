@@ -153,6 +153,15 @@ func (e *Executor) processOps(ctx context.Context) {
 		}
 		e.executeOp(ctx, op)
 	}
+	// Claims that committed on global but whose reply was lost, where
+	// global's claimed row reached the cache after executeOp's rollback and
+	// replaced its pending mark (B4).
+	for _, op := range e.cache.ReclaimableOps(e.workerID) {
+		if ctx.Err() != nil {
+			return
+		}
+		e.executeOp(ctx, op)
+	}
 }
 
 func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
@@ -160,7 +169,8 @@ func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
 
 	// Mark as claimed locally first to prevent PendingPowerOps and
 	// PendingLifecycleOps from returning it on the next tick while
-	// we're still executing.
+	// we're still executing. This also forgets an earlier unanswered
+	// claim: this attempt's outcome decides.
 	e.cache.MarkOpClaimed(op.ID.String())
 
 	// Claim the operation via central API
@@ -181,9 +191,14 @@ func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
 		// the claim actually COMMITTED and only the reply was lost:
 		// ClaimOperation's idempotent re-claim branch hands back an op
 		// this worker already holds (claimed, by us, no phase yet), so
-		// the retry resumes the op instead of stalling it (B4).
+		// the retry resumes the op instead of stalling it (B4). Global's
+		// row for such a claim (the reconnect's op_resync, or the late
+		// claim's op_delta) can reach the cache after this rollback and
+		// replace the pending mark; RollBackClaim records the claim as
+		// unanswered so ReclaimableOps still returns the op for the
+		// retry.
 		log.Warn("failed to claim operation", "err", err)
-		e.cache.MarkOpStatus(op.ID.String(), model.OpPending)
+		e.cache.RollBackClaim(op.ID.String())
 		return
 	}
 

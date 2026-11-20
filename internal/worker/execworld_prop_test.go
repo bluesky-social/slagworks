@@ -48,7 +48,6 @@ import (
 // otherwise reject and the executor does not currently guarantee. These are
 // counted, not failed; every other class fails the case.
 var epTolerated = map[string]string{
-	"stall-claimed-not-driven":    "claim committed, reply lost, hub's claimed row lands after the local rollback: the op is never re-claimed (it dies in the orphaned-claim sweep)",
 	"report-lost":                 "a terminal or phase op_update is in memory and unacknowledged: it is lost on a restart or a dropped write, and the op stays claimed until a sweep fails it",
 	"act-after-removed":           "the executor keeps actuating an op the worker already saw removed (abort or sweep mid-run)",
 	"stale-list-claim":            "the executor claims an op whose machine left the view since the pass built its pending list, then fails it as not in cache",

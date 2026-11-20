@@ -560,8 +560,19 @@ worker, the executor's pending-op wake fires (or its 5s backstop tick),
    This prevents the next 5-second tick re-driving the same op.
 2. WS RPC `Claimer.ClaimOp(opID)`. On lost race, keep the local
    claimed mark and exit; the winning worker will drive.
-3. On transport error, roll back to `OpPending` in the cache
-   (line 140).
+3. On transport error (RPC timeout, dropped connection), roll back
+   to `OpPending` in the cache and record the claim as unanswered
+   (`Cache.RollBackClaim`); the next tick retries it. The claim may
+   have committed with only its reply lost: the retry then takes
+   `ClaimOperation`'s idempotent re-claim branch
+   (`opstate.CanReclaim`) and drives the op. Global's row for that
+   claim (claimed by this worker, no phase) can reach the cache after
+   the rollback, as the reconnect's `op_resync` or the late claim's
+   `op_delta`, and replace the pending mark; `Cache.ReclaimableOps`
+   then hands the op to the executor instead. The record is in memory
+   only: after a restart the worker cannot tell an unanswered claim
+   from one it won and acted on, so `ExpireOrphanedClaims` fails such
+   an op.
 4. Dispatch to `runPowerOp` (line 151) or `runLifecycleOp` (line 288).
 
 `runLifecycleOp` does:
