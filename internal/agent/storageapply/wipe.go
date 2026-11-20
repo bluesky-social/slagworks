@@ -470,8 +470,11 @@ func wipefsSignatures(out string) []string {
 // --destructive: it refuses, before any disk is touched, when an md array is
 // already assembled at a /dev/mdN node the plan creates a raid device at.
 //
-// The deploy environment's udev assembles every md array it finds, and an
-// array whose superblock asks for /dev/md0 gets it. On this path the
+// Nothing in the agent decides which arrays the deploy environment has
+// assembled by the time it runs: that is up to the boot image's initrd and
+// udev rules and the metadata on the disks (see StopResidualMDDevices and
+// PreflightPreserve for arrays found assembled on real hosts), and an array
+// whose superblock asks for /dev/md0 can be given it. On this path the
 // layout's own disks are blank (CheckDisksClean), so an assembled array's
 // members are all on disks the deploy does not write. `mdadm --create` fails
 // on a node in use, and by then the plan has partitioned the layout's disks:
