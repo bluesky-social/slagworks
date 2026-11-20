@@ -1295,3 +1295,67 @@ func TestSyncImages_FailingImageDoesNotBlockOthers(t *testing.T) {
 		})
 	}
 }
+
+// TestSyncImages_RefusesNameOfTheBootloader: an image's link shares
+// imagesDir with an entry no image owns, the systemd-bootx64.efi the
+// slagworks package links there (served to every UEFI target as its
+// bootloader). An image named after it must be refused like a path-shaped
+// name: reported in the error, never downloaded, and the entry left alone.
+// Before the fix the name passed model.ValidateImageName and SyncImages
+// replaced the bootloader with the image, so the bootloader step of every
+// UEFI deploy at the site failed.
+func TestSyncImages_RefusesNameOfTheBootloader(t *testing.T) {
+	const name = "systemd-bootx64.efi"
+	tarPath, sha := buildTestTarball(t, "noble-pxe")
+	tarData, _ := os.ReadFile(tarPath)
+	var downloads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads.Add(1)
+		w.Write(tarData)
+	}))
+	defer srv.Close()
+
+	imagesDir := t.TempDir()
+	efi := filepath.Join(imagesDir, name)
+	if err := os.WriteFile(efi, []byte("package-installed efi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	good := map[string]*model.Image{
+		"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: srv.URL + "/noble-pxe.tar.gz"},
+	}
+	if err := SyncImages(slog.Default(), imagesDir, good); err != nil {
+		t.Fatalf("setup sync of noble-pxe: %v", err)
+	}
+	before, err := os.ReadDir(imagesDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloads.Store(0)
+
+	err = SyncImages(slog.Default(), imagesDir, map[string]*model.Image{
+		name:        {Name: name, SHA256: sha, URL: srv.URL + "/bad.tar.gz"},
+		"noble-pxe": good["noble-pxe"],
+	})
+	if err == nil || !strings.Contains(err.Error(), name) {
+		t.Errorf("SyncImages with image name %q returned %v, want an error naming it", name, err)
+	}
+	if got, rerr := os.ReadFile(efi); rerr != nil || string(got) != "package-installed efi" {
+		t.Errorf("SyncImages with image name %q replaced the bootloader (read %q, %v)", name, got, rerr)
+	}
+	after, err := os.ReadDir(imagesDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := func(es []os.DirEntry) (out []string) {
+		for _, e := range es {
+			out = append(out, e.Name())
+		}
+		return out
+	}
+	if !slices.Equal(names(before), names(after)) {
+		t.Errorf("SyncImages with image name %q changed imagesDir: %v, was %v", name, names(after), names(before))
+	}
+	if n := downloads.Load(); n != 0 {
+		t.Errorf("downloads = %d, want 0 (noble-pxe is up to date and the refused name must not be fetched)", n)
+	}
+}

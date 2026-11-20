@@ -17,6 +17,15 @@ import (
 // (slagctl image sync runs on operator laptops).
 var imageNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
+// imagesDirBootAsset is an entry of the images dir that is not an image:
+// the systemd-bootx64.efi the slagworks package links there
+// (deploy/postinstall.sh), which the boot handler serves to every UEFI
+// target as its bootloader. imagepull.SyncImages replaces
+// <imagesDir>/<name> with the image's link, so no image may take that name.
+// An image's other entries, its version directories <name>@<sha16>, cannot
+// collide with a name: imageNameRE has no '@'.
+const imagesDirBootAsset = "systemd-bootx64.efi"
+
 // ValidateImageName reports whether name is usable as an image name. The
 // API checks it when a row is written, and imagepull.SyncImages checks it
 // again before turning the name into a path, since SyncImages also takes
@@ -25,6 +34,9 @@ var imageNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 func ValidateImageName(name string) error {
 	if !imageNameRE.MatchString(name) {
 		return fmt.Errorf("invalid image name %q: use lowercase letters, digits, '.', '_' and '-', starting with a letter or digit (for example noble-pxe)", name)
+	}
+	if name == imagesDirBootAsset {
+		return fmt.Errorf("invalid image name %q: that is the UEFI bootloader the slagworks package installs in the images directory; choose another name (for example noble-pxe)", name)
 	}
 	return nil
 }

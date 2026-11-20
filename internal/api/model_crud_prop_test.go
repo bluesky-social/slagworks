@@ -100,11 +100,12 @@ func (r *pmRun) sshKey() {
 const pmUUIDName = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 
 // pmImageNameOK is the documented image-name rule: lowercase letters,
-// digits, '.', '_' and '-', starting with a letter or digit. The name becomes
-// a directory on every site worker, so "..", a slash or an upper-case twin
-// of another name must not be accepted.
+// digits, '.', '_' and '-', starting with a letter or digit, and not
+// "systemd-bootx64.efi". The name becomes an entry of the images dir on
+// every site worker, so "..", a slash, an upper-case twin of another name or
+// the name of the bootloader in that dir must not be accepted.
 func pmImageNameOK(name string) bool {
-	if name == "" || name == "." || name == ".." {
+	if name == "" || name == "." || name == ".." || name == "systemd-bootx64.efi" {
 		return false
 	}
 	for i, c := range name {

@@ -91,7 +91,8 @@ func Installed(imagesDir, name string) (string, bool) {
 // Each name becomes <imagesDir>/<name>, which SyncImages replaces, so a
 // name that fails model.ValidateImageName is skipped before anything is
 // downloaded or touched: "." or ".." would otherwise point that replacement
-// at imagesDir or its parent. A sha256 that is not 64 hex digits is skipped
+// at imagesDir or its parent, and "systemd-bootx64.efi" at the bootloader
+// the package links into imagesDir. A sha256 that is not 64 hex digits is skipped
 // the same way, since part of it becomes a directory name (no such digest
 // could match a download anyway).
 //

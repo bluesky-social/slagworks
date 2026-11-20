@@ -288,9 +288,11 @@ Notes:
   never cut off.
 - The row name is the link name. `SyncImages` skips, with an
   error, any name that fails `model.ValidateImageName` (lowercase
-  letters, digits, `.`, `_`, `-`, starting with a letter or digit)
-  before downloading or removing anything, and still syncs the other
-  rows. The API refuses such names when the row is written. It skips a
+  letters, digits, `.`, `_`, `-`, starting with a letter or digit; not
+  `systemd-bootx64.efi`, the bootloader the package links into the
+  images directory) before downloading or removing anything, and still
+  syncs the other rows. The API refuses such names when the row is
+  written. It skips a
   row whose `sha256` is not 64 hex digits the same way.
 - A plain `noble-pxe/` directory (put there by hand, or extracted in
   place by a release before version directories) is replaced by the

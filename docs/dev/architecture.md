@@ -773,7 +773,10 @@ lock; its cleanup never ran). The image
 name becomes the link it replaces, so it skips, with an error, a name
 that fails `model.ValidateImageName` before downloading anything; the
 API applies the same rule when the row is written. A `sha256` that is
-not 64 hex digits is skipped the same way. Images are independent: a
+not 64 hex digits is skipped the same way. The name rule keeps the
+name one plain path element and off the other entry of `imagesDir`: not
+`systemd-bootx64.efi`, the bootloader the package links there. Images
+are independent: a
 refused name, failed download, digest mismatch or failed link switch
 costs only that image, the other images still sync, and every failure
 is joined into the returned error.

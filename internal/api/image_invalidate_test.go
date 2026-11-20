@@ -134,10 +134,12 @@ func TestImageUpsert_InvalidatesAllSites(t *testing.T) {
 // TestImageWrite_RejectsInvalidName: an image name becomes a directory on
 // every site worker (imagepull.SyncImages removes and replaces
 // <images_dir>/<name>), so POST and PUT must refuse a name that is not a
-// plain path element with a 400, store nothing, and push no snapshot.
-// Before the fix both accepted "..", "." and "../victim", and the next
-// snapshot made every site worker delete its data dir, its images dir, or
-// a sibling of it.
+// plain path element, or that names the package's systemd-bootx64.efi in
+// the images dir, with a 400, store nothing, and push no snapshot. Before
+// the fix both accepted "..", "." and "../victim", and the next snapshot
+// made every site worker delete its data dir, its images dir, or a sibling
+// of it; they also accepted "systemd-bootx64.efi", which replaced the
+// bootloader with the image.
 func TestImageWrite_RejectsInvalidName(t *testing.T) {
 	db := testpg.DB(t, store.Migrate)
 	st := store.New(db)
@@ -174,14 +176,14 @@ func TestImageWrite_RejectsInvalidName(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	for _, name := range []string{"..", ".", "../victim", "noble-pxe/..", ".hidden", "Noble-PXE", "noble pxe"} {
+	for _, name := range []string{"..", ".", "../victim", "noble-pxe/..", ".hidden", "Noble-PXE", "noble pxe", "systemd-bootx64.efi"} {
 		if code := send(http.MethodPost, "/api/v1/images", name); code != http.StatusBadRequest {
 			t.Errorf("POST image name %q: status %d, want 400", name, code)
 		}
 	}
 	// The PUT name comes from the path; ".." and "." reach the handler
 	// as-is (Go's client and echo's router do not clean them).
-	for _, name := range []string{"..", ".", ".hidden", "Noble-PXE"} {
+	for _, name := range []string{"..", ".", ".hidden", "Noble-PXE", "systemd-bootx64.efi"} {
 		if code := send(http.MethodPut, "/api/v1/images/"+name, "noble-pxe"); code != http.StatusBadRequest {
 			t.Errorf("PUT image name %q: status %d, want 400", name, code)
 		}
