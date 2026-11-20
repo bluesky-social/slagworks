@@ -91,7 +91,7 @@ func authWhoamiCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			id, err := clientauth.CachedIdentity(tokenCacheConfig())
 			if err != nil {
-				return err
+				return fmt.Errorf("%w\n  run `slagctl auth login` to sign in", err)
 			}
 			if jsonOut {
 				return format.PrintJSON(cmd.OutOrStdout(), id)

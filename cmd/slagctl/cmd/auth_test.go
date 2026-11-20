@@ -79,6 +79,24 @@ func TestAuthWhoamiAndLogoutUseTokenCache(t *testing.T) {
 	}
 }
 
+// TestAuthWhoamiWithoutSessionNamesLoginCommand: with no cached token (a
+// fresh install, or after `auth logout`), `auth whoami` fails, and like every
+// other not-signed-in path in slagctl the error names the command that fixes
+// it rather than ending at the token file's "no such file or directory".
+func TestAuthWhoamiWithoutSessionNamesLoginCommand(t *testing.T) {
+	isolateUserDirs(t)
+
+	_, err := execCmd(t, nil, "auth", "whoami")
+	if err == nil {
+		t.Fatal("auth whoami with no cached token succeeded")
+	}
+	for _, want := range []string{"not logged in", "run `slagctl auth login`"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("auth whoami with no cached token: err = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
 func TestDoctorChecksWithoutToken(t *testing.T) {
 	isolateUserDirs(t)
 
