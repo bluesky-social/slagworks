@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -48,14 +50,46 @@ func Accept(w http.ResponseWriter, r *http.Request, opts *websocket.AcceptOption
 	return &Conn{conn: c}, nil
 }
 
-// Dial opens a WebSocket connection to the given URL (client-side).
+// Dial opens a WebSocket connection to the given URL (client-side). When
+// the server refuses the upgrade, the error carries the reason it gave
+// (see DialError).
 func Dial(ctx context.Context, url string, opts *websocket.DialOptions) (*Conn, error) {
-	c, _, err := websocket.Dial(ctx, url, opts) //nolint:bodyclose // websocket owns the response
+	c, resp, err := websocket.Dial(ctx, url, opts) //nolint:bodyclose // websocket owns the response
 	if err != nil {
-		return nil, err
+		return nil, DialError(err, resp)
 	}
 	c.SetReadLimit(defaultReadLimit)
 	return &Conn{conn: c}, nil
+}
+
+// maxRefusalReason bounds how much of a refused upgrade's body DialError
+// keeps. Global's refusals are one sentence; a proxy's error page is not,
+// and a reconnecting client logs the error on every attempt.
+const maxRefusalReason = 512
+
+// DialError returns err, the error websocket.Dial returned with resp,
+// with the reason the server gave for refusing the upgrade. A server
+// answers a refused upgrade with a status and a body that says why (global
+// writes "missing worker token: ..." or {"message":"invalid token"}), but
+// websocket.Dial's error names only the status. The body is appended on
+// one line, its whitespace collapsed, cut at maxRefusalReason bytes. err
+// is returned unchanged when there is no response (the request got no
+// answer) or the body is empty.
+func DialError(err error, resp *http.Response) error {
+	if resp == nil || resp.Body == nil {
+		return err
+	}
+	// On a failed handshake websocket.Dial leaves the body's first
+	// kilobyte readable.
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*maxRefusalReason))
+	reason := strings.Join(strings.Fields(string(body)), " ")
+	if len(reason) > maxRefusalReason {
+		reason = strings.ToValidUTF8(reason[:maxRefusalReason], "")
+	}
+	if reason == "" {
+		return err
+	}
+	return fmt.Errorf("%w; the server said: %s", err, reason)
 }
 
 // Wrap creates a Conn from an existing websocket.Conn.

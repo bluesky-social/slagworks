@@ -142,7 +142,12 @@ connection. A worker that global refuses (an older build across a
 release whose changelog marks a breaking change to the worker protocol
 or its authentication, for example) never sees that build and cannot
 auto-upgrade: install the matching packages on it by hand, as the
-release's breaking-change note says.
+release's breaking-change note says. To find such workers, look in
+global's log: it logs a `refusing site worker connection` warning with
+the `remote_ip` of each worker it refuses before the WebSocket upgrade,
+saying why and what to do. The worker's own `WebSocket disconnected,
+reconnecting` line carries the reason global gave only when the worker
+already runs a build that reads it.
 
 ## Infrastructure required per mode
 

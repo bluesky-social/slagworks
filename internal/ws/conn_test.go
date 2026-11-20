@@ -98,3 +98,56 @@ func TestConnPing(t *testing.T) {
 		t.Fatalf("ping: %v", err)
 	}
 }
+
+// TestDial_RefusalCarriesTheServersReason: a site worker whose connection
+// global refuses logs Dial's error and nothing else, on every reconnect.
+// Global answers a refused upgrade with a status and a sentence that says
+// what is wrong ("missing worker token: send it as Authorization: Bearer
+// <token>"); Dial must not reduce it to the bare status code. A proxy's
+// error page arrives the same way, so the reason is kept to one bounded
+// line.
+func TestDial_RefusalCarriesTheServersReason(t *testing.T) {
+	const reason = "missing worker token: send it as Authorization: Bearer <token>"
+	// An HTML error page longer than the bound: its first part is kept on
+	// one line, and nothing from past the first 512 bytes.
+	page := "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\n" +
+		strings.Repeat("<p>filler</p>\n", 60) + "AFTER-THE-BOUND</body></html>\n"
+	cases := []struct {
+		name    string
+		status  int
+		body    string
+		want    []string
+		notWant []string
+	}{
+		{name: "hub refusal", status: http.StatusUnauthorized, body: reason,
+			want: []string{"401", reason}},
+		{name: "proxy error page", status: http.StatusBadGateway, body: page,
+			want: []string{"502", "<html> <head><title>502 Bad Gateway</title></head> <body> <p>filler</p>"}, notWant: []string{"\n", "AFTER-THE-BOUND"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, tc.body, tc.status)
+			}))
+			defer srv.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			conn, err := Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+			if err == nil {
+				_ = conn.CloseNow()
+				t.Fatalf("Dial succeeded against a server that answers %d", tc.status)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Dial error %q does not contain %q", err, want)
+				}
+			}
+			for _, bad := range tc.notWant {
+				if strings.Contains(err.Error(), bad) {
+					t.Errorf("Dial error %q contains %q", err, bad)
+				}
+			}
+		})
+	}
+}

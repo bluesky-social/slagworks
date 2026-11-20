@@ -27,6 +27,10 @@ func streamDialOptions(token string) *websocket.DialOptions {
 // must present a refreshed one. An error getting the token is returned
 // unchanged.
 //
+// When global refuses the upgrade (an expired token, a group the operator
+// lacks, a parameter it cannot parse), the error carries the reason global
+// gave, not only the status (ws.DialError).
+//
 // Global sends one message per stored row, and the row's size is set
 // upstream, not by coder/websocket's 32 KiB default read limit: a log
 // envelope arrives in a site-worker batch of up to ws.MaxMessageBytes/4,
@@ -35,7 +39,7 @@ func streamDialOptions(token string) *websocket.DialOptions {
 // `machine logs` and stall every reconnecting watch at that row. The limit
 // is therefore ws.MaxMessageBytes, the largest message the site-worker link
 // carries.
-func dialStream(ctx context.Context, url string) (*websocket.Conn, error) {
+func dialStream(ctx context.Context, streamURL string) (*websocket.Conn, error) {
 	token := ""
 	if apiClient != nil {
 		var err error
@@ -43,7 +47,10 @@ func dialStream(ctx context.Context, url string) (*websocket.Conn, error) {
 			return nil, err
 		}
 	}
-	conn, resp, err := websocket.Dial(ctx, url, streamDialOptions(token))
+	conn, resp, err := websocket.Dial(ctx, streamURL, streamDialOptions(token))
+	if err != nil {
+		err = ws.DialError(err, resp)
+	}
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}

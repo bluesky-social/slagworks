@@ -118,6 +118,57 @@ func TestWatchTUIStreams_SendBearerHeader(t *testing.T) {
 	})
 }
 
+// TestStreams_RefusalCarriesGlobalsReason: global refuses a stream upgrade
+// with a status and a body that says why (an expired token, a group the
+// operator lacks, a parameter it cannot parse). Every stream slagctl opens
+// returns that reason, not only the status code.
+func TestStreams_RefusalCarriesGlobalsReason(t *testing.T) {
+	const reason = `{"message":"not authorized: token carries none of the required groups"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, reason, http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+	prevURL, prevClient := apiURL, apiClient
+	apiURL = srv.URL
+	apiClient = slclient.New(slclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(),
+		Bearer: func(context.Context) (string, error) { return "stream-test-token", nil }})
+	t.Cleanup(func() { apiURL, apiClient = prevURL, prevClient })
+
+	streams := []struct {
+		name string
+		open func(ctx context.Context) error
+	}{
+		{"machine logs", func(ctx context.Context) error {
+			return runLogsStream(ctx, ws.LogStreamSubscribeMsg{}, func(slogkit.Envelope, int64) error { return nil }, false)
+		}},
+		{"machine logs --sol", func(ctx context.Context) error {
+			return runConsoleStream(ctx, uuid.NewString(), "", true, false, true)
+		}},
+		{"watch console", func(ctx context.Context) error {
+			return consoleSource(uuid.NewString())(ctx, func([]byte, bool) {}, func() {})
+		}},
+		{"watch logs", func(ctx context.Context) error {
+			var lastSeen int64
+			return streamLogEnvelopes(ctx, uuid.NewString(), uuid.NewString(), time.Time{}, &lastSeen, func(int64, slogkit.Envelope) {})
+		}},
+	}
+	for _, s := range streams {
+		t.Run(s.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := s.open(ctx)
+			if err == nil {
+				t.Fatal("the stream opened against a server that answers 403")
+			}
+			for _, want := range []string{"403", reason} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 func TestOperationWatchPlain_SendsBearerHeader(t *testing.T) {
 	seen := stubStreamServer(t, readOne)
 	devNull, err := os.Open(os.DevNull)
