@@ -2,7 +2,10 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/netbox"
@@ -26,6 +29,14 @@ type ConfigOwnerNetBox interface {
 // has no location). The caller can't route a worker RPC for such a device.
 var ErrNoOwningConfig = fmt.Errorf("no site_config claims this device")
 
+// ErrAmbiguousOwningConfig means more than one site_config claims the
+// device. CheckOverlap refuses such configs when one is created or updated,
+// but a later NetBox edit can still produce them: moving one claimed
+// location under another on the same site nests the two scopes. The caller
+// can't route a worker RPC for such a device until an operator restores the
+// location tree or narrows a config.
+var ErrAmbiguousOwningConfig = errors.New("more than one site_config claims this device")
+
 // ResolveOwningConfigSlug maps a NetBox device to the slug of the
 // site_config (= the site-worker identity) that claims it. This is the
 // authoritative "which worker owns this device" resolver: worker RPC
@@ -38,9 +49,10 @@ var ErrNoOwningConfig = fmt.Errorf("no site_config claims this device")
 //
 // The device's NetBox site (dev.Site.Slug) selects the candidate configs;
 // each candidate's Scope is resolved against the site's location tree and
-// the unique one whose Scope.ClaimsDevice(dev) holds wins. CheckOverlap
-// guarantees at most one config claims any device, so a match is
-// unambiguous. Returns ErrNoOwningConfig if none claims it.
+// the unique one whose Scope.ClaimsDevice(dev) holds wins. Returns
+// ErrNoOwningConfig if none claims it, and ErrAmbiguousOwningConfig if
+// several do: picking one would make the answer depend on the order the
+// store lists configs in, which Postgres does not fix.
 func ResolveOwningConfigSlug(ctx context.Context, nb ConfigOwnerNetBox, st ConfigOwnerStore, dev netbox.Device) (string, error) {
 	if dev.Site == nil || dev.Site.Slug == "" {
 		return "", fmt.Errorf("device has no NetBox site")
@@ -79,6 +91,7 @@ func ResolveOwningConfigSlug(ctx context.Context, nb ConfigOwnerNetBox, st Confi
 		}
 	}
 
+	var claimers []string
 	for _, cfg := range configs {
 		scope, err := resolveScope(cfg, nbSite, locations)
 		if err != nil {
@@ -88,10 +101,18 @@ func ResolveOwningConfigSlug(ctx context.Context, nb ConfigOwnerNetBox, st Confi
 			continue
 		}
 		if scope.ClaimsDevice(dev) {
-			return cfg.Slug, nil
+			claimers = append(claimers, cfg.Slug)
 		}
 	}
-	return "", ErrNoOwningConfig
+	switch len(claimers) {
+	case 0:
+		return "", ErrNoOwningConfig
+	case 1:
+		return claimers[0], nil
+	}
+	slices.Sort(claimers)
+	return "", fmt.Errorf("%w: NetBox device %d is claimed by site_configs %s, whose scopes now overlap (typically a NetBox location was moved under another); move the location back in NetBox, or narrow or delete all but one of these configs",
+		ErrAmbiguousOwningConfig, dev.ID, strings.Join(claimers, ", "))
 }
 
 // Scope is the resolved NetBox scope of a SiteConfig: which NetBox site
@@ -176,10 +197,76 @@ func resolveScope(cfg model.SiteConfig, siteSlug string, locations []netbox.Loca
 	return s, nil
 }
 
+// resolveClaimScope is resolveScope for the paths that act on a config's
+// claim (the snapshot builder and the reconciler): it also re-checks the
+// partition invariant (ruling 2) against the current location tree.
+// CheckOverlap runs only when a config is created or updated, so a NetBox
+// edit made afterwards can still break the invariant without touching
+// site_configs: moving one claimed location under another on the same site
+// nests the two scopes, and both configs then claim the inner location's
+// devices. Building either config would put those devices in two workers'
+// snapshots, so an overlapping config fails here like a stale one until an
+// operator restores the location tree or narrows a config. Both configs
+// fail, not just the outer one: the move may be the first step of folding
+// one config's location into the other's, and only the operator knows which
+// config should own the devices.
+//
+// siblings is the candidate set of other configs; cfg's own row (by slug)
+// and configs on other NetBox sites are skipped. A sibling whose scope no
+// longer resolves is skipped too: it is stale, claims nothing, and is
+// surfaced on its own. (CheckOverlap instead refuses a candidate next to a
+// stale config, because an operator is present to fix it; here that would
+// let one stale config stop its healthy siblings from building.)
+func resolveClaimScope(cfg model.SiteConfig, siblings []model.SiteConfig, locations []netbox.Location) (Scope, error) {
+	scope, err := resolveScope(cfg, cfg.NetBoxSite, locations)
+	if err != nil {
+		return Scope{}, err
+	}
+	var overlaps []string
+	for _, sib := range siblings {
+		if sib.Slug == cfg.Slug || sib.NetBoxSite != cfg.NetBoxSite {
+			continue
+		}
+		sibScope, err := resolveScope(sib, sib.NetBoxSite, locations)
+		if err != nil {
+			continue
+		}
+		if scopesOverlap(scope, sibScope) {
+			overlaps = append(overlaps, fmt.Sprintf("site_config %q (%s)", sib.Slug, scopeName(sibScope)))
+		}
+	}
+	if len(overlaps) > 0 {
+		slices.Sort(overlaps)
+		return Scope{}, fmt.Errorf("site_config %q (%s) overlaps %s on NetBox site %s: they claim the same devices, so none of their snapshots is built; move the location back in NetBox, or narrow or delete configs until none overlap",
+			cfg.Slug, scopeName(scope), strings.Join(overlaps, ", "), cfg.NetBoxSite)
+	}
+	return scope, nil
+}
+
+// scopesOverlap reports whether two scopes on the same NetBox site can claim
+// the same device: a whole-site scope claims every device, and two location
+// scopes overlap iff either subtree contains the other's root location.
+func scopesOverlap(a, b Scope) bool {
+	if a.WholeSite() || b.WholeSite() {
+		return true
+	}
+	return a.SubtreeIDs[b.LocationID] || b.SubtreeIDs[a.LocationID]
+}
+
+// scopeName describes a scope for an operator-facing error.
+func scopeName(s Scope) string {
+	if s.WholeSite() {
+		return "whole site"
+	}
+	return "location " + s.LocationSlug
+}
+
 // CheckOverlap reports an error if the candidate config would overlap
 // any existing config over the same NetBox site, where overlap means
 // the two configs could claim the same device (ruling 2, the
-// create/update half of the partition invariant). Cases:
+// create/update half of the partition invariant; resolveClaimScope
+// re-checks it on every snapshot build and reconcile, because a later
+// NetBox edit can nest two admitted locations). Cases:
 //
 //   - Either config is whole-site: a whole-site config claims every
 //     device in the site, so it overlaps any other config on that site.
@@ -223,7 +310,7 @@ func CheckOverlap(candidate model.SiteConfig, existing []model.SiteConfig, locat
 		}
 		// Both location-scoped: overlap iff either subtree contains the
 		// other's root location.
-		if candScope.SubtreeIDs[eScope.LocationID] || eScope.SubtreeIDs[candScope.LocationID] {
+		if scopesOverlap(candScope, eScope) {
 			return fmt.Errorf("config %q (location %s) overlaps existing config %q (location %s): one location is the same as or nested within the other",
 				candidate.Slug, candidate.NetBoxLocation, e.Slug, e.NetBoxLocation)
 		}

@@ -351,7 +351,18 @@ Fields:
 - **`netbox_location`** — optional NetBox location slug. When set, the
   config claims only devices in that location and its child locations,
   so several configs can split one NetBox site. Configs on the same site
-  may not overlap.
+  may not overlap: create and update refuse a config whose location is
+  the same as, or nested with, another config's. Moving a location in
+  NetBox can still nest two configured locations afterwards. Global then
+  refuses both configs, as it does a config whose location is gone: it
+  stops building their snapshots, so their workers keep serving the last
+  one, and lists both under `stale_sites` in `/healthz`
+  (`slagworks_site_stale` is 1). Deploy and commission preflight for
+  their machines fails, and power status, boot status and outlet power
+  for a device both configs claim fail with an error naming the configs.
+  Move the location back in NetBox, or narrow or delete one of the
+  configs; the next reconcile (every five minutes) clears the flags and
+  rebuilds the configs that remain.
 - **`ephemeral_pool_start`**, **`ephemeral_pool_end`** — the fabric DHCP
   pool. Required, IPv4, start no greater than end.
 - **`relay_pools`** — pools for subnets reached through a DHCP relay,

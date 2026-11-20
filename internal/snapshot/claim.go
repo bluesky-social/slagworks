@@ -29,11 +29,14 @@ type claimLocationReader interface {
 // holds the cfg it iterates), and the webhook + commission paths, which see a
 // raw device with no pre-scoping, route through here.
 //
-// A device is claimed by at most one config: CheckOverlap enforces disjoint
-// claims over a shared netbox_site. The resolver still returns a slice so the
-// "claimed by none" case (unmanaged site, or an unclaimed location of a
-// managed site) is the natural empty result, and a future relaxation of the
-// overlap rule doesn't need a signature change.
+// CheckOverlap keeps claims over a shared netbox_site disjoint when configs
+// are created or updated, but a later NetBox edit that moves one claimed
+// location under another leaves a device claimed by both configs until an
+// operator repairs it. The resolver then returns every claimer, so callers
+// that invalidate or mirror reach both; the snapshot builder and reconciler
+// refuse such configs (resolveClaimScope), so neither config's snapshot is
+// rebuilt meanwhile. The empty result is the "claimed by none" case
+// (unmanaged site, or an unclaimed location of a managed site).
 type ClaimResolver struct {
 	nb claimLocationReader
 	st claimConfigLister
