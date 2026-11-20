@@ -43,8 +43,11 @@ import (
 //     up (conditional clear — the re-wipe-window fix).
 //   - failedOps: opID -> failed marker; blocks UpdateOpPhase after terminal
 //     failure. Local, preserved across stream applies, and keeps the op's
-//     Status failed against a delta or resync that still shows it active
-//     (keepLocalFailure) until op_removed clears it.
+//     Status failed until op_removed clears it: against a delta or resync
+//     that still shows it active (keepLocalFailure), and against the
+//     executor's claim bookkeeping (markClaimAttempt, rollBackClaim,
+//     setStatus), which can still be under way for an op the agent failed
+//     on the pending-op boot clause.
 //   - phaseStart: opID -> phase timing, for phase-duration logging. Local.
 //   - phoneHomed: deploy op IDs that phone-homed LOCALLY (RecordPhoneHome).
 //     A resync or delta that brings the op back as claimed-deploying must
@@ -1159,11 +1162,14 @@ func (o *opState) activeBootingOpForMachine(machineID uuid.UUID) *model.Operatio
 
 // --- Op mutators (write under mu.Lock) ---
 
-// setStatus sets an op's status in-place (no-op if the op is absent).
+// setStatus sets an op's status in-place (no-op if the op is absent). An op
+// the agent failed keeps its failed status until op_removed (see the
+// failedOps field): the executor's running mark after a late claim grant
+// must not make it active again.
 func (o *opState) setStatus(opID string, status model.OperationStatus) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if op, ok := o.ops[opID]; ok {
+	if op, ok := o.ops[opID]; ok && !o.failedOps[opID] {
 		op.Status = status
 	}
 }
@@ -1171,12 +1177,13 @@ func (o *opState) setStatus(opID string, status model.OperationStatus) {
 // markClaimAttempt marks an op claimed locally as the executor sends a claim
 // for it, so the pending readers stop returning it, and forgets any earlier
 // unanswered claim: this attempt's outcome now decides, and rollBackClaim
-// records it again if it goes unanswered too.
+// records it again if it goes unanswered too. An op the agent failed keeps
+// its failed status (see the failedOps field).
 func (o *opState) markClaimAttempt(opID string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	delete(o.claimUnanswered, opID)
-	if op, ok := o.ops[opID]; ok {
+	if op, ok := o.ops[opID]; ok && !o.failedOps[opID] {
 		op.Status = model.OpClaimed
 	}
 }
@@ -1185,13 +1192,18 @@ func (o *opState) markClaimAttempt(opID string) {
 // back to pending so the pending readers return the op for a retry, and
 // records the claim as unanswered so reclaimableOps returns the op if
 // global's claimed row replaces that mark first. A no-op for an op that
-// ended while the claim was in flight (op_removed left its tombstone). An op
-// a resync merely omitted meanwhile (its machine left the site's scope) has
-// no row to roll back but keeps the record, for when the row comes back.
+// ended while the claim was in flight: op_removed left its tombstone, or
+// the agent, running on the pending-op boot clause, failed the op (see the
+// failedOps field), which leaves nothing to retry. An op a resync merely
+// omitted meanwhile (its machine left the site's scope) has no row to roll
+// back but keeps the record, for when the row comes back.
 func (o *opState) rollBackClaim(opID string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if _, ended := o.tombstones[opID]; ended {
+		return
+	}
+	if o.failedOps[opID] {
 		return
 	}
 	o.claimUnanswered[opID] = true
@@ -1203,7 +1215,8 @@ func (o *opState) rollBackClaim(opID string) {
 // markFailed marks an op failed, clears its phase timing, and (if present)
 // sets its in-memory Status/Phase. Once marked failed, updatePhase for this
 // op is rejected — this prevents phase progression after terminal failure —
-// and stream applies keep it failed until op_removed (keepLocalFailure).
+// and stream applies (keepLocalFailure) and the executor's status writes
+// keep it failed until op_removed.
 func (o *opState) markFailed(opID, phase string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()

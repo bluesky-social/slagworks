@@ -586,7 +586,10 @@ started, and a snapshot applied while earlier ops held the BMC can drop
 this machine (it moved to another site). The executor leaves such an op
 unclaimed and pending for the site that owns the machine now, rather
 than winning a claim it must then fail or having the hub's membership
-check decline it. Then:
+check decline it. It also leaves unclaimed an op whose agent has
+reported it failed since the pass began (a host can run the agent on
+the pending-op boot clause before any claim lands; see
+[Timeouts](#timeouts-and-phase-based-expiration)). Then:
 
 1. `Cache.MarkOpClaimed` locally in the cache first (line 120).
    This prevents the next 5-second tick re-driving the same op.
@@ -644,11 +647,15 @@ abort, a NetBox drift fail or a timeout sweep can therefore land an
 `op_removed` for the op while the executor is inside a BMC round trip.
 Before each write to the host or its BMC (the PXE or boot-device arm, the
 power action, `bmc_reconcile`'s account pass and its time pass) the
-executor re-reads the op layer (`Executor.opRemoved`); if the op is gone
+executor re-reads the op layer (`Executor.opEnded`); if the op is gone
 it stops there and reports nothing, since global already holds the
-terminal row. An `op_removed` that lands after a write does not undo it:
-a lifecycle op aborted just after its power cycle still reboots the host,
-which then boots from disk (`BootLocal`: no active op authorizes it).
+terminal row. It stops the same way when the agent has reported a
+lifecycle op failed (see
+[Timeouts](#timeouts-and-phase-based-expiration)): that failure is
+already queued for global. An `op_removed` that lands after a write
+does not undo it: a lifecycle op aborted just after its power cycle
+still reboots the host, which then boots from disk (`BootLocal`: no
+active op authorizes it).
 
 ### Complete
 
@@ -797,6 +804,17 @@ worker keeps such an op failed (`keepLocalFailure` in
 again and reports for the op are refused as terminal. When the failure
 never reached global, the op stays active there until a timeout sweep
 fails it.
+
+The executor's own bookkeeping holds the failure too. The agent can fail
+a deploy the executor has not finished claiming: a host that PXEs while
+the deploy is pending runs the agent on the pending-op boot clause, and
+the claim RPC can wait out its 30-second deadline on a global that is
+not answering. The claim attempt, the rollback of an unanswered claim
+and the running mark after a granted claim all leave a failed op failed;
+`executeOp` does not claim an op the agent failed after the pass built
+its pending list; and the check before each host write
+(`Executor.opEnded`) stops on the failure as it does on `op_removed`.
+Tests: `executor_agent_failure_test.go`.
 
 Each sweep fails its ops one transaction at a time and keeps going past
 a per-op error, returning both the ops it failed and the joined error.

@@ -668,7 +668,10 @@ unanswered, see below). Per-op:
 
 - Skip the op, unclaimed, if its machine has left the view since the
   pass built its pending list (a snapshot applied while earlier ops
-  held the BMC).
+  held the BMC), or if its agent has reported it failed since then (a
+  host can run the agent on the pending-op boot clause before any
+  claim lands). The worker holds an agent's failure until `op_removed`,
+  and none of the steps below writes over it.
 - `MarkOpClaimed` locally in the cache first (line 120) to prevent
   the next tick re-driving.
 - WS `claimOp` RPC (`Claimer` interface, implemented by
