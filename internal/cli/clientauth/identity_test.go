@@ -55,20 +55,21 @@ func TestDecodeIdentity_NotAJWT(t *testing.T) {
 }
 
 func TestConfigValidate(t *testing.T) {
-	good := Config{AppName: "slagctl", Issuer: "https://x/", ClientID: "cid", LoopbackPort: 8766}
+	good := Config{AppName: "slagctl", API: "https://api/", Issuer: "https://x/", ClientID: "cid", LoopbackPort: 8766}
 	if err := good.validate(); err != nil {
 		t.Errorf("valid config rejected: %v", err)
 	}
 	// device flow doesn't need a loopback port
-	dev := Config{AppName: "slagctl", Issuer: "https://x/", ClientID: "cid", Device: true}
+	dev := Config{AppName: "slagctl", API: "https://api/", Issuer: "https://x/", ClientID: "cid", Device: true}
 	if err := dev.validate(); err != nil {
 		t.Errorf("valid device config rejected: %v", err)
 	}
 	for _, bad := range []Config{
-		{Issuer: "https://x/", ClientID: "c", LoopbackPort: 1}, // no AppName
-		{AppName: "d", ClientID: "c", LoopbackPort: 1},         // no Issuer
-		{AppName: "d", Issuer: "https://x/", LoopbackPort: 1},  // no ClientID
-		{AppName: "d", Issuer: "https://x/", ClientID: "c"},    // loopback, no port
+		{API: "https://api/", Issuer: "https://x/", ClientID: "c", LoopbackPort: 1}, // no AppName
+		{AppName: "d", Issuer: "https://x/", ClientID: "c", LoopbackPort: 1},        // no API
+		{AppName: "d", API: "https://api/", ClientID: "c", LoopbackPort: 1},         // no Issuer
+		{AppName: "d", API: "https://api/", Issuer: "https://x/", LoopbackPort: 1},  // no ClientID
+		{AppName: "d", API: "https://api/", Issuer: "https://x/", ClientID: "c"},    // loopback, no port
 	} {
 		if err := bad.validate(); err == nil {
 			t.Errorf("expected validation error for %+v", bad)
@@ -83,7 +84,7 @@ func TestCachedTokenLifecycle(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", "")
-	cfg := Config{AppName: "slagctl", Issuer: "https://issuer.invalid/", ClientID: "cid", LoopbackPort: 8765}
+	cfg := Config{AppName: "slagctl", API: "https://api.invalid", Issuer: "https://issuer.invalid/", ClientID: "cid", LoopbackPort: 8765}
 	wantPath := filepath.Join(home, ".config", "slagctl", "token.json")
 
 	if _, err := CachedIdentity(cfg); err == nil {

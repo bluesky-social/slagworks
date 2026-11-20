@@ -39,9 +39,14 @@ func writeTokenCache(t *testing.T, configHome, username string) string {
 	}
 	jwt := "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".sig"
 	tok, err := json.Marshal(map[string]any{
-		"access_token": jwt,
-		"token_type":   "Bearer",
-		"expiry":       time.Now().Add(time.Hour).Format(time.RFC3339),
+		"api":       "https://slagworks.example",
+		"issuer":    "https://idp.example/",
+		"client_id": "slagctl",
+		"token": map[string]any{
+			"access_token": jwt,
+			"token_type":   "Bearer",
+			"expiry":       time.Now().Add(time.Hour).Format(time.RFC3339),
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -191,8 +196,11 @@ func TestDoctorTokenCheckWithExpiredAccessToken(t *testing.T) {
 		for name, v := range map[string]any{
 			"config.json": map[string]string{"api": api.URL, "oidc_issuer": idp.URL, "oidc_client_id": "slagctl"},
 			"token.json": map[string]any{
-				"access_token": jwt(expired), "refresh_token": refreshToken,
-				"token_type": "Bearer", "expiry": expired.Format(time.RFC3339),
+				"api": api.URL, "issuer": idp.URL, "client_id": "slagctl",
+				"token": map[string]any{
+					"access_token": jwt(expired), "refresh_token": refreshToken,
+					"token_type": "Bearer", "expiry": expired.Format(time.RFC3339),
+				},
 			},
 		} {
 			b, err := json.Marshal(v)

@@ -71,16 +71,17 @@ func Logout(ctx context.Context, cfg Config) error {
 }
 
 // WriteCachedToken persists a freshly-obtained token to the app's default cache
-// location (used by `auth login`). Bearer() handles caching on its own login
-// path; this is the explicit-login entrypoint. It waits for a refresh in flight
-// in another invocation, which would otherwise overwrite the new token with the
-// refreshed old session.
+// location (used by `auth login`), recording cfg's API, issuer and client as
+// what it was issued for. Bearer() handles caching on its own login path; this
+// is the explicit-login entrypoint. It waits for a refresh in flight in another
+// invocation, which would otherwise overwrite the new token with the refreshed
+// old session.
 func WriteCachedToken(ctx context.Context, cfg Config, tok *oauth2.Token) error {
 	path, err := defaultTokenPath(cfg.AppName)
 	if err != nil {
 		return err
 	}
-	return storeToken(ctx, path, tok)
+	return storeToken(ctx, path, session{binding: cfg.binding(), Token: tok})
 }
 
 // CachedIdentity loads the cached access token and decodes its identity for
@@ -92,14 +93,14 @@ func CachedIdentity(cfg Config) (*Identity, error) {
 	if err != nil {
 		return nil, err
 	}
-	tok, err := readCache(path)
+	s, err := readCache(path)
 	if err != nil {
 		return nil, fmt.Errorf("not logged in (no cached token): %w", err)
 	}
-	id, err := DecodeIdentity(tok.AccessToken)
+	id, err := DecodeIdentity(s.Token.AccessToken)
 	if err != nil {
 		return nil, err
 	}
-	id.Refreshable = tok.RefreshToken != ""
+	id.Refreshable = s.Token.RefreshToken != ""
 	return id, nil
 }

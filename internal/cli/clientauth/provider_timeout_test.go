@@ -109,8 +109,8 @@ func seedExpiredSession(t *testing.T, cfg Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeCache(path, &oauth2.Token{AccessToken: "at-0", RefreshToken: "rt-0", TokenType: "Bearer",
-		Expiry: time.Now().Add(-time.Minute)}); err != nil {
+	if err := writeCache(path, session{binding: cfg.binding(), Token: &oauth2.Token{AccessToken: "at-0", RefreshToken: "rt-0", TokenType: "Bearer",
+		Expiry: time.Now().Add(-time.Minute)}}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -144,7 +144,7 @@ func TestCachedBearer_RefreshGetsNoAnswer(t *testing.T) {
 	shortProviderTimeout(t)
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	idp := newWedgedProvider(t, pathToken)
-	cfg := Config{AppName: "slagctl", Issuer: idp.URL, ClientID: "c", LoopbackPort: 8765}
+	cfg := Config{AppName: "slagctl", API: "https://api.example", Issuer: idp.URL, ClientID: "c", LoopbackPort: 8765}
 	seedExpiredSession(t, cfg)
 
 	expectNoAnswer(t, idp.URL, func() error {
@@ -163,7 +163,7 @@ func TestBearer_DiscoveryGetsNoAnswer(t *testing.T) {
 	shortProviderTimeout(t)
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	idp := newWedgedProvider(t, pathDiscovery, pathToken)
-	cfg := Config{AppName: "slagctl", Issuer: idp.URL, ClientID: "c", Device: true, Stderr: io.Discard}
+	cfg := Config{AppName: "slagctl", API: "https://api.example", Issuer: idp.URL, ClientID: "c", Device: true, Stderr: io.Discard}
 	seedExpiredSession(t, cfg)
 
 	expectNoAnswer(t, idp.URL, func() error {
@@ -180,7 +180,7 @@ func TestBearer_RefreshGetsNoAnswerStartsNoLogin(t *testing.T) {
 	shortProviderTimeout(t)
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	idp := newWedgedProvider(t, pathToken)
-	cfg := Config{AppName: "slagctl", Issuer: idp.URL, ClientID: "c", Device: true, Stderr: io.Discard}
+	cfg := Config{AppName: "slagctl", API: "https://api.example", Issuer: idp.URL, ClientID: "c", Device: true, Stderr: io.Discard}
 	seedExpiredSession(t, cfg)
 
 	expectNoAnswer(t, idp.URL, func() error {
@@ -197,7 +197,7 @@ func TestBearer_RefreshGetsNoAnswerStartsNoLogin(t *testing.T) {
 func TestLogin_DeviceAuthorizationGetsNoAnswer(t *testing.T) {
 	shortProviderTimeout(t)
 	idp := newWedgedProvider(t, pathDevice)
-	cfg := Config{AppName: "slagctl", Issuer: idp.URL, ClientID: "c", Device: true, Stderr: io.Discard}
+	cfg := Config{AppName: "slagctl", API: "https://api.example", Issuer: idp.URL, ClientID: "c", Device: true, Stderr: io.Discard}
 
 	expectNoAnswer(t, idp.URL, func() error {
 		_, err := Login(context.Background(), cfg)
@@ -241,7 +241,7 @@ func TestLogin_CodeExchangeGetsNoAnswer(t *testing.T) {
 			}
 		}
 	}()
-	cfg := Config{AppName: "slagctl", Issuer: idp.URL, ClientID: "c", LoopbackPort: port, Stderr: promptWriter}
+	cfg := Config{AppName: "slagctl", API: "https://api.example", Issuer: idp.URL, ClientID: "c", LoopbackPort: port, Stderr: promptWriter}
 
 	expectNoAnswer(t, idp.URL, func() error {
 		_, err := Login(context.Background(), cfg)

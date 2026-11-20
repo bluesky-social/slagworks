@@ -22,6 +22,12 @@ func tokenPath(t *testing.T) string {
 	return filepath.Join(t.TempDir(), "slagctl", "token.json")
 }
 
+// testBinding is what the tests below bind their sessions to where the
+// binding itself is not under test.
+var testBinding = binding{API: "https://api.example", Issuer: "https://idp.example/", ClientID: "test"}
+
+func testSession(tok *oauth2.Token) session { return session{binding: testBinding, Token: tok} }
+
 func TestCacheRoundTripAndPerms(t *testing.T) {
 	path := tokenPath(t)
 	tok := &oauth2.Token{
@@ -30,7 +36,7 @@ func TestCacheRoundTripAndPerms(t *testing.T) {
 		Expiry:       time.Now().Add(time.Hour),
 		TokenType:    "Bearer",
 	}
-	if err := writeCache(path, tok); err != nil {
+	if err := writeCache(path, testSession(tok)); err != nil {
 		t.Fatalf("writeCache: %v", err)
 	}
 	// file perms 0600, dir perms 0700
@@ -49,7 +55,7 @@ func TestCacheRoundTripAndPerms(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readCache: %v", err)
 	}
-	if got.AccessToken != "at-1" || got.RefreshToken != "rt-1" {
+	if got.Token.AccessToken != "at-1" || got.Token.RefreshToken != "rt-1" || got.binding != testBinding {
 		t.Errorf("round-trip mismatch: %+v", got)
 	}
 }
@@ -76,15 +82,15 @@ func TestReadCache_ExpiryFromAccessToken(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := tokenPath(t)
-			if err := writeCache(path, &tc.tok); err != nil {
+			if err := writeCache(path, testSession(&tc.tok)); err != nil {
 				t.Fatal(err)
 			}
 			got, err := readCache(path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !got.Expiry.Equal(tc.want) {
-				t.Errorf("Expiry = %v, want %v", got.Expiry, tc.want)
+			if !got.Token.Expiry.Equal(tc.want) {
+				t.Errorf("Expiry = %v, want %v", got.Token.Expiry, tc.want)
 			}
 		})
 	}
@@ -96,9 +102,31 @@ func TestReadCacheMissing(t *testing.T) {
 	}
 }
 
+// TestCachedBearer_BareTokenIsNoSession: a cache holding a bare token, with
+// no record of what it was issued for (the layout before the cache recorded
+// one), cannot be tied to any server, so it is never handed out.
+func TestCachedBearer_BareTokenIsNoSession(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg := Config{AppName: "slagctl", API: testBinding.API, Issuer: testBinding.Issuer, ClientID: testBinding.ClientID, LoopbackPort: 8765}
+	path, err := defaultTokenPath(cfg.AppName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bare := `{"access_token":"at-bare","refresh_token":"rt-bare","token_type":"Bearer","expiry":"` + time.Now().Add(time.Hour).Format(time.RFC3339) + `"}`
+	if err := os.WriteFile(path, []byte(bare), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := CachedBearer(context.Background(), cfg); err == nil {
+		t.Fatalf("CachedBearer handed out %q from a cache that does not say what it was issued for", got)
+	}
+}
+
 func TestDeleteCache(t *testing.T) {
 	path := tokenPath(t)
-	_ = writeCache(path, &oauth2.Token{AccessToken: "x", Expiry: time.Now().Add(time.Hour)})
+	_ = writeCache(path, testSession(&oauth2.Token{AccessToken: "x", Expiry: time.Now().Add(time.Hour)}))
 	if err := deleteCache(path); err != nil {
 		t.Fatalf("deleteCache: %v", err)
 	}
@@ -117,7 +145,7 @@ func TestDeleteCache(t *testing.T) {
 // already queued on the old inode) still believes it is exclusive.
 func TestDeleteCache_LockStillExcludes(t *testing.T) {
 	path := tokenPath(t)
-	if err := writeCache(path, &oauth2.Token{AccessToken: "x", Expiry: time.Now().Add(time.Hour)}); err != nil {
+	if err := writeCache(path, testSession(&oauth2.Token{AccessToken: "x", Expiry: time.Now().Add(time.Hour)})); err != nil {
 		t.Fatal(err)
 	}
 	holder := flock.New(path + ".lock")
@@ -204,11 +232,11 @@ func TestPersistingTokenSource_RefreshAndWriteBack(t *testing.T) {
 		Expiry:       time.Now().Add(-time.Minute), // expired
 		TokenType:    "Bearer",
 	}
-	if err := writeCache(path, expired); err != nil {
+	if err := writeCache(path, testSession(expired)); err != nil {
 		t.Fatal(err)
 	}
 
-	ts := newPersistingTokenSource(context.Background(), fe.srv.URL, fe.config(), path)
+	ts := newPersistingTokenSource(context.Background(), fe.config(), testBinding, path)
 	tok, err := ts.Token()
 	if err != nil {
 		t.Fatalf("Token(): %v", err)
@@ -216,16 +244,19 @@ func TestPersistingTokenSource_RefreshAndWriteBack(t *testing.T) {
 	if tok.AccessToken != "at-refreshed" {
 		t.Errorf("access token = %q, want at-refreshed", tok.AccessToken)
 	}
-	// the rotated refresh token must be persisted
+	// the rotated refresh token must be persisted, still bound to its server
 	onDisk, err := readCache(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if onDisk.RefreshToken != "rt-1-next" {
-		t.Errorf("on-disk refresh token = %q, want rt-1-next (rotation not persisted)", onDisk.RefreshToken)
+	if onDisk.Token.RefreshToken != "rt-1-next" {
+		t.Errorf("on-disk refresh token = %q, want rt-1-next (rotation not persisted)", onDisk.Token.RefreshToken)
 	}
-	if onDisk.AccessToken != "at-refreshed" {
-		t.Errorf("on-disk access token = %q, want at-refreshed", onDisk.AccessToken)
+	if onDisk.Token.AccessToken != "at-refreshed" {
+		t.Errorf("on-disk access token = %q, want at-refreshed", onDisk.Token.AccessToken)
+	}
+	if onDisk.binding != testBinding {
+		t.Errorf("on-disk binding = %+v, want %+v", onDisk.binding, testBinding)
 	}
 }
 
@@ -241,9 +272,9 @@ func TestPersistingTokenSource_ValidTokenNoRefresh(t *testing.T) {
 		Expiry:       time.Now().Add(time.Hour),
 		TokenType:    "Bearer",
 	}
-	_ = writeCache(path, valid)
+	_ = writeCache(path, testSession(valid))
 
-	ts := newPersistingTokenSource(context.Background(), fe.srv.URL, fe.config(), path)
+	ts := newPersistingTokenSource(context.Background(), fe.config(), testBinding, path)
 	tok, err := ts.Token()
 	if err != nil {
 		t.Fatal(err)
@@ -270,9 +301,9 @@ func TestPersistingTokenSource_RefreshErrorPreservesCache(t *testing.T) {
 		Expiry:       time.Now().Add(-time.Minute),
 		TokenType:    "Bearer",
 	}
-	_ = writeCache(path, expired)
+	_ = writeCache(path, testSession(expired))
 
-	ts := newPersistingTokenSource(context.Background(), fe.srv.URL, fe.config(), path)
+	ts := newPersistingTokenSource(context.Background(), fe.config(), testBinding, path)
 	if _, err := ts.Token(); err == nil {
 		t.Fatal("expected refresh error for a consumed refresh token")
 	}
@@ -281,8 +312,8 @@ func TestPersistingTokenSource_RefreshErrorPreservesCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cache should still be readable: %v", err)
 	}
-	if onDisk.RefreshToken != "rt-dead" || onDisk.AccessToken != "at-old" {
-		t.Errorf("cache was modified on failed refresh: %+v", onDisk)
+	if onDisk.Token.RefreshToken != "rt-dead" || onDisk.Token.AccessToken != "at-old" {
+		t.Errorf("cache was modified on failed refresh: %+v", onDisk.Token)
 	}
 }
 
@@ -294,12 +325,12 @@ func TestPersistingTokenSource_ConcurrentRefreshSingleRotation(t *testing.T) {
 	fe := newFakeTokenEndpoint()
 	defer fe.close()
 	path := tokenPath(t)
-	_ = writeCache(path, &oauth2.Token{
+	_ = writeCache(path, testSession(&oauth2.Token{
 		AccessToken:  "at-old",
 		RefreshToken: "rt-1",
 		Expiry:       time.Now().Add(-time.Minute),
 		TokenType:    "Bearer",
-	})
+	}))
 
 	const n = 8
 	var wg sync.WaitGroup
@@ -309,7 +340,7 @@ func TestPersistingTokenSource_ConcurrentRefreshSingleRotation(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			ts := newPersistingTokenSource(context.Background(), fe.srv.URL, fe.config(), path)
+			ts := newPersistingTokenSource(context.Background(), fe.config(), testBinding, path)
 			toks[i], errs[i] = ts.Token()
 		}(i)
 	}
@@ -414,16 +445,16 @@ func newGatedProvider(t *testing.T) *gatedProvider {
 // the token endpoint, i.e. while the refresher holds the cache lock.
 func (p *gatedProvider) startRefresh(t *testing.T, path string) <-chan error {
 	t.Helper()
-	if err := writeCache(path, &oauth2.Token{
+	if err := writeCache(path, testSession(&oauth2.Token{
 		AccessToken: "old-session-at1", RefreshToken: "old-session-rt1",
 		TokenType: "Bearer", Expiry: time.Now().Add(-time.Minute),
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	oc := &oauth2.Config{ClientID: "cid", Endpoint: oauth2.Endpoint{TokenURL: p.srv.URL + "/token"}}
 	done := make(chan error, 1)
 	go func() {
-		_, err := newPersistingTokenSource(context.Background(), p.srv.URL, oc, path).Token()
+		_, err := newPersistingTokenSource(context.Background(), oc, testBinding, path).Token()
 		done <- err
 	}()
 	select {
@@ -488,7 +519,7 @@ func TestLogout_WaitsForInFlightRefresh(t *testing.T) {
 		t.Fatalf("Logout: %v", err)
 	}
 	if onDisk, err := readCache(path); err == nil {
-		t.Fatalf("token cache is back after logout: refresh token %q is on disk", onDisk.RefreshToken)
+		t.Fatalf("token cache is back after logout: refresh token %q is on disk", onDisk.Token.RefreshToken)
 	}
 }
 
@@ -516,8 +547,8 @@ func TestWriteCachedToken_WaitsForInFlightRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if onDisk.RefreshToken != "new-session-rt" {
-		t.Fatalf("after login the cache holds %q, want the new login's new-session-rt", onDisk.RefreshToken)
+	if onDisk.Token.RefreshToken != "new-session-rt" {
+		t.Fatalf("after login the cache holds %q, want the new login's new-session-rt", onDisk.Token.RefreshToken)
 	}
 }
 
@@ -528,7 +559,7 @@ func TestWriteCachedToken_WaitsForInFlightRefresh(t *testing.T) {
 func TestBearer_LoginWaitsForInFlightRefresh(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	p := newGatedProvider(t)
-	cfg := Config{AppName: "slagctl", Issuer: p.srv.URL, ClientID: "cid", Device: true, Stderr: io.Discard}
+	cfg := Config{AppName: "slagctl", API: "https://api.example", Issuer: p.srv.URL, ClientID: "cid", Device: true, Stderr: io.Discard}
 	path, err := defaultTokenPath(cfg.AppName)
 	if err != nil {
 		t.Fatal(err)
@@ -556,8 +587,84 @@ func TestBearer_LoginWaitsForInFlightRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if onDisk.RefreshToken != "new-session-rt" {
-		t.Fatalf("after Bearer's login the cache holds %q, want the new login's new-session-rt", onDisk.RefreshToken)
+	if onDisk.Token.RefreshToken != "new-session-rt" {
+		t.Fatalf("after Bearer's login the cache holds %q, want the new login's new-session-rt", onDisk.Token.RefreshToken)
+	}
+	if onDisk.binding != cfg.binding() {
+		t.Fatalf("Bearer's login is cached as issued for %+v, want %+v", onDisk.binding, cfg.binding())
+	}
+}
+
+// TestBearer_RefreshNeverReturnsAnotherServersSession: a command against
+// server A finds A's access token expired and, while it runs OIDC discovery
+// before taking the cache lock to refresh, `auth login --api B` completes in
+// another invocation. Under the lock the cache holds B's fresh session. The
+// command must not hand B's token to A, refresh it with A's provider, or
+// replace it with a login of its own.
+func TestBearer_RefreshNeverReturnsAnotherServersSession(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	var cfgA, cfgB Config
+	var mu sync.Mutex
+	var refreshes []string // refresh tokens A's provider received
+	idpA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			// B's login lands between Bearer's first read and its lock.
+			if err := WriteCachedToken(context.Background(), cfgB, &oauth2.Token{
+				AccessToken: "B-at-1", RefreshToken: "B-rt-1", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour),
+			}); err != nil {
+				t.Errorf("B's login: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"issuer": cfgA.Issuer, "authorization_endpoint": cfgA.Issuer + "/authorize",
+				"token_endpoint": cfgA.Issuer + "/token", "jwks_uri": cfgA.Issuer + "/jwks",
+				"device_authorization_endpoint": cfgA.Issuer + "/device",
+			})
+		case "/token":
+			_ = r.ParseForm()
+			mu.Lock()
+			refreshes = append(refreshes, r.Form.Get("refresh_token"))
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "A-at-2", "refresh_token": "A-rt-2", "token_type": "Bearer", "expires_in": 600,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(idpA.Close)
+	cfgA = Config{AppName: "slagctl", API: "https://a.example", Issuer: idpA.URL, ClientID: "slagctl", Device: true, Stderr: io.Discard}
+	cfgB = Config{AppName: "slagctl", API: "https://b.example", Issuer: "https://idp-b.invalid/", ClientID: "slagctl", Device: true}
+	if err := WriteCachedToken(context.Background(), cfgA, &oauth2.Token{
+		AccessToken: "A-at-1", RefreshToken: "A-rt-1", TokenType: "Bearer", Expiry: time.Now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, err := Bearer(ctx, cfgA)
+	if got == "B-at-1" {
+		t.Fatal("Bearer for server A returned server B's access token")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, rt := range refreshes {
+		if rt == "B-rt-1" {
+			t.Fatal("server A's identity provider received server B's refresh token")
+		}
+	}
+	if err == nil {
+		t.Fatalf("Bearer for server A returned %q with only B's session cached, want an error", got)
+	}
+	path, err := defaultTokenPath(cfgA.AppName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	onDisk, err := readCache(path)
+	if err != nil || onDisk.Token.AccessToken != "B-at-1" {
+		t.Fatalf("B's login was replaced: cache %+v err %v", onDisk, err)
 	}
 }
 
@@ -608,14 +715,14 @@ func TestBearer_RefreshesTokenIssuedWithoutExpiresIn(t *testing.T) {
 			}))
 			defer idp.Close()
 
-			cfg := Config{AppName: "slagctl", Issuer: idp.URL, ClientID: "cid", Device: true, Stderr: io.Discard}
+			cfg := Config{AppName: "slagctl", API: "https://api.example", Issuer: idp.URL, ClientID: "cid", Device: true, Stderr: io.Discard}
 			path, err := defaultTokenPath(cfg.AppName)
 			if err != nil {
 				t.Fatal(err)
 			}
 			// What a login without expires_in leaves once the access token's
 			// lifetime has passed.
-			if err := writeCache(path, &oauth2.Token{AccessToken: expired, RefreshToken: "rt-0", TokenType: "Bearer"}); err != nil {
+			if err := writeCache(path, session{binding: cfg.binding(), Token: &oauth2.Token{AccessToken: expired, RefreshToken: "rt-0", TokenType: "Bearer"}}); err != nil {
 				t.Fatal(err)
 			}
 

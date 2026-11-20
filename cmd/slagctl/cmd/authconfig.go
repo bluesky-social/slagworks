@@ -142,6 +142,11 @@ func fetchClientConfig(ctx context.Context, api string) (issuer, clientID string
 // they are used only for that server: pointing slagctl at another API must
 // never hand it this token, nor send the refresh token to an identity
 // provider that other server names. Any other server needs its own login.
+//
+// The saved config is written after the token, so the two can disagree (an
+// interactive login of an earlier command lands after a later `auth login`
+// elsewhere, or the config write fails). clientauth therefore checks the
+// API, issuer and client recorded with the token itself as well.
 func authConfig(api string) (clientauth.Config, error) {
 	saved, err := loadSavedConfig()
 	if err != nil {
@@ -152,6 +157,7 @@ func authConfig(api string) (clientauth.Config, error) {
 	}
 	return clientauth.Config{
 		AppName:      appName,
+		API:          api,
 		Issuer:       saved.OIDCIssuer,
 		ClientID:     saved.OIDCClientID,
 		LoopbackPort: oidcLoopbackPort,

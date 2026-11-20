@@ -326,7 +326,12 @@ operator therefore configures one value, the API URL.
 - The cached token is bound to the server of the last login. A command
   aimed at another server (`--api`, `SLAGWORKS_API`) is refused until
   you `slagctl auth login --api` there, so a token is never sent to a
-  server it was not issued for.
+  server it was not issued for. The token cache records the server,
+  identity provider and client each token was issued for, and slagctl
+  checks that record too, so this holds even when two slagctl
+  invocations sign in to different servers at the same time: a command
+  then reports that you are not signed in to its server rather than
+  using, refreshing or replacing the other server's session.
 - The loopback redirect uses a fixed port (`8765`). This port must
   be registered with the IdP as an allowed redirect URI. If a local
   browser flow is not available, `slagctl auth login --device`

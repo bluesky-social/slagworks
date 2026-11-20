@@ -86,7 +86,7 @@ func newDeviceProvider(t *testing.T, o deviceProviderOpts) *deviceProvider {
 }
 
 func (p *deviceProvider) login(ctx context.Context, stderr io.Writer) error {
-	_, err := Login(ctx, Config{AppName: "slagctl", Issuer: p.srv.URL, ClientID: "c", Device: true, Stderr: stderr})
+	_, err := Login(ctx, Config{AppName: "slagctl", API: "https://api.example", Issuer: p.srv.URL, ClientID: "c", Device: true, Stderr: stderr})
 	return err
 }
 

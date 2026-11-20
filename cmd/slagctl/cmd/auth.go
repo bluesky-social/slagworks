@@ -41,6 +41,7 @@ no local browser is available.`,
 			}
 			cfg := clientauth.Config{
 				AppName:      appName,
+				API:          apiURL,
 				Issuer:       issuer,
 				ClientID:     clientID,
 				LoopbackPort: oidcLoopbackPort,

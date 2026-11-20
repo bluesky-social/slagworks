@@ -3,10 +3,18 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"golang.org/x/oauth2"
+
+	"github.com/bluesky-social/slagworks/internal/cli/clientauth"
 )
 
 // isolateConfig points the slagctl config dir at a temp dir and clears the
@@ -125,5 +133,171 @@ func TestAuthConfig_TokenIsBoundToTheLoginServer(t *testing.T) {
 	cfg, err = authConfig("https://prod.example")
 	if err != nil || cfg.Issuer != "https://idp.example/" {
 		t.Fatalf("env overrides must not change the issuer of a saved login: %+v err %v", cfg, err)
+	}
+}
+
+// signInServer is a slagworks server with its own identity provider. Every
+// token the provider mints carries the server's name, so the server can tell
+// when it is handed another server's access token and the provider when it is
+// handed another provider's refresh token.
+type signInServer struct {
+	name      string
+	idp, api  *httptest.Server
+	mu        sync.Mutex
+	bearers   []string // bearer tokens the API received
+	refreshes []string // refresh tokens the provider received
+}
+
+func newSignInServer(t *testing.T, name string) *signInServer {
+	t.Helper()
+	s := &signInServer{name: name}
+	minted := 0
+	s.idp = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"issuer": s.idp.URL, "authorization_endpoint": s.idp.URL + "/authorize",
+				"token_endpoint": s.idp.URL + "/token", "jwks_uri": s.idp.URL + "/jwks",
+				"device_authorization_endpoint": s.idp.URL + "/device",
+			})
+		case "/device":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"device_code": "dc", "user_code": "UC", "verification_uri": s.idp.URL + "/verify",
+				"expires_in": 30, "interval": 1,
+			})
+		case "/verify":
+			// The device page exists; login checks it before polling.
+			_, _ = w.Write([]byte("{}"))
+		case "/token":
+			_ = r.ParseForm()
+			s.mu.Lock()
+			if rt := r.Form.Get("refresh_token"); rt != "" {
+				s.refreshes = append(s.refreshes, rt)
+			}
+			minted++
+			at, rt := fmt.Sprintf("%s-at-%d", name, minted), fmt.Sprintf("%s-rt-%d", name, minted)
+			s.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": at, "refresh_token": rt, "token_type": "Bearer", "expires_in": 600,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(s.idp.Close)
+	s.api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v1/client-config" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"oidc_issuer": s.idp.URL, "oidc_client_id": "slagctl"})
+			return
+		}
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		s.mu.Lock()
+		s.bearers = append(s.bearers, tok)
+		s.mu.Unlock()
+		if !strings.HasPrefix(tok, name+"-at-") {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"invalid token"}`))
+			return
+		}
+		_, _ = w.Write([]byte("[]"))
+	}))
+	t.Cleanup(s.api.Close)
+	return s
+}
+
+// runSlagctl runs one slagctl invocation in-process.
+func runSlagctl(t *testing.T, timeout time.Duration, args ...string) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	root := NewRootCmd()
+	root.SetArgs(args)
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	return root.ExecuteContext(ctx)
+}
+
+// The token cache must hold, with the token, which server it was issued for,
+// because the saved server (config.json) is a different file written at a
+// different moment. Two invocations that interleave can leave the cache
+// holding server A's session while the saved server is B:
+//
+//  1. `auth login --api A`.
+//  2. Terminal 1 runs a command against A that needs an interactive login,
+//     so its Bearer starts A's browser flow.
+//  3. Meanwhile terminal 2 runs `auth login --device --api B` to completion,
+//     writing B's token and then B as the saved server.
+//  4. Terminal 1's browser login completes and Bearer stores A's new token.
+//  5. `slagctl machine list`, which goes to the saved server, B.
+//
+// A failed config write at the end of `auth login` leaves the same split.
+// Step 5 must not hand A's access token to B, nor (once it has expired) A's
+// refresh token to B's identity provider; it must say the operator is not
+// signed in to B.
+func TestAuth_TokenNeverReachesAnotherServer(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		expired bool // A's access token has expired by step 5, so it would be refreshed
+	}{
+		{name: "access token", expired: false},
+		{name: "refresh token", expired: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateConfig(t)
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			t.Setenv("BSKY_CLI_NO_VERSION_GATE", "1")
+			// No `open` or `xdg-open`: a test must never launch a browser.
+			t.Setenv("PATH", t.TempDir())
+			a, b := newSignInServer(t, "A"), newSignInServer(t, "B")
+
+			if err := runSlagctl(t, 20*time.Second, "auth", "login", "--device", "--api", a.api.URL); err != nil { // 1
+				t.Fatal(err)
+			}
+			if err := runSlagctl(t, 5*time.Second, "machine", "list", "--json"); err != nil {
+				t.Fatalf("a command right after signing in to A: %v", err)
+			}
+			cfgA, err := authConfig(a.api.URL) // 2: what terminal 1's root command built
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := runSlagctl(t, 20*time.Second, "auth", "login", "--device", "--api", b.api.URL); err != nil { // 3
+				t.Fatal(err)
+			}
+			// 4: terminal 1's login for A lands. Bearer caches it with the
+			// same storeToken write WriteCachedToken makes, under cfgA.
+			oc := &oauth2.Config{ClientID: cfgA.ClientID, Endpoint: oauth2.Endpoint{TokenURL: cfgA.Issuer + "/token"}}
+			tokA, err := oc.Exchange(context.Background(), "code")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.expired {
+				tokA.Expiry = time.Now().Add(-time.Minute)
+				tokA.ExpiresIn = 0
+			}
+			if err := clientauth.WriteCachedToken(context.Background(), cfgA, tokA); err != nil {
+				t.Fatal(err)
+			}
+			// 5. A short deadline: falling back to an interactive login here
+			// would wait for a browser that never comes.
+			err = runSlagctl(t, 3*time.Second, "machine", "list", "--json")
+
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			for _, tok := range b.bearers {
+				if strings.HasPrefix(tok, "A-") {
+					t.Fatalf("server B received access token %q minted by server A's identity provider", tok)
+				}
+			}
+			for _, rt := range b.refreshes {
+				if strings.HasPrefix(rt, "A-") {
+					t.Fatalf("server B's identity provider received refresh token %q minted by A's", rt)
+				}
+			}
+			if err == nil || !strings.Contains(err.Error(), "not signed in to "+b.api.URL) || !strings.Contains(err.Error(), "slagctl auth login") {
+				t.Fatalf("with the cached session issued for A, a command against B: err = %v, want it to say it is not signed in to B and name `slagctl auth login`", err)
+			}
+		})
 	}
 }
