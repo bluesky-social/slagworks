@@ -102,9 +102,14 @@ initramfs carries that file. An md superblock on a disk the layout leaves
 alone (a disk outside the layout, or a `retain` disk) is therefore never
 assembled at boot, and so cannot take the `/dev/mdN` name a layout array
 needs. To keep using such an array, name it in the layout as a `preserve`
-device. An array created on the installed system later is not assembled at
-boot until its `ARRAY` line is in `mdadm.conf` (`mdadm --detail --brief
-<dev>` prints it) and the initramfs the bootloader loads carries that file:
+device, listing every member, spares included: before assembling it the
+deploy stops any array the deploy environment assembled from those
+members, and without `--destructive` it stops no array that holds a
+device outside the layout, so it refuses one that holds a member
+together with an unlisted device. An array created on the installed
+system later is not assembled at boot until its `ARRAY` line is in
+`mdadm.conf` (`mdadm --detail --brief <dev>` prints it) and the
+initramfs the bootloader loads carries that file:
 run `update-initramfs -u`, and on UEFI also copy the regenerated
 `/boot/initrd.img-<version>` to `/boot/efi/slagworks/initrd.img`, the copy
 systemd-boot loads.

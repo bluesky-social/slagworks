@@ -94,12 +94,38 @@ func TestDeploy_BystanderArrayHoldsPlannedMDName_DestructiveCompletes(t *testing
 
 func TestCheckMDNamesFree(t *testing.T) {
 	raidLayout := bystanderMD0Case(false).Layout
+	// keepLayout preserves the array on nvme1n1 and nvme2n1 at /dev/md0.
+	keepLayout := preserveBystanderCase("md127", false).Layout
+	// bothLayout adds a raid created at /dev/md0, which puts the preserved
+	// array at /dev/md1.
+	bothLayout := storage.Layout{Devices: map[string]storage.Device{
+		"sdb": {Type: "disk"}, "sdc": {Type: "disk"},
+		"mdboot": {Type: "raid", Level: 1, Members: []string{"sdb", "sdc"}},
+		"mdkeep": keepLayout.Devices["mdkeep"],
+	}}
+	keepMembers := []string{"nvme1n1", "nvme2n1"}
 	tests := []struct {
 		name    string
 		layout  storage.Layout
+		disks   []string // whole disks the host has, for resolving preserve members
 		arrays  map[string]*hArray
 		wantErr []string // nil: the check passes
 	}{
+		{name: "preserve: its own auto-assembly at its planned name", layout: keepLayout, disks: keepMembers,
+			arrays: map[string]*hArray{"md0": {name: "md0", members: []string{"nvme1n1", "nvme2n1"}}}},
+		{name: "preserve: its auto-assembly at a raid's planned name", layout: bothLayout, disks: keepMembers,
+			arrays: map[string]*hArray{"md0": {name: "md0", members: []string{"nvme2n1"}}}},
+		{name: "preserve: array outside the layout on a name the plan does not use", layout: keepLayout,
+			arrays: map[string]*hArray{"md127": {name: "md127", members: []string{"sdd"}}}},
+		{name: "preserve: array outside the layout on the preserve array's name", layout: keepLayout, disks: keepMembers,
+			arrays:  map[string]*hArray{"md0": {name: "md0", members: []string{"sdd"}}},
+			wantErr: []string{`preserve "mdkeep" is assembled at /dev/md0`, "sdd[0]", "--destructive"}},
+		{name: "preserve: array outside the layout on a raid's name", layout: bothLayout, disks: keepMembers,
+			arrays:  map[string]*hArray{"md0": {name: "md0", members: []string{"sdd"}}},
+			wantErr: []string{`raid "mdboot" is created at /dev/md0`, "sdd[0]"}},
+		{name: "preserve: array mixing a preserve member and a disk outside the layout", layout: keepLayout, disks: keepMembers,
+			arrays:  map[string]*hArray{"md0": {name: "md0", members: []string{"nvme1n1", "sdd"}}},
+			wantErr: []string{`preserve "mdkeep"`, "nvme1n1[0] sdd[1]"}},
 		{name: "no arrays assembled", layout: raidLayout},
 		{name: "array on a name the plan does not use", layout: raidLayout,
 			arrays: map[string]*hArray{"md127": {name: "md127", members: []string{"sdd"}}}},
@@ -119,10 +145,18 @@ func TestCheckMDNamesFree(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newFakeHost()
+			for _, d := range tt.disks {
+				h.addDisk(d, 480103981056, "nvme")
+			}
 			for n, a := range tt.arrays {
 				h.arrays[n] = a
 			}
 			err := CheckMDNamesFree(quietCtx(h), tt.layout)
+			for _, c := range h.calls {
+				if c != "cat /proc/mdstat" && !strings.HasPrefix(c, "lsblk -ndo KNAME ") {
+					t.Errorf("the check ran %q; it may only read /proc/mdstat and resolve preserve members", c)
+				}
+			}
 			if tt.wantErr == nil {
 				if err != nil {
 					t.Fatalf("CheckMDNamesFree: %v, want nil", err)
@@ -135,11 +169,6 @@ func TestCheckMDNamesFree(t *testing.T) {
 			for _, want := range tt.wantErr {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("refusal does not mention %q: %v", want, err)
-				}
-			}
-			for _, c := range h.calls {
-				if c != "cat /proc/mdstat" {
-					t.Errorf("the check ran %q; it may only read /proc/mdstat", c)
 				}
 			}
 		})
