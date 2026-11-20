@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -825,6 +826,193 @@ func TestPowerPDUOutlet_INV1_OffOnServingWorker_SerialCase_RefusedAtCreation(t *
 	_, status := roundtrip(t, srv, "pdu-0102-left", 5, "off")
 	if status != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422 (INV-1: off on serving worker whose serial differs only in case)", status)
+	}
+}
+
+// gwNBID is the NetBox ID of the second device in twoDeviceOutletFixture.
+const gwNBID = 713
+
+// twoDeviceOutletFixture is singleFeedFixture with Outlet 5's cable fanned
+// out to a second device (a Y-cable: NetBox allows several terminations on
+// one cable end). Outlet 5 lists kworker-1.pop1 PSU1 first, then
+// oob-gw-1.pop1 (id 713, serial SN-GW1) PSU1. Cutting Outlet 5 cuts both.
+func twoDeviceOutletFixture() *outletFixture {
+	f := singleFeedFixture()
+	gw := netbox.Device{
+		ID:     gwNBID,
+		Name:   "oob-gw-1.pop1",
+		Serial: "SN-GW1",
+		Site:   &netbox.NestedRef{ID: 1, Name: "pop1", Slug: "pop1"},
+	}
+	f.devices = append(f.devices, gw)
+	f.deviceByID[gwNBID] = gw
+	outlet5 := &f.powerOutletsByDeviceID[pduNBID][0]
+	outlet5.ConnectedEndpoints = append(outlet5.ConnectedEndpoints, netbox.PowerPort{
+		ID: 6009, Name: "PSU1", Device: &netbox.NestedRef{ID: gwNBID, Name: "oob-gw-1.pop1"},
+	})
+	f.powerPortsByDeviceID[gwNBID] = []netbox.PowerPort{{
+		ID: 6009, Name: "PSU1", Device: &netbox.NestedRef{ID: gwNBID, Name: "oob-gw-1.pop1"},
+		ConnectedEndpoints:          []netbox.PowerOutlet{{ID: 5001, Name: "Outlet 5", Device: &netbox.NestedRef{ID: pduNBID, Name: "pdu-0102-left"}}},
+		ConnectedEndpointsReachable: true,
+	}}
+	return f
+}
+
+// TestPowerPDUOutlet_OutletFeedingTwoDevicesIsRefused: an outlet whose cable
+// fans out to two devices cuts both. Here the second is a serving site
+// worker, whose feed `off` must never cut (INV-1). The warning, the preflight
+// token and the interlock each identify one downstream device, so the
+// request must be refused rather than resolved from the first endpoint.
+func TestPowerPDUOutlet_OutletFeedingTwoDevicesIsRefused(t *testing.T) {
+	key := []byte("test-preflight-key-32-bytes-fixed")
+	newServer := func(t *testing.T) (*httptest.Server, *store.Store) {
+		s, st := outletFixtureServer(t, twoDeviceOutletFixture(), pduSecret(), key)
+		seedPDUMachine(t, st, pduNBID)
+		seedWorkerWithSerial(t, st, "pop1", "oob-gw-1", "SN-GW1") // oob-gw-1 is a serving site worker
+		srv := httptest.NewServer(s.echo)
+		t.Cleanup(srv.Close)
+		return srv, st
+	}
+	assertNoOps := func(t *testing.T, st *store.Store) {
+		t.Helper()
+		ops, err := st.ListOperations(nil)
+		if err != nil {
+			t.Fatalf("list ops: %v", err)
+		}
+		if len(ops) != 0 {
+			t.Errorf("%d operation(s) created, want none", len(ops))
+		}
+	}
+
+	t.Run("resolve", func(t *testing.T) {
+		srv, _ := newServer(t)
+		resp := getJSON(t, srv, "/api/v1/pdus/pdu-0102-left/outlet/5/power/resolve?verb=off")
+		defer resp.Body.Close()
+		msg, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("status %d (%s); want 422", resp.StatusCode, msg)
+		}
+		for _, dev := range []string{"kworker-1.pop1", "oob-gw-1.pop1"} {
+			if !strings.Contains(string(msg), dev) {
+				t.Errorf("refusal %s does not name %q", msg, dev)
+			}
+		}
+	})
+
+	t.Run("resolve then post", func(t *testing.T) {
+		srv, st := newServer(t)
+		op, status := roundtrip(t, srv, "pdu-0102-left", 5, "off")
+		if op != nil || status != http.StatusUnprocessableEntity {
+			t.Errorf("`off` on an outlet that feeds kworker-1 and the serving worker oob-gw-1: status %d, created=%v; want 422 and no operation", status, op != nil)
+		}
+		assertNoOps(t, st)
+	})
+
+	// The POST re-resolves the outlet, so a token minted while Outlet 5 fed
+	// kworker-1 alone (before the second device was cabled) is refused too.
+	t.Run("token minted before the fan-out", func(t *testing.T) {
+		srv, st := newServer(t)
+		token, err := mintPreflightToken(key, preflightClaims{
+			Verb:             "off",
+			PDUDeviceID:      pduNBID,
+			Outlet:           5,
+			DownstreamSerial: "SN-KWORKER1",
+			Classification:   "sole",
+			ExpiresAt:        time.Now().Add(5 * time.Minute).Unix(),
+		})
+		if err != nil {
+			t.Fatalf("mint: %v", err)
+		}
+		body, _ := json.Marshal(map[string]string{"verb": "off", "preflight_token": token})
+		req, _ := http.NewRequest(http.MethodPost,
+			srv.URL+"/api/v1/pdus/pdu-0102-left/outlet/5/power", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST power: %v", err)
+		}
+		defer resp.Body.Close()
+		msg, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("status %d (%s); want 422", resp.StatusCode, msg)
+		}
+		assertNoOps(t, st)
+	})
+}
+
+// TestResolvePDUOutletPower_SecondEndpointHasNoDevice: every endpoint of the
+// outlet's cable must name a parent device, not just the first. A port with
+// none means the outlet cuts something NetBox cannot identify, so the outlet
+// resolves as unconnected (fail-closed) and gets no token.
+func TestResolvePDUOutletPower_SecondEndpointHasNoDevice(t *testing.T) {
+	f := singleFeedFixture()
+	outlet5 := &f.powerOutletsByDeviceID[pduNBID][0]
+	outlet5.ConnectedEndpoints = append(outlet5.ConnectedEndpoints, netbox.PowerPort{ID: 6010, Name: "orphan-PSU"})
+	s, st := outletFixtureServer(t, f, pduSecret(), nil)
+	seedPDUMachine(t, st, pduNBID)
+
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	resp := getJSON(t, srv, "/api/v1/pdus/pdu-0102-left/outlet/5/power/resolve?verb=cycle")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var r OutletResolution
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if r.Connected || r.Classification != "unconnected" || r.PreflightToken != "" {
+		t.Errorf("connected %v, classification %q, token issued %v; want false, unconnected, no token",
+			r.Connected, r.Classification, r.PreflightToken != "")
+	}
+	if !strings.Contains(r.Warning, "orphan-PSU") {
+		t.Errorf("warning %q does not name the port with no device", r.Warning)
+	}
+}
+
+// TestResolvePDUOutletPower_OutletFeedingTwoPortsOfOneDevice: a cable that
+// fans out to two power-ports of the SAME device still identifies exactly
+// one downstream device, so it resolves normally and reports both ports.
+func TestResolvePDUOutletPower_OutletFeedingTwoPortsOfOneDevice(t *testing.T) {
+	f := singleFeedFixture()
+	kworker := &netbox.NestedRef{ID: downstreamNBID, Name: "kworker-1.pop1"}
+	outlet5 := &f.powerOutletsByDeviceID[pduNBID][0]
+	outlet5.ConnectedEndpoints = append(outlet5.ConnectedEndpoints,
+		netbox.PowerPort{ID: 6002, Name: "PSU2", Device: kworker})
+	f.powerPortsByDeviceID[downstreamNBID] = append(f.powerPortsByDeviceID[downstreamNBID], netbox.PowerPort{
+		ID: 6002, Name: "PSU2", Device: kworker,
+		ConnectedEndpoints:          []netbox.PowerOutlet{{ID: 5001, Name: "Outlet 5", Device: &netbox.NestedRef{ID: pduNBID, Name: "pdu-0102-left"}}},
+		ConnectedEndpointsReachable: true,
+	})
+	s, st := outletFixtureServer(t, f, pduSecret(), nil)
+	seedPDUMachine(t, st, pduNBID)
+
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	resp := getJSON(t, srv, "/api/v1/pdus/pdu-0102-left/outlet/5/power/resolve?verb=cycle")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var r OutletResolution
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if r.DownstreamDevice != "kworker-1.pop1" || r.DownstreamSerial != "SN-KWORKER1" {
+		t.Errorf("downstream = %q/%q, want kworker-1.pop1/SN-KWORKER1", r.DownstreamDevice, r.DownstreamSerial)
+	}
+	if r.DownstreamPort != "PSU1, PSU2" {
+		t.Errorf("downstream_port = %q, want %q", r.DownstreamPort, "PSU1, PSU2")
+	}
+	// Both PSUs hang off one outlet of one PDU: cutting it drops the device.
+	if r.Classification != "sole" {
+		t.Errorf("classification = %q, want sole", r.Classification)
+	}
+	if r.PreflightToken == "" {
+		t.Error("expected a preflight_token")
 	}
 }
 
