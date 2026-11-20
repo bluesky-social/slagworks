@@ -124,16 +124,21 @@ type QueryFilter struct {
 	OpID        uuid.UUID
 	Sources     []string
 	MinLevel    string
-	Since       time.Time
 
-	// SinceOrReceived widens Since for reads past a stream cursor (the
-	// live tail and a resume): a row passes when its emitter ts or its
-	// global_received_at is at or after Since. ts alone would hide every
-	// line from an emitter whose clock runs behind (agents before clock
-	// sync, see migration 00016); global_received_at alone would hide a
-	// line whose emitter agrees with the caller while global's clock
-	// lags. The seed backfill leaves it unset and bounds on ts.
-	SinceOrReceived bool
+	// Since, when set, restricts to rows whose emitter ts or whose
+	// global_received_at is at or after it: what either clock places in
+	// the window. ts alone would hide every line from an emitter whose
+	// clock runs behind (agents before clock sync, see migration 00016);
+	// global_received_at alone would hide a line whose emitter agrees
+	// with the caller while global's clock lags.
+	//
+	// The rule is the same for every query a stream makes, backfill
+	// pages and live-tail polls alike, and it has to be. A stream pages
+	// by id and moves its cursor past whatever a query did not return,
+	// so a row that one query's bound hides and a later query's bound
+	// admits is never delivered. A bound that depends only on the row
+	// cannot do that.
+	Since time.Time
 
 	// LastSeenID, when > 0, restricts to rows with id > LastSeenID.
 	LastSeenID int64
@@ -200,12 +205,8 @@ func (s *Store) Query(ctx context.Context, filter QueryFilter) ([]Result, error)
 		q = q.Where("level IN ?", levels)
 	}
 	if !filter.Since.IsZero() {
-		if filter.SinceOrReceived {
-			// Parenthesized for the same reason as the machine/op OR.
-			q = q.Where("(ts >= ? OR global_received_at >= ?)", filter.Since, filter.Since)
-		} else {
-			q = q.Where("ts >= ?", filter.Since)
-		}
+		// Parenthesized for the same reason as the machine/op OR.
+		q = q.Where("(ts >= ? OR global_received_at >= ?)", filter.Since, filter.Since)
 	}
 	if filter.LastSeenID > 0 {
 		q = q.Where("id > ?", filter.LastSeenID)

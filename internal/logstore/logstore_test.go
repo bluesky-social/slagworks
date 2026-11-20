@@ -150,7 +150,8 @@ func TestInsertBatchAndQuery(t *testing.T) {
 // op on the same machine. The caller bounds noise with `since` (not exercised
 // here). A bare op or bare machine filter reduces to a single equality.
 func TestQuery_MachineOrOpScope(t *testing.T) {
-	st := newTestStore(t)
+	db := testpg.DB(t, store.Migrate)
+	st := logstore.New(db)
 	ctx := context.Background()
 
 	machine := uuid.New()
@@ -224,8 +225,9 @@ func TestQuery_MachineOrOpScope(t *testing.T) {
 	})
 
 	t.Run("since still bounds the OR (parenthesization holds)", func(t *testing.T) {
-		// An OLD line for this machine, well before `since`. The machine_id =
-		// M match must NOT let it bypass the since-bound — that's the
+		// An OLD line for this machine, well before `since` by the
+		// emitter's clock and by global's. The machine_id = M match must
+		// NOT let it bypass the since-bound — that's the
 		// unparenthesized-OR footgun (roast HIGH). It must be excluded.
 		oldLine := slogkit.Envelope{
 			TS: now.Add(-time.Hour), Level: slogkit.LevelInfo, Source: slogkit.SourceSite,
@@ -233,6 +235,9 @@ func TestQuery_MachineOrOpScope(t *testing.T) {
 		}
 		if err := st.InsertBatch(ctx, []slogkit.Envelope{oldLine}); err != nil {
 			t.Fatalf("insert old: %v", err)
+		}
+		if err := db.Exec("UPDATE log_envelopes SET global_received_at = ts WHERE msg = ?", oldLine.Msg).Error; err != nil {
+			t.Fatalf("backdate old: %v", err)
 		}
 		got, err := st.Query(ctx, logstore.QueryFilter{
 			MachineID: machine, OpID: op, Since: now.Add(-time.Minute),
@@ -246,6 +251,61 @@ func TestQuery_MachineOrOpScope(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestQuery_SinceAdmitsWhatEitherClockPlacesInTheWindow: Since passes a row
+// whose emitter ts or whose global_received_at is at or after it, on every
+// query. An emitter whose clock runs behind stamps ts before the window on
+// lines global receives inside it; a global whose clock lags receives
+// lines late that their emitter stamped inside it. Only a row both clocks
+// place before Since is outside the window. The bound must not depend on
+// which query of a stream is asking (a paging cursor would step over what
+// an earlier, narrower query hid), so QueryFilter has no way to ask for
+// one clock alone.
+func TestQuery_SinceAdmitsWhatEitherClockPlacesInTheWindow(t *testing.T) {
+	db := testpg.DB(t, store.Migrate)
+	st := logstore.New(db)
+	ctx := context.Background()
+	machine := uuid.New()
+	now := time.Now().UTC().Round(time.Microsecond)
+	since := now.Add(-10 * time.Minute)
+
+	rows := []struct {
+		msg          string
+		ts, received time.Time
+	}{
+		{"both clocks in the window", since.Add(time.Minute), since.Add(time.Minute)},
+		{"emitter clock behind", since.Add(-time.Hour), since.Add(2 * time.Minute)},
+		{"global clock behind", since.Add(3 * time.Minute), since.Add(-time.Hour)},
+		{"before the window on both clocks", since.Add(-time.Hour), since.Add(-time.Hour)},
+	}
+	for _, r := range rows {
+		env := slogkit.Envelope{TS: r.ts, Level: slogkit.LevelInfo, Source: slogkit.SourceAgent, Msg: r.msg, MachineID: machine}
+		if err := st.InsertBatch(ctx, []slogkit.Envelope{env}); err != nil {
+			t.Fatalf("insert %q: %v", r.msg, err)
+		}
+		if err := db.Exec("UPDATE log_envelopes SET global_received_at = ? WHERE machine_id = ? AND msg = ?", r.received, machine, r.msg).Error; err != nil {
+			t.Fatalf("set global_received_at for %q: %v", r.msg, err)
+		}
+	}
+
+	got, err := st.Query(ctx, logstore.QueryFilter{MachineID: machine, Since: since})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msgs []string
+	for _, r := range got {
+		msgs = append(msgs, r.Envelope.Msg)
+	}
+	want := []string{"both clocks in the window", "emitter clock behind", "global clock behind"}
+	if len(msgs) != len(want) {
+		t.Fatalf("Query with Since returned %q, want %q in id order", msgs, want)
+	}
+	for i := range want {
+		if msgs[i] != want[i] {
+			t.Fatalf("Query with Since returned %q, want %q in id order", msgs, want)
+		}
+	}
 }
 
 // TestRunRetention_PolicyScopedBySource pins the B6 retention contract:

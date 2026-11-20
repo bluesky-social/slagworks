@@ -99,7 +99,7 @@ func RenderNetworkConfig(ctx *agent.Context, machineID string) (*NetworkConfig, 
 	// is co-located with the script so its `import slagworks_netlib` resolves
 	// against the script's own directory.
 	sidecars := map[string][]byte{netlib.ModuleName + ".py": netlib.Source}
-	bundleJSON, err := execkit.RunConfigScript(ctx.Log, "network", scriptContent, "SLAGWORKS_NETWORK_FACTS", facts, sidecars)
+	bundleJSON, err := execkit.RunConfigScript(ctx.Procs, ctx.Log, "network", scriptContent, "SLAGWORKS_NETWORK_FACTS", facts, sidecars)
 	if err != nil {
 		return nil, err
 	}

@@ -342,9 +342,13 @@ func (p *InMemoryProvider) HandleProgressReport(report *ProgressReport) error {
 			}
 		}
 	}
-	if bound == nil || bound.MachineID != mid || bound.Status == OpCompleted || bound.Status == OpFailed {
+	if bound == nil || bound.Status == OpCompleted || bound.Status == OpFailed {
 		p.mu.RUnlock()
-		return fmt.Errorf("report is not bound to an active operation")
+		return fmt.Errorf("report is not bound to an active operation: %w", ErrOperationNotActive)
+	}
+	if bound.MachineID != mid {
+		p.mu.RUnlock()
+		return fmt.Errorf("operation %s belongs to machine %s, not %s", oid, bound.MachineID, mid)
 	}
 	if report.Event == "commission_report" && bound.Type != OpCommission {
 		p.mu.RUnlock()

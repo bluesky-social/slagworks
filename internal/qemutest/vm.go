@@ -118,12 +118,30 @@ type VMConfig struct {
 	// firmware fallback. Default false preserves existing tests.
 	StrictBoot bool
 
+	// NetworkBootFirst pins the firmware's boot order with QEMU bootindex
+	// properties: the primary NIC first, the primary disk second. It
+	// replaces -boot (BootOrder and StrictBoot are ignored). OVMF rebuilds
+	// its BootOrder from the bootindex list on every boot, so the order an
+	// installed OS writes does not stick (efibootmgr -c puts its entry
+	// first), while a one-shot BootNext is still honored ahead of it. That
+	// is the firmware a redeploy needs: every boot is a network boot unless
+	// BootNext says otherwise, as on a host whose BMC holds a PXE override.
+	// Without it an OVMF VM that has been installed once boots its disk
+	// forever and cannot be redeployed in place.
+	NetworkBootFirst bool
+
 	// BMCQMPPath, when non-empty, opens a SECOND dedicated QMP socket at
 	// this path for the FakeBMC. It exists so the FakeBMC's commands and
 	// replies never consume events/replies on the primary test QMP socket
 	// (vm.QMP). The path is exposed before Start via VM.BMCQMPPath so a
 	// test can construct a FakeBMC that dials it.
 	BMCQMPPath string
+
+	// ExtraArgs are raw QEMU arguments appended after the harness-built
+	// device list. The storage property suite uses them with NoPrimaryDisk
+	// to attach disks with a bus, block size, bootindex and discard mode
+	// ExtraDisk cannot express.
+	ExtraArgs []string
 
 	// BMC, when non-nil, attaches a simulated BMC to the VM via
 	// QEMU's ipmi-bmc-extern + isa-ipmi-kcs devices. Inside the guest
@@ -267,6 +285,9 @@ func (vm *VM) buildArgs() []string {
 	if vm.Config.Firmware == UEFI {
 		net0Device += ",romfile="
 	}
+	if vm.Config.NetworkBootFirst {
+		net0Device += ",bootindex=0"
+	}
 	// Two serial ports, both captured.
 	//   - ttyS0: unix-socket chardev. Carries iPXE/SeaBIOS firmware
 	//     output. Test process reads via SerialMonitor.
@@ -305,7 +326,16 @@ func (vm *VM) buildArgs() []string {
 		"-netdev", fmt.Sprintf("bridge,id=net0,br=%s", vm.Config.Network.Bridge),
 		"-device", net0Device,
 	)
-	if !vm.Config.NoPrimaryDisk {
+	switch {
+	case vm.Config.NoPrimaryDisk:
+	case vm.Config.NetworkBootFirst:
+		// bootindex is a device property, so the disk needs an explicit
+		// -device; it is the same virtio-blk-pci that if=virtio creates.
+		args = append(args,
+			"-drive", fmt.Sprintf("file=%s,format=qcow2,if=none,id=primary", vm.diskPath),
+			"-device", "virtio-blk-pci,drive=primary,bootindex=1",
+		)
+	default:
 		args = append(args, "-drive", fmt.Sprintf("file=%s,format=qcow2,if=virtio", vm.diskPath))
 	}
 
@@ -417,7 +447,10 @@ func (vm *VM) buildArgs() []string {
 	if vm.Config.StrictBoot {
 		bootOpts = append(bootOpts, "strict=on")
 	}
-	args = append(args, "-boot", strings.Join(bootOpts, ","))
+	if !vm.Config.NetworkBootFirst {
+		args = append(args, "-boot", strings.Join(bootOpts, ","))
+	}
+	args = append(args, vm.Config.ExtraArgs...)
 	if vm.Config.StartPaused {
 		args = append(args, "-S")
 	}
