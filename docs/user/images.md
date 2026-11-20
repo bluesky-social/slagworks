@@ -234,8 +234,8 @@ algorithm:
 3. If the version directory is already on disk (a rollback to the
    version the link was last switched away from), skip to step 6.
 4. Otherwise, HTTP-GET the row's `URL` into a temp file, stream through
-   `sha256.New()` while writing, verify the hash matches the row (fail
-   the whole sync if not).
+   `sha256.New()` while writing, verify the hash matches the row (if
+   not, report the mismatch and leave the link on the previous version).
 5. Extract the tarball into a temp dir and check that its top-level
    directory holds all four image files (`vmlinuz`, `initrd`,
    `initrd-local`, `root.squashfs`) as regular files. A tarball missing
@@ -298,6 +298,10 @@ Notes:
   then the boot handler serves the plain directory by name. A
   `noble-pxe.sha256` file left by such a release is no longer read and
   can be deleted.
+- Each row is synced on its own. A failed download, hash mismatch or
+  link switch on one row costs only that row: the other rows still
+  sync, the site worker logs the failure as "image sync failed", and
+  `slagctl image sync` exits with every row's error.
 - No cpio repack, no InjectOverlayInit. The initrd downloaded IS the
   initrd served. That's the entire point of baking the BOOT hook at
   image-build time.

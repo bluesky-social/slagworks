@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -1202,5 +1203,95 @@ func TestSyncImages_SlowDownloadIsNotAbandoned(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); err != nil {
 		t.Errorf("vmlinuz not found: %v", err)
+	}
+}
+
+// TestSyncImages_FailingImageDoesNotBlockOthers: each image has its own
+// link and version directories, so an image whose download or digest check
+// fails must not stop the other images in the same call from syncing;
+// its error is reported in the returned error. SyncImages ranges over a map,
+// so the failing image is reached first in only some iteration orders. Each
+// case therefore re-runs the sync in a fresh directory until the server
+// sees the failing image requested first, then checks that call. Before the
+// fix SyncImages returned on the first failure, so in that order the good
+// image was never fetched.
+func TestSyncImages_FailingImageDoesNotBlockOthers(t *testing.T) {
+	tarPath, sha := buildTestTarball(t, "noble-pxe")
+	tarData, _ := os.ReadFile(tarPath)
+
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path == "/missing.tar.gz" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write(tarData)
+	}))
+	defer srv.Close()
+
+	cases := []struct {
+		name    string
+		sha     string // the failing image's row digest
+		path    string // the failing image's URL path
+		wantErr string
+	}{
+		{
+			name:    "sha256 mismatch",
+			sha:     strings.Repeat("0", 64),
+			path:    "/bad.tar.gz",
+			wantErr: "image jammy-pxe: sha256 mismatch",
+		},
+		{
+			name:    "object missing",
+			sha:     sha,
+			path:    "/missing.tar.gz",
+			wantErr: "image jammy-pxe: download returned 404",
+		},
+	}
+
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const maxTries = 1000
+			for try := 0; try < maxTries; try++ {
+				imagesDir := t.TempDir()
+				mu.Lock()
+				requests = nil
+				mu.Unlock()
+
+				err := SyncImages(quiet, imagesDir, map[string]*model.Image{
+					"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: srv.URL + "/good.tar.gz"},
+					"jammy-pxe": {Name: "jammy-pxe", SHA256: tc.sha, URL: srv.URL + tc.path},
+				})
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("try %d: SyncImages returned %v, want an error containing %q", try, err, tc.wantErr)
+				}
+
+				mu.Lock()
+				first := ""
+				if len(requests) > 0 {
+					first = requests[0]
+				}
+				mu.Unlock()
+				if first != tc.path {
+					continue // the good image was reached first; not the order under test
+				}
+
+				if got, _ := Installed(imagesDir, "noble-pxe"); got != "noble-pxe@"+sha[:16] {
+					t.Fatalf("noble-pxe did not sync after jammy-pxe failed first (installed %q; SyncImages returned %v)", got, err)
+				}
+				if _, serr := os.Stat(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); serr != nil {
+					t.Fatalf("noble-pxe installed but image missing: %v", serr)
+				}
+				return
+			}
+			t.Fatalf("jammy-pxe was never requested first in %d tries", maxTries)
+		})
 	}
 }

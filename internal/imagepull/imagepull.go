@@ -93,8 +93,13 @@ func Installed(imagesDir, name string) (string, bool) {
 // downloaded or touched: "." or ".." would otherwise point that replacement
 // at imagesDir or its parent. A sha256 that is not 64 hex digits is skipped
 // the same way, since part of it becomes a directory name (no such digest
-// could match a download anyway). A skipped image does not stop the other
-// images from syncing; it is reported in the returned error.
+// could match a download anyway).
+//
+// Images are independent (each has its own link and version directories),
+// so a skipped image, a failed download, a digest mismatch or a failed link
+// switch costs only that image: the other images still sync, and every
+// failure is reported in the returned error. Stopping at the first failure
+// would make which images synced depend on map iteration order.
 //
 // The row's SHA256 is whatever string was written to the API, which
 // checks only that it is non-empty. A hex digest names the same tarball in
@@ -116,10 +121,10 @@ func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Ima
 		removeLeftovers(log, imagesDir)
 	}
 
-	var refused []error
+	var errs []error
 	for name, img := range images {
 		if err := model.ValidateImageName(name); err != nil {
-			refused = append(refused, fmt.Errorf("image not synced: %w; rename or delete the image row", err))
+			errs = append(errs, fmt.Errorf("image not synced: %w; rename or delete the image row", err))
 			continue
 		}
 		if img.URL == "" {
@@ -127,7 +132,7 @@ func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Ima
 		}
 		want := strings.ToLower(strings.TrimSpace(img.SHA256))
 		if !digestRE.MatchString(want) {
-			refused = append(refused, fmt.Errorf("image %s not synced: sha256 %q is not 64 hex digits; correct the image row's sha256", name, img.SHA256))
+			errs = append(errs, fmt.Errorf("image %s not synced: sha256 %q is not 64 hex digits; correct the image row's sha256", name, img.SHA256))
 			continue
 		}
 		version := versionDir(name, want)
@@ -143,11 +148,13 @@ func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Ima
 		} else {
 			log.Info("downloading image", "name", name, "url", img.URL)
 			if err := pullImage(log, img, want, versionPath); err != nil {
-				return errors.Join(append(refused, fmt.Errorf("image %s: %w", name, err))...)
+				errs = append(errs, fmt.Errorf("image %s: %w", name, err))
+				continue
 			}
 		}
 		if err := activate(imagesDir, name, version); err != nil {
-			return errors.Join(append(refused, fmt.Errorf("image %s: %w", name, err))...)
+			errs = append(errs, fmt.Errorf("image %s: %w", name, err))
+			continue
 		}
 		keep := []string{version}
 		if linked {
@@ -156,7 +163,7 @@ func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Ima
 		prune(log, imagesDir, name, keep)
 		log.Info("image ready", "name", name, "sha256", want, "version", version)
 	}
-	return errors.Join(refused...)
+	return errors.Join(errs...)
 }
 
 func isDir(path string) bool {

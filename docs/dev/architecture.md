@@ -771,10 +771,12 @@ time, and while holding it removes the `.image-download-*`,
 by a sync whose process exited partway (the kernel drops a dead holder's
 lock; its cleanup never ran). The image
 name becomes the link it replaces, so it skips, with an error, a name
-that fails `model.ValidateImageName` before downloading anything, and
-still syncs the other images; the API applies the same rule when the
-row is written. A `sha256` that is not 64 hex digits is skipped the
-same way.
+that fails `model.ValidateImageName` before downloading anything; the
+API applies the same rule when the row is written. A `sha256` that is
+not 64 hex digits is skipped the same way. Images are independent: a
+refused name, failed download, digest mismatch or failed link switch
+costs only that image, the other images still sync, and every failure
+is joined into the returned error.
 `Retryable(err)` reports whether a sync error includes a failure to
 fetch from the URL (transport error, non-200 response, body cut
 short, stalled download); the site worker's cache retries only those,

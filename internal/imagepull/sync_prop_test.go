@@ -16,7 +16,9 @@ package imagepull
 //
 // Image names reach the site worker through the site snapshot. A path-shaped
 // name ("..", "a/b") is refused: it is reported in the returned error, puts
-// nothing on disk, and does not stop the other images from syncing.
+// nothing on disk, and does not stop the other images from syncing. A failed
+// pull is likewise reported and leaves that image's previous cache in place
+// without stopping the other images.
 
 import (
 	"archive/tar"
@@ -321,20 +323,11 @@ func runSyncHistory(t *rapid.T, allowHostile bool, stats map[string]int) {
 				}
 				continue
 			}
-			// Not synced. Only acceptable when another image's pull failed
-			// (SyncImages stops at the first failing pull, in map order); a
-			// refused name stops nothing.
-			if !anyFailing {
-				t.Fatalf("step %d: image %q not synced (link %q, want the %s version) and SyncImages returned %v", step, name, link, wantSHA[name][:16], syncErr)
-			}
-			// It must then still hold the previous good content, if any.
-			if prev, ok := model_[name]; ok {
-				for fn, content := range prev {
-					if served(after, name, fn) != content {
-						t.Fatalf("step %d: image %q lost its previous good content %s without a successful resync", step, name, fn)
-					}
-				}
-			}
+			// Not synced. Never acceptable: images are independent, so
+			// neither another image's failed pull nor a refused name stops
+			// this one.
+			t.Fatalf("step %d: image %q not synced (link %q, want the %s version) and SyncImages returned %v; failing pulls=%v",
+				step, name, link, wantSHA[name][:16], syncErr, failing)
 		}
 
 		// Bystanders: nothing outside the link and version directories of
