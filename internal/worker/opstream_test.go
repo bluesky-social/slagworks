@@ -2,6 +2,7 @@ package worker
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -40,7 +41,7 @@ func TestRewipeWindow_BothOrders(t *testing.T) {
 			Status: model.OpClaimed, Phase: "awaiting_phone_home", Version: 1,
 		})
 		// Local phone-home: overlay -> running, op latched.
-		c.RecordPhoneHome(id)
+		c.RecordPhoneHome(id, opID)
 		if got := c.BootActionForMAC(mac); got != model.BootLocal {
 			t.Fatalf("after phone-home: got %d, want BootLocal", got)
 		}
@@ -370,6 +371,156 @@ func TestUntrustedRehydration(t *testing.T) {
 	}
 }
 
+// TestBootAction_LongDisconnectedWorkerDoesNotServeInstaller: a worker whose
+// connection to global ended long ago does not boot a host into the agent
+// from the op set it held when the connection ended.
+//
+// Two workers serve the site, both active. Both hold a deploy for a host;
+// then this worker's connection to global drops and stays down while its
+// DHCP and boot HTTP keep serving the site. The deploy finishes through the
+// other worker: the host installs, phones home, and global marks it running
+// and removes the op. This worker hears none of it. Hours later the host
+// reboots, network-boots first, and its PXE lands on this worker, which still
+// holds the deploy and serves the installer: with the destructive flag the
+// agent wipes a running host. An op global aborted or swept during the
+// outage is served the same way. A commission op left in the set boots the
+// commission agent onto the host the same way.
+//
+// A rehydrated set is already kept from actuating until the next op_resync
+// (TestUntrustedRehydration), because global may have ended any of its ops
+// while the worker was away. A set frozen by a disconnect is stale for the
+// same reason once the outage outlasts global's OpTimeout.
+func TestBootAction_LongDisconnectedWorkerDoesNotServeInstaller(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		state  model.MachineState // snapshot baseline
+		op     model.Operation    // ID and MachineID filled in below
+		action model.BootAction   // what the op authorizes while the stream is current
+	}{
+		{
+			name:   "claimed deploy",
+			state:  model.MachineStateCommissioned,
+			op:     model.Operation{Type: model.OpDeploy, Status: model.OpClaimed, ClaimedBy: "worker-b", Phase: "pxe_booting", Version: 3, Params: []byte(`{"destructive":true}`)},
+			action: model.BootDeploy,
+		},
+		{
+			name:   "pending deploy",
+			state:  model.MachineStateCommissioned,
+			op:     model.Operation{Type: model.OpDeploy, Status: model.OpPending, Version: 1, Params: []byte(`{"destructive":true}`)},
+			action: model.BootDeploy,
+		},
+		{
+			name:   "claimed commission",
+			state:  model.MachineStateNew,
+			op:     model.Operation{Type: model.OpCommission, Status: model.OpClaimed, ClaimedBy: "worker-b", Phase: "pxe_booting", Version: 3},
+			action: model.BootCommission,
+		},
+		{
+			name:   "pending commission",
+			state:  model.MachineStateNew,
+			op:     model.Operation{Type: model.OpCommission, Status: model.OpPending, Version: 1},
+			action: model.BootCommission,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const mac = "02:00:00:00:00:07"
+			c := NewCache(nil)
+			id := uuid.New()
+			c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 1, Machines: []model.MachineSnapshot{{
+				ID: id, State: tc.state, PXEEligible: true,
+				Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}},
+			}}})
+			op := tc.op
+			op.ID, op.MachineID = uuid.New(), id
+			seedOpsResync(c, op)
+			if got := c.BootActionForMAC(mac); got != tc.action {
+				t.Fatalf("precondition: a connected worker holding the op serves %d, want %d", got, tc.action)
+			}
+
+			// The connection to global ended two hours ago. Whatever global
+			// did with the op since then never reached this worker.
+			c.OpStreamDown(time.Now().Add(-2 * time.Hour))
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Fatalf("a worker cut off from global for two hours served boot action %d from its frozen op set; want BootLocal (%d): "+
+					"global has ended that op and the host may be in production", got, model.BootLocal)
+			}
+
+			// The next connection's op_resync makes the set current again.
+			seedOpsResync(c, op)
+			if got := c.BootActionForMAC(mac); got != tc.action {
+				t.Fatalf("after an op_resync that still carries the op the worker serves %d, want %d", got, tc.action)
+			}
+		})
+	}
+}
+
+// TestBootAction_DisconnectedWorkerFinishesRunningInstall: the window does
+// not disturb an install. A deploy whose host PXE'd before or shortly after
+// the connection dropped boots the installer, and when the outage then runs
+// long the worker still takes the agent's reports and keeps the installed
+// host on its disk.
+func TestBootAction_DisconnectedWorkerFinishesRunningInstall(t *testing.T) {
+	setup := func(t *testing.T, downFor time.Duration) (*Cache, uuid.UUID, uuid.UUID, string) {
+		t.Helper()
+		const mac = "02:00:00:00:00:08"
+		c := NewCache(nil)
+		id, opID := uuid.New(), uuid.New()
+		deployingMachine(c, id, mac)
+		seedOpsResync(c, model.Operation{
+			ID: opID, MachineID: id, Type: model.OpDeploy,
+			Status: model.OpClaimed, ClaimedBy: "worker-a", Phase: "pxe_booting", Version: 3,
+		})
+		c.OpStreamDown(time.Now().Add(-downFor))
+		return c, id, opID, mac
+	}
+
+	t.Run("short outage still boots the installer", func(t *testing.T) {
+		c, _, _, mac := setup(t, 5*time.Minute)
+		if got := c.BootActionForMAC(mac); got != model.BootDeploy {
+			t.Fatalf("five minutes into an outage the worker serves %d, want BootDeploy", got)
+		}
+	})
+
+	t.Run("long outage still takes the agent's reports", func(t *testing.T) {
+		c, id, opID, mac := setup(t, 2*time.Hour)
+		if err := c.HandleProgressReport(&model.ProgressReport{
+			MachineID: id.String(), OperationID: opID.String(), Event: "deploy_complete",
+		}); err != nil {
+			t.Fatalf("deploy_complete during a long outage refused: %v", err)
+		}
+		if op := c.GetOperation(opID.String()); op == nil || op.Phase != "awaiting_phone_home" {
+			t.Fatalf("after deploy_complete op = %+v, want phase awaiting_phone_home", op)
+		}
+		if got := c.BootActionForMAC(mac); got != model.BootLocal {
+			t.Fatalf("the installed host's reboot during a long outage served %d, want BootLocal", got)
+		}
+	})
+}
+
+// TestOpStreamDown_KeepsFirstTimeOfOutage: the WS client reports the
+// connection down after every failed attempt, every 30 seconds at most. Only
+// the first report of an outage may set the time, or the window would never
+// run out; only an op_resync ends the outage.
+func TestOpStreamDown_KeepsFirstTimeOfOutage(t *testing.T) {
+	c := NewCache(nil)
+	first := time.Now().Add(-time.Hour)
+	c.OpStreamDown(first)
+	c.OpStreamDown(time.Now())
+	if got := streamDownSince(c); !got.Equal(first) {
+		t.Fatalf("stream down since %v after a second report, want the first, %v", got, first)
+	}
+	seedOpsResync(c)
+	if got := streamDownSince(c); !got.IsZero() {
+		t.Fatalf("stream down since %v after an op_resync, want the zero time", got)
+	}
+}
+
+func streamDownSince(c *Cache) time.Time {
+	c.opState.mu.RLock()
+	defer c.opState.mu.RUnlock()
+	return c.opState.streamDownSince
+}
+
 // TestAbortSweepDurablePropagation is the worker-side half of the abort/sweep
 // durable-state rule: an op_removed carrying machine_state=failed moves the
 // overlay to failed, and boot is fail-closed (BootLocal) throughout. The
@@ -564,7 +715,7 @@ func TestAwaitingPhoneHomeSurvivesRestart(t *testing.T) {
 				t.Fatalf("deploy_complete: %v", err)
 			}
 			if tc.phoneHome {
-				c.RecordPhoneHome(id)
+				c.RecordPhoneHome(id, opID)
 			}
 			if got := c.BootActionForMAC(mac); got != model.BootLocal {
 				t.Fatalf("precondition: installed host got %d, want BootLocal", got)

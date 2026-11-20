@@ -267,6 +267,13 @@ func (p *InMemoryProvider) GetSSHKeys() []string {
 	return out
 }
 
+// GetImages returns no rows: the test provider carries no image rows, so
+// the boot handler serves HandlerConfig.DefaultImage. Tests of the image
+// row rules use worker.Cache.
+func (p *InMemoryProvider) GetImages() map[string]*Image {
+	return nil
+}
+
 func (p *InMemoryProvider) DeployOpForMAC(mac string) *Operation {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

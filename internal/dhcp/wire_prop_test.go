@@ -59,7 +59,7 @@ func wireHandler() *Handler {
 		},
 		BootEligible: func(mac string) bool { return mac != propMAC(2).String() },
 		ARPProbe:     func(ip net.IP) bool { return toPIP(ip) == a4(10, 1, 0, 11) },
-		OnACK:        func(string, bool) {},
+		OnACK:        func(string, ClientKind) {},
 		OnLeaseEvent: func(LeaseEvent) {},
 		LeaseStore:   &propStore{rows: map[string]PersistedLease{}},
 	})

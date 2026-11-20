@@ -103,7 +103,8 @@ Two systemd units ship (`deploy/systemd/`):
   `PrivateTmp=yes`, `NoNewPrivileges=yes`). `Restart=on-failure`.
 - `slagworksd-site.service` — runs `/usr/bin/slagworksd site` as
   **root** with env from `/etc/slagworks/site.env`. `Type=notify` (the
-  worker signals readiness once connected) and `Restart=always`. It runs
+  worker signals readiness once its boot services are running, whether or
+  not global is reachable) and `Restart=always`. It runs
   as root because it binds raw DHCP sockets and ports 67/69, reads the
   host's SMBIOS serial, and replaces its own package during auto-upgrade.
 
@@ -194,6 +195,13 @@ operators reach it over HTTP(S); the default listen address is `:8081`
   [`configuration.md`](configuration.md#operator-authentication).
 - **Tailscale** (optional) — an OAuth client for deploy-time tailnet
   enrollment.
+- **A proxy or load balancer** (optional) in front of global must pass
+  WebSocket upgrades and the `Authorization` header through, with an idle
+  timeout of at least 60 seconds. Global pings the operator streams
+  (`slagctl machine logs -f`, `slagctl machine logs --sol -f` and the watch
+  view) every 30 seconds so that a quiet stream stays open; a shorter idle
+  timeout can still close one. 60 seconds is the default for an AWS ALB and
+  for nginx's `proxy_read_timeout`.
 
 ### `slagworksd site`
 
@@ -232,22 +240,30 @@ Requirements on the host and its position:
 - **Redundancy (optional).** Two workers can serve one site config,
   either active/standby with a VIP (`SLAGWORKS_STANDBY`, `SLAGWORKS_VIP`)
   or both active, with the OOB dynamic pool split into per-worker slices
-  defined in NetBox. Register and configure each worker separately.
+  defined in NetBox. The fabric ephemeral range and relay pools are split
+  into per-worker shares automatically, one per registered worker, so
+  delete the registration of a worker you retire. Register and configure
+  each worker separately.
 
 State:
 
 - **SQLite** at `SLAGWORKS_DATA_DIR/worker.db` (default
   `/var/lib/slagworks/worker.db`): the last snapshot, the worker
   identity, DHCP leases and the observation outbox. A worker that starts
-  while global is unreachable serves from the cached snapshot. The
-  packaged unit is `Type=notify` and the worker reports ready only after
-  its first successful connection, so while global stays unreachable
-  systemd's start timeout (90 seconds by default) applies to it.
+  while global is unreachable, or refuses it, serves from the cached
+  snapshot. It waits up to 5 seconds for global's first snapshot, starts
+  its services, and then reports ready to systemd (`Type=notify`) whether
+  or not it is connected, so systemd's start timeout never depends on
+  global. A worker with no cached snapshot and no connection is therefore
+  `active` while serving nothing; `/readyz` and the
+  `slagworks_site_ws_connected` metric say whether it is connected.
 - **Image cache** in `SLAGWORKS_IMAGES_DIR` (default `/srv/images`; set it
   to `/var/lib/slagworks/images` for package installs, see
   [configuration](configuration.md#slagworksd-site)). On every snapshot apply
-  the worker compares each image's on-disk SHA-256 marker with the
-  database row and downloads on mismatch.
+  the worker compares each image's on-disk version link with the
+  database row's SHA-256 and downloads on mismatch, in the background: the worker
+  connects and reports ready without waiting for the download, and holds
+  commission and deploy operations until it ends.
 
 ### `slagworks-agent`
 
@@ -268,7 +284,10 @@ the packages on every site worker that serves the affected boots
 - On a site worker: `curl -s http://localhost:9090/readyz`. It returns 200
   once the worker is connected to global, its snapshot lists at least one
   image, `systemd-bootx64.efi` is present in the images directory, the
-  agent binary exists, and no foreign OOB DHCP server has been detected.
+  agent binary exists, no foreign OOB DHCP server has been detected, and
+  the fabric DHCP leg is not running without its pool because the
+  snapshot's DHCP config does not parse (see
+  [configuration](configuration.md#site-config-model)).
   Otherwise it returns 503 with the failing condition in `reason`.
 - On an operator machine: `slagctl auth login`, then `slagctl worker list`
   should list every registered site worker.

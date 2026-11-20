@@ -24,7 +24,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	m := &Metrics{
 		RebuildsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "slagworks_snapshot_rebuilds_total",
-			Help: "Snapshot rebuilds by site and outcome (success | skipped_no_change | error_netbox | error_postgres).",
+			Help: "Snapshot rebuilds by site and outcome (success | skipped_no_change | error_netbox: a NetBox call failed or its data did not build | error_postgres).",
 		}, []string{"site", "outcome"}),
 
 		RebuildDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{

@@ -48,7 +48,10 @@ type SiteSnapshot struct {
 	// ports, and every other OOB host gets its reserved IP. Distinct from
 	// the per-machine interface IPs in MachineSnapshot.Interfaces (which
 	// feed the same ReserveIP lookup but are scoped to slagworks machines
-	// and exclude ipmi). Empty on sites with no slagworks-oob prefix.
+	// and exclude ipmi). A MAC whose interfaces carry more than one OOB
+	// address, or whose address another MAC also carries, has no entry:
+	// the builder leaves it out and logs it rather than guess. Empty on
+	// sites with no slagworks-oob prefix.
 	Reservations []Reservation `json:"reservations,omitempty"`
 }
 
@@ -79,6 +82,14 @@ type DHCPConfig struct {
 	// LeaseSeconds is the lease duration (option 51) from the prefix
 	// dhcp_lease_seconds custom field. 0 = handler default.
 	LeaseSeconds int `json:"lease_seconds,omitempty"`
+	// Workers are the IDs of the site workers registered to this site
+	// config, sorted. Every worker builds its pools from this one
+	// snapshot, so the worker at position i allocates only from share i
+	// of the ephemeral range and of each relay pool's range (a /31 relay
+	// pool is not split): see dhcp.PoolConfig.WorkerShare. A registered
+	// worker that is offline or on standby keeps its share, so the shares
+	// do not move when a worker disconnects or reconnects.
+	Workers []string `json:"workers,omitempty"`
 }
 
 // OOBConfig is the OOB-segment DHCP configuration the site worker binds in
@@ -142,7 +153,9 @@ type SnapshotInterface struct {
 	// form. When the interface has several, Build picks the device's
 	// primary_ip4 if it is among them, else the numerically lowest IPv4
 	// address (the lowest IPv6 address when there is no IPv4), whatever
-	// order NetBox listed them in.
+	// order NetBox listed them in. Within a family, addresses whose NetBox
+	// role is unset or loopback come before those with another role
+	// (secondary, anycast, vip, vrrp, hsrp, glbp, carp).
 	IP string `json:"ip,omitempty"`
 
 	// The fields below carry the extra topology an L2 bond host needs and
@@ -360,7 +373,9 @@ func (s SiteSnapshot) ContentHash() (string, error) {
 	// re-sorted — that order is intentional and stable. DHCP.RelayPools
 	// isn't re-sorted either: configured pools keep their authored order
 	// (the worker serves from the first pool containing giaddr), and the
-	// builder emits the generated /31 pools sorted by subnet.
+	// builder emits the generated /31 pools sorted by subnet. Nor is
+	// DHCP.Workers: the builder emits it sorted, and its order assigns each
+	// worker's share of the dynamic ranges.
 	copied.OOB.DynamicSlices = append([]OOBDynamicSlice(nil), s.OOB.DynamicSlices...)
 
 	// Machine.ID is a UUID and guaranteed unique, so a simple comparator

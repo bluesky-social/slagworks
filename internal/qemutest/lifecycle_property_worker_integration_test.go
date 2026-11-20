@@ -513,13 +513,20 @@ func (w *propWorker) PowerLog() []propPowerAction {
 }
 
 // onACK is cmd/slagworksd/site.go's dhcpCfg.OnACK.
-func (w *propWorker) onACK(mac string, isIPXE bool) {
+func (w *propWorker) onACK(mac string, client dhcp.ClientKind) {
+	var phase string
+	switch client {
+	case dhcp.ClientFirmware:
+		phase = "dhcp_ack"
+	case dhcp.ClientIPXE:
+		phase = "ipxe_dhcp"
+	case dhcp.ClientOther:
+		// The booted environment's own DHCP client: no boot phase.
+		return
+	}
 	// The ACK is a moment a history can aim at: the instant the host's
 	// PXE traffic turns into a phase update on the worker.
-	ev := propHTTPEvent{At: time.Now(), Inc: w.inc, Kind: "dhcp", MAC: strings.ToLower(mac), Phase: "dhcp_ack", Connected: w.Connected(), Status: 200}
-	if isIPXE {
-		ev.Phase = "ipxe_dhcp"
-	}
+	ev := propHTTPEvent{At: time.Now(), Inc: w.inc, Kind: "dhcp", MAC: strings.ToLower(mac), Phase: phase, Connected: w.Connected(), Status: 200}
 	w.rec.fire(true, &ev)
 	cache := w.cache.Load()
 	if cache == nil {
@@ -533,16 +540,12 @@ func (w *propWorker) onACK(mac string, isIPXE bool) {
 	if op == nil {
 		return
 	}
-	phase := "dhcp_ack"
-	if isIPXE {
-		phase = "ipxe_dhcp"
-	}
 	cache.UpdateOpPhase(op.ID.String(), phase)
 }
 
 // simDHCP answers the simulated host's DHCP exchange: a lease (and the
 // OnACK hook) only when the worker is up and the MAC is a known machine.
-func (w *propWorker) simDHCP(mac string, isIPXE bool) bool {
+func (w *propWorker) simDHCP(mac string, client dhcp.ClientKind) bool {
 	if !w.Alive() {
 		return false
 	}
@@ -550,7 +553,7 @@ func (w *propWorker) simDHCP(mac string, isIPXE bool) bool {
 	if cache == nil || cache.MachineByMAC(mac) == nil {
 		return false
 	}
-	w.onACK(mac, isIPXE)
+	w.onACK(mac, client)
 	return true
 }
 
@@ -959,11 +962,11 @@ func (h *propSimHost) boot(gen int) {
 		return
 	}
 	script := ""
-	if h.w.simDHCP(h.mac, false) {
+	if h.w.simDHCP(h.mac, dhcp.ClientFirmware) {
 		if !h.pause(gen, h.step) {
 			return
 		}
-		h.w.simDHCP(h.mac, true)
+		h.w.simDHCP(h.mac, dhcp.ClientIPXE)
 		req := httptest.NewRequest(http.MethodGet, "/boot/ipxe?mac="+h.mac, nil)
 		if st, body, err := h.w.serveDirect(req); err == nil && st == http.StatusOK {
 			script = body

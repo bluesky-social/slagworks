@@ -34,7 +34,7 @@ import (
 type Inputs struct {
 	Site           netbox.Site
 	Config         model.SiteConfig
-	Prefixes       []netbox.Prefix  // tag=slagworks-production; [0] is the DHCP primary, so callers pass a stable order
+	Prefixes       []netbox.Prefix  // tag=slagworks-production; a location-scoped config's own location's first (see dhcpPrefix)
 	OOBPrefixes    []netbox.Prefix  // tag=slagworks-oob; empty pre-cutover
 	OOBRanges      []netbox.IPRange // role=slagworks-oob-dynamic; empty pre-cutover
 	Devices        []netbox.Device
@@ -46,6 +46,11 @@ type Inputs struct {
 	Scripts        []model.StorageScript
 	NetworkScripts []model.NetworkScript
 	SSHKeys        []string
+
+	// Workers are the IDs of the site workers registered to this config,
+	// in any order. Build emits them sorted as DHCP.Workers, which assigns
+	// each worker its share of the fabric dynamic ranges.
+	Workers []string
 
 	// ConsolePorts are the console ports of the scoped devices, each with
 	// its cable-path far end. Build resolves a machine's cabled
@@ -103,20 +108,26 @@ type AddressChoice struct {
 //
 //   - the device's primary IPv4 (NetBox primary_ip4, matched by address ID;
 //     0 for none) when it is one of them;
-//   - otherwise the numerically lowest IPv4 address, ties broken by the
-//     shorter prefix length, then the lower NetBox ID;
-//   - an interface with no IPv4 address gets its lowest IPv6 address by the
-//     same ordering. An address that does not parse sorts after every one
-//     that does.
+//   - otherwise an IPv4 address, preferring the interface's own addresses
+//     (NetBox role unset or loopback, see netbox.IPAddress.IsOwnAddress)
+//     over secondary and shared (anycast, VIP, FHRP) ones, and among those
+//     the numerically lowest, ties broken by the shorter prefix length, then
+//     the lower NetBox ID;
+//   - an interface with no IPv4 address gets an IPv6 address by the same
+//     ordering. An address that does not parse sorts after every one that
+//     does.
 //
 // IPv4 comes first because the facts hold one address per interface and
 // every shipped network script and the worker's DHCP reservation read it as
 // IPv4. The primary comes first because it is the address the operator
 // already named as the host's own; on a storage host's ten-address data
-// interface it is the host address and the rest are service addresses.
+// interface it is the host address and the rest are service addresses. An
+// own address comes before a lower shared one because NetBox already says
+// the shared one is not this host's: the shipped L3 scripts render lo's /32
+// as the BGP router-id, which must not be a router's anycast address.
 func chooseInterfaceAddress(addrs []netbox.IPAddress, primaryIP4 int) netbox.IPAddress {
 	type key struct {
-		class int // 0 IPv4, 1 IPv6, 2 unparseable
+		class int // 0 own IPv4, 1 other IPv4, 2 own IPv6, 3 other IPv6, 4 unparseable
 		addr  netip.Addr
 		bits  int
 	}
@@ -128,12 +139,16 @@ func chooseInterfaceAddress(addrs []netbox.IPAddress, primaryIP4 int) netbox.IPA
 		} else if a, err := netip.ParseAddr(ip.Address); err == nil {
 			addr, bits = a.Unmap(), a.Unmap().BitLen()
 		} else {
-			return key{class: 2}
+			return key{class: 4}
 		}
-		if addr.Is4() {
-			return key{0, addr, bits}
+		class := 0
+		if !addr.Is4() {
+			class = 2
 		}
-		return key{1, addr, bits}
+		if !ip.IsOwnAddress() {
+			class++
+		}
+		return key{class, addr, bits}
 	}
 	best, bestKey := addrs[0], keyOf(addrs[0])
 	for _, ip := range addrs {
@@ -155,13 +170,53 @@ func chooseInterfaceAddress(addrs []netbox.IPAddress, primaryIP4 int) netbox.IPA
 	return best
 }
 
+// dhcpPrefix picks the slagworks-production prefix the fabric DHCP subnet,
+// gateway, DNS servers and lease time come from: the most specific prefix
+// containing the config's ephemeral pool start, among
+//
+//   - every prefix, for a whole-site config (the dispatcher passes it only
+//     the prefixes scoped to the site itself);
+//   - the prefixes scoped to the same location as Prefixes[0], for a
+//     location-scoped config. The dispatcher lists the config's own location
+//     first, so its prefix supplies the subnet even when a child location's
+//     prefix also holds the pool.
+//
+// The pool decides, not list order, because a scope carries more than one
+// production prefix once an operator tags another so hosts in it resolve a
+// gateway, and NetBox lists prefixes by address: the first one listed can be
+// a prefix the pool is not in, and the worker would hand out pool addresses
+// with that prefix's mask and gateway. When no candidate contains the pool
+// start the snapshot is inconsistent whichever is chosen, so the first
+// candidate (NetBox's lowest address) is kept and a warning logged.
+func dhcpPrefix(in Inputs) netbox.Prefix {
+	first := in.Prefixes[0]
+	best, bestBits := first, -1
+	if pool, err := netip.ParseAddr(in.Config.EphemeralPoolStart); err == nil {
+		pool = pool.Unmap()
+		for _, p := range in.Prefixes {
+			if in.Config.LocationScoped() && (p.ScopeType != first.ScopeType || p.ScopeID != first.ScopeID) {
+				continue
+			}
+			if pfx, err := netip.ParsePrefix(p.Prefix); err == nil && pfx.Bits() > bestBits && pfx.Contains(pool) {
+				best, bestBits = p, pfx.Bits()
+			}
+		}
+	}
+	if bestBits < 0 {
+		slog.Warn("snapshot: the ephemeral pool start is in none of the slagworks-production prefixes the fabric DHCP subnet can come from; serving the first one, so pool addresses go out with a mask and gateway that do not fit them. Move the pool into one of those prefixes (slagctl site-config update), or tag slagworks-production the prefix it lies in, scoped to the config's site or own location",
+			"site", in.Site.Slug, "config", in.Config.Slug,
+			"ephemeral_pool_start", in.Config.EphemeralPoolStart, "prefix", first.Prefix)
+	}
+	return best
+}
+
 // buildWithChoices is Build plus the list of multi-address interfaces it
 // had to choose an address for, ordered by NetBox interface ID.
 func buildWithChoices(in Inputs) (model.SiteSnapshot, []AddressChoice, error) {
 	if len(in.Prefixes) == 0 {
 		return model.SiteSnapshot{}, nil, fmt.Errorf("site %s: no slagworks-production prefix", in.Site.Slug)
 	}
-	primary := in.Prefixes[0]
+	primary := dhcpPrefix(in)
 	gateway := prefixGatewayIP(primary)
 
 	dhcp := model.DHCPConfig{
@@ -173,6 +228,9 @@ func buildWithChoices(in Inputs) (model.SiteSnapshot, []AddressChoice, error) {
 		Promiscuous:        in.Config.Promiscuous,
 		DNS:                prefixCSVField(primary, "dns_servers"),
 		LeaseSeconds:       prefixIntField(primary, "dhcp_lease_seconds"),
+	}
+	if len(in.Workers) > 0 {
+		dhcp.Workers = slices.Sorted(slices.Values(in.Workers))
 	}
 	// L3 host fabric: generate a single-address relay pool per host /31
 	// leg. The leaf's dhcp-helper relays PXE DISCOVERs with giaddr = the
@@ -415,21 +473,36 @@ func buildWithChoices(in Inputs) (model.SiteSnapshot, []AddressChoice, error) {
 
 	// OOB DHCP reservations: every interface (INCLUDING mgmt_only) whose
 	// assigned IP falls in a slagworks-oob prefix, across ALL site devices.
-	// This is what lets the worker replace dnsmasq for the OOB net. Build
-	// fails loudly on a conflicting reservation set rather than serving a
-	// half-bad one. Empty in.OOBPrefixes (pre-cutover) → no reservations.
-	reservations, err := buildOOBReservations(in.OOBPrefixes, in.Interfaces, in.IPs)
+	// This is what lets the worker replace dnsmasq for the OOB net. A MAC
+	// whose reservation NetBox makes ambiguous is left out and named in a
+	// warning; it never fails the site. Empty in.OOBPrefixes (pre-cutover)
+	// → no reservations.
+	//
+	// These warnings, like the console-port one, repeat on every build: a
+	// left-out MAC is a host the worker no longer serves as modelled, which
+	// stays worth seeing until NetBox is fixed. (The multi-address report
+	// above is deduplicated by the dispatcher because those interfaces are
+	// legitimate and every one of them is still served.)
+	reservations, leftOut, err := buildOOBReservations(in.OOBPrefixes, in.Interfaces, in.IPs)
 	if err != nil {
 		return model.SiteSnapshot{}, nil, fmt.Errorf("site %s: OOB reservations: %w", in.Site.Slug, err)
 	}
+	if len(leftOut) > 0 {
+		slog.Warn("snapshot: OOB DHCP reservations left out; each MAC listed gets no static lease until NetBox gives it exactly one address inside the slagworks-oob prefix that no other MAC also has (model a shared address such as a VIP on an FHRP group, not on the interfaces)",
+			"site", in.Site.Slug, "config", in.Config.Slug, "count", len(leftOut), "macs", leftOut)
+	}
 
 	// OOB segment config (subnet/gateway/DNS/NTP/dynamic-pool), sourced from
-	// the slagworks-oob prefix + its dynamic ip-range. Zero value when there
+	// the slagworks-oob prefix + its dynamic ip-ranges. Zero value when there
 	// is no OOB prefix (pre-cutover). The worker derives serverIP + bind
 	// iface host-locally from OOB.Subnet.
-	oob, err := buildOOBConfig(in.OOBPrefixes, in.OOBRanges)
+	oob, leftOutRanges, err := buildOOBConfig(in.OOBPrefixes, in.OOBRanges)
 	if err != nil {
 		return model.SiteSnapshot{}, nil, fmt.Errorf("site %s: OOB config: %w", in.Site.Slug, err)
+	}
+	if len(leftOutRanges) > 0 {
+		slog.Warn("snapshot: OOB dynamic ranges left out; give each slagworks-oob-dynamic range a slagworks_oob_owner (the address of the gateway that serves it) that no other range names",
+			"site", in.Site.Slug, "config", in.Config.Slug, "count", len(leftOutRanges), "ranges", leftOutRanges)
 	}
 
 	return model.SiteSnapshot{
@@ -454,9 +527,12 @@ func buildWithChoices(in Inputs) (model.SiteSnapshot, []AddressChoice, error) {
 // or a site that doesn't run OOB DHCP. DNS/NTP are read from comma-
 // separated prefix custom fields (dns_servers/ntp_servers), mirroring the
 // gateway_ip CF pattern; missing/empty = advertise none.
-func buildOOBConfig(oobPrefixes []netbox.Prefix, oobRanges []netbox.IPRange) (model.OOBConfig, error) {
+//
+// It also returns, one line each, the dynamic ranges it left out (see
+// below); a bad range never fails the build.
+func buildOOBConfig(oobPrefixes []netbox.Prefix, oobRanges []netbox.IPRange) (model.OOBConfig, []string, error) {
 	if len(oobPrefixes) == 0 {
-		return model.OOBConfig{}, nil
+		return model.OOBConfig{}, nil, nil
 	}
 	if len(oobPrefixes) > 1 {
 		// A site has exactly one OOB /22. More than one slagworks-oob
@@ -466,7 +542,7 @@ func buildOOBConfig(oobPrefixes []netbox.Prefix, oobRanges []netbox.IPRange) (mo
 		for i, p := range oobPrefixes {
 			ps[i] = p.Prefix
 		}
-		return model.OOBConfig{}, fmt.Errorf("expected exactly one slagworks-oob prefix, got %d: %v", len(oobPrefixes), ps)
+		return model.OOBConfig{}, nil, fmt.Errorf("expected exactly one slagworks-oob prefix, got %d: %v", len(oobPrefixes), ps)
 	}
 	p := oobPrefixes[0]
 	cfg := model.OOBConfig{
@@ -479,13 +555,32 @@ func buildOOBConfig(oobPrefixes []netbox.Prefix, oobRanges []netbox.IPRange) (mo
 	// Each dynamic ip-range is one gateway's split-pool slice, owned by the
 	// gateway named in its slagworks_oob_owner custom field. Emit all of
 	// them; the worker selects its own by matching its derived serverIP.
-	// A slice missing its owner CF is a data error (the worker couldn't tell
-	// whose it is), so fail loud. Zero ranges = reservations-only OOB.
+	// Zero ranges = reservations-only OOB.
+	//
+	// A range with no owner (the worker couldn't tell whose it is), and
+	// every range whose owner another range also names (which slice does
+	// that gateway serve?), is left out and reported. The other slices are
+	// unaffected; a gateway whose slice is left out serves reservations
+	// only, and a client holding a lease in that slice is NAKed on renewal
+	// and gets a fresh one from a slice that is still served.
+	owners := make(map[string]int, len(oobRanges))
+	for _, r := range oobRanges {
+		if owner := iprangeStringCF(r, "slagworks_oob_owner"); owner != "" {
+			owners[owner]++
+		}
+	}
+	var leftOut []string
 	for _, r := range oobRanges {
 		owner := iprangeStringCF(r, "slagworks_oob_owner")
-		if owner == "" {
-			return model.OOBConfig{}, fmt.Errorf("OOB dynamic range %s-%s has no slagworks_oob_owner custom field",
-				r.StartAddress, r.EndAddress)
+		switch {
+		case owner == "":
+			leftOut = append(leftOut, fmt.Sprintf("%s-%s (NetBox IP range %d): no slagworks_oob_owner",
+				r.StartAddress, r.EndAddress, r.ID))
+			continue
+		case owners[owner] > 1:
+			leftOut = append(leftOut, fmt.Sprintf("%s-%s (NetBox IP range %d): slagworks_oob_owner %s is also the owner of another range",
+				r.StartAddress, r.EndAddress, r.ID, owner))
+			continue
 		}
 		cfg.DynamicSlices = append(cfg.DynamicSlices, model.OOBDynamicSlice{
 			Start: stripMask(r.StartAddress),
@@ -493,16 +588,7 @@ func buildOOBConfig(oobPrefixes []netbox.Prefix, oobRanges []netbox.IPRange) (mo
 			Owner: owner,
 		})
 	}
-	// Reject duplicate slice owners (two ranges claiming the same gateway is
-	// ambiguous — which slice does that gateway serve?).
-	seenOwner := make(map[string]bool, len(cfg.DynamicSlices))
-	for _, s := range cfg.DynamicSlices {
-		if seenOwner[s.Owner] {
-			return model.OOBConfig{}, fmt.Errorf("two OOB dynamic slices claim owner %s", s.Owner)
-		}
-		seenOwner[s.Owner] = true
-	}
-	return cfg, nil
+	return cfg, leftOut, nil
 }
 
 // prefixCSVField reads a comma-separated text custom field off a prefix
@@ -575,25 +661,40 @@ func iprangeStringCF(r netbox.IPRange, field string) string {
 // reservations cover every site device and the machine loop's one-address
 // choice covers only bound machines.
 //
-// Fails loudly (per the plan's conflict-rejection rule) on:
-//   - more than one OOB IP on a single interface,
-//   - the same MAC mapped to two different IPs (across interfaces),
-//   - the same IP mapped to two different MACs.
+// The reservation is keyed by MAC, and interfaces can share one (a bond and
+// its VLAN children), so the join is over MACs: a MAC gets a reservation
+// only when its interfaces carry exactly one distinct OOB address and no
+// other MAC carries that address. Any other MAC is left out rather than
+// given one of its addresses, because no rule here can tell which address
+// the host should get (on a gateway's NIC the shared VIP is usually the
+// lowest), and handing a host the wrong static IP is worse than none. The
+// same address modelled twice on one MAC's interfaces is one address, not a
+// conflict.
 //
-// A half-bad reservation set is worse than none — it would hand a host the
-// wrong static IP. Returning an error fails the whole snapshot build so the
-// operator sees the NetBox data problem instead of shipping a bad lease.
+// A left-out MAC never fails the build: every other MAC keeps its
+// reservation, and the MACs left out are returned, one line each naming the
+// NetBox interfaces and addresses, for the caller to report. A left-out MAC
+// that is not a machine's is unknown to the worker: it gets no static lease
+// (a dynamic one from the owning gateway's slice, if any), and, since it is
+// no longer a reservation, the worker's BootEligible gate no longer
+// withholds a PXE bootfile from it. Only a netboot client gets one
+// (bootFileFor's option 60 check), and its /boot/ipxe answer is the
+// local-boot script because the MAC is not a machine. A machine's physical
+// NIC is unaffected: its static lease comes from the machine's interface
+// facts, which take precedence over this set.
+//
 // Interfaces with no MAC or no OOB IP are silently skipped (not every iface
-// is a reservation). Returns nil when there are no OOB prefixes.
-func buildOOBReservations(oobPrefixes []netbox.Prefix, interfaces []netbox.Interface, ips []netbox.IPAddress) ([]model.Reservation, error) {
+// is a reservation). Returns nil when there are no OOB prefixes. The only
+// error is an OOB prefix that does not parse.
+func buildOOBReservations(oobPrefixes []netbox.Prefix, interfaces []netbox.Interface, ips []netbox.IPAddress) ([]model.Reservation, []string, error) {
 	if len(oobPrefixes) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	nets := make([]*net.IPNet, 0, len(oobPrefixes))
 	for _, p := range oobPrefixes {
 		_, n, err := net.ParseCIDR(p.Prefix)
 		if err != nil {
-			return nil, fmt.Errorf("parse OOB prefix %q: %w", p.Prefix, err)
+			return nil, nil, fmt.Errorf("parse OOB prefix %q: %w", p.Prefix, err)
 		}
 		nets = append(nets, n)
 	}
@@ -606,8 +707,8 @@ func buildOOBReservations(oobPrefixes []netbox.Prefix, interfaces []netbox.Inter
 		return false
 	}
 
-	// All OOB IPs per interface (NOT last-write-wins): keeps every
-	// IPAddress row so a multi-OOB-IP interface is detectable below.
+	// Every OOB IP per interface (NOT last-write-wins), so an interface
+	// with more than one is detectable below.
 	oobIPsByIface := make(map[int][]string)
 	for _, ip := range ips {
 		if ip.AssignedObjectID == nil || ip.AssignedObjectType != "dcim.interface" || !ip.IsActive() {
@@ -624,37 +725,70 @@ func buildOOBReservations(oobPrefixes []netbox.Prefix, interfaces []netbox.Inter
 		oobIPsByIface[id] = append(oobIPsByIface[id], parsed.String())
 	}
 
-	byMAC := make(map[string]string) // mac(lower) -> ip
-	byIP := make(map[string]string)  // ip -> mac(lower)
-	var out []model.Reservation
+	// The distinct OOB addresses and the interfaces per MAC, and the
+	// distinct MACs per address. macs keeps first-seen interface order so
+	// the output follows the interface list.
+	type macUse struct {
+		addrs  []string
+		ifaces []netbox.Interface
+	}
+	byMAC := make(map[string]*macUse)
+	var macs []string
+	macsByAddr := make(map[string][]string)
 	for _, iface := range interfaces {
 		oobIPs := oobIPsByIface[iface.ID]
-		if len(oobIPs) == 0 {
-			continue
-		}
-		if len(oobIPs) > 1 {
-			return nil, fmt.Errorf("interface %d (%s) has %d OOB IPs (%v); expected exactly one",
-				iface.ID, iface.Name, len(oobIPs), oobIPs)
-		}
-		ipStr := oobIPs[0]
 		mac := strings.ToLower(iface.GetMAC())
-		if mac == "" {
+		if len(oobIPs) == 0 || mac == "" {
 			continue
 		}
-		if prev, ok := byMAC[mac]; ok && prev != ipStr {
-			return nil, fmt.Errorf("MAC %s assigned two OOB IPs (%s and %s)", mac, prev, ipStr)
+		u := byMAC[mac]
+		if u == nil {
+			u = &macUse{}
+			byMAC[mac] = u
+			macs = append(macs, mac)
 		}
-		if prevMAC, ok := byIP[ipStr]; ok && prevMAC != mac {
-			return nil, fmt.Errorf("OOB IP %s assigned to two MACs (%s and %s)", ipStr, prevMAC, mac)
+		u.ifaces = append(u.ifaces, iface)
+		for _, a := range oobIPs {
+			if !slices.Contains(u.addrs, a) {
+				u.addrs = append(u.addrs, a)
+				macsByAddr[a] = append(macsByAddr[a], mac)
+			}
 		}
-		if _, dup := byMAC[mac]; dup {
-			continue // identical (mac,ip) already recorded
-		}
-		byMAC[mac] = ipStr
-		byIP[ipStr] = mac
-		out = append(out, model.Reservation{MAC: mac, IP: ipStr})
 	}
-	return out, nil
+
+	var out []model.Reservation
+	var leftOut []string
+	for _, mac := range macs {
+		u := byMAC[mac]
+		switch {
+		case len(u.addrs) > 1:
+			slices.Sort(u.addrs)
+			leftOut = append(leftOut, fmt.Sprintf("%s on %s: %d OOB addresses (%s)",
+				mac, describeInterfaces(u.ifaces), len(u.addrs), strings.Join(u.addrs, ", ")))
+		case len(macsByAddr[u.addrs[0]]) > 1:
+			others := slices.DeleteFunc(slices.Clone(macsByAddr[u.addrs[0]]), func(m string) bool { return m == mac })
+			slices.Sort(others)
+			leftOut = append(leftOut, fmt.Sprintf("%s on %s: OOB address %s is also on %s",
+				mac, describeInterfaces(u.ifaces), u.addrs[0], strings.Join(others, ", ")))
+		default:
+			out = append(out, model.Reservation{MAC: mac, IP: u.addrs[0]})
+		}
+	}
+	return out, leftOut, nil
+}
+
+// describeInterfaces names NetBox interfaces for an operator: device name
+// (when NetBox nested it), interface name and ID.
+func describeInterfaces(ifaces []netbox.Interface) string {
+	names := make([]string, len(ifaces))
+	for i, iface := range ifaces {
+		name := iface.Name
+		if iface.Device != nil && iface.Device.Name != "" {
+			name = iface.Device.Name + " " + name
+		}
+		names[i] = fmt.Sprintf("%s (NetBox interface %d)", name, iface.ID)
+	}
+	return strings.Join(names, ", ")
 }
 
 // defaultConsoleBaud is the console speed assumed when NetBox leaves a

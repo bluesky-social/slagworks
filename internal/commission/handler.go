@@ -33,6 +33,10 @@ type Store interface {
 	ValidateOperationBinding(opID, machineID uuid.UUID, opType model.OperationType, result json.RawMessage) (bool, error)
 	CommitCommissionResult(opID, machineID uuid.UUID, data json.RawMessage) (*store.OpOutcome, bool, error)
 
+	// SetOperationPhase latches a deploy op at awaiting_phone_home from
+	// its deploy_complete observation. It leaves a terminal op as it is.
+	SetOperationPhase(opID uuid.UUID, phase string) (store.PhaseTransition, error)
+
 	// CompleteOperationWithState / FailOperationOutcome finalize a
 	// bmc_reconcile op from its bmc_reconcile_report observation, and
 	// CompleteOperationWithState completes a deploy op from its
@@ -111,9 +115,12 @@ type ClaimResolver interface {
 // state; the identity rebuild is fired separately via the Invalidator
 // below (unchanged). The bmc_reconcile_report handler publishes
 // op_removed for the bmc_reconcile op it finalizes (no machine state),
-// and the phone_home handler publishes op_removed carrying running for
-// the deploy op it completes. Nil disables the op-stream publish (tests).
+// the deploy_complete handler publishes op_delta when it latches the
+// deploy op at awaiting_phone_home, and the phone_home handler publishes
+// op_removed carrying running for the deploy op it completes. Nil
+// disables the op-stream publish (tests).
 type OpPublisher interface {
+	PublishOpDelta(op model.Operation, machineState model.MachineState)
 	PublishOpRemoved(op model.Operation, machineState model.MachineState)
 }
 
@@ -294,13 +301,27 @@ func (h *Handler) handleDHCPLease(ctx context.Context, obs model.Observation) er
 	return h.store.RecordDHCPLeaseEvent(ctx, obs.SiteSlug, obs.WorkerID, ev.Event, ev.MAC, ev.IP, ev.Kind, ev.Pool, machineID, expiresAt)
 }
 
-// handleDeployComplete persists the monitor credential the agent's BMC
-// reconcile phase produced at the end of deploy: it upserts the per-host
-// monitor cred into pop/<pop>/bmc-creds-monitor, keyed by the NetBox
-// device serial. This is the cred ipmi_exporter consumes for fleet-wide
-// BMC scrapes. slagworks keeps no BMC credential of its own (it drives
-// BMCs with the bmc-creds-admin entry), so the monitor cred is the only
-// thing a deploy reports.
+// handleDeployComplete latches the deploy op at awaiting_phone_home and
+// persists the monitor credential the agent's BMC reconcile phase produced
+// at the end of deploy.
+//
+// The latch is the phase that keeps the installed host off the installer
+// (docs/dev/state-machine.md, "The awaiting_phone_home latch"). The site
+// worker that accepted deploy_complete latched its own copy and queued a
+// phase op_update, but that update is memory-only and unacknowledged, and
+// the other worker of a both-active pair, or a worker that restarts or
+// resyncs, takes the phase from global's row. This observation is the
+// durable record that the install finished, so it writes the phase too,
+// before the monitor credential: a monitor failure that drops the
+// observation must not take the latch with it. The write is a no-op when
+// the op_update got there first or the op is already terminal (a replay
+// after phone-home completed it).
+//
+// The monitor cred is upserted into pop/<pop>/bmc-creds-monitor, keyed by
+// the NetBox device serial. This is the cred ipmi_exporter consumes for
+// fleet-wide BMC scrapes. slagworks keeps no BMC credential of its own (it
+// drives BMCs with the bmc-creds-admin entry), so the monitor cred is the
+// only credential a deploy reports.
 //
 // Empty Data, or a report with no Monitor, is the no-rotation case: the
 // agent's reconcile wrote no new password, and the stored monitor entry
@@ -310,6 +331,23 @@ func (h *Handler) handleDeployComplete(ctx context.Context, obs model.Observatio
 		obs.OperationID, obs.MachineID, model.OpDeploy, nil,
 	); err != nil {
 		return reportBindingError("validate deploy operation binding", err)
+	}
+	t, err := h.store.SetOperationPhase(obs.OperationID, "awaiting_phone_home")
+	if err != nil {
+		return fmt.Errorf("latch deploy op %s at awaiting_phone_home: %w", obs.OperationID, err)
+	}
+	if t.Changed {
+		h.log.Info("phase transition",
+			"op_id", obs.OperationID,
+			"machine_id", t.MachineID,
+			"trace_id", t.TraceID,
+			"phase", t.NewPhase,
+			"prev_phase", t.PrevPhase,
+			"duration_ms", t.Duration.Milliseconds(),
+			"via", "deploy_complete observation")
+		if h.publisher != nil && t.Op != nil {
+			h.publisher.PublishOpDelta(*t.Op, "")
+		}
 	}
 	if len(obs.Data) == 0 {
 		return nil

@@ -624,6 +624,137 @@ func TestHub_ColdHelloKeepsSnapshotPushedDuringRebuild(t *testing.T) {
 	}
 }
 
+// fillThenFail stands in for the slug's rebuild actor when a cold hello's
+// own rebuild wait fails although the hub's cache was filled while it
+// waited. A hello that arrives while a rebuild is already running waits for
+// the next one; fill is what happens in between (the running rebuild
+// pushes, or a sibling worker's cold hello caches its result), and the
+// error is the next rebuild failing or outlasting RebuildTimeout.
+type fillThenFail struct {
+	fill func(ctx context.Context)
+}
+
+func (r *fillThenFail) RebuildAndWait(ctx context.Context, _ string) (model.SiteSnapshot, error) {
+	r.fill(ctx)
+	return model.SiteSnapshot{}, errors.New("netbox: context deadline exceeded")
+}
+
+// readHelloCompletion reads the rest of a hello exchange: zero or more
+// snapshots carrying wantSeq, then the op_resync that completes the hello.
+// An error message or a dropped connection fails the test.
+func readHelloCompletion(ctx context.Context, t *testing.T, h *Hub, conn *Conn, slug string, wantSeq int64) {
+	t.Helper()
+	for {
+		env, err := conn.ReadMessage(ctx)
+		if err != nil {
+			t.Fatalf("the hub dropped the connection instead of completing the hello: %v", err)
+		}
+		switch env.Type {
+		case TypeSnapshot:
+			var msg SnapshotMsg
+			if json.Unmarshal(env.Data, &msg) != nil || msg.Snapshot.SeqNum != wantSeq {
+				t.Fatalf("snapshot = %s, want seq %d", env.Data, wantSeq)
+			}
+		case TypeOpResync:
+			if n := len(h.rpcTargets(slug)); n != 1 {
+				t.Errorf("hello completed but the hub has %d RPC targets for the site, want 1", n)
+			}
+			return
+		case TypeError:
+			t.Fatalf("the hub refused a hello it can answer from its cached snapshot: %s", env.Data)
+		default:
+			t.Fatalf("unexpected message %s before op_resync", env.Type)
+		}
+	}
+}
+
+// TestHub_ColdHelloAnsweredFromPushedSnapshotWhenItsRebuildFails: a
+// connection registers for Push fan-out before its hello is answered, so a
+// snapshot pushed while a cold hello waits on its rebuild reaches the
+// worker as the connection's first message. The worker takes it for the
+// hello reply and considers itself connected (it reports READY, drains its
+// outbox, claims operations). When the hello's own rebuild wait then
+// fails, the hub must still finish the hello from the snapshot it now
+// caches, not refuse and close a connection the worker is already using.
+func TestHub_ColdHelloAnsweredFromPushedSnapshotWhenItsRebuildFails(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "site-a", "worker-1")
+	pushed := model.SiteSnapshot{SeqNum: 4, Site: model.SiteInfo{Slug: "site-a"}}
+	delivered := make(chan struct{})
+	reb := &fillThenFail{}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: reb, RebuildTimeout: 2 * time.Second})
+	reb.fill = func(ctx context.Context) {
+		h.Push("site-a", pushed)
+		// Fail only once the worker holds the fan-out, the order a
+		// production rebuild's debounce and NetBox gather produce.
+		select {
+		case <-delivered:
+		case <-ctx.Done():
+		}
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer func() { _ = conn.CloseNow() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeHello, "", HelloMsg{WorkerID: "worker-1", Proto: OpStreamProto}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := conn.ReadMessage(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg SnapshotMsg
+	if env.Type != TypeSnapshot || json.Unmarshal(env.Data, &msg) != nil || msg.Snapshot.SeqNum != 4 {
+		t.Fatalf("first message = %s %s, want the pushed snapshot seq 4", env.Type, env.Data)
+	}
+	close(delivered)
+	readHelloCompletion(ctx, t, h, conn, "site-a", 4)
+}
+
+// TestHub_ColdHelloAnsweredFromSiblingsSnapshotWhenItsRebuildFails: the
+// same failure when the cache was filled without a Push, by another
+// worker's cold hello for the site caching its rebuild result. Nothing has
+// reached this connection yet, so the hello reply carries the snapshot.
+func TestHub_ColdHelloAnsweredFromSiblingsSnapshotWhenItsRebuildFails(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "site-a", "worker-1")
+	reb := &fillThenFail{}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: reb, RebuildTimeout: 2 * time.Second})
+	reb.fill = func(context.Context) {
+		h.mu.Lock()
+		h.snapshots["site-a"] = model.SiteSnapshot{SeqNum: 4, Site: model.SiteInfo{Slug: "site-a"}}
+		h.mu.Unlock()
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer func() { _ = conn.CloseNow() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeHello, "", HelloMsg{WorkerID: "worker-1", Proto: OpStreamProto}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := conn.ReadMessage(ctx)
+	if err != nil {
+		t.Fatalf("the hub dropped the connection instead of answering the hello: %v", err)
+	}
+	var msg SnapshotMsg
+	if env.Type != TypeSnapshot || json.Unmarshal(env.Data, &msg) != nil || msg.Snapshot.SeqNum != 4 {
+		t.Fatalf("hello reply = %s %s, want the cached snapshot seq 4", env.Type, env.Data)
+	}
+	readHelloCompletion(ctx, t, h, conn, "site-a", 4)
+}
+
 func TestHub_UnregisterOnDisconnect(t *testing.T) {
 	h, auth, _ := newTestHub(t)
 	auth.register("tok-1", "pop3", "worker-1")
@@ -944,6 +1075,121 @@ func TestHub_ObservationHandlerError_RepliesWithError(t *testing.T) {
 	_ = unmarshalData(env.Data, &resp)
 	if resp.Error == "" {
 		t.Fatal("expected error in rpc_response, got empty")
+	}
+}
+
+// leaseOrderProbe is an ObservationHandler that records when the handling
+// of each dhcp_lease observation starts and ends. The first one it gets
+// holds on for a while, as the ledger handler does while it waits for a
+// database connection, and lets go early if a second one starts meanwhile.
+type leaseOrderProbe struct {
+	mu      sync.Mutex
+	events  []string
+	calls   int
+	second  chan struct{} // closed when a second handler starts
+	holdFor time.Duration
+}
+
+func (p *leaseOrderProbe) HandleObservation(_ context.Context, obs model.Observation) error {
+	var ev model.DHCPLeaseEvent
+	if err := json.Unmarshal(obs.Data, &ev); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.calls++
+	first := p.calls == 1
+	if p.calls == 2 {
+		close(p.second)
+	}
+	p.events = append(p.events, "start "+ev.Event)
+	p.mu.Unlock()
+	if first {
+		select {
+		case <-p.second:
+		case <-time.After(p.holdFor):
+		}
+	}
+	p.mu.Lock()
+	p.events = append(p.events, "end "+ev.Event)
+	p.mu.Unlock()
+	return nil
+}
+
+// TestHub_HandlesAWorkersDHCPLeaseObservationsOneAtATimeInArrivalOrder: the
+// lease ledger (store.RecordDHCPLeaseEvent) folds a worker's allocate,
+// renew and delete events, and the fold depends on their order: a delete
+// applied before the allocate it follows finds no open row and does
+// nothing, and the allocate then opens a row for a lease the worker no
+// longer holds. The worker sends its outbox in order on one connection,
+// without waiting for each ack, and after an outage sends the backlog in
+// one burst, so the hub must finish one dhcp_lease observation before it
+// starts the next.
+func TestHub_HandlesAWorkersDHCPLeaseObservationsOneAtATimeInArrivalOrder(t *testing.T) {
+	h, auth, _ := newTestHub(t)
+	auth.register("tok-1", "pop3", "worker-1")
+	probe := &leaseOrderProbe{second: make(chan struct{}), holdFor: 300 * time.Millisecond}
+	h.cfg.ObsHandler = probe
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// One lease, granted and then released: two outbox rows, sent back
+	// to back as the worker's drain sends them.
+	reqIDs := map[string]string{}
+	for _, event := range []string{"allocate", "delete"} {
+		data, err := json.Marshal(model.DHCPLeaseEvent{
+			Event: event, MAC: "02:00:00:00:00:01", IP: "192.0.2.20",
+			Kind: "dynamic", Pool: "ephemeral",
+			ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reqID := "req-lease-" + event
+		reqIDs[reqID] = event
+		if err := conn.WriteTyped(ctx, TypeObservation, reqID, ObservationMsg{
+			Event: "dhcp_lease", Timestamp: time.Now().UTC().Format(time.RFC3339), Data: data,
+		}); err != nil {
+			t.Fatalf("send %s: %v", event, err)
+		}
+	}
+
+	var acked []string
+	for len(acked) < 2 {
+		env, err := conn.ReadMessage(ctx)
+		if err != nil {
+			t.Fatalf("waiting for both acks (got %v): %v", acked, err)
+		}
+		if env.Type != TypeRPCResponse {
+			continue
+		}
+		event, ok := reqIDs[env.RequestID]
+		if !ok {
+			t.Fatalf("rpc_response for unknown request_id %q", env.RequestID)
+		}
+		acked = append(acked, event)
+	}
+
+	probe.mu.Lock()
+	got := append([]string(nil), probe.events...)
+	probe.mu.Unlock()
+	want := []string{"start allocate", "end allocate", "start delete", "end delete"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("the hub handled one worker's dhcp_lease observations as %v, want %v: "+
+			"a later lease event ran while an earlier one was still being handled, "+
+			"so the ledger can apply the delete before the allocate and leave the lease open", got, want)
+	}
+	if fmt.Sprint(acked) != "[allocate delete]" {
+		t.Fatalf("acks arrived as %v, want [allocate delete]", acked)
 	}
 }
 

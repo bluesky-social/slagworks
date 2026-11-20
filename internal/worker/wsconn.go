@@ -1,8 +1,10 @@
 package worker
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -112,6 +114,11 @@ type WSConn struct {
 	// never touches a real /usr/bin/slagworks-upgrade.
 	upgradeExec func(target globalBuild) ([]byte, error)
 
+	// reconnectRand draws the jitter for Run's reconnect wait, in [0,1).
+	// nil means randFloat. Tests pin the draw so the wait is
+	// deterministic.
+	reconnectRand func() float64
+
 	// powerFactory builds a power.Controller for hub-originated
 	// power_status RPCs (the BMC read path). Same factory the
 	// executor uses for actuation ops; nil means the worker rejects
@@ -129,6 +136,13 @@ type WSConn struct {
 	// while the WS read loop is already live answering RPCs
 	// concurrently on other goroutines (roast finding, 2026-07-13).
 	dhcpLeaseSource atomic.Pointer[func() []dhcp.LeaseInfo]
+
+	// heartbeatInterval and idleTimeout override ws.HeartbeatInterval
+	// (how often heartbeatLoop sends) and ws.IdleTimeout (how long the
+	// read loop waits for anything from global) when non-zero. Tests
+	// shorten them.
+	heartbeatInterval time.Duration
+	idleTimeout       time.Duration
 }
 
 // WSConnConfig carries the site worker identity + global endpoint.
@@ -315,29 +329,64 @@ func (w *WSConn) WaitForSync(ctx context.Context) error {
 	}
 }
 
+// Reconnect backoff for Run: the wait starts at reconnectBackoffMin and
+// doubles after every attempt up to reconnectBackoffMax.
+const (
+	reconnectBackoffMin = time.Second
+	reconnectBackoffMax = 30 * time.Second
+)
+
 // Run connects to the global API and enters the message loop. It
-// reconnects with exponential backoff on disconnect. Blocks until ctx
-// is cancelled.
+// reconnects on disconnect after an exponential backoff plus up to 20% of
+// jitter. Blocks until ctx is cancelled.
+//
+// The backoff returns to its first step only after an attempt that lasted
+// at least reconnectBackoffMax with the hello accepted. A global that
+// accepts each hello and then drops the connection (it cannot read the
+// active operations for the op_resync, say) is therefore retried at the
+// ladder's pace and at most about once per reconnectBackoffMax, not once a
+// second: each attempt costs global a token lookup, a NetBox serial lookup,
+// a site_workers write and a hello reply, from every worker at once. The
+// price is that a connection lost soon after a reconnect that followed a
+// long outage waits up to reconnectBackoffMax before the next attempt.
+//
+// The jitter matters because a global restart, or a restart of a proxy in
+// front of global, drops every worker's socket at once: without it the
+// whole fleet would redial at the same instant and keep retrying in
+// lockstep while global is down.
 func (w *WSConn) Run(ctx context.Context) error {
-	backoff := time.Second
+	draw := w.reconnectRand
+	if draw == nil {
+		draw = randFloat
+	}
+	backoff := reconnectBackoffMin
 	for {
+		start := time.Now()
 		wasConnected, err := w.connectAndRun(ctx)
+		// The op stream ended with the connection: every op_delta and
+		// op_removed from here on is lost until the next connection's
+		// op_resync. Tell the cache before Connected reports false, so once
+		// the worker reads as disconnected no report is refused as final
+		// merely because its op is absent from the set; the cache also
+		// stops actuating from what it holds once the outage runs long.
+		w.cache.OpStreamDown(time.Now())
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
 		w.connected.Store(false)
-		if wasConnected {
-			backoff = time.Second
+		if wasConnected && time.Since(start) >= reconnectBackoffMax {
+			backoff = reconnectBackoffMin
 		}
-		w.log.Warn("WebSocket disconnected, reconnecting", "err", err, "backoff", backoff)
+		wait := applyJitterWith(backoff, 0.2, draw())
+		w.log.Warn("WebSocket disconnected, reconnecting", "err", err, "backoff", wait)
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		}
-		backoff = min(backoff*2, 30*time.Second)
+		backoff = min(backoff*2, reconnectBackoffMax)
 	}
 }
 
@@ -385,6 +434,12 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 	if err := conn.WriteTyped(ctx, ws.TypeHello, "", hello); err != nil {
 		return false, fmt.Errorf("send hello: %w", err)
 	}
+	// Heartbeat from here on, for the life of the connection. Global drops
+	// a worker it hears nothing from for ws.IdleTimeout once it has
+	// replied to the hello, and nothing bounds how long this function
+	// takes to apply that reply and reload the outbox before it reaches
+	// its read loop.
+	go w.heartbeatLoop(connCtx, conn)
 
 	// Read the hello reply — must be snapshot or no_change, and it MUST
 	// carry an op-stream Proto >= ours. A reply with an absent/lower Proto
@@ -422,7 +477,6 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 
 	w.connected.Store(true)
 	w.syncedOnce.Do(func() { close(w.syncedCh) })
-	_ = sdnotify.Send(sdnotify.Ready)
 	w.log.Info("WebSocket connected",
 		"seq", w.cache.LastSeqNum(),
 		"machines", w.cache.MachineCount(),
@@ -456,7 +510,9 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 	// retried until it succeeds; a table that never reads again keeps the
 	// worker off global, with this error on every attempt, until the
 	// operator repairs the local database. Boot and DHCP serving do not
-	// depend on the connection and continue from the cache.
+	// depend on the connection and continue from the cache, except that the
+	// op set stops actuating boots once the outage outlasts
+	// opStreamTrustWindow: this loop never reads the op_resync.
 	if err := w.cache.ReloadOutboxFromDisk(); err != nil {
 		w.drainMu.Unlock()
 		w.log.Error("cannot read the persisted outbox; dropping this connection and retrying. If this repeats, the outbox table of the worker's local database is damaged and needs repair (sqlite3 PRAGMA integrity_check on the file named in err)",
@@ -465,14 +521,22 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 	}
 	w.drainMu.Unlock()
 
-	// Start heartbeat and outbox drain goroutines scoped to the
-	// per-connection context so they exit on disconnect.
-	go w.heartbeatLoop(connCtx, conn)
+	// Start the outbox drain goroutine scoped to the per-connection
+	// context so it exits on disconnect.
 	go w.drainLoop(connCtx, conn)
 
-	// Enter read loop.
+	// Enter read loop. Global heartbeats every ws.HeartbeatInterval, so
+	// silence for idleTimeout means the path to it stopped delivering:
+	// TCP gives no sign of that while something in the path keeps
+	// acknowledging what this worker writes, and every op_update written
+	// in the meantime is lost.
+	idle := cmp.Or(w.idleTimeout, ws.IdleTimeout)
 	for {
-		env, err := conn.ReadMessage(ctx)
+		env, err := conn.ReadMessageIdle(ctx, idle)
+		if errors.Is(err, ws.ErrPeerSilent) {
+			return true, fmt.Errorf("global sent nothing for %s though it heartbeats every %s; dropping the connection to reconnect: %w",
+				idle, ws.HeartbeatInterval, err)
+		}
 		if err != nil {
 			return true, fmt.Errorf("read: %w", err)
 		}
@@ -482,6 +546,9 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 			if err := w.applySnapshot(env.Data, false); err != nil {
 				return true, err
 			}
+		case ws.TypeHeartbeat:
+			// Global's keepalive. Its arrival is the point
+			// (ReadMessageIdle above); it carries nothing to act on.
 		case ws.TypeNoChange:
 			// No-op. Hub may send these during reconciliation as an
 			// explicit ack; we don't currently generate such a path
@@ -918,8 +985,14 @@ func (w *WSConn) drainOnce(ctx context.Context, conn *ws.Conn) {
 	}
 }
 
+// heartbeatLoop sends global a heartbeat every ws.HeartbeatInterval. Global
+// drops a connection it has heard nothing on for ws.IdleTimeout, so these
+// are what keep an idle site connected. The write has no deadline of its
+// own: it waits behind any message being written (a large observation on a
+// slow link can take minutes), and that message's bytes keep global's idle
+// timer running meanwhile.
 func (w *WSConn) heartbeatLoop(ctx context.Context, conn *ws.Conn) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(cmp.Or(w.heartbeatInterval, ws.HeartbeatInterval))
 	defer ticker.Stop()
 
 	for {

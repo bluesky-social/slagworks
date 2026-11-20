@@ -375,9 +375,12 @@ type Prefix struct {
 }
 
 type IPAddress struct {
-	ID                 int          `json:"id"`
-	Address            string       `json:"address"`
-	Status             *NestedValue `json:"status,omitempty"`
+	ID      int          `json:"id"`
+	Address string       `json:"address"`
+	Status  *NestedValue `json:"status,omitempty"`
+	// Role is NetBox's IP role choice (loopback, secondary, anycast, vip,
+	// vrrp, hsrp, glbp, carp), nil when unset. See IsOwnAddress.
+	Role               *NestedValue `json:"role,omitempty"`
 	AssignedObjectType string       `json:"assigned_object_type,omitempty"`
 	AssignedObjectID   *int         `json:"assigned_object_id,omitempty"`
 }
@@ -392,6 +395,15 @@ type IPAddress struct {
 // the data, not a new requirement on it.
 func (ip IPAddress) IsActive() bool {
 	return ip.Status == nil || ip.Status.Value == "active"
+}
+
+// IsOwnAddress reports whether NetBox's role leaves the address its
+// interface's own: no role, or role loopback. Role secondary marks an extra
+// address next to the interface's main one, and anycast, vip, vrrp, hsrp,
+// glbp and carp mark an address shared with other hosts; neither is the
+// address that identifies the host on that interface.
+func (ip IPAddress) IsOwnAddress() bool {
+	return ip.Role == nil || ip.Role.Value == "" || ip.Role.Value == "loopback"
 }
 
 type IPRange struct {

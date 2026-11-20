@@ -773,6 +773,130 @@ func TestReconcileInterfaces_MgmtOnlyRerunMarksAssignedMACPrimary(t *testing.T) 
 	}
 }
 
+// TestReconcileInterfaces_BMCNICAdoptsMACLessIPMIRow pins the earlier
+// half-finished write on the BMC row. A new interface takes three writes:
+// the interface POST, the MAC-object POST, then the primary PATCH. When
+// the run fails after the first (a 5xx or timeout on the MAC POST, a lost
+// response, a restart mid-sync), NetBox keeps a MAC-less mgmt_only "ipmi"
+// row; an operator modelling the BMC before its MAC is known leaves the
+// same row. The rerun must give that row the BMC MAC. Recognising the BMC
+// row only by name and MAC sent the NIC to create, where the protected
+// "ipmi" row failed every later commission with a modeling conflict.
+func TestReconcileInterfaces_BMCNICAdoptsMACLessIPMIRow(t *testing.T) {
+	bmc := ifaceRow(90, "ipmi", "1000base-t", "", nil)
+	bmc["mgmt_only"] = true
+	f := newReconcileFixture([]map[string]any{bmc})
+	srv := f.server(t)
+	defer srv.Close()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+	err := c.ReconcileInterfaces(context.Background(), 1, []NICData{
+		{Name: "ipmi", MAC: "d0:50:99:aa:bb:cc", IntfType: "1000base-t", MgmtOnly: true},
+	}, false)
+	if err != nil {
+		t.Fatalf("ReconcileInterfaces with a MAC-less ipmi row: %v", err)
+	}
+	if len(f.posts) != 0 || len(f.deletes) != 0 {
+		t.Errorf("interface POSTs = %v, DELETEs = %v, want none (row 90 is the BMC row)", f.posts, f.deletes)
+	}
+	if len(f.macs) != 1 || f.macs[0]["assigned_object_id"] != float64(90) {
+		t.Errorf("MAC-object POSTs = %v, want one assigned to row 90", f.macs)
+	}
+	ps := f.patches[90]
+	if len(ps) != 1 || len(ps[0]) != 1 || ps[0]["primary_mac_address"] != float64(9001) {
+		t.Errorf("row 90: PATCHes = %v, want exactly [{primary_mac_address: 9001}]", ps)
+	}
+}
+
+// TestReconcileInterfaces_BMCNICRecognisesOperatorIPMI0Row pins the BMC
+// row under an operator's name. Operators model the BMC interface as
+// mgmt_only under whatever name their hardware uses ("ipmi0", "bmc",
+// "mgmt"); the synthetic BMC NIC is always named "ipmi". A mgmt_only row
+// already carrying the BMC MAC is the BMC row whatever its name, and must
+// not get a second mgmt_only "ipmi" row with the same MAC beside it.
+func TestReconcileInterfaces_BMCNICRecognisesOperatorIPMI0Row(t *testing.T) {
+	bmc := ifaceRow(91, "ipmi0", "1000base-t", "D0:50:99:AA:BB:01", nil)
+	bmc["mgmt_only"] = true
+	f := newReconcileFixture([]map[string]any{bmc})
+	srv := f.server(t)
+	defer srv.Close()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+	err := c.ReconcileInterfaces(context.Background(), 1, []NICData{
+		{Name: "ipmi", MAC: "d0:50:99:aa:bb:01", IntfType: "1000base-t", MgmtOnly: true},
+	}, false)
+	if err != nil {
+		t.Fatalf("ReconcileInterfaces: %v", err)
+	}
+	if len(f.posts) != 0 {
+		t.Errorf("interface POSTs = %v, want none: ipmi0 already is the BMC row with that MAC", f.posts)
+	}
+	if ps := f.patches[91]; len(ps) != 0 {
+		t.Errorf("row 91 (operator BMC row) PATCHes = %v, want none", ps)
+	}
+	if len(f.macs) != 0 {
+		t.Errorf("MAC-object POSTs = %v, want none", f.macs)
+	}
+}
+
+// TestReconcileInterfaces_BMCNICKeepsOperatorPrimaryMAC is the BMC row
+// carrying the BMC MAC as a second, non-primary MAC object (an operator
+// recording both the dedicated and the shared-LAN MAC of a BMC that can
+// fail over between them). It is still the BMC row, so nothing is created,
+// and its primary is the operator's choice: reconcile must not move it to
+// whichever port the BMC reported from this time.
+func TestReconcileInterfaces_BMCNICKeepsOperatorPrimaryMAC(t *testing.T) {
+	bmc := ifaceRow(92, "ipmi0", "1000base-t", "D0:50:99:AA:BB:02", nil)
+	bmc["mgmt_only"] = true
+	bmc["primary_mac_address"] = map[string]any{"id": 902, "mac_address": "D0:50:99:AA:BB:02"}
+	bmc["mac_addresses"] = []map[string]any{
+		{"id": 902, "mac_address": "D0:50:99:AA:BB:02"},
+		{"id": 903, "mac_address": "D0:50:99:AA:BB:03"},
+	}
+	f := newReconcileFixture([]map[string]any{bmc})
+	srv := f.server(t)
+	defer srv.Close()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+	err := c.ReconcileInterfaces(context.Background(), 1, []NICData{
+		{Name: "ipmi", MAC: "d0:50:99:aa:bb:03", IntfType: "1000base-t", MgmtOnly: true},
+	}, false)
+	if err != nil {
+		t.Fatalf("ReconcileInterfaces: %v", err)
+	}
+	if len(f.posts) != 0 || len(f.macs) != 0 {
+		t.Errorf("interface POSTs = %v, MAC-object POSTs = %v, want none: ipmi0 carries the BMC MAC", f.posts, f.macs)
+	}
+	if ps := f.patches[92]; len(ps) != 0 {
+		t.Errorf("row 92 (operator BMC row) PATCHes = %v, want none (its primary MAC is operator-chosen)", ps)
+	}
+}
+
+// TestReconcileInterfaces_BMCNICChangedMACOnIPMIRowIsLoudError pins the
+// boundary of the MAC-less adoption above: an "ipmi" row carrying a
+// different MAC is not re-MACed to the reported one. It may be an
+// operator's row for the other port of a failover BMC, so a changed BMC
+// MAC still fails loudly for the operator to resolve.
+func TestReconcileInterfaces_BMCNICChangedMACOnIPMIRowIsLoudError(t *testing.T) {
+	bmc := ifaceRow(93, "ipmi", "1000base-t", "D0:50:99:AA:BB:04", nil)
+	bmc["mgmt_only"] = true
+	f := newReconcileFixture([]map[string]any{bmc})
+	srv := f.server(t)
+	defer srv.Close()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+	err := c.ReconcileInterfaces(context.Background(), 1, []NICData{
+		{Name: "ipmi", MAC: "d0:50:99:aa:bb:05", IntfType: "1000base-t", MgmtOnly: true},
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "modeling conflict") {
+		t.Fatalf("ReconcileInterfaces = %v, want the modeling-conflict error", err)
+	}
+	if len(f.posts) != 0 || len(f.macs) != 0 || len(f.patches[93]) != 0 {
+		t.Errorf("writes: interface POSTs = %v, MAC-object POSTs = %v, row 93 PATCHes = %v, want none",
+			f.posts, f.macs, f.patches[93])
+	}
+}
+
 // TestReconcileInterfaces_MgmtOnlyIdempotentRegardlessOfProcessingOrder
 // pins a roast-found regression: on shared-LOM hardware, the protected
 // BMC row and an unprotected host interface can carry the same MAC.

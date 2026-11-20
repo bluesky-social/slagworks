@@ -183,6 +183,18 @@ func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
 		return
 	}
 
+	// Leave unclaimed an op the agent has failed since the pass began. A
+	// host can run the agent on the pending-op boot clause before any claim
+	// lands, and the ops ahead of this one (a claim RPC alone can wait 30s
+	// for an answer) give it time to fail. The failure is already queued for
+	// global and the worker holds it until op_removed (keepLocalFailure);
+	// a granted claim would move the machine to deploying on global for an
+	// op this worker will not drive.
+	if e.cache.IsOpFailed(op.ID.String()) {
+		log.Info("the agent reported the operation failed since the pass began; leaving it unclaimed")
+		return
+	}
+
 	// Mark as claimed locally first to prevent PendingPowerOps and
 	// PendingLifecycleOps from returning it on the next tick while
 	// we're still executing. This also forgets an earlier unanswered
@@ -274,7 +286,7 @@ func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 				marshalError(fmt.Errorf("unknown boot_device %q", params.BootDevice)))
 			return
 		}
-		if e.opRemoved(log, op, "set boot device") {
+		if e.opEnded(log, op, "set boot device") {
 			return
 		}
 		if err := ctrl.SetBootDevice(ctx, dev); err != nil {
@@ -284,7 +296,7 @@ func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 		}
 	}
 
-	if e.opRemoved(log, op, string(op.Type)) {
+	if e.opEnded(log, op, string(op.Type)) {
 		return
 	}
 	log.Info("executing power operation")
@@ -431,7 +443,7 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 	}
 	defer func() { _ = ctrl.Close(ctx) }()
 
-	if e.opRemoved(log, op, "set PXE boot device") {
+	if e.opEnded(log, op, "set PXE boot device") {
 		return
 	}
 	if err := ctrl.SetBootDevice(ctx, power.BootPXE); err != nil {
@@ -446,7 +458,7 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 		state = power.StateOn
 	}
 
-	if e.opRemoved(log, op, "power on or cycle") {
+	if e.opEnded(log, op, "power on or cycle") {
 		return
 	}
 	if state == power.StateOff {
@@ -474,17 +486,31 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 	log.Info("machine booting to PXE, waiting for agent report", "op_type", op.Type)
 }
 
-// opRemoved re-reads the op layer, the sole authority for actuation, and
-// reports whether op has left it since the claim. The executor works from
-// the copy of the op it took before the claim, but the WS read loop, a
-// separate goroutine, can apply global's op_removed (or an op_resync
-// without the op) while the executor is inside a BMC round trip: the
-// operator aborted the machine, or a NetBox drift fail or a timeout sweep
-// failed the op. The executor calls this before each write to the host or
-// its BMC and, when the op is gone, stops without reporting: global already
-// holds the op's terminal row. A write that went out before the removal is
-// not undone.
-func (e *Executor) opRemoved(log *slog.Logger, op model.Operation, next string) bool {
+// opEnded re-reads the op layer, the sole authority for actuation, and
+// reports whether op has ended since the claim. The executor works from the
+// copy of the op it took before the claim, but other goroutines keep
+// writing the op layer while the executor is inside a BMC round trip or
+// waiting on the claim RPC:
+//
+//   - The WS read loop applies global's op_removed (or an op_resync without
+//     the op): the operator aborted the machine, or a NetBox drift fail or a
+//     timeout sweep failed the op. Global already holds the op's terminal
+//     row.
+//   - The report handler marks a lifecycle op failed on the agent's failure
+//     report. A host can run the agent on the pending-op boot clause before
+//     any claim lands, so the agent can fail the op the executor is still
+//     claiming or driving. The failure is already queued for global, and
+//     the worker holds it until op_removed (keepLocalFailure).
+//
+// The executor calls this before each write to the host or its BMC and,
+// when the op has ended, stops without reporting. A write that went out
+// before the op ended is not undone.
+func (e *Executor) opEnded(log *slog.Logger, op model.Operation, next string) bool {
+	if e.cache.IsOpFailed(op.ID.String()) {
+		log.Warn("the agent reported the operation failed while this worker was claiming or driving it; stopping before the next host write",
+			"next", next)
+		return true
+	}
 	if e.cache.GetOperation(op.ID.String()) != nil {
 		return false
 	}

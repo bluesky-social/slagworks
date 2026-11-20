@@ -438,7 +438,8 @@ func (s *Store) CompleteActiveOperation(
 // PhaseTransition describes the result of a SetOperationPhase call.
 // Caller emits a single "phase transition" log envelope when Changed
 // is true; ignores when false (the worker emitted a duplicate phase
-// event, or the op is already terminal, and the row didn't change).
+// event, the op is already terminal, or the op is held at
+// awaiting_phone_home, and the row didn't change).
 type PhaseTransition struct {
 	Changed   bool
 	PrevPhase string
@@ -472,6 +473,19 @@ type PhaseTransition struct {
 // terminal record. Moving the version would also publish an op_delta
 // above the tombstone workers keep for the removed op.
 //
+// A deploy at awaiting_phone_home is held there: only "failed" moves it
+// (the agent's failure report); completion and abort end the op without a
+// phase write. The phase keeps the installed host off the installer, the
+// same rule each site worker applies to its own copy of the op
+// (opState.updatePhase), and this row is where a worker that has not seen
+// the latch (the other worker of a both-active pair, a restarted or
+// resynced worker) gets it. The reports dropped here are late: a worker
+// that has not seen the latch answering the installed host's next PXE
+// (dhcp_ack, ipxe_loaded), or phase reports a worker queued before a
+// disconnect, which its reconnect drain sends after the deploy_complete
+// observation that latched the row. Moving the row would hand every
+// worker that loads it afterwards a deploy that looks mid-install.
+//
 // Returns the transition shape (prev_phase, duration in prev) so the
 // caller can emit a "phase transition" log envelope.
 func (s *Store) SetOperationPhase(opID uuid.UUID, phase string) (PhaseTransition, error) {
@@ -492,7 +506,7 @@ func (s *Store) SetOperationPhase(opID uuid.UUID, phase string) (PhaseTransition
 			return err
 		}
 		unchanged := PhaseTransition{Changed: false, NewPhase: phase, MachineID: op.MachineID, TraceID: op.TraceID}
-		if op.Phase == phase {
+		if op.Phase == phase || (op.Phase == "awaiting_phone_home" && phase != "failed") {
 			t = unchanged
 			return nil
 		}
@@ -953,8 +967,7 @@ func (s *Store) CreateMachineOp(machineID uuid.UUID, opType model.OperationType,
 		err := tx.Where("machine_id = ? AND status IN ?", machineID, opstate.ActiveStatuses).
 			First(&active).Error
 		if err == nil {
-			return fmt.Errorf("machine already has an active %s operation; watch it with `slagctl operation watch %s` or cancel it with `slagctl machine abort %s`",
-				active.Type, active.ID, machineID)
+			return activeOpConflict(&active)
 		}
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
@@ -969,26 +982,26 @@ func (s *Store) CreateMachineOp(machineID uuid.UUID, opType model.OperationType,
 		return tx.Create(&op).Error
 	})
 	if err != nil {
-		return nil, err
+		return nil, s.lostCreateRace(machineID, err)
 	}
 	return &op, nil
 }
 
-// CreatePowerOp creates a power operation without checking for active
-// lifecycle operations. Power ops (on/off/cycle) must always be issuable
-// even when a commission or deploy op is pending, so the operator can
-// recover a stuck machine. No state guard; no machine state update.
+// CreatePowerOp creates a power operation (on/off/cycle) or an out-of-band
+// BMC operation (set_boot_device, bmc_reconcile). It checks neither machine
+// state nor the lock and updates no machine state, so it works on an
+// in-service host. One active op per machine (idx_one_active_op_per_machine)
+// still holds: with any op in flight, a commission or deploy included, the
+// request is refused with that op's ID, and the operator waits for it or
+// aborts it first.
 func (s *Store) CreatePowerOp(machineID uuid.UUID, opType model.OperationType, params json.RawMessage) (*model.Operation, error) {
 	var op model.Operation
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var active model.Operation
-		err := tx.Where("machine_id = ? AND type IN ? AND status IN ?", machineID,
-			[]model.OperationType{model.OpPowerOn, model.OpPowerOff, model.OpPowerCycle},
-			opstate.ActiveStatuses).
+		err := tx.Where("machine_id = ? AND status IN ?", machineID, opstate.ActiveStatuses).
 			First(&active).Error
 		if err == nil {
-			return fmt.Errorf("machine already has an active %s operation; watch it with `slagctl operation watch %s` or cancel it with `slagctl machine abort %s`",
-				active.Type, active.ID, machineID)
+			return activeOpConflict(&active)
 		}
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
@@ -1003,7 +1016,37 @@ func (s *Store) CreatePowerOp(machineID uuid.UUID, opType model.OperationType, p
 		return tx.Create(&op).Error
 	})
 	if err != nil {
-		return nil, err
+		return nil, s.lostCreateRace(machineID, err)
 	}
 	return &op, nil
+}
+
+// activeOpConflict is the refusal for a create on a machine that already has
+// an operation in flight. The API returns it verbatim as the 409 body.
+func activeOpConflict(active *model.Operation) error {
+	return fmt.Errorf("machine already has an active %s operation; watch it with `slagctl operation watch %s` or cancel it with `slagctl machine abort %s`",
+		active.Type, active.ID, active.MachineID)
+}
+
+// lostCreateRace handles the error from a create's transaction. Two creates
+// on one machine can both pass the active-op check before either inserts,
+// since neither sees the other's uncommitted row; the unique index then
+// refuses the later insert. That violation is turned into the refusal the
+// check would have given, naming the op that won. Any other error is
+// returned unchanged.
+func (s *Store) lostCreateRace(machineID uuid.UUID, err error) error {
+	if !errors.Is(err, gorm.ErrDuplicatedKey) {
+		return err
+	}
+	var active model.Operation
+	qerr := s.db.Where("machine_id = ? AND status IN ?", machineID, opstate.ActiveStatuses).
+		First(&active).Error
+	switch {
+	case qerr == nil:
+		return activeOpConflict(&active)
+	case errors.Is(qerr, gorm.ErrRecordNotFound):
+		return fmt.Errorf("another operation on machine %s was created at the same moment and has already ended; check `slagctl machine ops %s`, then retry", machineID, machineID)
+	default:
+		return fmt.Errorf("another operation on machine %s was created at the same moment, and reading it failed: %w", machineID, qerr)
+	}
 }

@@ -276,7 +276,7 @@ func TestRace_HandlerParallelTraffic(t *testing.T) {
 			return false
 		},
 		OnLeaseEvent: func(LeaseEvent) { evMu.Lock(); events++; evMu.Unlock() },
-		OnACK:        func(string, bool) {},
+		OnACK:        func(string, ClientKind) {},
 	})
 	h.SetLogger(slogDiscard())
 	oob := func(size int) IfaceParams {

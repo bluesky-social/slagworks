@@ -98,7 +98,10 @@ The installed system assembles exactly the arrays the layout names, created
 (`raid`) or reassembled (`preserve`), and no others. The agent writes
 `/etc/mdadm/mdadm.conf` with `AUTO -all` and one `ARRAY` line per layout
 array, identified by its UUID, then regenerates the initramfs so the
-initramfs carries that file. An md superblock on a disk the layout leaves
+initramfs carries that file. The file also keeps the stock `MAILADDR root`,
+without which `mdmonitor.service` refuses to start and the array goes
+unwatched; the image ships no mail transfer agent, so nothing is mailed
+until you install one. An md superblock on a disk the layout leaves
 alone (a disk outside the layout, or a `retain` disk) is therefore never
 assembled at boot, and so cannot take the `/dev/mdN` name a layout array
 needs. To keep using such an array, name it in the layout as a `preserve`

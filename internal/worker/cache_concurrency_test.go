@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -223,74 +225,131 @@ func TestCache_ConcurrentOpStateUnderApply(t *testing.T) {
 	}
 }
 
-// TestCache_SubscriberSingleFireUnderImageSyncOverlap pins the structural
-// double-fire fix. The old ApplySnapshot released its lock across the
-// (minutes-long) image sync, so a second apply arriving in that window
-// could swap in and fire subscribers twice for overlapping applies. Now
-// applyMu serializes the whole method, so N applies fire subscribers
-// exactly N times even when a second apply is attempted while the first
-// is blocked inside image sync.
-func TestCache_SubscriberSingleFireUnderImageSyncOverlap(t *testing.T) {
+// blockingImageSync is an imageSyncFn that records the SHA of each image
+// set it is handed and the most syncs it saw running at once, and blocks
+// every sync until release is closed.
+type blockingImageSync struct {
+	entered chan struct{} // receives once per sync, on entry
+	release chan struct{}
+	err     error // returned by every sync
+
+	mu      sync.Mutex
+	shas    []string
+	running int
+	maxRun  int
+}
+
+func newBlockingImageSync() *blockingImageSync {
+	return &blockingImageSync{entered: make(chan struct{}, 16), release: make(chan struct{})}
+}
+
+func (b *blockingImageSync) sync(_ string, images map[string]*model.Image) error {
+	sha := "" // an empty image set
+	if img, ok := images["noble-pxe"]; ok {
+		sha = img.SHA256
+	}
+	b.mu.Lock()
+	b.shas = append(b.shas, sha)
+	b.running++
+	b.maxRun = max(b.maxRun, b.running)
+	b.mu.Unlock()
+	b.entered <- struct{}{}
+	<-b.release
+	b.mu.Lock()
+	b.running--
+	b.mu.Unlock()
+	return b.err
+}
+
+// synced returns the SHAs of the image sets synced so far and the most
+// syncs that ran at once.
+func (b *blockingImageSync) synced() (shas []string, maxRun int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.shas...), b.maxRun
+}
+
+// imageSyncInFlight reports whether c has an image sync requested and not
+// yet finished.
+func imageSyncInFlight(c *Cache) bool {
+	c.imageSyncMu.Lock()
+	defer c.imageSyncMu.Unlock()
+	return c.imageSyncInFlightLocked()
+}
+
+func imageSnap(seq int64, sha string, machines ...model.MachineSnapshot) *model.SiteSnapshot {
+	return &model.SiteSnapshot{SeqNum: seq, Machines: machines,
+		Images: []model.Image{{Name: "noble-pxe", URL: "https://images.example.net/noble-pxe.tar.gz", SHA256: sha}}}
+}
+
+// applyWithin runs ApplySnapshot and fails the test if it has not returned
+// within 2s: the image download must not run on the caller's goroutine,
+// which in production is the WS read loop.
+func applyWithin(t *testing.T, c *Cache, snap *model.SiteSnapshot) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { defer close(done); c.ApplySnapshot(snap) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("ApplySnapshot(seq %d) blocked on the image download", snap.SeqNum)
+	}
+}
+
+// TestCache_ImageSyncRunsOffTheApplyPath: an apply returns, persisted and
+// with its subscribers fired exactly once, while an image download is in
+// progress. Downloads never overlap, and applies that arrive during one
+// collapse into a single sync of the newest image set.
+func TestCache_ImageSyncRunsOffTheApplyPath(t *testing.T) {
 	c := NewCache(nil)
 	c.ImagesDir = "/does-not-matter-test-seam"
-
-	// A slow image sync that blocks until we release it, so we can force a
-	// second ApplySnapshot to arrive mid-sync of the first.
-	syncEntered := make(chan struct{}, 1)
-	releaseSync := make(chan struct{})
-	var syncCalls atomic.Int64
-	c.imageSyncFn = func(_ string, _ map[string]*model.Image) error {
-		syncCalls.Add(1)
-		select {
-		case syncEntered <- struct{}{}:
-		default:
-		}
-		<-releaseSync
-		return nil
-	}
-
+	b := newBlockingImageSync()
+	c.imageSyncFn = b.sync
 	var fireCount atomic.Int64
 	c.OnSnapshotApplied(func() { fireCount.Add(1) })
 
-	img := []model.Image{{Name: "noble-pxe", URL: "s3://x", SHA256: "abc"}}
+	applyWithin(t, c, imageSnap(1, "sha-1"))
+	<-b.entered // the first download is in progress
+	applyWithin(t, c, imageSnap(2, "sha-2"))
+	applyWithin(t, c, imageSnap(3, "sha-3"))
 
-	// Apply #1: enters image sync and blocks there.
-	done1 := make(chan struct{})
-	go func() {
-		defer close(done1)
-		c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 1, Images: img})
-	}()
-	<-syncEntered // apply #1 is now parked inside image sync
-
-	// Apply #2: attempted while #1 holds applyMu inside image sync. It must
-	// block on applyMu (not swap in and double-fire).
-	done2 := make(chan struct{})
-	go func() {
-		defer close(done2)
-		c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 2, Images: img})
-	}()
-
-	// Give apply #2 a chance to (wrongly) proceed if the lock were released.
-	time.Sleep(100 * time.Millisecond)
-	select {
-	case <-done2:
-		t.Fatal("apply #2 completed while apply #1 was mid-image-sync; applyMu not held across sync")
-	default:
+	if got := fireCount.Load(); got != 3 {
+		t.Fatalf("subscriber fired %d times for 3 applies, want exactly 3", got)
+	}
+	if got := c.LastSeqNum(); got != 3 {
+		t.Fatalf("seqnum during the download: got %d, want 3", got)
 	}
 
-	// Release #1's sync; both applies now complete in order.
-	close(releaseSync)
-	<-done1
-	<-done2
+	close(b.release)
+	<-b.entered // the newest set's sync
+	waitFor(t, func() bool { return !imageSyncInFlight(c) })
+	shas, maxRun := b.synced()
+	if !slices.Equal(shas, []string{"sha-1", "sha-3"}) {
+		t.Errorf("synced image sets %q, want the first and then only the newest: [sha-1 sha-3]", shas)
+	}
+	if maxRun != 1 {
+		t.Errorf("%d image syncs ran at once, want 1", maxRun)
+	}
+}
 
-	if got := fireCount.Load(); got != 2 {
-		t.Fatalf("subscriber fired %d times for 2 applies, want exactly 2 (double-fire?)", got)
-	}
-	if got := syncCalls.Load(); got != 2 {
-		t.Fatalf("image sync ran %d times for 2 applies, want 2", got)
-	}
-	if got := c.LastSeqNum(); got != 2 {
-		t.Fatalf("final seqnum: got %d, want 2", got)
+// TestCache_EmptyImageSetSupersedesWaitingSet: a snapshot that removes every
+// image replaces a set still waiting behind a download, so the syncer does
+// not go on to download an image the applied snapshot no longer names.
+func TestCache_EmptyImageSetSupersedesWaitingSet(t *testing.T) {
+	c := NewCache(nil)
+	c.ImagesDir = "/does-not-matter-test-seam"
+	b := newBlockingImageSync()
+	c.imageSyncFn = b.sync
+
+	applyWithin(t, c, imageSnap(1, "sha-1"))
+	<-b.entered
+	applyWithin(t, c, imageSnap(2, "sha-2"))
+	applyWithin(t, c, &model.SiteSnapshot{SeqNum: 3})
+	close(b.release)
+	<-b.entered
+	waitFor(t, func() bool { return !imageSyncInFlight(c) })
+	if shas, _ := b.synced(); !slices.Equal(shas, []string{"sha-1", ""}) {
+		t.Errorf("synced image sets %q, want [sha-1 \"\"]: the removed image must not be downloaded", shas)
 	}
 }
 
@@ -309,21 +368,107 @@ func TestCache_StaleApplyNoSideEffect(t *testing.T) {
 
 	img := []model.Image{{Name: "noble-pxe", SHA256: "abc"}}
 	c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 5, Images: img})
+	waitFor(t, func() bool { return !imageSyncInFlight(c) })
 	if syncCalls.Load() != 1 || fireCount.Load() != 1 {
 		t.Fatalf("first apply: sync=%d fire=%d, want 1/1", syncCalls.Load(), fireCount.Load())
 	}
 
-	// Stale (SeqNum < current) and equal-SeqNum applies must be no-ops.
+	// Stale (SeqNum < current) and equal-SeqNum applies must be no-ops. A
+	// request would leave a sync in flight or already counted.
 	c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 3, Images: img})
 	c.ApplySnapshot(&model.SiteSnapshot{SeqNum: 5, Images: img})
-	if syncCalls.Load() != 1 {
-		t.Errorf("stale/equal apply ran image sync: calls=%d, want 1", syncCalls.Load())
+	if imageSyncInFlight(c) || syncCalls.Load() != 1 {
+		t.Errorf("stale/equal apply requested an image sync: in flight=%v calls=%d, want false/1",
+			imageSyncInFlight(c), syncCalls.Load())
 	}
 	if fireCount.Load() != 1 {
 		t.Errorf("stale/equal apply fired subscribers: fires=%d, want 1", fireCount.Load())
 	}
 	if c.LastSeqNum() != 5 {
 		t.Errorf("seqnum moved on stale apply: got %d, want 5", c.LastSeqNum())
+	}
+}
+
+// TestCache_LifecycleOpsWaitForImageSync: commission and deploy boot the
+// image on disk, so while a sync is in flight (the disk can still hold the
+// previous release under the same name) a pending lifecycle op is held
+// back from every path that would start it: the executor's pending list,
+// its re-claim of a claim whose reply was lost, and the boot decision for a
+// host that PXEs on its own. Power ops and an op already claimed are not
+// held. When the sync ends, whether it succeeded or failed, the executor is
+// woken and the ops are released.
+func TestCache_LifecycleOpsWaitForImageSync(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"sync succeeds", nil},
+		{"sync fails", errors.New("download returned 503")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewCache(nil)
+			c.ImagesDir = "/seam"
+			b := newBlockingImageSync()
+			b.err = tc.err
+			c.imageSyncFn = b.sync
+
+			const mac, claimedMAC = "52:54:00:00:00:31", "52:54:00:00:00:32"
+			id, claimedID := uuid.New(), uuid.New()
+			machine := func(id uuid.UUID, mac string) model.MachineSnapshot {
+				return model.MachineSnapshot{ID: id, State: model.MachineStateCommissioned, PXEEligible: true,
+					Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}}}
+			}
+			applyWithin(t, c, imageSnap(1, "sha-new", machine(id, mac), machine(claimedID, claimedMAC)))
+			<-b.entered
+			reclaim := model.Operation{ID: uuid.New(), MachineID: claimedID, Type: model.OpDeploy, Status: model.OpPending, Version: 1}
+			seedOpsResync(c,
+				model.Operation{ID: uuid.New(), MachineID: id, Type: model.OpDeploy, Status: model.OpPending, Version: 1},
+				model.Operation{ID: uuid.New(), MachineID: id, Type: model.OpPowerOn, Status: model.OpPending, Version: 1},
+				reclaim,
+			)
+			// The executor claimed reclaim, the reply was lost, and global's
+			// claimed row replaced the rollback's pending mark.
+			c.MarkOpClaimed(reclaim.ID.String())
+			c.RollBackClaim(reclaim.ID.String())
+			reclaim.Status, reclaim.ClaimedBy, reclaim.Version = model.OpClaimed, "worker-1", 2
+			c.ApplyOpDelta(reclaim, model.MachineStateDeploying)
+			select {
+			case <-c.OpWake:
+			default:
+			}
+
+			if got := c.PendingLifecycleOps(); len(got) != 0 {
+				t.Errorf("PendingLifecycleOps during the image sync = %d ops, want none: the deploy would boot the previous image", len(got))
+			}
+			if got := c.ReclaimableOps("worker-1"); len(got) != 0 {
+				t.Errorf("ReclaimableOps during the image sync = %d ops, want none: the re-claimed deploy would boot the previous image", len(got))
+			}
+			if got := c.BootActionForMAC(mac); got != model.BootLocal {
+				t.Errorf("BootActionForMAC for a pending deploy during the image sync = %v, want BootLocal", got)
+			}
+			if got := c.BootActionForMAC(claimedMAC); got != model.BootDeploy {
+				t.Errorf("BootActionForMAC for a claimed deploy during the image sync = %v, want BootDeploy: it is already being driven", got)
+			}
+			if got := c.PendingPowerOps(); len(got) != 1 {
+				t.Errorf("PendingPowerOps during the image sync = %d ops, want 1: power ops do not wait for images", len(got))
+			}
+
+			close(b.release)
+			select {
+			case <-c.OpWake:
+			case <-time.After(2 * time.Second):
+				t.Fatal("the executor was not woken when the image sync ended")
+			}
+			if got := c.PendingLifecycleOps(); len(got) != 1 {
+				t.Errorf("PendingLifecycleOps after the image sync = %d ops, want 1", len(got))
+			}
+			if got := c.ReclaimableOps("worker-1"); len(got) != 1 {
+				t.Errorf("ReclaimableOps after the image sync = %d ops, want 1", len(got))
+			}
+			if got := c.BootActionForMAC(mac); got != model.BootDeploy {
+				t.Errorf("BootActionForMAC for a pending deploy after the image sync = %v, want BootDeploy", got)
+			}
+		})
 	}
 }
 
@@ -345,11 +490,12 @@ func TestCache_ConditionalOverlayClear(t *testing.T) {
 			Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}},
 		}},
 	})
+	opID := uuid.New()
 	seedOpsResync(c, model.Operation{
-		ID: uuid.New(), MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Phase: "awaiting_phone_home",
+		ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Phase: "awaiting_phone_home",
 	})
 
-	c.RecordPhoneHome(id)
+	c.RecordPhoneHome(id, opID)
 	if got := c.MachineByID(id); got == nil || got.State != model.MachineStateRunning {
 		t.Fatalf("post phone-home: running overlay not applied, got %+v", got)
 	}

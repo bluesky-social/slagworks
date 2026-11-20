@@ -298,8 +298,9 @@ its end of the link collapses into the host's pool; with both ends
 present the higher address is taken as the host side. Pools are sorted
 by subnet so the snapshot hash does not depend on NetBox's list order
 (`netplan.go:45-105`). The site worker derives both ends of a `/31`
-pool from the relayed packet's giaddr, so the recorded host side never
-changes a DHCP answer.
+pool from the relayed packet's giaddr (or, for a renew the client
+unicasts to the worker, from its ciaddr), so the recorded host side
+never changes a DHCP answer.
 
 ### Test expectation
 
@@ -591,7 +592,12 @@ can't ride as one `key=value` argument (`checkKernelArgValue`).
 
 `resolveImageName` is deliberately kind-less: deploy and commission
 boot the byte-identical artifact from one Image row (`noble-pxe`)
-and the mode is a cmdline, not a separate image (`handler.go:467-475`).
+and the mode is a cmdline, not a separate image. It picks the row from
+the snapshot's image rows (`MachineProvider.GetImages`): the row named
+`HandlerConfig.DefaultImage`, else the only row, else a refusal script
+naming the rows; only with no rows does it serve `DefaultImage` by name.
+Image directories outlive their rows, so the directory name alone is
+not evidence that a row pins it.
 
 ### The server surface
 

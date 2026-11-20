@@ -660,8 +660,9 @@ func TestCache_ReloadOutboxFromDisk_AfterDrain(t *testing.T) {
 	c.ApplySnapshot(&model.SiteSnapshot{
 		Machines: []model.MachineSnapshot{{ID: id, State: model.MachineStateDeploying}},
 	})
-	c.recordDeployComplete(id, uuid.New(), nil)
-	c.RecordPhoneHome(id)
+	opID := uuid.New()
+	c.recordDeployComplete(id, opID, nil)
+	c.RecordPhoneHome(id, opID)
 
 	// Simulate drain (wsconn takes items out of memory to send them).
 	obs, _ := c.DrainOutbox()

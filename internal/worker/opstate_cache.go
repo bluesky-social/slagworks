@@ -43,8 +43,11 @@ import (
 //     up (conditional clear — the re-wipe-window fix).
 //   - failedOps: opID -> failed marker; blocks UpdateOpPhase after terminal
 //     failure. Local, preserved across stream applies, and keeps the op's
-//     Status failed against a delta or resync that still shows it active
-//     (keepLocalFailure) until op_removed clears it.
+//     Status failed until op_removed clears it: against a delta or resync
+//     that still shows it active (keepLocalFailure), and against the
+//     executor's claim bookkeeping (markClaimAttempt, rollBackClaim,
+//     setStatus), which can still be under way for an op the agent failed
+//     on the pending-op boot clause.
 //   - phaseStart: opID -> phase timing, for phase-duration logging. Local.
 //   - phoneHomed: deploy op IDs that phone-homed LOCALLY (RecordPhoneHome).
 //     A resync or delta that brings the op back as claimed-deploying must
@@ -68,14 +71,29 @@ import (
 //     outage). While untrusted the op set may force BootLocal (conservative)
 //     but never actuate (BootDeploy/BootCommission) and the executor is
 //     paused. The first op_resync clears it.
-//   - resynced: true once an op_resync has been applied in this process, so
-//     the op set is global's active set and not merely "nothing received
-//     yet". An agent report for an op the set does not hold is refused as
+//   - streamDownSince: when the worker's connection to global ended, or the
+//     zero time while the op stream is current. Set by OpStreamDown each
+//     time the WS client's connection ends, keeping the first time of an
+//     outage; cleared only by an op_resync, not by a hello that succeeds
+//     without one. A set frozen by a disconnect is stale for the same reason
+//     a rehydrated one is, so once the outage outlasts opStreamTrustWindow
+//     it may force BootLocal but never actuate, like an untrusted set.
+//     Reports are still accepted and the executor is not paused (a claim
+//     needs global, which settles it), so an install that finishes during
+//     the outage completes. In memory only: a restart rehydrates untrusted.
+//   - resynced: true while the op set tracks global's active set: an
+//     op_resync has been applied on the worker's current connection to
+//     global, whose op stream keeps it current (up to the stream's delivery
+//     lag). An agent report for an op the set does not hold is refused as
 //     final (model.ErrOperationNotActive, which stops the agent) only when
 //     the worker knows the op is over: it holds the op's tombstone, or the
-//     set is resynced. A worker started without a persisted op layer is
-//     neither untrusted nor resynced until its first op_resync, and must
-//     not tell a healthy deploy's agent to stop in that window.
+//     set is resynced. Set by applyOpResync, cleared by markStreamDown when
+//     the connection ends: from then on global can create, claim and drive
+//     an op this worker never hears of (the other worker of a pair drives
+//     it), so absence proves nothing until the reconnect's op_resync. A
+//     worker started without a persisted op layer is neither untrusted nor
+//     resynced until its first op_resync, and must not tell a healthy
+//     deploy's agent to stop in that window either.
 //   - claimUnanswered: op IDs whose most recent claim this process sent
 //     without learning the outcome (rollBackClaim: transport error, RPC
 //     timeout). That claim may have COMMITTED on global, and global's row
@@ -115,6 +133,8 @@ type opState struct {
 	untrusted bool
 	resynced  bool
 
+	streamDownSince time.Time
+
 	// wake is fired (buffered, non-blocking) when a delta/resync adds a
 	// PENDING op, so the executor picks it up in ms instead of waiting on
 	// its 5s backstop tick. nil in tests that don't wire an executor.
@@ -132,6 +152,39 @@ type opState struct {
 	// case-insensitively, so the match is model.SameHardwareSerial.
 	// Immutable after construction.
 	selfSerial string
+}
+
+// opStreamTrustWindow is how long a worker whose connection to global ended
+// keeps actuating from the op set it held (streamDownSince). It is the
+// default of global's OpTimeout: global fails every claimed or running op
+// within that time of its claim unless it is at awaiting_phone_home, which
+// boots locally anyway, and every op the frozen set holds as claimed was
+// claimed before the outage began. Past the window none of them can still be
+// one global is driving. An op the set holds as pending can still be live on
+// global, pending (up to PendingOpTimeout) or claimed by the peer since, and
+// withholding its boot until the worker reconnects is the safe direction. A
+// global configured with a longer OpTimeout only makes the worker withhold
+// earlier than needed.
+const opStreamTrustWindow = 30 * time.Minute
+
+// markStreamDown records that the worker's connection to global, and with it
+// the op stream, ended at since.
+//
+// The first call of an outage sets streamDownSince: the WS client calls it
+// after every failed attempt, and a later time would restart the window.
+//
+// It also clears resynced: until the reconnect's op_resync an op absent from
+// the set may be one global created since, so a report for it gets the
+// retryable refusal, not the final one. The op set, its tombstones and
+// terminal statuses stay as they are, so an end this worker did hear about
+// is still final.
+func (o *opState) markStreamDown(since time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.streamDownSince.IsZero() {
+		o.streamDownSince = since
+	}
+	o.resynced = false
 }
 
 // tombstoneCap bounds the tombstone set (opID -> terminal version). FIFO
@@ -356,6 +409,7 @@ func (o *opState) applyOpResync(ops []model.Operation, states map[string]model.M
 
 	o.untrusted = false
 	o.resynced = true
+	o.streamDownSince = time.Time{}
 	// fireWake is a lock-free channel send, so calling it while mu is held
 	// (before the deferred Unlock) is safe.
 	if anyPending {
@@ -525,28 +579,52 @@ func (o *opState) effectiveState(id uuid.UUID, base model.MachineState) model.Ma
 // --- Combined readers (view + op overlay, one generation under mu) ---
 
 // bootAction is the internal result of the boot-action decision, carrying
-// an optional fail-closed warning to emit AFTER releasing the lock (slow
-// slog IO must not block a pending writer under RLock).
+// an optional warning to emit AFTER releasing the lock (slow slog IO must
+// not block a pending writer under RLock): warn for the fail-closed rule,
+// withheldOp for an op a long-frozen op set held (actuateLocked).
 type bootAction struct {
 	action model.BootAction
 	warn   bool
 	mac    string
 	state  model.MachineState
+
+	withheldOp uuid.UUID
+	downSince  time.Time
 }
 
 // bootActionForMAC returns the boot action for a MAC. See the doc on
 // Cache.BootActionForMAC for the decision table and the two re-wipe-guard
-// clauses, plus the Tier-2 fail-closed + untrusted rules.
-func (o *opState) bootActionForMAC(mac string) model.BootAction {
-	r := o.bootActionLocked(mac)
+// clauses, plus the Tier-2 fail-closed rule and the untrusted and frozen-set
+// rules (actuateLocked). holdPending (an image sync is in flight) makes a
+// pending lifecycle op serve BootLocal.
+func (o *opState) bootActionForMAC(mac string, holdPending bool) model.BootAction {
+	r := o.bootActionLocked(mac, holdPending)
 	if r.warn {
 		slog.Warn("boot fail-closed: transient machine state with no active op (op/identity mismatch); serving BootLocal — resync or next op_delta heals it",
 			"mac", r.mac, "effective_state", string(r.state))
 	}
+	if r.withheldOp != uuid.Nil {
+		slog.Warn("boot withheld: this worker has had no connection to global for longer than the operation timeout, so the operation it holds for this host may be over; serving BootLocal until a reconnect resyncs the op set. Restore the worker's connection to global to resume lifecycle boots",
+			"mac", r.mac, "op_id", r.withheldOp, "op_stream_down_since", r.downSince, "trust_window", opStreamTrustWindow)
+	}
 	return r.action
 }
 
-func (o *opState) bootActionLocked(mac string) bootAction {
+// actuateLocked returns the agent boot an active op authorizes, unless the
+// op set is not global's current word: a rehydrated set (untrusted), or one
+// frozen by a connection to global that ended more than opStreamTrustWindow
+// ago. Either may force BootLocal but never actuate. Caller holds mu.
+func (o *opState) actuateLocked(mac string, op *model.Operation, action model.BootAction) bootAction {
+	if o.untrusted {
+		return bootAction{action: model.BootLocal}
+	}
+	if !o.streamDownSince.IsZero() && time.Since(o.streamDownSince) > opStreamTrustWindow {
+		return bootAction{action: model.BootLocal, mac: mac, withheldOp: op.ID, downSince: o.streamDownSince}
+	}
+	return bootAction{action: action}
+}
+
+func (o *opState) bootActionLocked(mac string, holdPending bool) bootAction {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	v := o.view.Load()
@@ -571,6 +649,15 @@ func (o *opState) bootActionLocked(mac string) bootAction {
 		return bootAction{action: model.BootLocal}
 	}
 
+	// An image sync is in flight, so the image on disk can still be the
+	// previous release under the same name: a pending op waits for it, as
+	// in Cache.PendingLifecycleOps. A claimed op is already being driven
+	// (the executor marks the op claimed before it cycles the host) and
+	// keeps its boot.
+	if holdPending && activeOp != nil && activeOp.Status == model.OpPending {
+		return bootAction{action: model.BootLocal}
+	}
+
 	switch state {
 	case model.MachineStateCommissioning:
 		// Fail-closed: a transient commissioning state must be backed by
@@ -579,50 +666,35 @@ func (o *opState) bootActionLocked(mac string) bootAction {
 		// baseline alone must never actuate (a dropped/late delta could
 		// leave a stale transient baseline via a kept identity trigger).
 		if activeOp != nil && activeOp.Type == model.OpCommission {
-			if o.untrusted {
-				return bootAction{action: model.BootLocal}
-			}
-			return bootAction{action: model.BootCommission}
+			return o.actuateLocked(mac, activeOp, model.BootCommission)
 		}
 		return bootAction{action: model.BootLocal, warn: true, mac: mac, state: state}
 	case model.MachineStateDeploying:
 		if activeOp != nil && activeOp.Type == model.OpDeploy {
-			if o.untrusted {
-				return bootAction{action: model.BootLocal}
-			}
-			return bootAction{action: model.BootDeploy}
+			return o.actuateLocked(mac, activeOp, model.BootDeploy)
 		}
 		return bootAction{action: model.BootLocal, warn: true, mac: mac, state: state}
 	case model.MachineStateNew:
 		// Commission is destructive-adjacent inventory authority, so even a
 		// new machine must have an explicit operation before it receives the
 		// agent. This guarantees every boot carries one machine/op binding.
-		if activeOp != nil && activeOp.Type == model.OpCommission && !o.untrusted {
-			return bootAction{action: model.BootCommission}
+		if activeOp != nil && activeOp.Type == model.OpCommission {
+			return o.actuateLocked(mac, activeOp, model.BootCommission)
 		}
 		return bootAction{action: model.BootLocal}
 	case model.MachineStateFailed:
 		// Failed retries require an explicit op (operator chose commission
 		// or deploy as the recovery path).
 		if activeOp != nil && activeOp.Type == model.OpCommission {
-			if o.untrusted {
-				return bootAction{action: model.BootLocal}
-			}
-			return bootAction{action: model.BootCommission}
+			return o.actuateLocked(mac, activeOp, model.BootCommission)
 		}
 		if activeOp != nil && activeOp.Type == model.OpDeploy {
-			if o.untrusted {
-				return bootAction{action: model.BootLocal}
-			}
-			return bootAction{action: model.BootDeploy}
+			return o.actuateLocked(mac, activeOp, model.BootDeploy)
 		}
 		return bootAction{action: model.BootLocal}
 	case model.MachineStateCommissioned:
 		if activeOp != nil && activeOp.Type == model.OpDeploy {
-			if o.untrusted {
-				return bootAction{action: model.BootLocal}
-			}
-			return bootAction{action: model.BootDeploy}
+			return o.actuateLocked(mac, activeOp, model.BootDeploy)
 		}
 		return bootAction{action: model.BootLocal}
 	case model.MachineStateRunning:
@@ -697,10 +769,11 @@ func (e opNotActiveError) Is(target error) bool { return target == model.ErrOper
 //
 // A rejection wraps model.ErrOperationNotActive only when the op is known to
 // be over: it is held with a terminal status, its tombstone is held, or it is
-// absent from a resynced set. That answer stops the agent, so every rejection
-// the worker cannot stand behind as final (an unsynchronized op layer, a
-// machine missing from the snapshot, a machine/op or event/type mismatch)
-// stays a plain error.
+// absent from a set resynced on the current connection to global (see the
+// resynced field). That answer stops the agent, so every rejection the worker
+// cannot stand behind as final (an unsynchronized op layer, an op absent
+// while the connection is down, a machine missing from the snapshot, a
+// machine/op or event/type mismatch) stays a plain error.
 func (o *opState) validateReportBinding(machineID, opID uuid.UUID, event string) (*model.MachineSnapshot, *model.Operation, bool, error) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
@@ -735,7 +808,7 @@ func (o *opState) validateReportBinding(machineID, opID uuid.UUID, event string)
 	op, ok := o.ops[opID.String()]
 	if !ok {
 		if _, removed := o.tombstones[opID.String()]; !removed && !o.resynced {
-			return nil, nil, false, fmt.Errorf("operation %s is not known on this site yet: no operation resync since the worker started", opID)
+			return nil, nil, false, fmt.Errorf("operation %s is not known on this site: the worker has not resynced its operations with global since it started or last lost its connection; retry once it has", opID)
 		}
 		return nil, nil, false, opNotActiveError(fmt.Sprintf("operation %s is not active on this site", opID))
 	}
@@ -823,11 +896,17 @@ func (o *opState) commissionOpForMAC(mac string) *model.Operation {
 }
 
 // recordPhoneHome sets the running overlay for a machine (if it exists in
-// the view), latches the deploy op as locally phone-homed, and returns the
-// active deploy op ID to complete, or uuid.Nil if none. Combined
-// reader/writer: reads the view and writes the overlay + scans ops under
+// the view), latches the deploy op the phone-home named as locally
+// phone-homed, and returns that op's ID to complete, or uuid.Nil if this
+// worker no longer holds it as an active deploy op of the machine. Combined
+// reader/writer: reads the view and writes the overlay + reads the op under
 // one mu.Lock.
-func (o *opState) recordPhoneHome(machineID uuid.UUID) uuid.UUID {
+//
+// The op is looked up by the ID the report named, never by machine: while a
+// new deploy's op_delta is ahead of the previous deploy's op_removed, the
+// worker holds two active deploy ops for the machine, and global completes
+// whichever one the phone_home observation carries.
+func (o *opState) recordPhoneHome(machineID, opID uuid.UUID) uuid.UUID {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	// Record the local machine-state advance as an overlay rather than
@@ -838,18 +917,17 @@ func (o *opState) recordPhoneHome(machineID uuid.UUID) uuid.UUID {
 	if _, ok := o.view.Load().machines[machineID]; ok {
 		o.machineState[machineID] = model.MachineStateRunning
 	}
-	for _, op := range o.ops {
-		if op.MachineID == machineID && op.Type == model.OpDeploy &&
-			op.Status != model.OpCompleted && op.Status != model.OpFailed {
-			// Latch this op as locally phone-homed: a reconnect op_resync
-			// that brings it back as claimed-deploying must not downgrade
-			// the running overlay and re-wipe the fresh disk.
-			o.phoneHomed[op.ID.String()] = true
-			o.settlePhoneHome(op.ID.String(), machineID)
-			return op.ID
-		}
+	op, ok := o.ops[opID.String()]
+	if !ok || op.MachineID != machineID || op.Type != model.OpDeploy ||
+		op.Status == model.OpCompleted || op.Status == model.OpFailed {
+		return uuid.Nil
 	}
-	return uuid.Nil
+	// Latch this op as locally phone-homed: a reconnect op_resync that
+	// brings it back as claimed-deploying must not downgrade the running
+	// overlay and re-wipe the fresh disk.
+	o.phoneHomed[op.ID.String()] = true
+	o.settlePhoneHome(op.ID.String(), machineID)
+	return op.ID
 }
 
 // --- Op-set readers (ops only, under mu.RLock) ---
@@ -1099,11 +1177,14 @@ func (o *opState) activeBootingOpForMachine(machineID uuid.UUID) *model.Operatio
 
 // --- Op mutators (write under mu.Lock) ---
 
-// setStatus sets an op's status in-place (no-op if the op is absent).
+// setStatus sets an op's status in-place (no-op if the op is absent). An op
+// the agent failed keeps its failed status until op_removed (see the
+// failedOps field): the executor's running mark after a late claim grant
+// must not make it active again.
 func (o *opState) setStatus(opID string, status model.OperationStatus) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if op, ok := o.ops[opID]; ok {
+	if op, ok := o.ops[opID]; ok && !o.failedOps[opID] {
 		op.Status = status
 	}
 }
@@ -1111,12 +1192,13 @@ func (o *opState) setStatus(opID string, status model.OperationStatus) {
 // markClaimAttempt marks an op claimed locally as the executor sends a claim
 // for it, so the pending readers stop returning it, and forgets any earlier
 // unanswered claim: this attempt's outcome now decides, and rollBackClaim
-// records it again if it goes unanswered too.
+// records it again if it goes unanswered too. An op the agent failed keeps
+// its failed status (see the failedOps field).
 func (o *opState) markClaimAttempt(opID string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	delete(o.claimUnanswered, opID)
-	if op, ok := o.ops[opID]; ok {
+	if op, ok := o.ops[opID]; ok && !o.failedOps[opID] {
 		op.Status = model.OpClaimed
 	}
 }
@@ -1125,13 +1207,18 @@ func (o *opState) markClaimAttempt(opID string) {
 // back to pending so the pending readers return the op for a retry, and
 // records the claim as unanswered so reclaimableOps returns the op if
 // global's claimed row replaces that mark first. A no-op for an op that
-// ended while the claim was in flight (op_removed left its tombstone). An op
-// a resync merely omitted meanwhile (its machine left the site's scope) has
-// no row to roll back but keeps the record, for when the row comes back.
+// ended while the claim was in flight: op_removed left its tombstone, or
+// the agent, running on the pending-op boot clause, failed the op (see the
+// failedOps field), which leaves nothing to retry. An op a resync merely
+// omitted meanwhile (its machine left the site's scope) has no row to roll
+// back but keeps the record, for when the row comes back.
 func (o *opState) rollBackClaim(opID string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if _, ended := o.tombstones[opID]; ended {
+		return
+	}
+	if o.failedOps[opID] {
 		return
 	}
 	o.claimUnanswered[opID] = true
@@ -1143,7 +1230,8 @@ func (o *opState) rollBackClaim(opID string) {
 // markFailed marks an op failed, clears its phase timing, and (if present)
 // sets its in-memory Status/Phase. Once marked failed, updatePhase for this
 // op is rejected — this prevents phase progression after terminal failure —
-// and stream applies keep it failed until op_removed (keepLocalFailure).
+// and stream applies (keepLocalFailure) and the executor's status writes
+// keep it failed until op_removed.
 func (o *opState) markFailed(opID, phase string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()

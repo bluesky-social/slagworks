@@ -844,16 +844,15 @@ func propCheckTree(c propCase, st propStep, ins *propInspect) *propTreeReport {
 		}
 	}
 
-	// Units that failed at boot. Two have failed on systems this image
-	// installs whatever the storage (cloud-config.service, and
-	// mdmonitor.service when an array exists), so they say nothing about the
+	// Units that failed at boot. cloud-config.service has failed on systems
+	// this image installs whatever the storage, so it says nothing about the
 	// layout; anything else is worth a look per case.
 	state := strings.Split(strings.TrimSpace(ins.Sections["state"]), "\n")
 	if len(state) == 0 || strings.TrimSpace(state[0]) != "running" {
 		var other []string
 		for _, line := range state[1:] {
 			f := strings.Fields(line)
-			if len(f) == 0 || f[0] == "cloud-config.service" || f[0] == "mdmonitor.service" {
+			if len(f) == 0 || f[0] == "cloud-config.service" {
 				continue
 			}
 			other = append(other, f[0])

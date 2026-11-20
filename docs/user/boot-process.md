@@ -102,11 +102,21 @@ a machine ever gets booted:
   a peer's slice — or outside the subnet entirely — the local worker NAKs
   it to force a re-DISCOVER onto whichever slice-owner picks it up
   (`splitPoolNAK`, `handler.go:680`). Reservations are unsliced and are
-  ACKed by either worker.
-- **On-ACK phase advance.** `OnACK(mac, isIPXE)` fires after a DHCPACK; the
-  site worker uses it to promote a booting op's phase to `dhcp_ack` for a
-  firmware DHCP and `ipxe_dhcp` for a post-chainload iPXE DHCP
-  (`cmd/slagworksd/site.go:640-660`).
+  ACKed by either worker. The fabric ephemeral range and each relay pool's
+  range are split the same way without operator data: the snapshot lists
+  the workers registered to the site config (`DHCPConfig.Workers`), and
+  each worker allocates only from its share by position in that list
+  (`PoolConfig.WorkerShare`). Each worker keeps its own lease table and
+  cannot ARP-probe a relayed subnet, so without the split two workers
+  answering one relayed DISCOVER stream could lease one address to two
+  hosts. A /31 relay pool is not split: its one client address comes from
+  `giaddr`.
+- **On-ACK phase advance.** `OnACK(mac, client)` fires after a DHCPACK with
+  the kind of client it went to; the site worker uses it to promote a
+  booting op's phase to `dhcp_ack` for PXE or HTTP-boot firmware and
+  `ipxe_dhcp` for slagworks iPXE after the chainload
+  (`cmd/slagworksd/site.go`). An ACK to any other client, such as the
+  deploy environment's own dhcpcd (stage 5), leaves the phase alone.
 - **Lease persistence.** When a `LeaseStore` is wired, leases are saved on
   every ACK and reloaded on startup with expired entries pruned
   (`handler.go:238-258`, `handler.go:1033-1041`).
@@ -218,7 +228,12 @@ Each generated script sets `BOOTIF=01-${net0/mac:hexhyp}` and `ip=dhcp` so
 stock Ubuntu `/init` (via `configure_networking`) knows which NIC iPXE
 chainloaded on and will DHCP on the correct port. `boot=slagworks` is the
 BOOT-hook selector; `slagworks.server=` and `slagworks.image=` tell the
-initrd hook where to fetch the squashfs from.
+initrd hook where to fetch the squashfs from. `slagworks.image=` names
+the image's version directory (`noble-pxe@<sha16>`) current when the
+script was served, the same one the script's kernel and initrd URLs
+name, and the agent fetches the UEFI ESP's kernel and initrd from it
+too, so one boot never mixes files from two image versions
+([images.md](images.md#site-workers-how-the-row-reaches-a-running-deploy)).
 
 The handler also fires an `ipxe_loaded` progress report for the active
 boot-driving op the moment the script goes out (`handler.go:181-196`), so
@@ -237,7 +252,8 @@ consults during a deploy (`handler.go:897-921`):
   `/boot/storage-script?mac=...` for the agent's convenience)
 - `/boot/ssh-keys` — operator authorized_keys the agent writes into the
   deployed OS
-- `/files/images/<image>/{vmlinuz,initrd,root.squashfs}` — the image tree
+- `/files/images/<image>@<sha16>/{vmlinuz,initrd,initrd-local,root.squashfs}`
+  — one version of the image
 - `/files/bin/slagworks-agent` — the agent binary (see the images doc for
   where this comes from; it is NOT part of the image)
 - `/files/bin/systemd-bootx64.efi` — the ESP bootloader binary. Not
@@ -279,7 +295,14 @@ what stock `/init` calls; the slagworks version does exactly this:
    `BOOTIF=` / `ip=dhcp` and DHCPs via dhcpcd on the right NIC. Discover
    the leased interface either from the exported `DEVICE` or by scanning
    `/sys/class/net` for a global IPv4 lease. Missing lease drops to
-   recovery.
+   recovery. `configure_networking` runs dhcpcd in oneshot mode, which
+   exits once it has the lease, and the kernel deletes the address when
+   the lease runs out (5 minutes by default). So the hook then starts
+   `dhcpcd -4 -b -K -L` on the leased interface to renew the lease for as
+   long as the environment runs: the agent's whole run and any hold in
+   recovery afterwards. If dhcpcd will not start, the hook prints a
+   warning and carries on, and the address lasts only until the lease
+   ends.
 3. Mount efivarfs at `/sys/firmware/efi/efivars` when present, so the
    agent's `efibootmgr -c` can write UEFI Boot#### entries later. On BIOS
    hosts this is a no-op. `slagworks.efivarfs=skip` is a test-only knob
@@ -320,7 +343,9 @@ pubkeys baked into the initrd (the image build's
 `SLAGWORKS_RECOVERY_AUTHORIZED_KEYS` input) into
 the overlay root, generates ephemeral host keys on tmpfs, writes a
 key-only sshd config, prints the leased IP to the SOL console, and execs
-`sshd -D -e` in the foreground so an operator can `ssh root@<ip>`.
+`sshd -D -e` in the foreground so an operator can `ssh root@<ip>`. The
+dhcpcd started in step 2 keeps renewing the lease, so the address stays
+up for as long as the host waits there.
 If no keys were baked in, the hook drops straight to a serial shell
 instead of starting a permission-denying sshd.
 
@@ -346,7 +371,8 @@ Phase set to authority:
 - `pxe_booting` is set by the site worker executor when it claims a deploy
   op (`internal/worker/executor.go:377`).
 - `dhcp_ack` and `ipxe_dhcp` come from the DHCP `OnACK` callback
-  (`cmd/slagworksd/site.go:640-660`).
+  (`cmd/slagworksd/site.go`), for the firmware's and iPXE's DHCP only;
+  the initrd's own `ip=dhcp` exchange sets no phase.
 - `ipxe_loaded` fires the moment the HTTP boot handler serves a script
   (`internal/httpboot/handler.go:181-196`).
 - `agent_starting`, `partitioning`, `rsyncing_os`, `installing_bootloader`,
@@ -388,7 +414,8 @@ What the agent actually does, in order:
     that directory; GRUB 2.12 cannot read past one and stops at
     `error: not a correct XFS inode.`
   - **RAID** (layouts with md arrays): `target.ConfigureRAID` writes
-    `/etc/mdadm/mdadm.conf` with `AUTO -all` and an `ARRAY` line, by UUID,
+    `/etc/mdadm/mdadm.conf` with `AUTO -all`, `MAILADDR root` (without
+    it `mdmonitor.service` fails at boot) and an `ARRAY` line, by UUID,
     for each array the layout names, regenerates the target's initramfs so
     it carries that file, and on UEFI replaces the ESP's
     `/slagworks/initrd.img` with it. The installed system then assembles

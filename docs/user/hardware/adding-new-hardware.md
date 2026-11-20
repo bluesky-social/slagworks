@@ -338,10 +338,16 @@ host address, a second address on a gateway NIC), the facts carry the
 device's primary IPv4 (`primary_ip4`) if it is one of them, and otherwise the
 numerically lowest active IPv4 address (ties: shorter prefix length, then
 lower NetBox ID); an interface with only IPv6 addresses gets the lowest of
-those. NetBox list order never changes the result. The global service logs
-one warning per site naming each such device, interface and chosen address,
-and repeats it only when that list changes. A script that needs a different
-address than the rule picks should make it the device's primary IPv4.
+those. Within a family, addresses whose NetBox role is unset or `loopback`
+come first: unless it is the primary, an address with role `secondary`,
+`anycast`, `vip`, `vrrp`, `hsrp`, `glbp` or `carp` is chosen only when every
+active address of that family on the interface has one of those roles. Set
+the role on an anycast or VIP address that shares an interface (often `lo`)
+with the host's own address, so the facts carry the host's address. NetBox
+list order never changes the result. The global service logs one warning
+per site naming each such device, interface and chosen address, and repeats
+it only when that list changes. A script that needs a different address
+than the rule picks should make it the device's primary IPv4.
 `Gateway` is the longest-prefix-match of the
 interface CIDR against site prefixes' `gateway_ip` custom field. The script
 owns all topology interpretation from these facts; slagworks itself is

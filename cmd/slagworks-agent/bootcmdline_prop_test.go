@@ -100,7 +100,8 @@ func (p *propProvider) CommissionOpForMAC(mac string) *model.Operation {
 	}
 	return nil
 }
-func (p *propProvider) GetSSHKeys() []string { return nil }
+func (p *propProvider) GetSSHKeys() []string               { return nil }
+func (p *propProvider) GetImages() map[string]*model.Image { return nil }
 func (p *propProvider) HandleProgressReport(r *model.ProgressReport) error {
 	p.reports = append(p.reports, *r)
 	return nil

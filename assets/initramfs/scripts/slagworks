@@ -155,8 +155,8 @@ slagworks_download() {
 # slagworks_recovery_drop: enter recovery mode. Materialize operator
 # authorized_keys baked into the initrd into the chroot, generate ephemeral
 # host keys (tmpfs, fresh per boot), and start sshd in the foreground so an
-# operator can `ssh root@$IP`. Networking stays up because configure_networking
-# only set a lease; there is no daemon to tear it down. Never returns: it execs
+# operator can `ssh root@$IP`. The address stays up because mountroot left a
+# dhcpcd renewing its lease (see keep-lease there). Never returns: it execs
 # sshd, and if sshd dies it drops to a shell. We do NOT reboot from recovery;
 # the operator decides when to leave.
 #
@@ -289,6 +289,27 @@ mountroot() {
     fi
     SLAG_IP=$(ip addr show "$SLAG_IFACE" | grep 'inet ' | awk '{print $2}')
     _step "got-ip iface=$SLAG_IFACE ip=$SLAG_IP"
+
+    # Keep the lease. configure_networking ran `dhcpcd -1` (oneshot), which
+    # exited once it had a lease and left the address in the kernel with the
+    # lease's lifetime: the kernel deletes the address when the lease runs
+    # out (5 minutes on the default lease). The agent may run for the whole
+    # operation timeout, and the recovery sshd waits for an operator, so leave
+    # a dhcpcd running that renews the lease for as long as this environment
+    # lives. Pinning the address (valid_lft forever) instead would leave the
+    # site worker's lease to expire, and the worker could hand the address to
+    # another host. -K, as configure_networking passes it, makes dhcpcd
+    # ignore carrier changes, so a link flap leaves the address alone as it
+    # did before; the initrd's dhcpcd.conf sets `persistent`, so the address
+    # also survives the client exiting. A client that will not start does
+    # not stop the boot: the address lasts until the lease ends, as it did
+    # before.
+    _step "keep-lease iface=$SLAG_IFACE"
+    if ! dhcpcd -4 -b -K -L "$SLAG_IFACE" >/dev/null; then
+        echo "slagworks: WARNING: could not start dhcpcd to renew the lease on $SLAG_IFACE."
+        echo "slagworks: $SLAG_IP leaves this host when its DHCP lease ends. If operations"
+        echo "slagworks: here outlast it, raise dhcp_lease_seconds on the site's prefix."
+    fi
 
     _step "mount-efivarfs"
     slagworks_mount_efivarfs

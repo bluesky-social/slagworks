@@ -602,6 +602,7 @@ func (s *propStore) ListNetworkScripts() ([]model.NetworkScript, error) { return
 func (s *propStore) ListSSHPublicKeys() ([]string, error) {
 	return append([]string(nil), s.keys...), nil
 }
+func (s *propStore) ListSiteWorkers(string) ([]model.SiteWorker, error) { return nil, nil }
 
 func (s *propStore) deviceBound(id int, except uuid.UUID) bool {
 	for _, m := range s.machines {

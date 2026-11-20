@@ -95,7 +95,7 @@ func (c *envelopeCollector) dump(t *testing.T) string {
 func runUntilFirstDisconnect(t *testing.T, cfg WSConnConfig) string {
 	t.Helper()
 	sink := newEnvelopeCollector()
-	w := NewWSConn(cfg, nil, nil, nil)
+	w := NewWSConn(cfg, NewCache(nil), nil, nil)
 	w.SetLogger(slog.New(slogkit.NewHandler(slogkit.HandlerOptions{
 		Source: slogkit.SourceSite, Host: "w1", Sink: sink})))
 

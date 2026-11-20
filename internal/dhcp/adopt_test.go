@@ -368,40 +368,79 @@ func TestClassify_OwnLeaseNoLongerServable_NAKs(t *testing.T) {
 	}
 }
 
-// TestClassify_RelayedLeaseUnicastRenew_NeverGetsDirectPoolAddress: a client
-// that got its lease through a relay renews by unicast straight to the
-// server (RFC 2131 RENEWING: ciaddr set, giaddr 0; the same packet shape the
-// rebinding helper builds), so poolForRequest resolves the direct pool,
-// which does not cover the relayed lease. Before the fix the renew was ACKed
-// with a direct-pool address and router: an address from another subnet. It
-// must be answered at the held address or NAKed, and after a NAK the
-// client's re-DISCOVER through the relay gets the same address back.
-func TestClassify_RelayedLeaseUnicastRenew_NeverGetsDirectPoolAddress(t *testing.T) {
-	h := NewHandler(relayConfig()) // direct 10.99.1.0/24, relay 10.99.2.0/24
-	mac, _ := net.ParseMAC("52:54:00:00:01:0c")
-	relay := net.ParseIP("10.99.2.1")
-
-	offer := h.HandlePacket(mustDiscover(t, mac, withGiaddr(relay)))
-	if offer == nil || offer.YourIPAddr.String() != "10.99.2.100" {
-		t.Fatalf("setup: want a relayed OFFER of 10.99.2.100, got %v", offer)
+// TestClassify_RelayedLeaseUnicastRenew_ACKsTheHeldAddress: a client that
+// took its lease through a relay renews it by unicast straight to the server
+// (RFC 2131 4.3.2 RENEWING: ciaddr set, giaddr 0; the packet shape the
+// rebinding helper builds), so no relay has stamped giaddr on it. RFC 2131
+// has the server trust ciaddr here, so the handler must find the client's
+// relay subnet from ciaddr and ACK the held address with that subnet's
+// router and mask. The deploy environment leaves a renewing dhcpcd running,
+// so every deploy on a relayed subnet renews this way at half-lease.
+//
+// Before the fix the renew resolved the direct pool, which does not cover
+// the relayed lease, and was NAKed ("existing lease outside the resolved
+// pool's range"): a client that hears that NAK drops its address while it
+// re-DISCOVERs. Before that it was ACKed with a direct-pool address and
+// router, an address from another subnet.
+func TestClassify_RelayedLeaseUnicastRenew_ACKsTheHeldAddress(t *testing.T) {
+	cases := []struct {
+		name   string
+		relay  RelaySubnet
+		giaddr string
+		held   string // the address the relayed DISCOVER/REQUEST leases
+		router string
+		mask   int
+	}{
+		{
+			name:  "relay subnet",
+			relay: relayConfig().RelaySubnets[0], // 10.99.2.0/24, range .100-.200, gateway .1
+			// giaddr is the relay's address on the client's subnet.
+			giaddr: "10.99.2.1", held: "10.99.2.100", router: "10.99.2.1", mask: 24,
+		},
+		{
+			name: "point-to-point /31 relay subnet",
+			// Recorded from the leaf's end, as the snapshot may: the
+			// handler derives both ends from the packet.
+			relay: RelaySubnet{
+				Subnet:     net.IPNet{IP: net.ParseIP("10.99.3.4"), Mask: net.CIDRMask(31, 32)},
+				RangeStart: net.ParseIP("10.99.3.4"),
+				RangeEnd:   net.ParseIP("10.99.3.4"),
+				Gateway:    net.ParseIP("10.99.3.5"),
+			},
+			giaddr: "10.99.3.4", held: "10.99.3.5", router: "10.99.3.4", mask: 31,
+		},
 	}
-	held := offer.YourIPAddr.String()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig() // direct 10.99.1.0/24
+			cfg.RelaySubnets = []RelaySubnet{tc.relay}
+			h := NewHandler(cfg)
+			mac, _ := net.ParseMAC("52:54:00:00:01:0c")
+			viaRelay := withGiaddr(net.ParseIP(tc.giaddr))
 
-	reply := h.HandlePacket(rebinding(t, mac, held))
-	switch {
-	case reply == nil:
-		t.Fatalf("unicast renew of %s got no reply; want NAK or ACK at %s", held, held)
-	case isACK(reply):
-		if reply.YourIPAddr.String() != held {
-			t.Fatalf("unicast renew of %s was ACKed with yiaddr %v (router %v); want NAK or ACK at %s",
-				held, reply.YourIPAddr, reply.Router(), held)
-		}
-	case !isNAK(reply):
-		t.Fatalf("unicast renew of %s got %v; want NAK or ACK at %s", held, reply.MessageType(), held)
-	}
+			offer := h.HandlePacket(mustDiscover(t, mac, viaRelay))
+			if offer == nil || offer.YourIPAddr.String() != tc.held {
+				t.Fatalf("setup: want a relayed OFFER of %s, got %v", tc.held, offer)
+			}
+			if ack := h.HandlePacket(mustRequestFromOffer(t, offer, viaRelay)); !isACK(ack) || ack.YourIPAddr.String() != tc.held {
+				t.Fatalf("setup: want a relayed ACK of %s, got %v", tc.held, ack)
+			}
 
-	again := h.HandlePacket(mustDiscover(t, mac, withGiaddr(relay)))
-	if again == nil || again.YourIPAddr.String() != held {
-		t.Fatalf("re-DISCOVER through the relay: want an OFFER of %s, got %v", held, again)
+			reply := h.HandlePacket(rebinding(t, mac, tc.held))
+			switch {
+			case reply == nil:
+				t.Fatalf("unicast renew of %s got no reply; want an ACK of %s", tc.held, tc.held)
+			case !isACK(reply):
+				t.Fatalf("unicast renew of %s got %v; want an ACK of %s", tc.held, reply.MessageType(), tc.held)
+			case reply.YourIPAddr.String() != tc.held:
+				t.Fatalf("unicast renew of %s was ACKed with yiaddr %v; want %s", tc.held, reply.YourIPAddr, tc.held)
+			}
+			if routers := reply.Router(); len(routers) != 1 || routers[0].String() != tc.router {
+				t.Fatalf("renew ACK routers = %v, want the relay subnet's %s", routers, tc.router)
+			}
+			if ones, _ := reply.SubnetMask().Size(); ones != tc.mask {
+				t.Fatalf("renew ACK mask = /%d, want the relay subnet's /%d", ones, tc.mask)
+			}
+		})
 	}
 }

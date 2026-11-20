@@ -4,6 +4,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# READY=1 once the site services are running (from the cached snapshot
+# if global has not answered within 5s), not once global accepts the
+# worker, so the default start timeout cannot kill a worker that global
+# refuses or cannot reach. /readyz reports the connection to global.
 Type=notify
 ExecStart=/usr/bin/slagworksd site
 # "-" prefix: a missing env file must not make systemd fail the unit

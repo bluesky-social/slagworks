@@ -22,8 +22,9 @@ package qemutest
 //     internal/store/operations.go and docs/dev/state-machine.md,
 //   - a reference model of the observation handler (internal/commission)
 //     minus NetBox/AWS: commission_report commits the inventory and
-//     completes the op, deploy_complete validates the binding, phone_home
-//     completes the deploy it names,
+//     completes the op, deploy_complete validates the binding and latches
+//     the op at awaiting_phone_home, phone_home completes the deploy it
+//     names,
 //   - the API server's publish rules for create/abort/sweep/lock
 //     (internal/api/server.go).
 //
@@ -417,7 +418,9 @@ func (s propStore) GetOperation(id uuid.UUID) (*model.Operation, error) {
 }
 
 // SetOperationPhase mirrors store.SetOperationPhase: a terminal op is left
-// as it is, and phase_entered_at and version move only on a real change.
+// as it is, a deploy at awaiting_phone_home is held there against any
+// phase but "failed", and phase_entered_at and version move only on a real
+// change.
 func (s propStore) SetOperationPhase(opID uuid.UUID, phase string) (store.PhaseTransition, error) {
 	g := s.g
 	time.Sleep(g.dbLatency / 4)
@@ -427,7 +430,7 @@ func (s propStore) SetOperationPhase(opID uuid.UUID, phase string) (store.PhaseT
 	if !ok {
 		return store.PhaseTransition{}, errPropNotFound
 	}
-	if op.Phase == phase || !propActive(op.Status) {
+	if op.Phase == phase || !propActive(op.Status) || (op.Phase == "awaiting_phone_home" && phase != "failed") {
 		return store.PhaseTransition{Changed: false, NewPhase: phase, MachineID: op.MachineID, TraceID: op.TraceID}, nil
 	}
 	now := g.now()
@@ -703,9 +706,20 @@ func (h propObsHandler) HandleObservation(_ context.Context, obs model.Observati
 		return nil
 	case "deploy_complete":
 		g.mu.Lock()
-		defer g.mu.Unlock()
 		_, err := g.validateBindingLocked(obs.OperationID, obs.MachineID, model.OpDeploy, nil)
-		return err
+		g.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		// The durable carrier of the awaiting_phone_home latch.
+		t, err := propStore{g}.SetOperationPhase(obs.OperationID, "awaiting_phone_home")
+		if err != nil {
+			return err
+		}
+		if t.Changed && t.Op != nil {
+			g.pub.PublishOpDelta(*t.Op, "")
+		}
+		return nil
 	case "phone_home":
 		return g.phoneHomeObservation(obs)
 	default:

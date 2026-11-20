@@ -2,6 +2,7 @@ package netbox
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -576,6 +577,120 @@ func TestCommissionToSync_PSUsBecomeModules(t *testing.T) {
 	}
 	if psuCount != 2 {
 		t.Errorf("expected 2 PSUs, got %d", psuCount)
+	}
+}
+
+// bayNames returns the bay names of the profile's modules in report order.
+func bayNames(s *CommissionSync, profile string) []string {
+	var out []string
+	for _, m := range s.Modules {
+		if m.ProfileName == profile {
+			out = append(out, m.BayName)
+		}
+	}
+	return out
+}
+
+// TestCommissionToSync_PlaceholderLocationsUseIndexedBays: the dmidecode
+// PSU Location and DIMM Locator are firmware strings that many boards leave
+// at a placeholder, often the same one on every PSU (two "Not Specified" on
+// a Dell R640, three "Default string" on a mini PC). ReconcileModules keys a
+// module by its bay name, so a placeholder repeated across PSUs put both
+// into one bay and lost one. A placeholder takes the indexed fallback an
+// empty location already gets.
+func TestCommissionToSync_PlaceholderLocationsUseIndexedBays(t *testing.T) {
+	psus := func(locs ...string) string {
+		var parts []string
+		for i, l := range locs {
+			parts = append(parts, fmt.Sprintf(`{"location":%q,"serial":"S%d","max_watts":750}`, l, i))
+		}
+		return `{"psus":[` + strings.Join(parts, ",") + `]}`
+	}
+	dimms := func(locs ...string) string {
+		var parts []string
+		for i, l := range locs {
+			parts = append(parts, fmt.Sprintf(`{"locator":%q,"size_mb":32768,"type":"DDR4","serial_number":"D%d"}`, l, i))
+		}
+		return `{"memory":{"dimms":[` + strings.Join(parts, ",") + `]}}`
+	}
+	cases := []struct {
+		name    string
+		report  string
+		profile string
+		want    []string
+	}{
+		{"PSUs at Not Specified", psus("Not Specified", "Not Specified"), "Power supply", []string{"PSU_0", "PSU_1"}},
+		{"PSUs at Default string", psus("Default string", "Default string", "Default string"), "Power supply", []string{"PSU_0", "PSU_1", "PSU_2"}},
+		{"single OEM placeholder PSU", psus("To Be Filled By O.E.M."), "Power supply", []string{"PSU_0"}},
+		{"real PSU locations kept", psus("PSU1", "PSU2"), "Power supply", []string{"PSU1", "PSU2"}},
+		{"real and placeholder PSU", psus("PSU1", "Not Specified"), "Power supply", []string{"PSU1", "PSU_1"}},
+		{"DIMMs at placeholder or empty locator", dimms("Not Specified", "", "DIMM_A1"), "Memory", []string{"DIMM_0", "DIMM_1", "DIMM_A1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := CommissionToSync(1, json.RawMessage(tc.report))
+			if err != nil {
+				t.Fatalf("CommissionToSync: %v", err)
+			}
+			if got := bayNames(s, tc.profile); fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("%s bay names = %q, want %q", tc.profile, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCommissionToSync_BayNamesAreUnique: real firmware names repeat too
+// (a board that prints the channel only in Bank Locator reports "DIMM 0"
+// once per channel), and a literal location can equal another PSU's
+// PSU_<index> fallback. The first module keeps the name; each later one
+// gets the lowest "_<n>" suffix no module in the report already uses, so
+// the names are stable across recommissions of the same hardware.
+func TestCommissionToSync_BayNamesAreUnique(t *testing.T) {
+	cases := []struct {
+		name    string
+		report  string
+		profile string
+		want    []string
+	}{
+		{
+			"DIMM locator repeated per channel",
+			`{"memory":{"dimms":[
+				{"locator":"DIMM 0","size_mb":16384},{"locator":"DIMM 0","size_mb":16384},
+				{"locator":"DIMM 1","size_mb":16384},{"locator":"DIMM 1","size_mb":16384}]}}`,
+			"Memory",
+			[]string{"DIMM 0", "DIMM 0_2", "DIMM 1", "DIMM 1_2"},
+		},
+		{
+			"suffix skips a name another module reports",
+			`{"memory":{"dimms":[
+				{"locator":"X","size_mb":16384},{"locator":"X","size_mb":16384},{"locator":"X_2","size_mb":16384}]}}`,
+			"Memory",
+			[]string{"X", "X_3", "X_2"},
+		},
+		{
+			"literal location equals another PSU's fallback",
+			`{"psus":[{"location":"","serial":"PA"},{"location":"PSU_0","serial":"PB"}]}`,
+			"Power supply",
+			[]string{"PSU_0", "PSU_0_2"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := CommissionToSync(1, json.RawMessage(tc.report))
+			if err != nil {
+				t.Fatalf("CommissionToSync: %v", err)
+			}
+			if got := bayNames(s, tc.profile); fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("%s bay names = %q, want %q", tc.profile, got, tc.want)
+			}
+			seen := map[string]bool{}
+			for _, m := range s.Modules {
+				if seen[m.BayName] {
+					t.Errorf("bay name %q used by more than one module", m.BayName)
+				}
+				seen[m.BayName] = true
+			}
+		})
 	}
 }
 

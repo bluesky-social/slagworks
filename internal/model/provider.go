@@ -195,6 +195,11 @@ type MachineProvider interface {
 	DeployOpForMAC(mac string) *Operation
 	CommissionOpForMAC(mac string) *Operation
 	GetSSHKeys() []string
+	// GetImages returns a copy of the site snapshot's image rows, keyed by
+	// row name. The boot handler picks the image directory to serve from
+	// these rows, since the worker syncs each row to a directory of the
+	// same name.
+	GetImages() map[string]*Image
 	// HandleProgressReport validates and applies one agent report. An
 	// error wrapping ErrOperationNotActive means the report's operation is
 	// over for good; any other error is a rejection the reporter may retry.

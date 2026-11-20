@@ -293,7 +293,12 @@ direction. On a commission report, slagworks PATCHes the Device with
 the fields it discovered:
 
 - Top-level: `serial`, `asset_tag`, `name` (hostname), `status`
-  (`active` on deploy), `device_type`.
+  (`active` on deploy), `device_type`. NetBox requires `asset_tag` to be
+  unique across all devices and at most 50 characters; when it refuses
+  the reported tag, the sync logs a warning in global's log naming the
+  device, machine and tag, leaves the device's `asset_tag` unchanged and
+  writes the other fields, so one bad firmware tag never fails a
+  commission.
 - Tags: adds `slagworks-managed` and keeps every operator tag. NetBox
   replaces the whole tag set on PATCH, so the sync reads the device's
   tags first and writes them back with `slagworks-managed` added; once
@@ -315,9 +320,14 @@ when the initrd's kernel names shift (a card added or replaced) a row is
 renamed to follow its MAC and keeps its lag, IPs and cable. Setting a
 NIC's MAC is two writes (assign a MAC object, then mark it primary); a
 run that finds the MAC object already assigned but not primary marks it
-primary instead of creating another. That includes the protected `ipmi`
-row matching the BMC MAC, the one write reconcile makes to a protected
-row. On switches (device role `leaf`, `spine`,
+primary instead of creating another. The BMC, reported as a synthetic
+`mgmt_only` NIC named `ipmi`, reconciles onto the protected `mgmt_only`
+row carrying its MAC whatever that row is named (`ipmi0`, `bmc`), or else
+onto a MAC-less `mgmt_only` row named `ipmi` (a prior run's interface
+create whose MAC write failed). Setting that row's primary MAC when it has
+none is the one write reconcile makes to a protected row; an `ipmi` row
+carrying a MAC the BMC no longer reports fails the commission loudly for
+the operator to resolve. On switches (device role `leaf`, `spine`,
 `oob-switch`) interface names and the row set are operator-owned: the
 commission initrd's kernel names (`enp3s0npN`, `eno1`) are not the
 operational `swpN`/`eth0`, so reconcile only patches non-name fields of
@@ -362,13 +372,29 @@ empty (`builder.go:68`). A machine's interface facts hold one address:
 when an interface of a bound machine carries more than one active IP
 address, Build keeps the device's `primary_ip4` if it is one of them,
 else the numerically lowest IPv4 address (the lowest IPv6 address when
-the interface has no IPv4), independent of NetBox list order. The
+the interface has no IPv4), independent of NetBox list order. Within a
+family, an address whose NetBox role is unset or `loopback` comes before
+one NetBox marks as `secondary` or shared (`anycast`, `vip`, `vrrp`,
+`hsrp`, `glbp`, `carp`), so a router's anycast /32 on `lo` never displaces
+its identity /32. The
 dispatcher logs the affected interfaces in one warning per site, repeated
 only when the set or a chosen address changes.
+OOB reservations are keyed by MAC: a MAC gets one only when its
+interfaces carry exactly one address inside the `slagworks-oob` prefix
+and no other MAC carries that address. Build leaves any other MAC out
+and keeps every other reservation; unless the MAC is a machine's NIC
+(whose static lease comes from the machine's interface facts), the
+worker then treats it as an unknown MAC with no static lease. A
+`slagworks-oob-dynamic` range with no `slagworks_oob_owner`, or whose
+owner another range also names, is left out the same way. Build logs
+what it left out on every build; neither fails the site. More than one
+`slagworks-oob` prefix, or one that does not parse, still does.
 Its inputs (`Inputs`, `builder.go:31`) are
 NetBox reads (site, config, prefixes, OOB prefixes and ranges,
 devices, device-types, interfaces, IPs), Postgres reads (machines,
-images, storage scripts, network scripts, SSH keys), and
+images, storage scripts, network scripts, SSH keys, and the config's
+registered site workers, whose sorted IDs become `DHCP.Workers` and
+assign each worker its share of the fabric dynamic ranges), and
 an optional `BMCAdminSecret` from AWS Secrets for admin-cred
 prestamping.
 
@@ -507,6 +533,20 @@ Global to site:
   ops.
 - `power_status_request` / `boot_status_request` (`131`, `150`) —
   synchronous RPCs invoked by the API for operator reads.
+- `heartbeat` (`HeartbeatMsg`) — every 30 seconds, so an idle site still
+  hears from global.
+
+Both ends heartbeat every `ws.HeartbeatInterval` (30s) and read with
+`Conn.ReadMessageIdle`, which drops the connection when nothing has
+arrived for `ws.IdleTimeout` (90s). That is how either end notices a path
+that stopped delivering without a FIN or RST; TCP alone reports it only
+when retransmission gives up, or never when something in the path keeps
+acknowledging. The timer restarts on each 32 KiB of a message as it
+arrives, so a large message on a slow link is not cut. These are messages
+rather than WebSocket pings because coder/websocket answers a ping from
+inside the receiver's read and fails that read when the pong cannot be
+written within 5 seconds, which it cannot while a large message is being
+written ahead of it.
 
 There is a generic `rpc_response` envelope (line 319) with a
 `Terminal` flag, and the slagctl-side stream types
@@ -532,9 +572,16 @@ cast pipeline, and the `SourceSOL` constant no longer exists.
   SeqNum is below the cached one closes the slug's connections instead,
   so each worker reconnects and adopts the new snapshot from its hello
   reply.
-- On hello, sends a snapshot or `no_change`. Coalesces concurrent
-  hello-triggered rebuilds through a
-  `singleflight.Group` (`helloRebuild`, 226).
+- On hello, sends a snapshot or `no_change`. With no cached snapshot for
+  the slug (global just started) the hello waits, up to `RebuildTimeout`,
+  on the slug's rebuild actor (`Rebuilder.RebuildAndWait`), where
+  concurrent hellos batch onto one rebuild. When that wait fails, the hello
+  is still answered from a snapshot cached meanwhile (by a push, or by
+  another worker's hello); it is refused with `rebuild_failed` only when
+  the cache is still empty.
+- After the hello reply, heartbeats the worker every 30 seconds
+  (`workerConn.heartbeatLoop`) and drops a connection that has sent
+  nothing for 90 seconds.
 - Dispatches inbound envelopes per type (`dispatch`, 701) to
   handlers implemented in `internal/hubhandlers`:
   `handleObservation` (789), `handleOpUpdate` (837),
@@ -580,7 +627,11 @@ polling loop.
 
 `WSConn` (line 31) manages the single upstream connection.
 
-- `Run` (274) drives the connect / read / drain loops with backoff.
+- `Run` (274) drives the connect / read / drain loops with backoff: the
+  wait between attempts starts at 1s and doubles to 30s, and returns to
+  1s only after an attempt that lasted 30s with the hello accepted, so a
+  global that accepts each hello and drops the connection is retried
+  every 30s rather than every second.
 - Snapshot receive path: `applySnapshot` (461) calls
   `cache.ApplySnapshot`, persists the sync cursor
   (`localDB.SetSyncCursor`), and then `checkVersion` (495). If the
@@ -592,6 +643,10 @@ polling loop.
 - Outbound drain loops: `drainLoop` (579) for observations and op
   updates, `logRingDrainLoop` (601), `castDrainLoop` (701),
   `heartbeatLoop` (670).
+- `heartbeatLoop` starts as soon as the hello is sent, so the time the
+  worker takes to apply the hello reply is not silence to global. The
+  read loop drops the connection and reconnects
+  when global has sent nothing for 90 seconds; global heartbeats every 30.
 - RPC surface: `handlePowerStatus` (760) and `handleBootStatus`
   (840) are called on the receive path when the hub asks for a
   synchronous power or boot read; the controller is built by the
@@ -619,11 +674,26 @@ the current), except the first snapshot on each connection, which
 `WSConn` applies with `AdoptSnapshot` whatever its SeqNum: it is
 global's current view, and global's per-site counter can go backwards
 (site config deleted and recreated, database restored, worker pointed
-at another global). It runs `imagepull.SyncImages` synchronously under
-`imageSyncMu` on every apply (`cache.go:578`) — that is what pulls
-images to disk if the snapshot points at a new SHA. `OnSnapshotApplied`
-callbacks fire outside the lock; today the cast manager and DHCP
-handler subscribe.
+at another global). Every apply hands the snapshot's image set to a
+background syncer (`requestImageSync`) that runs `imagepull.SyncImages`
+— that is what pulls images to disk if the snapshot points at a new
+SHA. The download never runs on the WS read loop: the worker keeps
+answering RPCs, applying op messages and completing its hello for the
+whole download. One sync runs at a time, and sets requested meanwhile
+collapse into one sync of the newest. While a sync is in flight a
+pending commission or deploy waits, so it does not start against the
+previous image still on disk: `PendingLifecycleOps` returns nothing,
+`ReclaimableOps` leaves lifecycle ops out, and `BootActionForMAC`
+serves `BootLocal` for a pending one (a claimed op keeps its boot). A
+failed sync releases them. Nothing else requests a sync while the
+snapshot is unchanged, so when a sync fails to fetch an image
+(`imagepull.FetchFailed`) a timer requests those images again until
+they sync or a newer request supersedes it: 5s after the failure,
+doubling to 5 minutes, each with up to 20% jitter so the workers that
+failed on the same outage do not retry in lockstep. Other failures
+repeat on every attempt and are logged, not retried.
+`OnSnapshotApplied` callbacks fire outside the lock; today the cast
+manager and DHCP handler subscribe.
 
 Public boot-time reads (called from the DHCP handler, the HTTP-boot
 handler, and the executor):
@@ -675,12 +745,16 @@ first in line again.
 The executor (`Executor`, line 47) is the drive loop for pending
 operations. `Run` (85) ticks every 5 seconds and calls `processOps`
 (99): first `PendingPowerOps` from the cache, then
-`PendingLifecycleOps`, then `ReclaimableOps` (claims that went
+`PendingLifecycleOps` (empty while an image sync is in flight, see the
+Cache section above), then `ReclaimableOps` (claims that went
 unanswered, see below). Per-op:
 
 - Skip the op, unclaimed, if its machine has left the view since the
   pass built its pending list (a snapshot applied while earlier ops
-  held the BMC).
+  held the BMC), or if its agent has reported it failed since then (a
+  host can run the agent on the pending-op boot clause before any
+  claim lands). The worker holds an agent's failure until `op_removed`,
+  and none of the steps below writes over it.
 - `MarkOpClaimed` locally in the cache first (line 120) to prevent
   the next tick re-driving.
 - WS `claimOp` RPC (`Claimer` interface, implemented by
@@ -746,16 +820,56 @@ GORM over SQLite at `/var/lib/slagworks/worker.db` (unless
 
 ### Image sync — `internal/imagepull`
 
-`SyncImages(log, imagesDir, images)` (`imagepull.go:41`) iterates the
-snapshot's images map. For each image it compares the on-disk
-`<imagesDir>/<name>/.sha256` marker with the snapshot's declared
-`sha256`; on mismatch it downloads the tarball from the URL in the
-image row and calls `extractTarGz` (`imagepull.go:173`). Idempotent
-and safe under concurrent snapshot applies (see
-`imageSyncMu` in the cache). The image name becomes the directory it
-removes and replaces, so it skips, with an error, a name that fails
-`model.ValidateImageName` before downloading anything, and still syncs
-the other images; the API applies the same rule when the row is written.
+`SyncImages(log, imagesDir, images)` iterates the snapshot's images
+map. Each version of an image lives in its own directory,
+`<imagesDir>/<name>@<sha16>` (the first 16 hex digits of the tarball's
+SHA256), and `<imagesDir>/<name>` is a symlink to the current one. An
+image is up to date when its link names the row's version directory;
+the row's `sha256` is lowercased and trimmed first (the API stores the
+value as written).
+Otherwise SyncImages downloads and verifies the tarball, extracts it
+(`extractTarGz`), requires the four image files (`imageFiles`) as
+regular files in the extracted directory, so a tarball that matches its
+digest but lacks one is never installed, and renames the result into
+its version directory,
+then switches the link by renaming a new symlink over it, so a reader
+never finds the image missing. It keeps the version the link named
+before the switch and deletes older ones; re-pinning that previous
+version switches back without a download. Idempotent; on a site worker
+it runs on the cache's background syncer, one sync at a time. A
+download that receives no data for a minute (response headers included)
+is abandoned with an error, so a connection that stops delivering
+cannot hold the syncer. It holds an exclusive `flock` on
+`imagesDir` for its whole run, so syncs of one dir from different
+processes (the worker and `slagctl image sync --dir`) also run one at a
+time, and while holding it removes the `.image-download-*`,
+`.image-extract-*`, `.image-link-*` and `.image-old-*` temp entries left
+by a sync whose process exited partway (the kernel drops a dead holder's
+lock; its cleanup never ran). The image
+name becomes the link it replaces, so it skips, with an error, a name
+that fails `model.ValidateImageName` before downloading anything; the
+API applies the same rule when the row is written. A `sha256` that is
+not 64 hex digits is skipped the same way. The name rule keeps the
+name one plain path element and off the other entry of `imagesDir`: not
+`systemd-bootx64.efi`, the bootloader the package links there. Images
+are independent: a
+refused name, failed download, digest mismatch or failed link switch
+costs only that image, the other images still sync, and every failure
+is joined into the returned error.
+`FetchFailed(err)` names the images in a sync error that failed to
+fetch from the URL (transport error, non-200 response, body cut
+short, stalled download); the site worker's cache retries only those,
+since a digest mismatch, an unreadable tarball, a refused name or a
+local write error would fail the same way again.
+
+The boot handler (`resolveImageName` in `internal/httpboot`) reads the
+link once per boot script and puts the version directory into the
+kernel and initrd URLs and `slagworks.image=`. The BOOT hook
+(`root.squashfs`) and the agent's UEFI bootloader step (`vmlinuz`,
+`initrd-local`) build their URLs from `slagworks.image=`, so every file
+one boot fetches comes from one version even if the image is re-pinned
+mid-boot. A boot that spans two re-pins finds its version deleted and
+fails its next fetch.
 
 ## The on-target agent
 
@@ -839,7 +953,9 @@ OIDC-protected under `/api/v1` (middleware in `internal/api/oidcauth.go`):
 - Streams (WebSocket upgrades, token in the `Authorization` header):
   `GET /logs/stream`, `GET /console/stream`. They accept an upgrade
   with no `Origin` header or a same-origin one and refuse any other
-  origin (`acceptOperatorStream` in `logs_stream.go`).
+  origin (`acceptOperatorStream` in `logs_stream.go`), and ping the
+  client every 30 seconds so a proxy's idle timeout does not close a
+  quiet stream (`keepOperatorStreamAlive`).
 - Machine writes: `PATCH /machines/:id`;
   `POST /machines/:id/deploy` / `commission` / `lock` / `unlock` /
   `activate` / `deactivate` / `power` / `boot` / `bmc-reconcile` /
@@ -1069,8 +1185,11 @@ configuration (`Config`, 57) carries:
   known, but must not get a bootfile. Unknown MACs are still
   eligible on a promiscuous pool; the httpboot layer decides what
   to serve them.
-- `OnACK(mac, opID)` — records DHCP phases (`dhcp_ack`, `ipxe_dhcp`)
-  on the machine's booting op for the TUI (`site.go:646`).
+- `OnACK(mac, client)` — records DHCP phases on the machine's booting
+  op for the TUI: `dhcp_ack` when `client` is `ClientFirmware`,
+  `ipxe_dhcp` when it is `ClientIPXE`, nothing for `ClientOther` (the
+  deploy environment's own DHCP client, an installed OS)
+  (`site.go:757`).
 
 The handler supports the multi-interface split-pool case
 (`IfaceParams`, line 135), relay pools for L3 fabrics
@@ -1208,9 +1327,9 @@ Packages:
   by the site worker for the `bmc_reconcile` op.
 - `commission` — Observation handler for `commission_report`,
   `deploy_complete`, `bmc_reconcile_report`, and `dhcp_lease` events.
-  Writes commission data back to NetBox, stores the BMC monitor
-  credential in AWS, finalizes `bmc_reconcile` ops, and records the
-  DHCP lease ledger.
+  Writes commission data back to NetBox, latches a deploy op at
+  `awaiting_phone_home` and stores the BMC monitor credential in AWS,
+  finalizes `bmc_reconcile` ops, and records the DHCP lease ledger.
 - `configscript` — Shared config-script parser and matcher used by
   both the storage and network script pipelines.
 - `dhcp` — DHCPv4 handler and server, multi-interface, split-pool,
@@ -1227,7 +1346,8 @@ Packages:
   `ws.OpUpdateHandler`, `LogBatchHandler`, `CastBatchHandler`, and
   `CastResumeHandler` interfaces wired in `buildGlobal`.
 - `imagepull` — `SyncImages` fetches missing image tarballs to
-  disk on the site worker and writes `.sha256` markers.
+  per-version directories on the site worker and switches each
+  image's link to the current version.
 - `logring` — Bounded in-process log ring with byte and age budgets
   and drop-oldest under pressure.
 - `logstore` — Postgres `log_envelopes` write, query, and retention.

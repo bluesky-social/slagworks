@@ -50,6 +50,47 @@ func acceptOperatorStream(c *echo.Context) (*websocket.Conn, error) {
 	return websocket.Accept(c.Response(), c.Request(), &websocket.AcceptOptions{})
 }
 
+// operatorStreamKeepalive is how often the logs and console streams ping
+// their client. A stream with nothing new to send writes nothing else, and
+// a proxy or load balancer in front of global closes a connection that
+// carries no bytes for its idle timeout (60s by default for an AWS ALB and
+// for nginx's proxy_read_timeout). docs/user/installation.md states the
+// resulting minimum idle timeout.
+const operatorStreamKeepalive = 30 * time.Second
+
+// keepOperatorStreamAlive pings conn every s.streamKeepalive until ctx
+// ends. ctx must come from conn.CloseRead: its reader goroutine is what
+// receives the client's pongs, and it ends ctx when the connection closes,
+// so this goroutine stops with the handler's deferred CloseNow.
+//
+// An unanswered ping is not an error. A client stops reading, and so stops
+// answering, whenever its output backs up (`slagctl machine logs -f |
+// less` while the operator pages, a terminal paused with ^S); it is still
+// connected, and the stream already ends when the client closes or drops
+// the connection (CloseRead) or a write fails. Waiting for the pong only
+// bounds each ping. coder/websocket does close the connection when a ping
+// frame it has started to write is still blocked five seconds after the
+// ping began, which takes a client that has stopped reading for long
+// enough to fill the socket buffers between it and the server.
+func (s *Server) keepOperatorStreamAlive(ctx context.Context, conn *websocket.Conn) {
+	interval := s.streamKeepalive
+	if interval <= 0 {
+		interval = operatorStreamKeepalive
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		pingCtx, cancel := context.WithTimeout(ctx, interval)
+		_ = conn.Ping(pingCtx)
+		cancel()
+	}
+}
+
 // handleLogsStream serves /api/v1/logs/stream as a WebSocket. The
 // client sends one ws.LogStreamSubscribeMsg, the server replies with
 // backfill (filtered by the subscribe message) and then live-tails
@@ -91,6 +132,7 @@ func (s *Server) handleLogsStream(c *echo.Context) error {
 	// connection and would query the store every pollInterval for the
 	// life of the process.
 	ctx = conn.CloseRead(ctx)
+	go s.keepOperatorStreamAlive(ctx, conn)
 	var env ws.Envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		writeErr(ctx, conn, "protocol_error", "malformed subscribe envelope: "+err.Error())
