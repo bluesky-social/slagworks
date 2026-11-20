@@ -15,10 +15,11 @@ func lscpuJSON(sockets string) string {
 // socket lscpu reports. A count no machine has (corrupted output, a broken
 // lscpu) must come back as an error naming the count, not as an allocation
 // of that many entries: a count in the billions took the agent down with an
-// out-of-memory, and a larger one panicked in make. The largest count
-// accepted still yields one entry per socket.
+// out-of-memory, and a larger one panicked in make. A count too large for
+// an int is refused the same way rather than read as one socket. The
+// largest count accepted still yields one entry per socket.
 func TestCollectCPUs_SocketCountBounded(t *testing.T) {
-	for _, sockets := range []string{"1025", "4294967296", "9223372036854775807"} {
+	for _, sockets := range []string{"1025", "4294967296", "9223372036854775807", "18446744073709551616", "-5000000000000000000000"} {
 		r := newMapRunner()
 		r.set(lscpuJSON(sockets), "lscpu", "--json")
 		cpus, err := collectCPUs(r)
@@ -43,6 +44,25 @@ func TestCollectCPUs_SocketCountBounded(t *testing.T) {
 	}
 	if cpus[1023].Cores != 96 || cpus[1023].Threads != 192 {
 		t.Errorf("last entry: %+v", cpus[1023])
+	}
+
+	// A count that is not a number still reads as one socket.
+	for _, sockets := range []string{"-", "", "n/a"} {
+		r := newMapRunner()
+		r.set(lscpuJSON(sockets), "lscpu", "--json")
+		if cpus, err := collectCPUs(r); err != nil || len(cpus) != 1 {
+			t.Errorf("Socket(s) = %q: got %d entries, err %v; want 1 entry", sockets, len(cpus), err)
+		}
+	}
+}
+
+// TestCollectCPUs_LscpuUnavailable: a host without a working lscpu fails
+// the step with the reason.
+func TestCollectCPUs_LscpuUnavailable(t *testing.T) {
+	res := &CommissionResult{}
+	v := lscpuStep(newMapRunner(), res)
+	if v.Status != StepStatusFailed || !strings.Contains(v.Error, "lscpu failed") || len(res.CPUs) != 0 {
+		t.Errorf("verdict = %+v with %d CPUs, want failed naming lscpu", v, len(res.CPUs))
 	}
 }
 
