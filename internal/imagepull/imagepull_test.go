@@ -2,16 +2,17 @@ package imagepull
 
 import (
 	"archive/tar"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -190,41 +191,62 @@ func TestProgressWriter_UnknownLengthSuppressesProgress(t *testing.T) {
 	}
 }
 
+// completeImage returns the four files docs/user/images.md says an image
+// carries, with contents tagged so two builds can be told apart on disk.
+func completeImage(tag string) map[string]string {
+	return map[string]string{
+		"vmlinuz":       "kernel-" + tag,
+		"initrd":        "initrd-" + tag,
+		"initrd-local":  "initrd-local-" + tag,
+		"root.squashfs": "root-" + tag,
+	}
+}
+
+// buildTestTarball writes a complete image tarball whose top-level
+// directory is name.
 func buildTestTarball(t *testing.T, name string) (path string, sha string) {
 	t.Helper()
-	dir := t.TempDir()
-	tarPath := filepath.Join(dir, name+".tar.gz")
+	return buildTestTarballFiles(t, name, completeImage(name))
+}
 
+// buildTestTarballFiles writes a tarball holding files under one top-level
+// directory, and returns its path and SHA-256.
+func buildTestTarballFiles(t *testing.T, top string, files map[string]string) (path string, sha string) {
+	t.Helper()
+	tarPath := filepath.Join(t.TempDir(), top+".tar.gz")
 	f, err := os.Create(tarPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	hasher := sha256.New()
 	gzw := gzip.NewWriter(f)
 	tw := tar.NewWriter(gzw)
-
-	// Directory entry
-	tw.WriteHeader(&tar.Header{Name: name + "/", Typeflag: tar.TypeDir, Mode: 0755})
-
-	// Fake vmlinuz
-	content := []byte("fake-kernel-content")
-	tw.WriteHeader(&tar.Header{Name: name + "/vmlinuz", Size: int64(len(content)), Mode: 0644, Typeflag: tar.TypeReg})
-	tw.Write(content)
-
-	// Fake initrd
-	content2 := []byte("fake-initrd-content")
-	tw.WriteHeader(&tar.Header{Name: name + "/initrd", Size: int64(len(content2)), Mode: 0644, Typeflag: tar.TypeReg})
-	tw.Write(content2)
-
-	tw.Close()
-	gzw.Close()
-	f.Close()
-
-	// Compute SHA256
-	raw, _ := os.ReadFile(tarPath)
-	hasher.Write(raw)
-	return tarPath, hex.EncodeToString(hasher.Sum(nil))
+	if err := tw.WriteHeader(&tar.Header{Name: top + "/", Typeflag: tar.TypeDir, Mode: 0755}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range slices.Sorted(maps.Keys(files)) {
+		content := []byte(files[name])
+		if err := tw.WriteHeader(&tar.Header{Name: top + "/" + name, Size: int64(len(content)), Mode: 0644, Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	return tarPath, hex.EncodeToString(sum[:])
 }
 
 func TestSyncImages_Downloads(t *testing.T) {
@@ -282,29 +304,18 @@ func pinServer(t *testing.T, blobs map[string][]byte) (*httptest.Server, *atomic
 	return srv, &hits
 }
 
-// versionTarball builds a noble-pxe tarball whose vmlinuz reads content.
+// versionTarball builds a complete noble-pxe tarball whose vmlinuz reads
+// content.
 func versionTarball(t *testing.T, content string) ([]byte, string) {
 	t.Helper()
-	var buf bytes.Buffer
-	gzw := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gzw)
-	if err := tw.WriteHeader(&tar.Header{Name: "noble-pxe/", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+	files := completeImage(content)
+	files["vmlinuz"] = content
+	path, sha := buildTestTarballFiles(t, "noble-pxe", files)
+	data, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tw.WriteHeader(&tar.Header{Name: "noble-pxe/vmlinuz", Size: int64(len(content)), Mode: 0o644, Typeflag: tar.TypeReg}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tw.Write([]byte(content)); err != nil {
-		t.Fatal(err)
-	}
-	if err := tw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := gzw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	sum := sha256.Sum256(buf.Bytes())
-	return buf.Bytes(), hex.EncodeToString(sum[:])
+	return data, sha
 }
 
 func readOrEmpty(path string) string {
@@ -690,6 +701,79 @@ func (h *signalHandler) Handle(ctx context.Context, r slog.Record) error {
 	return h.captureHandler.Handle(ctx, r)
 }
 
+// serveTarball serves the file at tarPath for every request and returns
+// the server's URL.
+func serveTarball(t *testing.T, tarPath string) string {
+	t.Helper()
+	data, err := os.ReadFile(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(data)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// TestSyncImages_IncompleteImageKeepsPrevious: a tarball whose digest
+// matches the row but which lacks one of the four image files (say, a
+// hand-assembled tarball without initrd-local) must be refused before the
+// previous image is removed. Before the fix it replaced a complete image
+// and was marked synced: PXE still booted, and every UEFI deploy then
+// failed at installing_bootloader with a 404 on initrd-local, after the
+// target's disks had been partitioned and rsynced.
+func TestSyncImages_IncompleteImageKeepsPrevious(t *testing.T) {
+	cases := []struct {
+		name    string
+		missing string // the file the error must name
+		edit    func(files map[string]string)
+	}{
+		{"without vmlinuz", "vmlinuz", func(f map[string]string) { delete(f, "vmlinuz") }},
+		{"without initrd", "initrd", func(f map[string]string) { delete(f, "initrd") }},
+		{"without initrd-local", "initrd-local", func(f map[string]string) { delete(f, "initrd-local") }},
+		{"without root.squashfs", "root.squashfs", func(f map[string]string) { delete(f, "root.squashfs") }},
+		// A directory where a file belongs is no more servable than no entry.
+		{"initrd-local is a directory", "initrd-local", func(f map[string]string) {
+			delete(f, "initrd-local")
+			f["initrd-local/stray"] = "x"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			imagesDir := t.TempDir()
+			goodPath, goodSHA := buildTestTarballFiles(t, "noble-pxe", completeImage("good"))
+			if err := SyncImages(slog.Default(), imagesDir, map[string]*model.Image{
+				"noble-pxe": {Name: "noble-pxe", SHA256: goodSHA, URL: serveTarball(t, goodPath)},
+			}); err != nil {
+				t.Fatalf("initial sync of a complete image: %v", err)
+			}
+
+			files := completeImage("bad")
+			tc.edit(files)
+			badPath, badSHA := buildTestTarballFiles(t, "noble-pxe", files)
+			err := SyncImages(slog.Default(), imagesDir, map[string]*model.Image{
+				"noble-pxe": {Name: "noble-pxe", SHA256: badSHA, URL: serveTarball(t, badPath)},
+			})
+			if err == nil || !strings.Contains(err.Error(), "noble-pxe/"+tc.missing) {
+				t.Errorf("SyncImages of a tarball without a regular file %s returned %v; want an error naming noble-pxe/%s", tc.missing, err, tc.missing)
+			}
+			for file, want := range completeImage("good") {
+				got, rerr := os.ReadFile(filepath.Join(imagesDir, "noble-pxe", file))
+				if rerr != nil || string(got) != want {
+					t.Errorf("noble-pxe/%s = %q (%v) after the refused sync; want the previous image's %q", file, got, rerr, want)
+				}
+			}
+			if got, _ := Installed(imagesDir, "noble-pxe"); got != "noble-pxe@"+goodSHA[:16] {
+				t.Errorf("installed version = %q, want the previous image's noble-pxe@%s", got, goodSHA[:16])
+			}
+			if _, serr := os.Lstat(filepath.Join(imagesDir, "noble-pxe@"+badSHA[:16])); !os.IsNotExist(serr) {
+				t.Errorf("the refused tarball left a version directory behind (stat err %v)", serr)
+			}
+		})
+	}
+}
+
 // TestSyncImages_RefusesPathShapedName: an image's name becomes a path
 // under imagesDir, and the name arrives from the image row via the site
 // snapshot (or from slagctl image sync --images-json). A name that is not
@@ -788,7 +872,7 @@ func TestSyncImages_DigestSpellingDoesNotMatter(t *testing.T) {
 			if err := SyncImages(slog.Default(), imagesDir, images); err != nil {
 				t.Fatalf("SyncImages with digest %q for a tarball whose digest is %s: %v", tc.digest, sha, err)
 			}
-			if got, err := os.ReadFile(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); err != nil || string(got) != "fake-kernel-content" {
+			if got, err := os.ReadFile(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); err != nil || string(got) != "kernel-noble-pxe" {
 				t.Fatalf("vmlinuz = %q, %v; want the tarball's content", got, err)
 			}
 			if got, _ := Installed(imagesDir, "noble-pxe"); got != "noble-pxe@"+sha[:16] {

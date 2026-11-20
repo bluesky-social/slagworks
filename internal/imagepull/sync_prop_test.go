@@ -219,6 +219,7 @@ func runSyncHistory(t *rapid.T, allowHostile bool, stats map[string]int) {
 			files := map[string]string{
 				"vmlinuz":       fmt.Sprintf("kernel-%s-v%d", name, version),
 				"initrd":        fmt.Sprintf("initrd-%s-v%d", name, version),
+				"initrd-local":  fmt.Sprintf("initrd-local-%s-v%d", name, version),
 				"root.squashfs": fmt.Sprintf("root-%s-v%d", name, version),
 			}
 			// The tarball's top-level dir is whatever the build named it;

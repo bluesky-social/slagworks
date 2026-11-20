@@ -752,7 +752,10 @@ image is up to date when its link names the row's version directory;
 the row's `sha256` is lowercased and trimmed first (the API stores the
 value as written).
 Otherwise SyncImages downloads and verifies the tarball, extracts it
-(`extractTarGz`) and renames the result into its version directory,
+(`extractTarGz`), requires the four image files (`imageFiles`) as
+regular files in the extracted directory, so a tarball that matches its
+digest but lacks one is never installed, and renames the result into
+its version directory,
 then switches the link by renaming a new symlink over it, so a reader
 never finds the image missing. It keeps the version the link named
 before the switch and deletes older ones; re-pinning that previous

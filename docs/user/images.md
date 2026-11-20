@@ -236,8 +236,12 @@ algorithm:
 4. Otherwise, HTTP-GET the row's `URL` into a temp file, stream through
    `sha256.New()` while writing, verify the hash matches the row (fail
    the whole sync if not).
-5. Extract the tarball into a temp dir and rename the extracted
-   directory to `<images_dir>/noble-pxe@<sha16>`.
+5. Extract the tarball into a temp dir and check that its top-level
+   directory holds all four image files (`vmlinuz`, `initrd`,
+   `initrd-local`, `root.squashfs`) as regular files. A tarball missing
+   one fails the sync for that image and leaves the link on the previous
+   version, so pin a complete image. Then rename the extracted directory
+   to `<images_dir>/noble-pxe@<sha16>`.
 6. Switch the link: create a new symlink and rename it over
    `<images_dir>/noble-pxe`. The rename replaces the link in one step,
    so a request never finds the image missing. A failure before this

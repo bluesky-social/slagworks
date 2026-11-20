@@ -1,8 +1,8 @@
 // Package imagepull downloads and extracts boot images (vmlinuz,
-// initrd, squashfs) into a local cache dir. Both site workers (on
-// startup/sync) and slagctl use this package; it has no dependencies
-// beyond internal/model so slagctl doesn't drag in the full worker
-// runtime.
+// initrd, initrd-local, squashfs) into a local cache dir. Both site
+// workers (on startup/sync) and slagctl use this package; it has no
+// dependencies beyond internal/model so slagctl doesn't drag in the full
+// worker runtime.
 //
 // Initrd-overlay injection used to live here too. It now happens at
 // build time (`scripts/image-build/build.sh` runs update-initramfs
@@ -72,7 +72,8 @@ func Installed(imagesDir, name string) (string, bool) {
 // Each version of an image lives in its own directory,
 // <imagesDir>/<name>@<sha16> (versionDir), and <imagesDir>/<name> is a
 // symlink to the current one. A new version is downloaded,
-// SHA256-verified, extracted and renamed into its version directory, and
+// SHA256-verified, extracted, checked for every file in imageFiles and
+// renamed into its version directory, and
 // only then does the link switch to it (activate). The previous version's
 // directory stays on disk, because a boot that started before the switch
 // fetches its remaining files (root.squashfs from the BOOT hook, vmlinuz and
@@ -419,6 +420,12 @@ func (s *stallReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// imageFiles are the files every image tarball carries in its top-level
+// directory (docs/user/images.md), all of which the site worker serves
+// under /files/images/<version directory>/. build.sh's sanity-check loop
+// and scripts/image-build/manifest_test.go keep the same list.
+var imageFiles = []string{"vmlinuz", "initrd", "initrd-local", "root.squashfs"}
+
 // pullImage downloads img.URL, checks it against wantSHA256 (lowercase hex,
 // as SyncImages normalizes it), and extracts it into targetDir, which must
 // not exist yet. On any failure targetDir is not created.
@@ -489,7 +496,7 @@ func pullImage(log *slog.Logger, img *model.Image, wantSHA256, targetDir string)
 		return fmt.Errorf("extracting: %w", err)
 	}
 
-	// The tarball contains <name>/{vmlinuz,initrd,root.squashfs}.
+	// The tarball contains <name>/{vmlinuz,initrd,initrd-local,root.squashfs}.
 	// Find the extracted directory (skip any non-directory entries like PaxHeaders).
 	entries, _ := os.ReadDir(tmpDir)
 	var extractedDir string
@@ -505,6 +512,19 @@ func pullImage(log *slog.Logger, img *model.Image, wantSHA256, targetDir string)
 			names[i] = e.Name()
 		}
 		return fmt.Errorf("no directory found in tarball, got: %v", names)
+	}
+
+	// A tarball that matches its digest can still lack a file the worker
+	// serves. Installed, it would look synced and the gap would show only
+	// when a boot fetched the missing file: for initrd-local, a UEFI
+	// deploy's installing_bootloader, after the target's disks were
+	// partitioned and rsynced. Refuse it here, before the version directory
+	// exists, so the link stays on the previous version.
+	for _, f := range imageFiles {
+		if fi, err := os.Lstat(filepath.Join(extractedDir, f)); err != nil || !fi.Mode().IsRegular() {
+			return fmt.Errorf("tarball has no regular file %s/%s (an image carries %s); the cached image, if any, is unchanged: pin a complete image",
+				filepath.Base(extractedDir), f, strings.Join(imageFiles, ", "))
+		}
 	}
 
 	if err := os.Rename(extractedDir, targetDir); err != nil {
