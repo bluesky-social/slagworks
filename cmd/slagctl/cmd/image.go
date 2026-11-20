@@ -65,9 +65,10 @@ func imageDeleteCmd() *cobra.Command {
 		Use:   "delete <name-or-id>",
 		Short: "delete an image row",
 		Long: `Deletes an image row by name or uuid. Site workers sync whatever image
-rows exist; deleting a row makes workers stop tracking that image on
-their next snapshot apply. Any already-downloaded file stays on disk
-under the worker's local image cache (nothing prunes it).`,
+rows exist; deleting a row pushes a snapshot to every site, and workers
+stop tracking and booting that image when they apply it. Any
+already-downloaded file stays on disk under the worker's local image
+cache (nothing prunes it).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ident := args[0]

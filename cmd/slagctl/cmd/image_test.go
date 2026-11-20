@@ -34,7 +34,8 @@ func TestImageList_Columns(t *testing.T) {
 
 // docs/user/images.md and troubleshooting.md tell operators to confirm an
 // image roll by comparing the pinned SHA in `slagctl image list` with the
-// worker's on-disk <name>.sha256 marker, so the table must show the digest.
+// version directory the worker's on-disk <name> link names, so the table
+// must show the digest.
 func TestImageList_ShowsPinnedSHA(t *testing.T) {
 	sum := "0123456789ab" + strings.Repeat("c", 52)
 	images := []model.Image{

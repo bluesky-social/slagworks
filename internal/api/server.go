@@ -1961,15 +1961,20 @@ func (s *Server) upsertImage(c *echo.Context) error {
 }
 
 // deleteImage removes an image row by name (or, if the caller resolved a
-// uuid client-side, that also works since DeleteImage accepts either). No
-// invalidateAllSites call: workers only need to pick this up on their
-// normal snapshot-apply cadence; a delete has no equivalent urgency to
-// createImage's fleet-rollout trigger (nothing to distribute).
+// uuid client-side, that also works since DeleteImage accepts either).
+//
+// It rebuilds every site's snapshot, as createImage and upsertImage do.
+// There is nothing to distribute, but the site worker's boot handler picks
+// the image to boot from the site's image rows: until a snapshot without
+// the deleted row reaches a worker, it keeps booting the image the operator
+// just unpinned, and a boot refused for having several rows keeps being
+// refused after the extra row is deleted.
 func (s *Server) deleteImage(c *echo.Context) error {
 	name := c.Param("name")
 	if err := s.store.DeleteImage(name); err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
+	s.invalidateAllSites()
 	return c.NoContent(http.StatusNoContent)
 }
 

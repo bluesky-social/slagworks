@@ -172,7 +172,7 @@ the real values over the WebSocket op stream. See
 | GET | `/images` | read | List image rows. |
 | POST | `/images` | admin | Create a row. Body `{"name","version","sha256","url","arch"}`; all but `arch` (default `amd64`) are required. The name must match `^[a-z0-9][a-z0-9._-]*$` and must not be `systemd-bootx64.efi` (`model.ValidateImageName`), since it becomes an entry of the images directory on every site worker, beside the package's `systemd-bootx64.efi`; 400 otherwise. 409 on conflict. Pushes a fresh snapshot to every site. |
 | PUT | `/images/:name` | admin | Create or replace the row named in the path (the path name wins over the body). Same name rule as POST. An `id` in the body is ignored: a replaced row keeps its id, a new row gets a fresh one. Used by `slagctl image follow-latest`. Pushes a fresh snapshot to every site. |
-| DELETE | `/images/:name` | admin | Delete by name or row id. A row id match wins; an identifier that is no row's id is tried as a name, even when it parses as a UUID. 204. Does not push a snapshot. |
+| DELETE | `/images/:name` | admin | Delete by name or row id. A row id match wins; an identifier that is no row's id is tried as a name, even when it parses as a UUID. 204. Pushes a fresh snapshot to every site, since each site worker boots the image its image rows name. |
 
 ## Storage and network scripts
 
