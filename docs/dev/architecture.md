@@ -275,7 +275,12 @@ direction. On a commission report, slagworks PATCHes the Device with
 the fields it discovered:
 
 - Top-level: `serial`, `asset_tag`, `name` (hostname), `status`
-  (`active` on deploy), `device_type`.
+  (`active` on deploy), `device_type`. NetBox requires `asset_tag` to be
+  unique across all devices and at most 50 characters; when it refuses
+  the reported tag, the sync logs a warning in global's log naming the
+  device, machine and tag, leaves the device's `asset_tag` unchanged and
+  writes the other fields, so one bad firmware tag never fails a
+  commission.
 - Tags: adds `slagworks-managed` and keeps every operator tag. NetBox
   replaces the whole tag set on PATCH, so the sync reads the device's
   tags first and writes them back with `slagworks-managed` added; once
@@ -297,9 +302,14 @@ when the initrd's kernel names shift (a card added or replaced) a row is
 renamed to follow its MAC and keeps its lag, IPs and cable. Setting a
 NIC's MAC is two writes (assign a MAC object, then mark it primary); a
 run that finds the MAC object already assigned but not primary marks it
-primary instead of creating another. That includes the protected `ipmi`
-row matching the BMC MAC, the one write reconcile makes to a protected
-row. On switches (device role `leaf`, `spine`,
+primary instead of creating another. The BMC, reported as a synthetic
+`mgmt_only` NIC named `ipmi`, reconciles onto the protected `mgmt_only`
+row carrying its MAC whatever that row is named (`ipmi0`, `bmc`), or else
+onto a MAC-less `mgmt_only` row named `ipmi` (a prior run's interface
+create whose MAC write failed). Setting that row's primary MAC when it has
+none is the one write reconcile makes to a protected row; an `ipmi` row
+carrying a MAC the BMC no longer reports fails the commission loudly for
+the operator to resolve. On switches (device role `leaf`, `spine`,
 `oob-switch`) interface names and the row set are operator-owned: the
 commission initrd's kernel names (`enp3s0npN`, `eno1`) are not the
 operational `swpN`/`eth0`, so reconcile only patches non-name fields of
@@ -344,9 +354,23 @@ empty (`builder.go:68`). A machine's interface facts hold one address:
 when an interface of a bound machine carries more than one active IP
 address, Build keeps the device's `primary_ip4` if it is one of them,
 else the numerically lowest IPv4 address (the lowest IPv6 address when
-the interface has no IPv4), independent of NetBox list order. The
+the interface has no IPv4), independent of NetBox list order. Within a
+family, an address whose NetBox role is unset or `loopback` comes before
+one NetBox marks as `secondary` or shared (`anycast`, `vip`, `vrrp`,
+`hsrp`, `glbp`, `carp`), so a router's anycast /32 on `lo` never displaces
+its identity /32. The
 dispatcher logs the affected interfaces in one warning per site, repeated
 only when the set or a chosen address changes.
+OOB reservations are keyed by MAC: a MAC gets one only when its
+interfaces carry exactly one address inside the `slagworks-oob` prefix
+and no other MAC carries that address. Build leaves any other MAC out
+and keeps every other reservation; unless the MAC is a machine's NIC
+(whose static lease comes from the machine's interface facts), the
+worker then treats it as an unknown MAC with no static lease. A
+`slagworks-oob-dynamic` range with no `slagworks_oob_owner`, or whose
+owner another range also names, is left out the same way. Build logs
+what it left out on every build; neither fails the site. More than one
+`slagworks-oob` prefix, or one that does not parse, still does.
 Its inputs (`Inputs`, `builder.go:31`) are
 NetBox reads (site, config, prefixes, OOB prefixes and ranges,
 devices, device-types, interfaces, IPs), Postgres reads (machines,

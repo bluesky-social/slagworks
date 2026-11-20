@@ -258,10 +258,11 @@ func (d *Dispatcher) gatherAndBuild(ctx context.Context, slug string, outcome *s
 		return model.SiteConfig{}, model.SiteSnapshot{}, err
 	}
 
-	// Prefix discovery: whole-site configs read site-scoped prefixes;
-	// location-scoped configs read prefixes scoped to ANY location in the
-	// claimed subtree (NetBox 4.x polymorphic scope — `?site=` does NOT
-	// include location-scoped prefixes, and a single-location query would
+	// Prefix discovery: whole-site configs read site-scoped prefixes
+	// (ListSitePrefixes leaves out prefixes scoped to a location inside the
+	// site, which NetBox's `?site=` filter also matches; those belong to a
+	// location-scoped config). Location-scoped configs read prefixes scoped
+	// to ANY location in the claimed subtree (a single-location query would
 	// miss prefixes scoped to descendant locations that Scope.ClaimsPrefix
 	// would otherwise accept). Either way Build asserts a non-empty
 	// slagworks-production prefix and fails loudly if absent.
@@ -384,8 +385,10 @@ func (d *Dispatcher) gatherAndBuild(ctx context.Context, slug string, outcome *s
 	if err != nil {
 		return model.SiteConfig{}, model.SiteSnapshot{}, err
 	}
-	// From here on, remaining errors are Postgres-side. Flip the
-	// default so the deferred emission reports correctly.
+	// The NetBox reads are done: the store reads below, and Rebuild's
+	// BumpSiteSnapshotMeta after a successful build, fail Postgres-side.
+	// Flip the default so the deferred emission reports correctly; the
+	// Build error path sets it back.
 	setOutcome("error_postgres")
 	machines, err := d.st.ListMachinesByDeviceIDs(deviceIDs)
 	if err != nil {
@@ -449,6 +452,9 @@ func (d *Dispatcher) gatherAndBuild(ctx context.Context, slug string, outcome *s
 		HostnameTemplate: d.hostnames,
 	})
 	if err != nil {
+		// Build fails only on NetBox data (no slagworks-production prefix,
+		// conflicting OOB reservations, a bad OOB prefix or range set).
+		setOutcome("error_netbox")
 		return model.SiteConfig{}, model.SiteSnapshot{}, err
 	}
 	// One warning per site, and only when the list changes: these
@@ -477,10 +483,11 @@ func (d *Dispatcher) locationSubtreePrefixes(ctx context.Context, scope Scope) (
 //
 // The order is fixed: the config's own location first, then the rest of
 // the subtree by ascending location id, each location's prefixes in
-// NetBox's order. Build serves Prefixes[0] as the fabric DHCP subnet and
-// gateway, so this makes the config's own prefix (the one site-config
-// create requires) the primary, and keeps a rebuild over unchanged NetBox
-// data from changing the content hash.
+// NetBox's order. Build takes the fabric DHCP subnet and gateway from a
+// prefix scoped to the first location listed (see dhcpPrefix), so this
+// makes the config's own location (the one site-config create requires a
+// prefix on) supply them, and keeps a rebuild over unchanged NetBox data
+// from changing the content hash.
 func (d *Dispatcher) locationSubtreePrefixesTagged(ctx context.Context, scope Scope, tag string) ([]netbox.Prefix, error) {
 	order := []int{scope.LocationID}
 	for _, id := range slices.Sorted(maps.Keys(scope.SubtreeIDs)) {

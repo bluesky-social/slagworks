@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/google/uuid"
@@ -170,12 +172,36 @@ func noBMCCredMsg(opKind, credNote string) string {
 	return fmt.Sprintf("refusing %s: no BMC credential could be resolved for this machine: %s.", opKind, credNote)
 }
 
-// httpResolveErr converts a resolveBMCRuntime error into an echo HTTP
-// error. Hard failures bubble as 500 — the op was rejected before
-// state was mutated, so the operator can retry once NetBox/AWS is
-// healthy.
+// transportGapError marks a transport-resolution failure that NetBox or the
+// admin secret answered definitively: the device's record rules the
+// transport out (no power-ports, an uncabled outlet, no oob_ip, no matching
+// credential entry, ...), and asking again changes nothing until someone
+// fixes that record. The PDU and AMT resolvers return one for every such
+// gap; their other errors mean a dependency could not be asked.
+type transportGapError struct{ err error }
+
+func (e *transportGapError) Error() string { return e.err.Error() }
+func (e *transportGapError) Unwrap() error { return e.err }
+
+// transportGapf formats a transportGapError.
+func transportGapf(format string, args ...any) error {
+	return &transportGapError{err: fmt.Errorf(format, args...)}
+}
+
+// httpResolveErr converts an error from a transport resolver (resolveVia,
+// resolveBMCRuntime, resolvePDURuntime, resolveAMTRuntime) into an echo
+// HTTP error. The request is refused before anything is created either
+// way. A transportGapError is 422: retrying cannot help until the NetBox
+// record or admin entry it names is fixed. Anything else is 503: NetBox,
+// the secret store or the database could not be asked (or NetBox is not
+// configured), and the operator can retry once it is healthy. The message
+// is the resolver's own, which already names the resolver.
 func httpResolveErr(err error) error {
-	return echo.NewHTTPError(503, "resolve bmc runtime: "+err.Error())
+	var gap *transportGapError
+	if errors.As(err, &gap) {
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, err.Error())
+	}
+	return echo.NewHTTPError(http.StatusServiceUnavailable, err.Error())
 }
 
 // netboxMgmtIPForDevice returns the active IP attached to a device's

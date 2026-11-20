@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -92,12 +93,18 @@ func TestBuildMultiAddressInterfaceIsOrderIndependent(t *testing.T) {
 // primary_ip4 when it is one of the interface's active addresses, else the
 // numerically lowest active IPv4 address (ties by prefix length, then NetBox
 // ID), else, on an interface with no IPv4 address, the lowest IPv6 address.
+// Within each family an address with no NetBox role (or role loopback) comes
+// before one with any other role.
 func TestBuildMultiAddressInterfaceRule(t *testing.T) {
 	devID := 7
 	bound := []model.Machine{{ID: uuid.MustParse("00000000-0000-0000-0000-000000000007"), NetBoxDeviceID: &devID}}
 	ifaces := []netbox.Interface{{ID: 70, Name: "eno1", Device: &netbox.NestedRef{ID: devID}}}
 	reserved := func(ip netbox.IPAddress) netbox.IPAddress {
 		ip.Status = &netbox.NestedValue{Value: "reserved"}
+		return ip
+	}
+	role := func(r string, ip netbox.IPAddress) netbox.IPAddress {
+		ip.Role = &netbox.NestedValue{Value: r}
 		return ip
 	}
 	for _, tc := range []struct {
@@ -122,6 +129,18 @@ func TestBuildMultiAddressInterfaceRule(t *testing.T) {
 			[]netbox.IPAddress{ifaceIP(1, "10.253.0.10/22", 70), ifaceIP(2, "10.253.0.9/22", 70)}, "10.253.0.9/22"},
 		{"unparseable address is never preferred", 0,
 			[]netbox.IPAddress{ifaceIP(1, "!bogus", 70), ifaceIP(2, "10.253.0.9/22", 70)}, "10.253.0.9/22"},
+		{"own address before a lower VIP", 0,
+			[]netbox.IPAddress{role("vip", ifaceIP(1, "10.0.0.5/24", 70)), ifaceIP(2, "10.0.0.9/24", 70)}, "10.0.0.9/24"},
+		{"own address before a lower secondary", 0,
+			[]netbox.IPAddress{role("secondary", ifaceIP(1, "10.0.0.5/24", 70)), ifaceIP(2, "10.0.0.9/24", 70)}, "10.0.0.9/24"},
+		{"loopback role is the interface's own", 0,
+			[]netbox.IPAddress{role("anycast", ifaceIP(1, "10.0.6.1/32", 70)), role("loopback", ifaceIP(2, "10.0.31.1/32", 70))}, "10.0.31.1/32"},
+		{"primary wins even with a shared role", 1,
+			[]netbox.IPAddress{role("vrrp", ifaceIP(1, "10.0.0.20/24", 70)), ifaceIP(2, "10.0.0.9/24", 70)}, "10.0.0.20/24"},
+		{"only shared addresses: lowest of them", 0,
+			[]netbox.IPAddress{role("carp", ifaceIP(1, "10.0.0.20/24", 70)), role("hsrp", ifaceIP(2, "10.0.0.9/24", 70))}, "10.0.0.9/24"},
+		{"shared IPv4 before own IPv6", 0,
+			[]netbox.IPAddress{role("glbp", ifaceIP(1, "10.0.0.20/24", 70)), ifaceIP(2, "2001:db8::9/64", 70)}, "10.0.0.20/24"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dev := netbox.Device{ID: devID, Name: "host-1"}
@@ -140,6 +159,63 @@ func TestBuildMultiAddressInterfaceRule(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestBuildPrefersAnInterfacesOwnAddressOverASharedRoleAddress: NetBox marks
+// an address shared between hosts with a role (anycast, vip, vrrp, hsrp,
+// glbp, carp) and an extra address next to the interface's main one with
+// role secondary. Neither is the interface's own address: when an interface
+// carries one next to an address with no role, the facts must carry the
+// role-less one, however the two compare numerically.
+//
+// The shipped L3 network scripts take "a /32 on the lo interface" as the
+// host's identity loopback and render it as the BGP router-id and the
+// announced prefix. A router's lo with an anycast /32 that sorts below its
+// identity /32, and primary_ip4 on another interface, must still hand the
+// scripts the identity /32.
+func TestBuildPrefersAnInterfacesOwnAddressOverASharedRoleAddress(t *testing.T) {
+	// Decoded from NetBox's JSON, as the client decodes it: role is a
+	// {value,label} choice, null when unset.
+	var ips []netbox.IPAddress
+	if err := json.Unmarshal([]byte(`[
+		{"id": 1, "address": "10.0.6.230/32", "status": {"value": "active"}, "role": {"value": "anycast", "label": "Anycast"},
+		 "assigned_object_type": "dcim.interface", "assigned_object_id": 50},
+		{"id": 2, "address": "10.0.31.1/32", "status": {"value": "active"}, "role": null,
+		 "assigned_object_type": "dcim.interface", "assigned_object_id": 50},
+		{"id": 3, "address": "10.0.12.20/23", "status": {"value": "active"}, "role": null,
+		 "assigned_object_type": "dcim.interface", "assigned_object_id": 51}
+	]`), &ips); err != nil {
+		t.Fatal(err)
+	}
+	dev := 10
+	snap, err := Build(Inputs{
+		Site:     netbox.Site{ID: 1, Slug: "site-a"},
+		Config:   model.SiteConfig{Slug: "site-a", NetBoxSite: "site-a"},
+		Prefixes: []netbox.Prefix{{ID: 1, Prefix: "10.0.4.0/22", CustomFields: gatewayJSON("10.0.7.254")}},
+		// primary_ip4 is the management address, not on lo.
+		Devices: []netbox.Device{{ID: dev, Name: "router-1.site-a", PrimaryIP4: &netbox.NestedRef{ID: 3}}},
+		Interfaces: []netbox.Interface{
+			{ID: 50, Name: "lo", Type: &netbox.NestedValue{Value: "virtual"}, Device: &netbox.NestedRef{ID: dev}},
+			{ID: 51, Name: "eno1", MACAddress: "02:00:00:00:00:01", Device: &netbox.NestedRef{ID: dev}},
+		},
+		IPs:      ips,
+		Machines: []model.Machine{{ID: uuid.MustParse("00000000-0000-0000-0000-0000000000aa"), NetBoxDeviceID: &dev, NetBoxSerial: "SN1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, ifc := range snap.Machines[0].Interfaces {
+		if ifc.Name == "lo" {
+			seen = true
+			if ifc.IP != "10.0.31.1/32" || ifc.Gateway != "" {
+				t.Fatalf("lo facts carry %s (gateway %q), want the host's own 10.0.31.1/32 with no gateway: an anycast-role address was chosen as the interface's address", ifc.IP, ifc.Gateway)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("no lo interface in the machine's facts")
 	}
 }
 

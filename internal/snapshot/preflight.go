@@ -59,6 +59,12 @@ type PreflightInput struct {
 	MonitorSecretPresent *bool
 }
 
+// GapMachineLocked is the gap PreflightMachine reports for a locked machine.
+// It is exported because it is the one gap that is about the machine's lock
+// and not its model: the API words its refusal around it instead of calling
+// the model incomplete.
+const GapMachineLocked = "the machine is locked and excluded from lifecycle operations (a machine is locked automatically when it enters service); check that it is safe to commission or deploy it, then run `slagctl machine unlock <machine>` and retry"
+
 // PreflightMachine validates that the NetBox/Postgres model carries
 // everything the boot for opType requires, and returns one human-readable
 // gap string per missing precondition. An empty slice means the op may
@@ -84,7 +90,7 @@ func PreflightMachine(in PreflightInput, opType model.OperationType) []string {
 	// accepted now?" Keep the durable lock/PXE gates visible here instead of
 	// returning OK and then rejecting the immediately-following submission.
 	if in.Machine.Locked {
-		gaps = append(gaps, "the machine is locked and excluded from lifecycle operations; investigate and explicitly unlock it before commission or deploy")
+		gaps = append(gaps, GapMachineLocked)
 	}
 	if opPXEBoots(opType) && !in.Machine.PXEEligible {
 		gaps = append(gaps, "the machine is not PXE-eligible; run `slagctl machine pxe-enable` (or submit with --pxe-enable) before commission or deploy")

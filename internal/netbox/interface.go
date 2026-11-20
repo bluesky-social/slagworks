@@ -91,12 +91,14 @@ func BuildInterfaceDescription(nic NICData) string {
 // (da3e1ac fixed the DELETE-safety half, this is the
 // MATCH-safety half.)
 //
-// The one place a protected row remains visible is the collision check
-// below the match loop: if an observed NIC's name collides with a
-// protected row's name and no unprotected candidate exists, NetBox's
-// device+name uniqueness constraint would reject a POST with a raw 400
-// (the protected row still holds the name in NetBox's DB even though
-// it's invisible to our maps) — that case must fail loudly instead.
+// A protected row remains visible in two places. A mgmt_only NIC (the
+// BMC) recognises its own BMC row (findBMCRow) and at most sets that
+// row's missing primary MAC. And the collision check below the match
+// loop: if an observed NIC's name collides with a protected row's name
+// and no unprotected candidate exists, NetBox's device+name uniqueness
+// constraint would reject a POST with a raw 400 (the protected row still
+// holds the name in NetBox's DB even though it's invisible to our maps)
+// — that case must fail loudly instead.
 //
 // operatorNames (see interfaceNamesOperatorOwned) switches the device to
 // enrich-only mode: matched rows get their non-name fields and MAC
@@ -134,21 +136,20 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 	// Drop the NICs reconcile leaves alone before matching, so a skipped
 	// NIC never claims a row.
 	observed := make([]NICData, 0, len(nics))
-	// Protected mgmt rows a mgmt_only NIC re-reported unchanged. The write
-	// phase touches only their primary MAC (ensureInterfaceMAC).
+	// BMC rows whose primary MAC the write phase still has to set
+	// (ensureInterfaceMAC), the only write reconcile makes to them.
 	var mgmtMACRepairs []ifaceWrite
 	for _, nic := range nics {
-		// A mgmt_only NIC matching an existing protected management row
-		// by name AND MAC is a rerun of a prior reconcile's own
-		// creation (e.g. the synthetic "ipmi" NICData SyncCommissionData
-		// emits every run for the BMC MAC) — SyncCommissionData promises
-		// idempotency, so this must skip the row: never a modeling-conflict
-		// error and never a field patch. The one write it may make, queued
-		// in mgmtMACRepairs for the write phase, is finishing that prior run's
-		// MAC write when it assigned the MAC object but failed before
-		// marking it primary (the MAC match below goes through GetMAC,
-		// which accepts an assigned non-primary object); ensureInterfaceMAC
-		// is a no-op once the primary is set.
+		// A mgmt_only NIC (the synthetic "ipmi" NICData SyncCommissionData
+		// emits every run for the BMC MAC) whose BMC row already exists
+		// (findBMCRow) must skip that row: never a modeling-conflict error,
+		// never a field patch, never a second row beside it. The one write
+		// it may make, queued in mgmtMACRepairs, is setting the primary MAC
+		// on a row that has none: finishing a prior run that created the
+		// row or assigned its MAC object and failed before marking it
+		// primary. A row that already has a primary keeps it, even when the
+		// BMC reported another MAC the row carries (an operator recording
+		// both ports of a BMC that fails over between them).
 		// This check must run BEFORE the byMAC match
 		// below: on shared-LOM hardware an unprotected host row can
 		// carry the same MAC as the BMC, and byMAC (which excludes
@@ -156,10 +157,11 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 		// attempting to rename it to the protected name and failing —
 		// making the outcome depend on NIC processing order. Checking
 		// here first is order-independent.
-		if nic.MgmtOnly {
-			if protected, exists := findProtectedInterfaceByName(existing, nic.Name); exists &&
-				protected.MgmtOnly && nic.MAC != "" && strings.EqualFold(protected.GetMAC(), nic.MAC) {
-				mgmtMACRepairs = append(mgmtMACRepairs, ifaceWrite{nic: nic, row: protected, matched: true})
+		if nic.MgmtOnly && nic.MAC != "" {
+			if row, ok := findBMCRow(existing, nic); ok {
+				if row.primaryMACAddress() == "" {
+					mgmtMACRepairs = append(mgmtMACRepairs, ifaceWrite{nic: nic, row: row, matched: true})
+				}
 				continue
 			}
 		}
@@ -244,12 +246,13 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 			// POSTing, check whether a protected row (excluded from
 			// byName above) already holds this exact name — NetBox's
 			// device+name uniqueness constraint would otherwise reject
-			// the POST with an opaque 400. The mgmt-only idempotency
-			// rerun case is handled earlier, before match resolution
+			// the POST with an opaque 400. A mgmt_only NIC's own BMC row
+			// is recognised earlier, before match resolution
 			// (order-independent w.r.t. shared-LOM MAC collisions), so
 			// any protected-name collision reaching here is a genuine
-			// modeling conflict — fail loudly, and never delete or
-			// rename the protected row to make room.
+			// modeling conflict (for the BMC NIC: an "ipmi" row carrying
+			// a MAC the BMC no longer reports) — fail loudly, and never
+			// delete, rename or re-MAC the protected row to make room.
 			if protected, exists := findProtectedInterfaceByName(existing, nic.Name); exists {
 				return fmt.Errorf("interface %q collides with protected interface %q (id=%d): modeling conflict, resolve in NetBox",
 					nic.Name, protected.Name, protected.ID)
@@ -366,16 +369,15 @@ func (c *Client) ReconcileInterfaces(ctx context.Context, deviceID int, nics []N
 // row.
 //
 // A mgmt_only NIC never participates in this ordinary matching at all:
-// its only legitimate match is the idempotency check in
-// ReconcileInterfaces (its own prior protected row). Letting it match
-// here would claim an UNPROTECTED host row on the first-ever reconcile of
-// shared-LOM hardware (no protected BMC row exists yet to make the
-// idempotency check fire) and rename that host interface to the BMC's
-// name with mgmt_only=true — the same modeling corruption row protection
-// exists to prevent, from the opposite direction. An unmatched mgmt NIC
-// is always-new: it goes to create, where the protected-name-collision
-// check still guards against colliding with an existing protected row
-// under a changed BMC MAC.
+// its only legitimate match is a protected BMC row (findBMCRow, checked
+// in ReconcileInterfaces). Letting it match here would claim an
+// UNPROTECTED host row on the first-ever reconcile of shared-LOM hardware
+// (no protected BMC row exists yet) and rename that host interface to the
+// BMC's name with mgmt_only=true — the same modeling corruption row
+// protection exists to prevent, from the opposite direction. A mgmt NIC
+// with no BMC row is always-new: it goes to create, where the
+// protected-name-collision check still guards against colliding with an
+// existing protected row under a changed BMC MAC.
 func matchInterfaces(nics []NICData, byMAC map[string][]Interface, byName map[string]Interface) map[int]Interface {
 	matches := make(map[int]Interface, len(nics))
 	claimed := make(map[int]bool, len(nics)) // row IDs
@@ -507,6 +509,54 @@ func planNameMoves(writes []ifaceWrite, byName map[string]Interface, consumed ma
 // MAC-matches the row and renames it to its final name.
 func renameAsideName(id int) string {
 	return fmt.Sprintf("slagworks-rename-%d", id)
+}
+
+// findBMCRow returns the protected management row a mgmt_only NIC (the
+// BMC) already has in existing:
+//
+//  1. a mgmt_only row carrying the NIC's MAC, as its primary or as any
+//     assigned MAC object, whatever its name. Operators name the BMC row
+//     after their hardware ("ipmi0", "bmc", "mgmt"), and the synthetic
+//     NIC is always "ipmi"; matching the name too gave every operator
+//     BMC row a second "ipmi" row with the same MAC.
+//  2. else a MAC-less mgmt_only row holding the NIC's name: the row a
+//     prior run created and failed to give a MAC (the interface POST
+//     committed, the MAC-object POST did not), or one an operator modeled
+//     before the MAC was known. Without this, that row's name collision
+//     failed every later commission until NetBox was edited by hand.
+//
+// A row of the NIC's name carrying a different MAC is not returned: it
+// may be an operator's row for the other port of a failover BMC, so the
+// caller's collision check fails loudly instead of re-MACing it.
+func findBMCRow(existing []Interface, nic NICData) (Interface, bool) {
+	for _, iface := range existing {
+		if iface.MgmtOnly && carriesMAC(iface, nic.MAC) {
+			return iface, true
+		}
+	}
+	for _, iface := range existing {
+		if iface.MgmtOnly && iface.Name == nic.Name && iface.GetMAC() == "" {
+			return iface, true
+		}
+	}
+	return Interface{}, false
+}
+
+// carriesMAC reports whether mac is iface's primary MAC or one of the MAC
+// objects assigned to it. An empty mac is carried by no row.
+func carriesMAC(iface Interface, mac string) bool {
+	if mac == "" {
+		return false
+	}
+	if strings.EqualFold(iface.primaryMACAddress(), mac) {
+		return true
+	}
+	for _, m := range iface.MACAddresses {
+		if strings.EqualFold(m.MACAddress, mac) {
+			return true
+		}
+	}
+	return false
 }
 
 // findProtectedInterfaceByName scans existing (not byName — protected

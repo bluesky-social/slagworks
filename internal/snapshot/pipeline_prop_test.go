@@ -440,7 +440,8 @@ func (p *propPipe) modelBuildError(slug string) string {
 // primary_ip4 (nbDevice gives a Primary device the address ID 2) when that
 // is one of the interface's active addresses, otherwise the numerically
 // lowest of them, ties by prefix length and then NetBox ID. Every address
-// this world draws is IPv4.
+// this world draws is IPv4 and carries no NetBox role, so the role ranking
+// (netfacts_prop_test.go models it) never applies here.
 func (p *propPipe) modelIP(d *pwDev, iface int) string {
 	var best *pwIP
 	var bestPfx netip.Prefix

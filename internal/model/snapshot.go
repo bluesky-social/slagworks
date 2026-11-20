@@ -48,7 +48,10 @@ type SiteSnapshot struct {
 	// ports, and every other OOB host gets its reserved IP. Distinct from
 	// the per-machine interface IPs in MachineSnapshot.Interfaces (which
 	// feed the same ReserveIP lookup but are scoped to slagworks machines
-	// and exclude ipmi). Empty on sites with no slagworks-oob prefix.
+	// and exclude ipmi). A MAC whose interfaces carry more than one OOB
+	// address, or whose address another MAC also carries, has no entry:
+	// the builder leaves it out and logs it rather than guess. Empty on
+	// sites with no slagworks-oob prefix.
 	Reservations []Reservation `json:"reservations,omitempty"`
 }
 
@@ -142,7 +145,9 @@ type SnapshotInterface struct {
 	// form. When the interface has several, Build picks the device's
 	// primary_ip4 if it is among them, else the numerically lowest IPv4
 	// address (the lowest IPv6 address when there is no IPv4), whatever
-	// order NetBox listed them in.
+	// order NetBox listed them in. Within a family, addresses whose NetBox
+	// role is unset or loopback come before those with another role
+	// (secondary, anycast, vip, vrrp, hsrp, glbp, carp).
 	IP string `json:"ip,omitempty"`
 
 	// The fields below carry the extra topology an L2 bond host needs and
