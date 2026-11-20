@@ -31,7 +31,7 @@ func TestDHCPLeaseForwarder_Model_Prop(t *testing.T) {
 	machineA := uuid.New()
 	rapid.Check(t, func(rt *rapid.T) {
 		// Each case starts from an empty outbox.
-		for _, p := range db.ListPendingOutbox() {
+		for _, p := range mustListOutbox(rt, db) {
 			db.AckOutboxRow(p.RowID)
 		}
 		c := NewCache(db)
@@ -77,7 +77,7 @@ func TestDHCPLeaseForwarder_Model_Prop(t *testing.T) {
 
 		// Read back through a restart so the payload round-trips SQLite.
 		db = reopenLocalDB(rt, db)
-		pend := db.ListPendingOutbox()
+		pend := mustListOutbox(rt, db)
 		if len(pend) != len(wantObs) {
 			rt.Fatalf("forwarder emitted %d observations, model expects %d", len(pend), len(wantObs))
 		}

@@ -143,7 +143,7 @@ func TestLocalDB_AdoptExistingFile(t *testing.T) {
 	if got := db.GetSyncCursor(); got != 1234 {
 		t.Errorf("sync cursor lost: %d", got)
 	}
-	if pending := db.ListPendingOutbox(); len(pending) != 1 || pending[0].Obs.Event != "phone_home" {
+	if pending := mustListOutbox(t, db); len(pending) != 1 || pending[0].Obs.Event != "phone_home" {
 		t.Errorf("outbox row lost: %+v", pending)
 	}
 	if machines := db.LoadMachineCache(); len(machines) != 1 {
@@ -391,7 +391,7 @@ func TestLocalDB_ResetSyncState(t *testing.T) {
 func TestLocalDB_Outbox_AppendAckRoundtrip(t *testing.T) {
 	db := openTestDB(t)
 
-	if got := db.ListPendingOutbox(); len(got) != 0 {
+	if got := mustListOutbox(t, db); len(got) != 0 {
 		t.Fatalf("expected empty pending outbox, got %d", len(got))
 	}
 
@@ -416,7 +416,7 @@ func TestLocalDB_Outbox_AppendAckRoundtrip(t *testing.T) {
 		t.Fatalf("bogus row ids: %d, %d", id1, id2)
 	}
 
-	pending := db.ListPendingOutbox()
+	pending := mustListOutbox(t, db)
 	if len(pending) != 2 {
 		t.Fatalf("expected 2 pending, got %d", len(pending))
 	}
@@ -428,18 +428,18 @@ func TestLocalDB_Outbox_AppendAckRoundtrip(t *testing.T) {
 	}
 
 	// List again — still both (no auto-delete).
-	if got := db.ListPendingOutbox(); len(got) != 2 {
+	if got := mustListOutbox(t, db); len(got) != 2 {
 		t.Fatalf("expected list to be non-destructive, got %d", len(got))
 	}
 
 	db.AckOutboxRow(id1)
-	pending = db.ListPendingOutbox()
+	pending = mustListOutbox(t, db)
 	if len(pending) != 1 || pending[0].RowID != id2 {
 		t.Fatalf("after ack: %+v", pending)
 	}
 
 	db.AckOutboxRow(id2)
-	if got := db.ListPendingOutbox(); len(got) != 0 {
+	if got := mustListOutbox(t, db); len(got) != 0 {
 		t.Fatalf("after acking both: %d remaining", len(got))
 	}
 }
