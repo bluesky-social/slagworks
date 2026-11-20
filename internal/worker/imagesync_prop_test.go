@@ -369,8 +369,8 @@ func TestProp_ImageSyncer_ConvergesOnTheLatestSnapshot(t *testing.T) {
 			if !p.wrongDigest {
 				continue
 			}
-			if got, max := after[p.path], p.scriptLen+1+externalSyncs[p.path]; got > max {
-				rt.Fatalf("%s is pinned with a wrong digest and was requested %d times; %d bucket faults, one worker sync and %d outside syncs allow %d",
+			if got, max := after[p.path], p.scriptLen+1+externalSyncs[p.path]; got < 1 || got > max {
+				rt.Fatalf("%s is pinned with a wrong digest and was requested %d times; %d bucket faults, one worker sync and %d outside syncs allow 1 to %d",
 					p.path, got, p.scriptLen, externalSyncs[p.path], max)
 			}
 		}

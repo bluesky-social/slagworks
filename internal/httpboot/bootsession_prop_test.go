@@ -47,6 +47,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -66,7 +67,10 @@ const (
 	sessionPendingMAC    = "52:54:00:aa:bb:02"
 )
 
-var sessionPendingMachine = uuid.MustParse("22222222-2222-4222-8222-222222222222")
+var (
+	sessionPendingMachine = uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	initrdLine            = regexp.MustCompile(`(?m)^initrd (\S+)`)
+)
 
 // sessionBucket is the object storage the image rows point at.
 type sessionBucket struct {
@@ -285,10 +289,11 @@ func TestProp_BootSession_OneImageVersionPerBoot(t *testing.T) {
 			case 0:
 				code, script := get("/boot/ipxe?mac=" + imageRowMAC)
 				kernel := kernelLine.FindStringSubmatch(script)
+				initrd := initrdLine.FindStringSubmatch(script)
 				kdir := kernelImageDir.FindStringSubmatch(script)
 				idir := initrdImageDir.FindStringSubmatch(script)
 				image := cmdlineImage.FindStringSubmatch(script)
-				if code != http.StatusOK || kernel == nil || kdir == nil || idir == nil || image == nil {
+				if code != http.StatusOK || kernel == nil || initrd == nil || kdir == nil || idir == nil || image == nil {
 					rt.Fatalf("%s: GET /boot/ipxe = %d, not a deploy boot script:\n%s", what, code, script)
 				}
 				want := m.bootImage()
@@ -297,15 +302,15 @@ func TestProp_BootSession_OneImageVersionPerBoot(t *testing.T) {
 						what, kdir[1], idir[1], image[1], want)
 				}
 				s.image = want
-				// iPXE expands ${next-server} and percent-encodes '@' in
-				// the request path.
-				u, err := url.Parse(strings.ReplaceAll(kernel[1], "${next-server}", "worker"))
-				if err != nil {
-					rt.Fatalf("%s: kernel URL %q: %v", what, kernel[1], err)
+				// iPXE fetches the two URLs the script names: it expands
+				// ${next-server} and percent-encodes '@' in the request path.
+				for _, raw := range []string{kernel[1], initrd[1]} {
+					u, err := url.Parse(strings.ReplaceAll(raw, "${next-server}", "worker"))
+					if err != nil {
+						rt.Fatalf("%s: script URL %q: %v", what, raw, err)
+					}
+					fetch(s, what, strings.ReplaceAll(u.EscapedPath(), "@", "%40"))
 				}
-				dir := strings.ReplaceAll(strings.TrimSuffix(u.EscapedPath(), "/vmlinuz"), "@", "%40")
-				fetch(s, what, dir+"/vmlinuz")
-				fetch(s, what, dir+"/initrd")
 			case 1:
 				fetch(s, what, "/files/images/"+s.image+"/root.squashfs")
 			case 2:

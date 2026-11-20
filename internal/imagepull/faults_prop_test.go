@@ -929,7 +929,11 @@ func TestHelperSyncChild(t *testing.T) {
 	_ = SyncImages(faultLog, ".", images)
 }
 
-func startSyncChild(t *rapid.T, imagesDir string, images map[string]*model.Image) (cmd *exec.Cmd, exited chan struct{}) {
+// startSyncChild starts a child sync of imagesDir. exited delivers the
+// child's exit error once: nil when it ran to the end, whatever the sync
+// itself returned; an error when it was killed, panicked, or the race
+// detector reported a race in it.
+func startSyncChild(t *rapid.T, imagesDir string, images map[string]*model.Image) (cmd *exec.Cmd, exited chan error) {
 	enc, err := json.Marshal(images)
 	if err != nil {
 		t.Fatalf("encode images: %v", err)
@@ -943,11 +947,8 @@ func startSyncChild(t *rapid.T, imagesDir string, images map[string]*model.Image
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start child: %v", err)
 	}
-	exited = make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(exited)
-	}()
+	exited = make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
 	return cmd, exited
 }
 
@@ -995,9 +996,12 @@ wait:
 				w.stats["kill_after_download"]++
 				break wait
 			}
-		case <-exited:
+		case err := <-exited:
+			if err != nil {
+				t.Fatalf("child sync failed by itself: %v", err)
+			}
 			w.stats["kill_child_already_exited"]++
-			break wait
+			return
 		case <-timeout:
 			_ = cmd.Process.Kill()
 			<-exited
@@ -1020,7 +1024,10 @@ wait:
 //   - nothing else changed, apart from temp entries, which the next sync
 //     removes.
 //
-// It returns the names that were plain directories and are now missing.
+// It returns the names that were plain directories and are now missing: the
+// first switch of a plain directory moves it aside and then renames the link
+// in, and a kill between the two renames leaves no <name> until the next
+// sync.
 func (w *faultWorld) checkAfterKill(t *rapid.T, when string) (missing []string) {
 	tree := w.imagesTree()
 	owned, _, _ := splitTree(tree, w.names)
@@ -1347,21 +1354,31 @@ func TestProp_SyncImages_ConcurrentSyncsSerialize(t *testing.T) {
 		}
 
 		var syncs sync.WaitGroup
+		var children []chan error
 		for _, p := range parts {
+			if p.child {
+				_, exited := startSyncChild(t, w.imagesDir, p.images)
+				children = append(children, exited)
+				continue
+			}
 			syncs.Add(1)
 			go func() {
 				defer syncs.Done()
-				if p.child {
-					_, exited := startSyncChild(t, w.imagesDir, p.images)
-					<-exited
-					return
-				}
 				_ = SyncImages(faultLog, w.imagesDir, p.images)
 			}()
 		}
 		syncs.Wait()
+		var childErr error
+		for _, exited := range children {
+			if err := <-exited; err != nil {
+				childErr = err
+			}
+		}
 		stop.Store(true)
 		readers.Wait()
+		if childErr != nil {
+			t.Fatalf("a child sync failed (a panic, or a data race under -race): %v", childErr)
+		}
 		if s := readerErr.Load(); s != nil {
 			t.Fatalf("during concurrent syncs: %s", *s)
 		}
