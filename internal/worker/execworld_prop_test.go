@@ -1553,7 +1553,7 @@ func (c *epBootCtrl) SetBootOverride(ctx context.Context, dev power.BootDevice, 
 
 var epReconcileOutcomes = []string{"rotated", "rotated", "verified", "reasserted", "nil-err", "nil-nil", "partial"}
 
-func (pw *epWorker) bmcReconcile(ctx context.Context, t bmcreconcile.LANTarget, monitorPassword string) (*bmcreconcile.Result, error) {
+func (pw *epWorker) bmcReconcile(ctx context.Context, t bmcreconcile.LANTarget, monitorPassword string, _ []string) (*bmcreconcile.Result, error) {
 	w := pw.w
 	a := pw.attemptForCall("the BMC reconciler")
 	if a == nil {
