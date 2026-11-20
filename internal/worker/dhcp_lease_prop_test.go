@@ -297,7 +297,7 @@ func TestProp_LedgerTracksHandler(t *testing.T) {
 
 				// Deliver the outbox to the ledger, folding as
 				// store.RecordDHCPLeaseEvent documents.
-				pending, _ := cache.DrainOutbox()
+				pending, _ := takeOutbox(cache)
 				for _, p := range pending {
 					if p.Obs.Event != "dhcp_lease" {
 						continue

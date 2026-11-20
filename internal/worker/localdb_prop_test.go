@@ -496,7 +496,7 @@ func TestLocalDBCorruption_Prop(t *testing.T) {
 		for i := 0; i < nRows; i++ {
 			pad := bytes.Repeat([]byte{'p'}, rapid.IntRange(0, 2000).Draw(rt, "pad"))
 			data, _ := json.Marshal(map[string]string{"pad": string(pad)})
-			if _, err := db.AppendOutbox(model.Observation{MachineID: uuid.New(), Event: "commission_report", Data: data}); err != nil {
+			if _, err := db.AppendOutbox(PendingOutbox{Obs: model.Observation{MachineID: uuid.New(), Event: "commission_report", Data: data}}); err != nil {
 				rt.Fatalf("append: %v", err)
 			}
 		}

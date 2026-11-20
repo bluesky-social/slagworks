@@ -1555,20 +1555,46 @@ func TestHub_OpUpdateDispatchedToHandler(t *testing.T) {
 	defer cancel()
 
 	opID := uuid.NewString()
-	if err := conn.WriteTyped(ctx, TypeOpUpdate, "", OpUpdateMsg{
+	if err := conn.WriteTyped(ctx, TypeOpUpdate, "req-op-1", OpUpdateMsg{
 		OperationID: opID,
 		Phase:       "partitioning",
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	// Fire-and-forget: no response expected. Poll the handler.
-	waitUntil(t, func() bool { return opHandler.count() == 1 }, 2*time.Second)
+	// The handler's success is acknowledged on the update's request_id.
+	resp := readRPCResponse(ctx, t, conn, "req-op-1")
+	if resp.Error != "" {
+		t.Fatalf("rpc_response error = %q, want none", resp.Error)
+	}
 	opHandler.mu.Lock()
 	defer opHandler.mu.Unlock()
+	if len(opHandler.received) != 1 {
+		t.Fatalf("handler calls = %d, want 1", len(opHandler.received))
+	}
 	got := opHandler.received[0]
 	if got.OperationID != opID || got.Phase != "partitioning" {
 		t.Fatalf("received: %+v", got)
+	}
+}
+
+// readRPCResponse reads messages until the rpc_response for reqID and
+// decodes it.
+func readRPCResponse(ctx context.Context, t *testing.T, conn *Conn, reqID string) RPCResponseMsg {
+	t.Helper()
+	for {
+		env, err := conn.ReadMessage(ctx)
+		if err != nil {
+			t.Fatalf("read rpc_response %s: %v", reqID, err)
+		}
+		if env.Type != TypeRPCResponse || env.RequestID != reqID {
+			continue
+		}
+		var resp RPCResponseMsg
+		if err := json.Unmarshal(env.Data, &resp); err != nil {
+			t.Fatalf("decode rpc_response: %v", err)
+		}
+		return resp
 	}
 }
 
@@ -1666,10 +1692,16 @@ func TestHub_AcceptsMultiMiBLogBatch(t *testing.T) {
 	}
 }
 
-func TestHub_OpUpdateHandlerErrorLoggedButNotPropagated(t *testing.T) {
+// TestHub_OpUpdateAnsweredWithHandlerOutcome: the hub answers every
+// op_update's request_id with the handler's outcome, so the worker drops
+// the update from its outbox on success or a terminal error and retries it
+// on any other error. An op_update whose payload does not decode is
+// answered terminally (resending it cannot help). The connection stays
+// open throughout.
+func TestHub_OpUpdateAnsweredWithHandlerOutcome(t *testing.T) {
 	auth := newFakeAuth()
 	auth.register("tok-1", "pop3", "worker-1")
-	opHandler := &fakeOpUpdateHandler{err: errors.New("db unreachable")}
+	opHandler := &fakeOpUpdateHandler{}
 	h := NewHub(HubConfig{
 		Auth:            auth,
 		Rebuilder:       &fakeRebuilder{},
@@ -1687,26 +1719,120 @@ func TestHub_OpUpdateHandlerErrorLoggedButNotPropagated(t *testing.T) {
 	defer conn.CloseNow()
 	helloAndDrain(t, conn, "worker-1")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := conn.WriteTyped(ctx, TypeOpUpdate, "", OpUpdateMsg{
-		OperationID: uuid.NewString(),
-		Phase:       "partitioning",
+	for i, tc := range []struct {
+		name         string
+		handlerErr   error
+		raw          json.RawMessage // sent instead of a well-formed OpUpdateMsg
+		wantError    bool
+		wantTerminal bool
+	}{
+		{name: "committed"},
+		{name: "transient", handlerErr: errors.New("db unreachable"), wantError: true},
+		{name: "terminal", handlerErr: fmt.Errorf("operation not found: %w", ErrTerminal), wantError: true, wantTerminal: true},
+		{name: "malformed", raw: json.RawMessage(`{"op_id":7}`), wantError: true, wantTerminal: true},
+	} {
+		opHandler.mu.Lock()
+		opHandler.err = tc.handlerErr
+		opHandler.mu.Unlock()
+		reqID := fmt.Sprintf("req-%d", i)
+		var err error
+		if tc.raw != nil {
+			err = conn.WriteMessage(ctx, Envelope{Type: TypeOpUpdate, RequestID: reqID, Data: tc.raw})
+		} else {
+			err = conn.WriteTyped(ctx, TypeOpUpdate, reqID, OpUpdateMsg{OperationID: uuid.NewString(), Phase: "partitioning"})
+		}
+		if err != nil {
+			t.Fatalf("%s: write: %v", tc.name, err)
+		}
+		resp := readRPCResponse(ctx, t, conn, reqID)
+		if (resp.Error != "") != tc.wantError || resp.Terminal != tc.wantTerminal {
+			t.Errorf("%s: rpc_response error=%q terminal=%v, want error=%v terminal=%v",
+				tc.name, resp.Error, resp.Terminal, tc.wantError, tc.wantTerminal)
+		}
+	}
+	if n := opHandler.count(); n != 3 {
+		t.Errorf("handler calls = %d, want 3 (the malformed update never reaches it)", n)
+	}
+}
+
+// blockingOpUpdateHandler holds HandleOpUpdate until release is closed and
+// records that it returned.
+type blockingOpUpdateHandler struct {
+	release  chan struct{}
+	returned atomic.Bool
+}
+
+func (b *blockingOpUpdateHandler) HandleOpUpdate(context.Context, OpUpdateMsg) error {
+	<-b.release
+	b.returned.Store(true)
+	return nil
+}
+
+// TestHub_OpUpdateAckedOnlyAfterHandlerReturns: the acknowledgement is
+// what lets the worker forget the update, so it must not leave the hub
+// before the handler (the Postgres write) has finished. A hub that crashes
+// before then never acknowledges, and the worker resends.
+func TestHub_OpUpdateAckedOnlyAfterHandlerReturns(t *testing.T) {
+	auth := newFakeAuth()
+	auth.register("tok-1", "pop3", "worker-1")
+	opHandler := &blockingOpUpdateHandler{release: make(chan struct{})}
+	h := NewHub(HubConfig{Auth: auth, Rebuilder: &fakeRebuilder{}, OpUpdateHandler: opHandler})
+	h.Push("pop3", model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "pop3"}})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	conn := dialHub(t, srv, "tok-1")
+	if conn == nil {
+		t.Fatal("dial failed")
+	}
+	defer conn.CloseNow()
+	helloAndDrain(t, conn, "worker-1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := conn.WriteTyped(ctx, TypeOpUpdate, "req-1", OpUpdateMsg{
+		OperationID: uuid.NewString(), Status: string(model.OpCompleted),
 	}); err != nil {
 		t.Fatal(err)
 	}
-
-	waitUntil(t, func() bool { return opHandler.count() == 1 }, 2*time.Second)
-	// Critically: connection must stay open. Send a second message to
-	// verify the read loop wasn't torn down.
-	if err := conn.WriteTyped(ctx, TypeOpUpdate, "", OpUpdateMsg{
-		OperationID: uuid.NewString(),
-		Phase:       "rsyncing_os",
-	}); err != nil {
-		t.Fatalf("second write failed, connection probably dead: %v", err)
+	type answer struct {
+		env           Envelope
+		err           error
+		afterHandling bool
 	}
-	waitUntil(t, func() bool { return opHandler.count() == 2 }, 2*time.Second)
+	got := make(chan answer, 1)
+	go func() {
+		for {
+			env, err := conn.ReadMessage(ctx)
+			if err != nil || (env.Type == TypeRPCResponse && env.RequestID == "req-1") {
+				got <- answer{env, err, opHandler.returned.Load()}
+				return
+			}
+		}
+	}()
+	select {
+	case a := <-got:
+		t.Fatalf("rpc_response %s (err %v) arrived while the handler was still running", a.env.Data, a.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(opHandler.release)
+	select {
+	case a := <-got:
+		if a.err != nil {
+			t.Fatalf("read rpc_response: %v", a.err)
+		}
+		var resp RPCResponseMsg
+		if err := json.Unmarshal(a.env.Data, &resp); err != nil {
+			t.Fatalf("decode rpc_response: %v", err)
+		}
+		if !a.afterHandling || resp.Error != "" {
+			t.Fatalf("got %+v (after handling=%v), want a success answered after the handler returned", resp, a.afterHandling)
+		}
+	case <-ctx.Done():
+		t.Fatal("no rpc_response after the handler returned")
+	}
 }
 
 // captureHandler is a slog.Handler that records every emitted record

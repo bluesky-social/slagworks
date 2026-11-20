@@ -93,7 +93,7 @@ func TestExecutor_NoClaimForMachineThatLeftTheViewMidPass(t *testing.T) {
 			if got := cache.GetOperation(left.ID.String()); got == nil || got.Status != model.OpPending {
 				t.Errorf("op on the machine that left the view: got %+v, want it still pending locally", got)
 			}
-			_, updates := cache.DrainOutbox()
+			_, updates := takeOutbox(cache)
 			for _, u := range updates {
 				if u.OperationID == left.ID.String() {
 					t.Errorf("queued op_update %+v for the op whose machine left the view; want none", u)

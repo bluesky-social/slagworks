@@ -48,14 +48,11 @@ type WSConn struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan json.RawMessage
 
-	// ackPending maps request_id (sent on an observation envelope) to
-	// the pending outbox entry it originated from. When the global
-	// sends rpc_response{ok:true} we ack the SQLite row via
-	// cache.AckObservation; on a non-terminal error we use the stored
-	// PendingOutbox to requeue just this entry with exponential
-	// backoff (cache.RequeueRejected), instead of calling
-	// ReloadOutboxFromDisk and risking duplicate sends of other
-	// still-in-flight observations.
+	// ackPending maps request_id (sent on an observation or op_update
+	// envelope) to the outbox entry it carried. When global sends
+	// rpc_response without an error we remove the entry via
+	// cache.AckOutbox; on a non-terminal error we requeue just this entry
+	// with exponential backoff (cache.RequeueRejected).
 	ackPendingMu sync.Mutex
 	ackPending   map[string]PendingOutbox
 
@@ -431,31 +428,28 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 
 	// Reconnect reset. Held under drainMu so any in-flight drainOnce
 	// from the previous connection's final ctx.Done pass completes
-	// before we clear ackPending / reload from disk. Without this
-	// guard:
-	//   - the old drainOnce could deliver an obs and write into our
-	//     newly cleared ackPending; the response is bound for the
-	//     dead conn, so the entry leaks.
-	//   - the old drainOnce could RequeueOutbox AFTER we reload,
-	//     duplicating items that reload already put back.
+	// before we clear ackPending and requeue what is in flight. Without
+	// this guard the old drainOnce could deliver an entry and write into
+	// our newly cleared ackPending; the response is bound for the dead
+	// conn, so the entry would stay in flight with nothing to answer it.
 	w.drainMu.Lock()
 	w.ackPendingMu.Lock()
 	w.ackPending = make(map[string]PendingOutbox)
 	w.ackPendingMu.Unlock()
-	// Pull unacked observations persisted in SQLite back into the
-	// in-memory queue. Critical for recovery from disconnect during
-	// the ack window: the observation was sent + SQLite row still
-	// exists, but it's no longer in the in-memory outbox because
-	// DrainOutbox removed it for the previous send. Without reload,
-	// we'd wait for worker restart to retry.
+	// Everything sent on the previous connection and not acknowledged
+	// goes out again: global may or may not have committed it (a crash
+	// between reading a frame and committing it, or a reply lost with
+	// the connection), and its handlers are idempotent. The reset also
+	// reads the SQLite table again for rows a failed read at startup left
+	// out of memory.
 	//
 	// A failed read ends this connection attempt. Carrying on would treat
-	// the outbox as empty for as long as the connection lasts, and a
-	// stranded phone_home or commission report then fails a healthy
-	// operation at its timeout. Run reconnects with backoff, so the read is
-	// retried until it succeeds; a table that never reads again keeps the
-	// worker off global, with this error on every attempt, until the
-	// operator repairs the local database. Boot and DHCP serving do not
+	// the outbox as complete for as long as the connection lasts, and a
+	// stranded phone_home, commission report or op update then fails a
+	// healthy operation at its timeout. Run reconnects with backoff, so the
+	// read is retried until it succeeds; a table that never reads again
+	// keeps the worker off global, with this error on every attempt, until
+	// the operator repairs the local database. Boot and DHCP serving do not
 	// depend on the connection and continue from the cache.
 	if err := w.cache.ReloadOutboxFromDisk(); err != nil {
 		w.drainMu.Unlock()
@@ -493,11 +487,11 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 		case ws.TypeOpRemoved:
 			w.applyOpRemoved(env.Data)
 		case ws.TypeClaimOpResp, ws.TypeRPCResponse:
-			// Observation acks claim request_ids from the ackPending
-			// map first; if the reqID belongs to an outbox observation,
-			// we ack the row and consume the response. Otherwise it's
-			// an active RPC (ClaimOp) waiting on pending{}.
-			if !w.handleObservationAck(env.RequestID, env.Data) {
+			// Outbox acks claim request_ids from the ackPending map
+			// first; if the reqID belongs to an outbox entry, we settle
+			// the entry and consume the response. Otherwise it's an
+			// active RPC (ClaimOp) waiting on pending{}.
+			if !w.handleOutboxAck(env.RequestID, env.Data) {
 				w.deliverRPCResponse(env.RequestID, env.Data)
 			}
 		case ws.TypePowerStatus:
@@ -862,57 +856,46 @@ func (w *WSConn) drainOnce(ctx context.Context, conn *ws.Conn) {
 	w.drainMu.Lock()
 	defer w.drainMu.Unlock()
 
-	obs, updates := w.cache.DrainOutbox()
+	entries := w.cache.DrainOutbox()
 
-	// DrainOutbox removes items from the in-memory queue before we
-	// try to send them. On send failure we requeue the remainder so
-	// the next wake retries — otherwise a transiently-failed
-	// op_update or observation would vanish for this session.
+	// DrainOutbox marks the entries in flight before we send them. On
+	// send failure we requeue the unsent remainder so the next wake
+	// retries.
 	//
-	// Each observation is sent with a fresh request_id paired with
-	// its SQLite row ID via ackPending. When the global's
-	// rpc_response arrives (handled in connectAndRun's read loop),
-	// we ack the row — closing the commission outbox contract: the
-	// worker keeps re-sending until global confirms both NetBox and
-	// Postgres writes succeeded.
-	for i, p := range obs {
+	// Each entry (observation or op_update) is sent with a fresh
+	// request_id paired with the entry via ackPending. Global answers it
+	// with rpc_response once its handler committed (handled in
+	// connectAndRun's read loop), and only then does the entry leave the
+	// outbox: the worker keeps re-sending until global confirms the
+	// write.
+	for i, p := range entries {
 		reqID := uuid.New().String()
-		frame, err := observationFrame(reqID, p.Obs)
+		frame, err := outboxFrame(reqID, p)
 		if err == nil && len(frame) > ws.MaxMessageBytes {
 			err = fmt.Errorf("encoded message is %d bytes, over the %d-byte limit global reads",
 				len(frame), ws.MaxMessageBytes)
 		}
 		if err != nil {
-			// No retry can deliver this row. Global closes the
+			// No retry can deliver this entry. Global closes the
 			// connection on an oversized message without answering
-			// it, and the reconnect's ReloadOutboxFromDisk puts the
-			// row back first, so sending or requeueing it would cut
-			// every later observation and op_update off from global
-			// for good. Drop it, as a terminal rejection does.
-			w.log.Error("dropping outbox observation that cannot be sent to global",
-				"event", p.Obs.Event, "machine_id", p.Obs.MachineID, "op_id", p.Obs.OperationID,
-				"row_id", p.RowID, "err", err)
-			w.cache.AckObservation(p.RowID)
+			// it, and the reconnect requeues it first, so sending or
+			// requeueing it would cut every later entry off from
+			// global for good. Drop it, as a terminal rejection does.
+			w.log.Error("dropping outbox entry that cannot be sent to global",
+				append(outboxLogAttrs(p), "row_id", p.RowID, "err", err)...)
+			w.cache.AckOutbox(p)
 			continue
 		}
 		// Track BEFORE sending: otherwise the global can process
-		// the observation and write rpc_response back faster than
-		// we return from WriteFrame, and the read loop drops the
-		// ack because ackPending doesn't know about reqID yet.
-		// Untrack on send failure so we don't leak the entry.
+		// the entry and write rpc_response back faster than we
+		// return from WriteFrame, and the read loop drops the ack
+		// because ackPending doesn't know about reqID yet. Untrack
+		// on send failure so we don't leak the entry.
 		w.trackAck(reqID, p)
 		if err := conn.WriteFrame(ctx, frame); err != nil {
 			w.untrackAck(reqID)
-			w.log.Warn("send observation failed, requeueing remainder", "err", err, "unsent", len(obs)-i)
-			w.cache.RequeueOutbox(obs[i:], updates)
-			return
-		}
-	}
-
-	for i, u := range updates {
-		if err := w.sendOpUpdate(ctx, conn, u); err != nil {
-			w.log.Warn("send op_update failed, requeueing remainder", "err", err, "unsent", len(updates)-i)
-			w.cache.RequeueOutbox(nil, updates[i:])
+			w.log.Warn("send outbox entry failed, requeueing remainder", "err", err, "unsent", len(entries)-i)
+			w.cache.RequeueOutbox(entries[i:])
 			return
 		}
 	}
@@ -1353,8 +1336,23 @@ func (w *WSConn) ResumeOffsetUs(ctx context.Context, machineID uuid.UUID) (int64
 	return w.CastResumeOffset(ctx, machineID)
 }
 
+// outboxFrame encodes an outbox entry as the message drainOnce sends (an
+// op_update for an op update entry, an observation otherwise), so its size
+// can be checked against ws.MaxMessageBytes first.
+func outboxFrame(reqID string, e PendingOutbox) ([]byte, error) {
+	if u := e.Update; u != nil {
+		return ws.EncodeTyped(ws.TypeOpUpdate, reqID, ws.OpUpdateMsg{
+			OperationID: u.OperationID,
+			Status:      u.Status,
+			Phase:       u.Phase,
+			Result:      u.Result,
+		})
+	}
+	return observationFrame(reqID, e.Obs)
+}
+
 // observationFrame encodes an outbox observation as the message drainOnce
-// sends, so its size can be checked against ws.MaxMessageBytes first.
+// sends.
 func observationFrame(reqID string, obs model.Observation) ([]byte, error) {
 	msg := ws.ObservationMsg{
 		MachineID:   obs.MachineID,
@@ -1366,14 +1364,21 @@ func observationFrame(reqID string, obs model.Observation) ([]byte, error) {
 	return ws.EncodeTyped(ws.TypeObservation, reqID, msg)
 }
 
-// trackAck records that a request_id corresponds to a particular
-// outbox entry, so the later rpc_response can ack the right row or
-// requeue just this entry on transient error. rowID == 0 (failed
-// persist path) is silently dropped: there's nothing to ack.
-func (w *WSConn) trackAck(reqID string, entry PendingOutbox) {
-	if entry.RowID == 0 {
-		return
+// outboxLogAttrs identifies an outbox entry in a log line. It never
+// includes the payload (an observation's data or an op update's result):
+// a deploy_complete or bmc_reconcile_report observation carries a
+// plaintext monitor password.
+func outboxLogAttrs(e PendingOutbox) []any {
+	if u := e.Update; u != nil {
+		return []any{"kind", outboxKindOpUpdate, "op_id", u.OperationID, "phase", u.Phase, "status", u.Status}
 	}
+	return []any{"kind", outboxKindObservation, "event", e.Obs.Event,
+		"machine_id", e.Obs.MachineID, "op_id", e.Obs.OperationID}
+}
+
+// trackAck records that a request_id corresponds to a particular
+// outbox entry, so the later rpc_response can settle that entry.
+func (w *WSConn) trackAck(reqID string, entry PendingOutbox) {
 	w.ackPendingMu.Lock()
 	w.ackPending[reqID] = entry
 	w.ackPendingMu.Unlock()
@@ -1387,13 +1392,13 @@ func (w *WSConn) untrackAck(reqID string) {
 	w.ackPendingMu.Unlock()
 }
 
-// handleObservationAck is called when an rpc_response arrives whose
-// request_id matches one we tracked for a sent observation. On
-// success, acks the SQLite row. On terminal error, acks so the row
-// stops cycling. On transient error, requeues just this entry in
-// memory — NOT via ReloadOutboxFromDisk, which would pull back any
-// other still-in-flight observations and cause duplicate sends.
-func (w *WSConn) handleObservationAck(reqID string, data json.RawMessage) bool {
+// handleOutboxAck is called when an rpc_response arrives, and reports
+// whether its request_id matched one we tracked for a sent outbox entry.
+// On success, removes the entry. On terminal error, removes it so it
+// stops cycling. On a transient error, or a response the worker cannot
+// decode, requeues just this entry with backoff: global may or may not
+// have committed it, and its handlers are idempotent.
+func (w *WSConn) handleOutboxAck(reqID string, data json.RawMessage) bool {
 	w.ackPendingMu.Lock()
 	entry, ok := w.ackPending[reqID]
 	if ok {
@@ -1406,14 +1411,14 @@ func (w *WSConn) handleObservationAck(reqID string, data json.RawMessage) bool {
 
 	var resp ws.RPCResponseMsg
 	if err := json.Unmarshal(data, &resp); err != nil {
-		w.log.Warn("malformed rpc_response for observation ack", "req_id", reqID, "err", err)
-		return true
+		resp.Error = fmt.Sprintf("malformed rpc_response: %v", err)
+		resp.Terminal = false
 	}
 	if resp.Error != "" {
 		if resp.Terminal {
-			w.log.Warn("observation rejected terminally, dropping outbox row",
-				"req_id", reqID, "row_id", entry.RowID, "err", resp.Error)
-			w.cache.AckObservation(entry.RowID)
+			w.log.Warn("outbox entry rejected terminally by global, dropping it",
+				append(outboxLogAttrs(entry), "req_id", reqID, "row_id", entry.RowID, "err", resp.Error)...)
+			w.cache.AckOutbox(entry)
 			return true
 		}
 		// Non-terminal rejection: requeue with per-row exponential
@@ -1426,23 +1431,13 @@ func (w *WSConn) handleObservationAck(reqID string, data json.RawMessage) bool {
 		if warn {
 			logFn = w.log.Warn
 		}
-		logFn("observation rejected by global, requeueing with backoff",
-			"req_id", reqID, "row_id", entry.RowID, "err", resp.Error,
-			"attempts", attempts, "retry_in", delay.Truncate(time.Millisecond))
+		logFn("outbox entry rejected by global, requeueing with backoff",
+			append(outboxLogAttrs(entry), "req_id", reqID, "row_id", entry.RowID, "err", resp.Error,
+				"attempts", attempts, "retry_in", delay.Truncate(time.Millisecond))...)
 		return true
 	}
-	w.cache.AckObservation(entry.RowID)
+	w.cache.AckOutbox(entry)
 	return true
-}
-
-func (w *WSConn) sendOpUpdate(ctx context.Context, conn *ws.Conn, update model.OperationUpdate) error {
-	msg := ws.OpUpdateMsg{
-		OperationID: update.OperationID,
-		Status:      update.Status,
-		Phase:       update.Phase,
-		Result:      update.Result,
-	}
-	return conn.WriteTyped(ctx, ws.TypeOpUpdate, "", msg)
 }
 
 // --- Pending RPC plumbing ---

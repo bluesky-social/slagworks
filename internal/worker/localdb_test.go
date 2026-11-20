@@ -2,6 +2,7 @@ package worker
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net"
 	"path/filepath"
 	"sort"
@@ -58,24 +59,41 @@ var preGooseSchema = []string{
 	"CREATE TABLE `current_deploy_ops` (`machine_id` text,`operation_id` text NOT NULL,PRIMARY KEY (`machine_id`))",
 }
 
-// TestLocalDB_FreshInstallSchema asserts that a fresh OpenLocalDB (which
-// now runs goose.Up) produces exactly the schema AutoMigrate used to
-// produce — same tables, same DDL, same implicit autoindexes. This is
-// the "fresh install matches old shape" half of the migration contract.
-func TestLocalDB_FreshInstallSchema(t *testing.T) {
-	// A DB built purely by hand-writing the AutoMigrate DDL: the
-	// reference shape.
-	refPath := filepath.Join(t.TempDir(), "ref.db")
-	refDB, err := sql.Open("sqlite", refPath)
+// postBaselineSchema is what the migrations after 00001 change, written
+// out by hand so the reference schema does not come from the migrations
+// under test.
+var postBaselineSchema = []string{
+	// 00002_outbox_kind
+	"ALTER TABLE `outbox` ADD COLUMN `kind` text NOT NULL DEFAULT 'observation'",
+}
+
+// latestLocalMigration is the goose version a migrated worker.db is at.
+const latestLocalMigration = 2
+
+// writeReferenceSchema creates at path the schema every migration together
+// should produce: the pre-goose baseline plus postBaselineSchema.
+func writeReferenceSchema(t *testing.T, path string) {
+	t.Helper()
+	refDB, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("open ref: %v", err)
 	}
-	for _, ddl := range preGooseSchema {
+	defer refDB.Close()
+	for _, ddl := range append(append([]string(nil), preGooseSchema...), postBaselineSchema...) {
 		if _, err := refDB.Exec(ddl); err != nil {
 			t.Fatalf("exec ref ddl %q: %v", ddl, err)
 		}
 	}
-	refDB.Close()
+}
+
+// TestLocalDB_FreshInstallSchema asserts that a fresh OpenLocalDB (which
+// runs goose.Up) produces exactly the schema AutoMigrate used to produce
+// plus the later migrations — same tables, same DDL, same implicit
+// autoindexes. This is the "fresh install matches the upgraded shape"
+// half of the migration contract.
+func TestLocalDB_FreshInstallSchema(t *testing.T) {
+	refPath := filepath.Join(t.TempDir(), "ref.db")
+	writeReferenceSchema(t, refPath)
 	want := dumpUserSchema(t, refPath)
 
 	// A DB built by the real OpenLocalDB path (goose).
@@ -93,8 +111,9 @@ func TestLocalDB_FreshInstallSchema(t *testing.T) {
 // TestLocalDB_AdoptExistingFile is the load-bearing deployment test: a
 // prod oob-gw already has a worker.db created by the old AutoMigrate path
 // with real rows in it. When the new binary starts, OpenLocalDB must
-// adopt that file in place — data intact, no re-create — and land goose
-// version 1.
+// adopt that file in place — data intact, no re-create — and run every
+// later migration. An outbox row written before the outbox carried op
+// updates comes back as the observation it is.
 func TestLocalDB_AdoptExistingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "worker.db")
 
@@ -157,25 +176,19 @@ func TestLocalDB_AdoptExistingFile(t *testing.T) {
 	}
 	closeLocalDB(t, db)
 
-	// 4. goose version 1 landed, and the schema is unchanged from the
-	//    pre-goose shape (adoption did not re-create tables).
-	if v := gooseVersion(t, path); v != 1 {
-		t.Errorf("goose version = %d, want 1", v)
+	// 4. Every migration landed, and the schema is the pre-goose shape
+	//    plus the later migrations (adoption did not re-create tables).
+	if v := gooseVersion(t, path); v != latestLocalMigration {
+		t.Errorf("goose version = %d, want %d", v, latestLocalMigration)
 	}
 	refPath := filepath.Join(t.TempDir(), "ref.db")
-	refDB, _ := sql.Open("sqlite", refPath)
-	for _, ddl := range preGooseSchema {
-		if _, err := refDB.Exec(ddl); err != nil {
-			t.Fatalf("exec ref ddl: %v", err)
-		}
-	}
-	refDB.Close()
+	writeReferenceSchema(t, refPath)
 	assertSchemaEqual(t, dumpUserSchema(t, refPath), dumpUserSchema(t, path))
 }
 
 // TestLocalDB_ReopenIdempotent verifies a second OpenLocalDB on an
-// already-migrated DB is a clean no-op (goose sees version 1, applies
-// nothing) — the ordinary worker-restart path.
+// already-migrated DB is a clean no-op (goose sees the latest version,
+// applies nothing) — the ordinary worker-restart path.
 func TestLocalDB_ReopenIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "worker.db")
 	db1, err := OpenLocalDB(path)
@@ -194,8 +207,8 @@ func TestLocalDB_ReopenIdempotent(t *testing.T) {
 	}
 	closeLocalDB(t, db2)
 
-	if v := gooseVersion(t, path); v != 1 {
-		t.Errorf("goose version = %d, want 1", v)
+	if v := gooseVersion(t, path); v != latestLocalMigration {
+		t.Errorf("goose version = %d, want %d", v, latestLocalMigration)
 	}
 }
 
@@ -396,19 +409,21 @@ func TestLocalDB_Outbox_AppendAckRoundtrip(t *testing.T) {
 	}
 
 	machineID := uuid.New()
-	id1, err := db.AppendOutbox(model.Observation{
+	id1, err := db.AppendOutbox(PendingOutbox{Obs: model.Observation{
 		MachineID: machineID,
 		Event:     "deploy_complete",
 		Timestamp: time.Now(),
-	})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	id2, err := db.AppendOutbox(model.Observation{
-		MachineID: machineID,
-		Event:     "phone_home",
-		Timestamp: time.Now(),
-	})
+	upd := model.OperationUpdate{
+		OperationID: uuid.NewString(),
+		Status:      string(model.OpFailed),
+		Phase:       "partitioning",
+		Result:      json.RawMessage(`{"error":"boom","phase":"partitioning"}`),
+	}
+	id2, err := db.AppendOutbox(PendingOutbox{Update: &upd})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,8 +435,12 @@ func TestLocalDB_Outbox_AppendAckRoundtrip(t *testing.T) {
 	if len(pending) != 2 {
 		t.Fatalf("expected 2 pending, got %d", len(pending))
 	}
-	if pending[0].Obs.Event != "deploy_complete" || pending[1].Obs.Event != "phone_home" {
-		t.Fatalf("unexpected events: %+v", pending)
+	if pending[0].Update != nil || pending[0].Obs.Event != "deploy_complete" {
+		t.Fatalf("first row: got %+v, want the deploy_complete observation", pending[0])
+	}
+	if got := pending[1].Update; got == nil || got.OperationID != upd.OperationID || got.Status != upd.Status ||
+		got.Phase != upd.Phase || string(got.Result) != string(upd.Result) {
+		t.Fatalf("second row: got %+v, want op update %+v", pending[1], upd)
 	}
 	if pending[0].RowID != id1 || pending[1].RowID != id2 {
 		t.Fatalf("row id mismatch: got %d,%d want %d,%d", pending[0].RowID, pending[1].RowID, id1, id2)
@@ -432,15 +451,42 @@ func TestLocalDB_Outbox_AppendAckRoundtrip(t *testing.T) {
 		t.Fatalf("expected list to be non-destructive, got %d", len(got))
 	}
 
-	db.AckOutboxRow(id1)
+	if err := db.AckOutboxRow(id1); err != nil {
+		t.Fatal(err)
+	}
 	pending = mustListOutbox(t, db)
 	if len(pending) != 1 || pending[0].RowID != id2 {
 		t.Fatalf("after ack: %+v", pending)
 	}
 
-	db.AckOutboxRow(id2)
+	if err := db.AckOutboxRow(id2); err != nil {
+		t.Fatal(err)
+	}
 	if got := mustListOutbox(t, db); len(got) != 0 {
 		t.Fatalf("after acking both: %d remaining", len(got))
+	}
+}
+
+// TestLocalDB_Outbox_UnknownKindDropped: a row whose kind this binary does
+// not know is deleted with a warning instead of being sent as something it
+// is not.
+func TestLocalDB_Outbox_UnknownKindDropped(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.AppendOutbox(PendingOutbox{Obs: model.Observation{MachineID: uuid.New(), Event: "phone_home"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.Exec("INSERT INTO outbox (kind, payload) VALUES ('future_kind', '{}')").Error; err != nil {
+		t.Fatal(err)
+	}
+	if got := mustListOutbox(t, db); len(got) != 1 || got[0].Obs.Event != "phone_home" {
+		t.Fatalf("got %+v, want only the phone_home observation", got)
+	}
+	var n int64
+	if err := db.db.Raw("SELECT count(*) FROM outbox").Scan(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("outbox has %d rows after the unknown kind was dropped, want 1", n)
 	}
 }
 
@@ -648,61 +694,50 @@ func TestLocalDB_LeaseStore(t *testing.T) {
 	}
 }
 
-// TestCache_ReloadOutboxFromDisk_AfterDrain verifies that after the WS
-// drain has removed observations from the in-memory queue but before
-// they're acked, a reconnect repopulates them from SQLite for retry.
-func TestCache_ReloadOutboxFromDisk_AfterDrain(t *testing.T) {
+// TestCache_ReloadOutboxFromDisk_ResendsInFlight verifies that entries drained and
+// sent but not acknowledged are sent again after a reconnect, and that an
+// acknowledged one is gone from memory and disk.
+func TestCache_ReloadOutboxFromDisk_ResendsInFlight(t *testing.T) {
 	db := openTestDB(t)
 	c := NewCache(db)
 	id := uuid.New()
 
-	// Append two observations.
+	// Two observations; neither settles an op (no deploy op is active, so
+	// the phone_home names none), so both drain at once.
 	c.ApplySnapshot(&model.SiteSnapshot{
 		Machines: []model.MachineSnapshot{{ID: id, State: model.MachineStateDeploying}},
 	})
 	c.recordDeployComplete(id, uuid.New(), nil)
 	c.RecordPhoneHome(id)
 
-	// Simulate drain (wsconn takes items out of memory to send them).
-	obs, _ := c.DrainOutbox()
-	if len(obs) != 2 {
-		t.Fatalf("drain: got %d, want 2", len(obs))
+	sent := c.DrainOutbox()
+	if len(sent) != 2 {
+		t.Fatalf("drain: got %d, want 2", len(sent))
+	}
+	if again := c.DrainOutbox(); len(again) != 0 {
+		t.Fatalf("in-flight entries drained again before a reconnect: %+v", again)
 	}
 
-	// Disconnect + reconnect: reload from SQLite. Rows are still there
-	// because nothing acked them.
-	c.ReloadOutboxFromDisk()
-	obs2, _ := c.DrainOutbox()
-	if len(obs2) != 2 {
-		t.Fatalf("after reload: got %d, want 2", len(obs2))
+	// Disconnect + reconnect: nothing acked them, so both go out again.
+	if err := c.ReloadOutboxFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	resent := c.DrainOutbox()
+	if len(resent) != 2 || resent[0].RowID != sent[0].RowID || resent[1].RowID != sent[1].RowID {
+		t.Fatalf("after reconnect: got %+v, want rows %d and %d again", resent, sent[0].RowID, sent[1].RowID)
 	}
 
-	// Ack one; reload should only pull the remaining unacked row.
-	c.AckObservation(obs2[0].RowID)
-	c.ReloadOutboxFromDisk()
-	obs3, _ := c.DrainOutbox()
-	if len(obs3) != 1 || obs3[0].RowID != obs2[1].RowID {
-		t.Fatalf("after ack + reload: got %+v, want only row %d", obs3, obs2[1].RowID)
+	// Ack one; the next reconnect resends only the other.
+	c.AckOutbox(resent[0])
+	if err := c.ReloadOutboxFromDisk(); err != nil {
+		t.Fatal(err)
 	}
-}
-
-// TestCache_ReloadOutboxFromDisk_DeduplicatesAgainstInMemory verifies
-// reload doesn't push duplicates when SQLite rows are already queued
-// in memory.
-func TestCache_ReloadOutboxFromDisk_DeduplicatesAgainstInMemory(t *testing.T) {
-	db := openTestDB(t)
-	c := NewCache(db)
-	id := uuid.New()
-	c.ApplySnapshot(&model.SiteSnapshot{
-		Machines: []model.MachineSnapshot{{ID: id, State: model.MachineStateDeploying}},
-	})
-	c.recordDeployComplete(id, uuid.New(), nil)
-
-	// Reload when the row is already in memory: should be a no-op.
-	c.ReloadOutboxFromDisk()
-	obs, _ := c.DrainOutbox()
-	if len(obs) != 1 {
-		t.Fatalf("expected single row post-reload, got %d", len(obs))
+	last := c.DrainOutbox()
+	if len(last) != 1 || last[0].RowID != sent[1].RowID {
+		t.Fatalf("after ack + reconnect: got %+v, want only row %d", last, sent[1].RowID)
+	}
+	if rows := mustListOutbox(t, db); len(rows) != 1 || rows[0].RowID != sent[1].RowID {
+		t.Fatalf("disk after ack: got %+v, want only row %d", rows, sent[1].RowID)
 	}
 }
 
@@ -822,11 +857,11 @@ func TestNewCache_WithLocalDB(t *testing.T) {
 	db.SaveMachineCache(map[uuid.UUID]*model.MachineSnapshot{
 		machineID: {ID: machineID, State: model.MachineStateRunning},
 	})
-	if _, err := db.AppendOutbox(model.Observation{
+	if _, err := db.AppendOutbox(PendingOutbox{Obs: model.Observation{
 		MachineID: machineID,
 		Event:     "phone_home",
 		Timestamp: time.Now(),
-	}); err != nil {
+	}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -836,7 +871,7 @@ func TestNewCache_WithLocalDB(t *testing.T) {
 		t.Fatalf("expected 1 cached machine, got %d", c.MachineCount())
 	}
 
-	pending, _ := c.DrainOutbox()
+	pending, _ := takeOutbox(c)
 	if len(pending) != 1 || pending[0].Obs.Event != "phone_home" {
 		t.Fatalf("expected persisted outbox entry, got %v", pending)
 	}

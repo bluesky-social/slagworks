@@ -14,7 +14,9 @@ package worker
 //     the world that happen WHILE the executor is inside a claim RPC or a
 //     BMC call (stream deliveries, aborts, sweeps, VIP loss, a crash);
 //   - a transport model that mirrors what WSConn does with the Cache's
-//     public outbox API (drain, requeue, ack, reload on reconnect).
+//     public outbox API (drain, requeue, requeue-rejected, ack, requeue
+//     in-flight on reconnect): every outbox entry, op update or
+//     observation, stays queued until the hub acknowledges it.
 //
 // Everything is single-threaded and deterministic given the rapid draw
 // stream, except for the map-iteration order of Cache.PendingPowerOps /
@@ -48,7 +50,6 @@ import (
 // otherwise reject and the executor does not currently guarantee. These are
 // counted, not failed; every other class fails the case.
 var epTolerated = map[string]string{
-	"report-lost":                    "a terminal or phase op_update is in memory and unacknowledged: it is lost on a restart or a dropped write, and the op stays claimed until a sweep fails it",
 	"orphan-sweep-phase-undelivered": "the worker recorded its first phase before actuating, but the op_update had not reached global when the orphaned-claim grace ran out (the worker was disconnected for the whole grace, or its sender had not run): the sweep fails an op that is still being actuated",
 	"double-drive-two-executors":     "two Executor instances of one worker (VIP lost and regained while the first is still inside a claim or a BMC call) both win the same op: the local claimed mark is erased by a hello op_resync or by the other executor's rollback, and the hub re-grants the claim to the same worker ID",
 }
@@ -212,7 +213,6 @@ type epOpFacts struct {
 	// phoneHomeAckedUnrecorded: one answered with success and queued nothing,
 	// with no earlier recorded phone-home to justify that.
 	phoneHomeRecorded, phoneHomeAckedUnrecorded bool
-	reportLossy                                 bool         // a report for this op was dropped by an injected lossy fault
 	hubFailedBy                                 string       // abort | orphan | stuck | phonehome | pending | worker | observation
 	running                                     map[int]bool // worker idx -> currently inside a won attempt
 }
@@ -622,14 +622,17 @@ func (h *epHub) complete(rec *epHubOp, target model.MachineState) {
 }
 
 // applyOpUpdate is the op_update handler: phase first, then status.
-func (h *epHub) applyOpUpdate(u model.OperationUpdate) {
+// Returns (err, terminal) like applyObservation: an update for an op the
+// hub does not know is dropped terminally; a resend of one already applied
+// changes nothing and is acknowledged.
+func (h *epHub) applyOpUpdate(u model.OperationUpdate) (error, bool) {
 	id, err := uuid.Parse(u.OperationID)
 	if err != nil {
-		return
+		return err, true
 	}
 	rec := h.ops[id]
 	if rec == nil {
-		return
+		return errors.New("operation not found"), true
 	}
 	facts := h.w.byOp[id]
 	if u.Phase != "" && rec.op.Phase != u.Phase && !epTerminal(rec.op.Status) {
@@ -646,13 +649,13 @@ func (h *epHub) applyOpUpdate(u model.OperationUpdate) {
 	switch u.Status {
 	case string(model.OpCompleted):
 		if epTerminal(rec.op.Status) {
-			return
+			return nil, false
 		}
 		var target model.MachineState
 		switch rec.op.Type {
 		case model.OpDeploy:
 			target = model.MachineStateRunning
-			if !facts.everAwait && !facts.reportLossy {
+			if !facts.everAwait {
 				h.w.violate("deploy-completed-early", "deploy op %s completed by op_update at phase %q (status %s) without ever reaching awaiting_phone_home",
 					h.w.opName(id), rec.op.Phase, rec.op.Status)
 			}
@@ -665,6 +668,7 @@ func (h *epHub) applyOpUpdate(u model.OperationUpdate) {
 	case string(model.OpFailed):
 		h.fail(rec, "worker")
 	}
+	return nil, false
 }
 
 // applyObservation is the observation handler. Returns (err, terminal).
@@ -838,9 +842,16 @@ type epWorker struct {
 	// current processOps pass started (when it built its pending lists).
 	viewAtPass map[uuid.UUID]bool
 
-	// transport-side report log, for the report oracles
+	// transport-side report log of this process, for the report oracles:
+	// the entries the hub acknowledged (or dropped terminally) and that
+	// therefore left the outbox. Together with what the outbox still
+	// holds, it is everything this process recorded.
 	updSent map[uuid.UUID][]model.OperationUpdate
 	obsSent map[uuid.UUID]int
+	// lastDelivered is, per op, the outbox row of the newest entry of its
+	// ordered chain this worker delivered to the hub. It outlives restarts:
+	// row IDs come from the worker's SQLite file.
+	lastDelivered map[string]uint64
 }
 
 func (pw *epWorker) openCache() {
@@ -908,21 +919,35 @@ func (pw *epWorker) untrusted() bool {
 	return pw.cache.opState.untrusted
 }
 
-// queuedUpdates / queuedObs peek the outbox without draining it.
+// queuedUpdates / queuedObs peek the outbox (every entry the hub has not
+// acknowledged, in flight or not) without draining it.
 func (pw *epWorker) queuedUpdates() []model.OperationUpdate {
 	pw.cache.outbox.mu.Lock()
 	defer pw.cache.outbox.mu.Unlock()
-	return append([]model.OperationUpdate(nil), pw.cache.outbox.opUpdates...)
+	var out []model.OperationUpdate
+	for _, e := range pw.cache.outbox.entries {
+		if e.Update != nil {
+			out = append(out, *e.Update)
+		}
+	}
+	return out
 }
 
 func (pw *epWorker) queuedObs() []PendingOutbox {
 	pw.cache.outbox.mu.Lock()
 	defer pw.cache.outbox.mu.Unlock()
-	return append([]PendingOutbox(nil), pw.cache.outbox.pending...)
+	var out []PendingOutbox
+	for _, e := range pw.cache.outbox.entries {
+		if e.Update == nil {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // updates returns every op_update this worker process has produced for id,
-// sent or still queued, in order.
+// acknowledged or still queued, in order. An op's updates are acknowledged
+// one at a time in record order, so the acknowledged ones come first.
 func (pw *epWorker) updates(id uuid.UUID) []model.OperationUpdate {
 	out := append([]model.OperationUpdate(nil), pw.updSent[id]...)
 	for _, u := range pw.queuedUpdates() {
@@ -944,8 +969,8 @@ func (pw *epWorker) obsCount(id uuid.UUID) int {
 }
 
 // connect is the WS (re)connect: hello, snapshot-or-no_change applied
-// before the connection counts as up, outbox reload, then the op_resync
-// queued on the stream.
+// before the connection counts as up, everything in flight requeued, then
+// the op_resync queued on the stream.
 func (pw *epWorker) connect() {
 	if pw.connUp {
 		return
@@ -962,7 +987,9 @@ func (pw *epWorker) connect() {
 	pw.connGen++
 	pw.inbox = nil
 	pw.viewEpoch++ // the hello snapshot may have changed the view
-	pw.cache.ReloadOutboxFromDisk()
+	if err := pw.cache.ReloadOutboxFromDisk(); err != nil {
+		pw.w.t.Fatalf("reload outbox: %v", err)
+	}
 	pw.inbox = append(pw.inbox, h.resyncFor())
 	pw.w.logf("w%d: connected (resync queued)", pw.idx)
 	pw.w.stat("conn.connect")
@@ -1023,91 +1050,141 @@ func (pw *epWorker) deliverAll() {
 	}
 }
 
-// drain mirrors WSConn.drainOnce over the Cache's public outbox API.
+// drain mirrors WSConn.drainOnce over the Cache's public outbox API, with
+// the hub acknowledging each entry once its handler has run.
 //
 // fault:
 //
 //	""           everything is delivered and acked
 //	"lostwrite"  the batch is written into a dying connection: nothing
-//	             reaches the hub, nothing is acked, the connection drops
-//	             (observations stay on disk; op_updates are simply gone)
-//	"hubdown"    the hub's handlers error: op_updates are logged and
-//	             dropped (fire-and-forget), observations are rejected
-//	             non-terminally
+//	             reaches the hub, nothing is acked, the connection drops;
+//	             the entries stay in flight until the reconnect requeues
+//	             them
+//	"hubdown"    the hub's handlers error: every entry is rejected
+//	             non-terminally and retried after its backoff
 //	"obsreject"  observations are rejected non-terminally; op_updates land
-//	"acklost"    the hub processes the first observation, its ack never
-//	             arrives and the connection drops
+//	"acklost"    the hub commits the first entry, its ack never arrives
+//	             and the connection drops; the reconnect resends it
 func (pw *epWorker) drain(fault string) {
 	w := pw.w
-	obs, updates := pw.cache.DrainOutbox()
+	entries := pw.cache.DrainOutbox()
 	if !pw.connUp {
-		pw.cache.RequeueOutbox(obs, updates)
+		pw.cache.RequeueOutbox(entries)
 		return
 	}
-	if fault != "" && (len(obs) > 0 || len(updates) > 0) {
+	if fault != "" && len(entries) > 0 {
 		w.stat("drain.fault." + fault)
 	}
-	for i, p := range obs {
-		pw.obsSent[p.Obs.OperationID]++
-		switch fault {
-		case "lostwrite":
-			w.stat("drain.obs_lost_in_flight")
-			w.logf("w%d -> observation %s op=%s LOST IN FLIGHT", pw.idx, p.Obs.Event, w.opName(p.Obs.OperationID))
+	pw.checkOneInFlightPerChain()
+	for i, p := range entries {
+		switch {
+		case fault == "lostwrite":
+			w.stat("drain.lost_in_flight")
+			w.logf("w%d -> %s LOST IN FLIGHT", pw.idx, pw.describe(p))
 			continue
-		case "obsreject", "hubdown":
-			w.stat("drain.obs_rejected")
-			w.logf("w%d -> observation %s op=%s rejected (transient)", pw.idx, p.Obs.Event, w.opName(p.Obs.OperationID))
+		case fault == "hubdown" || (fault == "obsreject" && p.Update == nil):
+			w.stat("drain.rejected")
+			w.logf("w%d -> %s rejected (transient)", pw.idx, pw.describe(p))
 			pw.cache.RequeueRejected(p)
 			continue
-		case "acklost":
-			w.stat("drain.obs_acklost")
-			w.logf("w%d -> observation %s op=%s processed, ack lost", pw.idx, p.Obs.Event, w.opName(p.Obs.OperationID))
-			_, _ = w.hub.applyObservation(p.Obs)
-			pw.cache.RequeueOutbox(obs[i+1:], updates)
+		case fault == "acklost":
+			w.stat("drain.acklost")
+			w.logf("w%d -> %s committed, ack lost", pw.idx, pw.describe(p))
+			_, _ = pw.deliverEntry(p)
+			pw.cache.RequeueOutbox(entries[i+1:])
 			pw.disconnect()
 			return
 		}
-		w.logf("w%d -> observation %s op=%s", pw.idx, p.Obs.Event, w.opName(p.Obs.OperationID))
-		w.stat("drain.obs")
-		if err, terminal := w.hub.applyObservation(p.Obs); err != nil && !terminal {
+		w.logf("w%d -> %s", pw.idx, pw.describe(p))
+		if err, terminal := pw.deliverEntry(p); err != nil && !terminal {
+			w.stat("drain.rejected_by_hub")
 			pw.cache.RequeueRejected(p)
-		} else {
-			pw.cache.AckObservation(p.RowID)
-		}
-	}
-	for _, u := range updates {
-		id, _ := uuid.Parse(u.OperationID)
-		pw.updSent[id] = append(pw.updSent[id], u)
-		if fault == "lostwrite" || fault == "hubdown" {
-			w.stat("drain.update_dropped")
-			w.logf("w%d -> op_update %s status=%q phase=%q DROPPED (%s)", pw.idx, w.opName(id), u.Status, u.Phase, fault)
-			if f := w.byOp[id]; f != nil {
-				f.reportLossy = true
-			}
 			continue
 		}
-		w.logf("w%d -> op_update %s status=%q phase=%q", pw.idx, w.opName(id), u.Status, u.Phase)
-		w.stat("drain.update")
-		w.hub.applyOpUpdate(u)
+		pw.cache.AckOutbox(p)
+		if u := p.Update; u != nil {
+			id, _ := uuid.Parse(u.OperationID)
+			pw.updSent[id] = append(pw.updSent[id], *u)
+		} else {
+			pw.obsSent[p.Obs.OperationID]++
+		}
 	}
 	if fault == "lostwrite" {
 		pw.disconnect()
 	}
 }
 
+func (pw *epWorker) describe(p PendingOutbox) string {
+	if u := p.Update; u != nil {
+		id, _ := uuid.Parse(u.OperationID)
+		return fmt.Sprintf("op_update %s status=%q phase=%q", pw.w.opName(id), u.Status, u.Phase)
+	}
+	return fmt.Sprintf("observation %s op=%s", p.Obs.Event, pw.w.opName(p.Obs.OperationID))
+}
+
+// epChainOp is the oracle's statement of an op's ordered outbox chain:
+// every op update, and the observations that complete or fail the op they
+// name.
+func epChainOp(p PendingOutbox) (string, bool) {
+	if p.Update != nil {
+		return p.Update.OperationID, true
+	}
+	switch p.Obs.Event {
+	case "phone_home", "commission_report", "bmc_reconcile_report":
+		return p.Obs.OperationID.String(), p.Obs.OperationID != uuid.Nil
+	}
+	return "", false
+}
+
+// deliverEntry hands one outbox entry to the hub, checking first that an
+// op's chain reaches the hub in record order: an entry may repeat the
+// newest one this worker delivered for its op (a resend after a lost ack)
+// but never come after a newer one.
+func (pw *epWorker) deliverEntry(p PendingOutbox) (error, bool) {
+	w := pw.w
+	if op, ok := epChainOp(p); ok {
+		if last := pw.lastDelivered[op]; p.RowID < last {
+			w.violate("outbox-order", "w%d delivered %s (row %d) after row %d of the same op", pw.idx, pw.describe(p), p.RowID, last)
+		} else if p.RowID == last {
+			w.stat("drain.resend_of_last_delivered")
+		}
+		pw.lastDelivered[op] = max(pw.lastDelivered[op], p.RowID)
+	}
+	if p.Update != nil {
+		w.stat("drain.update")
+		return w.hub.applyOpUpdate(*p.Update)
+	}
+	w.stat("drain.obs")
+	return w.hub.applyObservation(p.Obs)
+}
+
+// checkOneInFlightPerChain: the outbox never has two entries of one op's
+// ordered chain in flight at once.
+func (pw *epWorker) checkOneInFlightPerChain() {
+	pw.cache.outbox.mu.Lock()
+	defer pw.cache.outbox.mu.Unlock()
+	seen := map[string]bool{}
+	for _, e := range pw.cache.outbox.entries {
+		op, ok := epChainOp(e)
+		if !ok || !e.inFlight {
+			continue
+		}
+		if seen[op] {
+			pw.w.violate("outbox-order", "w%d has two entries of op %s's ordered chain in flight", pw.idx, op[:8])
+		}
+		seen[op] = true
+	}
+}
+
 // restart replaces the worker process: in-memory state is gone, LocalDB
-// survives. The op layer rehydrates untrusted; the connection is down.
+// survives, the outbox with it. The op layer rehydrates untrusted; the
+// connection is down.
 func (pw *epWorker) restart(why string) {
 	w := pw.w
 	w.logf("w%d: RESTART (%s)", pw.idx, why)
 	w.stat("worker.restart." + why)
-	for _, u := range pw.queuedUpdates() {
-		if id, err := uuid.Parse(u.OperationID); err == nil {
-			if f := w.byOp[id]; f != nil {
-				f.reportLossy = true
-				w.stat("worker.restart.updates_lost")
-			}
-		}
+	if n := pw.cache.OutboxDepth(); n > 0 {
+		w.stat("worker.restart.with_unacked_outbox")
 	}
 	if pw.cancel != nil {
 		pw.cancel()

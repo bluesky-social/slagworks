@@ -217,20 +217,19 @@ func (h *Handler) HandleObservation(ctx context.Context, obs model.Observation) 
 
 // handlePhoneHome completes the deploy op a phone_home observation names
 // and moves its machine to running. The installed OS phones home exactly
-// once after the site worker answers 2xx, and the worker's other signal,
-// an op_update{status=completed}, is memory-only on the worker and
-// unacknowledged on the wire, so this observation (persisted in the
-// worker's outbox until acked) is the record that survives a worker
-// restart, a dropped connection or a failed op_update handler. Without it
-// a healthy host would be failed at PhoneHomeTimeout.
+// once after the site worker answers 2xx, so this observation (persisted
+// in the worker's outbox until acked) is the record of the completion.
+// Without it a healthy host would be failed at PhoneHomeTimeout.
 //
-// Whichever of the two reaches global first completes the op; the other
-// is a no-op (ValidateOperationBinding reports alreadyCompleted, or
-// CompleteOperationWithState finds the op terminal). A phone_home with no
-// OperationID is a late phone-home (the worker held no active deploy op
-// for the machine) and is acked without a state change. A phone_home for
-// an op that is failed, foreign, or not a deploy is dropped terminally:
-// it must never revive a failed op.
+// The worker also queues an op_update{status=completed} right behind it,
+// and delivers an op's entries in the order it recorded them, so that
+// update normally finds the op completed. Whichever reaches global first
+// completes the op; the other is a no-op (ValidateOperationBinding reports
+// alreadyCompleted, or CompleteOperationWithState finds the op terminal).
+// A phone_home with no OperationID is a late phone-home (the worker held
+// no active deploy op for the machine) and is acked without a state
+// change. A phone_home for an op that is failed, foreign, or not a deploy
+// is dropped terminally: it must never revive a failed op.
 //
 // A completion publishes op_removed carrying running and invalidates the
 // sending worker's site snapshot so its baseline catches up, as the

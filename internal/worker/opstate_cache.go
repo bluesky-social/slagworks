@@ -179,9 +179,9 @@ func keepTerminalWait(existing, incoming *model.Operation) {
 // without a Version bump, and global applies the worker's failure op_updates
 // one write at a time: each phase write publishes an op_delta whose row is
 // still claimed, before the failure itself publishes op_removed. Those
-// echoes, and a resync built before global processed the failure (or after
-// the best-effort op_update was lost), carry a higher Version yet an active
-// status. Accepting one revives the op: the boot decision actuates the host
+// echoes, and a resync built before global processed the failure, carry a
+// higher Version yet an active status. Accepting one revives the op: the
+// boot decision actuates the host
 // again while updatePhase, which failedOps still blocks, drops every phase
 // the new agent run reports, so a deploy can never latch awaiting_phone_home
 // and re-images the host on every boot. Only op_removed, which clears

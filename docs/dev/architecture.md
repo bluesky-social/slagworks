@@ -465,6 +465,11 @@ Site to global:
   inventory reports, deploy-complete envelopes.
 - `op_update` (`OpUpdateMsg`, 52) — phase/status transitions
   observed by the worker.
+
+Both come out of the worker's durable outbox carrying a `request_id`,
+and global answers each with an `rpc_response` once its handler has
+committed (see [Cache](#cache--internalworkercachego), "Outbox
+handling").
 - `log_batch` (`LogBatchMsg`, 65) — batched slog envelopes from both
   the site worker and the on-target agent.
 - `cast_batch` / `cast_resume_request` (`CastBatchMsg`, 88;
@@ -527,12 +532,20 @@ cast pipeline, and the `SourceSOL` constant no longer exists.
 The concrete handler implementations wired in `buildGlobal` live in
 `internal/hubhandlers`:
 
-- `OpUpdate` (`hubhandlers.go:76`) — writes `SetOperationPhase`,
-  `CompleteOperationWithState`, or `FailOperation` to Postgres, and
-  fires the snapshot invalidator on any real transition
-  (`SetInvalidator`, line 102). Comment at line 80 explains why: before
-  this wiring, phase changes landed in Postgres but the worker
-  cache stayed frozen.
+- `OpUpdate` (`hubhandlers.go`) — writes `SetOperationPhase`,
+  `CompleteOperationWithState`, or `FailOperationOutcome` to Postgres,
+  publishes `op_delta` for a real phase change and `op_removed` for a
+  terminal one, and fires the snapshot invalidator when a terminal
+  transition wrote durable machine state (`SetInvalidator`). Its error
+  is the worker's acknowledgement: `handleOpUpdate` answers the
+  `op_update`'s `request_id` only after the handler returned. An update
+  no retry can apply (unknown op, malformed op ID, unsupported status,
+  neither phase nor status, a NUL in the phase, which Postgres text
+  cannot hold) wraps `ws.ErrTerminal` and the worker drops
+  it; a store error is transient and the worker resends the whole
+  update. A resend of an update already applied changes nothing: a
+  repeated phase is no transition (no `phase_entered_at` bump, envelope
+  or `op_delta`) and a terminal op takes no further writes.
 - `LogBatch` (`hubhandlers.go:210`) — inserts into `log_envelopes`
   via `logstore.Store.InsertBatch`, re-emits each envelope as JSONL
   on stdout (for the fleet log-shipper), and pushes into the
@@ -631,21 +644,48 @@ the agent POSTs `/api/v1/inventory`):
   `awaiting_phone_home` clobber guard (documented in the
   state-machine doc).
 
-Outbox handling: every observation the cache accepts is appended to
-a durable outbox row on the local SQLite (via `LocalDB.AppendOutbox`)
-and deleted only when global acks it; op updates are queued in
-memory only and are never acknowledged, so anything that must not be
-lost (commission reports, the phone-home that completes a deploy)
-rides an observation. Both are queued for the WebSocket drain
-(`cache.go:334 appendObservation`, `685 DrainOutbox`, `805 RequeueOutbox`,
-`824 AckObservation`, `843 ReloadOutboxFromDisk`). Retry backoff is in
-`armRetryTimerLocked` (724) and `RequeueRejected` (772). This is why
-a site worker restart does not lose commission reports. The one entry
-the drain never sends is one whose encoded `observation` message exceeds
-`ws.MaxMessageBytes` (16 MiB, the hub's read limit) or cannot be encoded:
-`WSConn.drainOnce` logs it at error level and deletes its row, because
-the hub would close the connection on it and the reconnect would put it
-first in line again.
+Outbox handling (`internal/worker/outbox.go`): every observation and
+every op update (phase or terminal status) the cache records is
+appended to a durable outbox row on the local SQLite (via
+`LocalDB.AppendOutbox`, its `kind` column saying which) before the
+recording call returns, and stays in memory and on disk until global
+acknowledges it. `WSConn.drainOnce` sends each entry the drain hands
+out (`Cache.DrainOutbox`) with a fresh `request_id` and marks it in
+flight; the `rpc_response` global sends once the handler committed
+removes it (`Cache.AckOutbox`), as does a terminal rejection; a
+transient rejection, or a response the worker cannot decode, requeues
+it with per-row backoff (`RequeueRejected`, retry timer in
+`armRetryTimerLocked`); a failed send requeues the unsent rest
+(`RequeueOutbox`); and every reconnect makes whatever was in flight
+due again (`ReloadOutboxFromDisk`), since global may or may not have
+committed it. A restart rehydrates every unacknowledged row; if that
+read fails, each reconnect reads the table again
+(`ReloadOutboxFromDisk`) and the connection attempt fails until it
+succeeds, so rows on disk are never treated as absent. Delivery is
+therefore at least once, and global's handlers are idempotent.
+
+The entries that settle an operation form that op's ordered chain:
+every op update, plus the observations whose handler completes or fails
+the op they name (`phone_home`, `commission_report`,
+`bmc_reconcile_report`). The drain hands out a chain entry only when no
+earlier entry of the same chain is still unacknowledged, so global
+commits an op's chain in the order the worker recorded it, whatever
+order its handlers run in (observations are handled concurrently), and
+a resend after a lost acknowledgement repeats only the newest entry
+global has seen for that op, never an older phase after a newer one.
+Other entries (no op, `deploy_complete`, `dhcp_lease`,
+`inventory_import`) go out as soon as they are due: a NetBox outage that
+keeps rejecting a `deploy_complete` does not hold back the `phone_home`
+that completes the deploy. Order across site workers is not covered: the
+VIP holder records an op's entries, and a resend from a worker that lost
+the VIP can still land after the new holder's newer phase.
+
+The one entry the drain never sends is one whose encoded message
+exceeds `ws.MaxMessageBytes` (16 MiB, the hub's read limit) or cannot be
+encoded: `WSConn.drainOnce` logs it at error level (identifying fields
+only, never the payload) and deletes its row, because the hub would
+close the connection on it and the reconnect would put it first in line
+again.
 
 ### Executor — `internal/worker/executor.go`
 
@@ -711,7 +751,8 @@ GORM over SQLite at `/var/lib/slagworks/worker.db` (unless
 - `kv` — worker identity (persistent UUID), sync cursor
   (last-applied `SeqNum`), and a per-boot instance id used to
   invalidate stale claims.
-- `outbox` — pending observations and op updates.
+- `outbox` — observations and op updates global has not acknowledged
+  (`kind` says which), in record order (AUTOINCREMENT row IDs).
 - `cached_machines` — a compact snapshot fallback used on restart
   before the first snapshot lands.
 - `dhcp_leases` — persisted DHCP leases so the pool survives

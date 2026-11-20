@@ -79,7 +79,7 @@ func TestPhoneHome_CompletesOnlyTheBoundDeployAwaitingIt(t *testing.T) {
 				rec := httptest.NewRecorder()
 				mux.ServeHTTP(rec, req.build(machineID, opID))
 
-				obs, updates := c.DrainOutbox()
+				obs, updates := takeOutbox(c)
 				var completed, phoneHomeObs bool
 				for _, u := range updates {
 					if u.OperationID == opID.String() && u.Status == string(model.OpCompleted) {

@@ -19,7 +19,7 @@ import (
 
 func drainDHCPLeaseObs(t *testing.T, c *Cache) []dhcpLeaseObservation {
 	t.Helper()
-	pending, _ := c.DrainOutbox()
+	pending, _ := takeOutbox(c)
 	out := make([]dhcpLeaseObservation, 0, len(pending))
 	for _, p := range pending {
 		if p.Obs.Event != "dhcp_lease" {
@@ -202,7 +202,7 @@ func TestDHCPLeaseForwarder_ClassifyAndResolveMachine(t *testing.T) {
 		IP: net.ParseIP("10.99.1.150"), Expiry: time.Now(), Pool: "p",
 	})
 
-	pending, _ := cache.DrainOutbox()
+	pending, _ := takeOutbox(cache)
 	if len(pending) != 2 {
 		t.Fatalf("got %d observations, want 2", len(pending))
 	}

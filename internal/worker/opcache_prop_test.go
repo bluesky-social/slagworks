@@ -15,6 +15,10 @@ package worker
 //     plus the re-send of active ops that follows every pushed snapshot).
 //   - A delivery channel carries those messages to the Cache under test and can
 //     delay, reorder (within a window), duplicate, and drop-then-resync them.
+//     The other direction carries the outbox (observations and op updates):
+//     global handles the entries on the wire in any order and acknowledges
+//     each; a dropped connection may have committed an entry and lost its
+//     acknowledgement, and the reconnect resends it.
 //   - Local events hit the Cache through its public surface: the executor's
 //     claim step (MarkOpClaimed, the rollback, the lifecycle phases), DHCP ACK
 //     phases, the boot-script fetch, agent progress reports (phase,
@@ -36,6 +40,10 @@ package worker
 //  3. Convergence. Once the channel quiesces (and again after a final
 //     identity snapshot + op_resync) the Cache's op set and effective machine
 //     states equal the truth.
+//  4. Outbox order. An op's ordered chain (its updates, and the observations
+//     that complete or fail it) has at most one entry in flight and reaches
+//     global in record order; a resend repeats at most the newest entry
+//     global already processed.
 //
 // Every violation carries an id. The few behaviors the Cache is known not to
 // guarantee are listed in pcTolerated: those are counted, not failed, and
@@ -79,8 +87,9 @@ var pcTolerated = map[string]string{
 	"rewipe-latch-lost-on-resync-omission": "an op_resync that omits a latched deploy op (the hub scopes it by its " +
 		"cached snapshot, and the machine was briefly absent from it) drops the latch and the phone-home pin; when " +
 		"the op comes back with global's pre-latch phase BootDeploy re-arms",
-	"failed-op-forgotten-on-restart": "the agent's failure report is kept in memory only (the failed mark and the " +
-		"failed op_update); a worker restart before global hears of it rehydrates the op as active and it actuates again",
+	"failed-op-forgotten-on-restart": "the agent's failure report is kept in memory only (the failed mark; the " +
+		"failed op_update is durable, but global applies it only after the reconnect's op_resync); a worker restart " +
+		"before global hears of it rehydrates the op as active and it actuates again until global's op_removed arrives",
 	"running-overlay-after-pending-op-failed": "a phone-home sets a running overlay that clears when the identity " +
 		"baseline becomes running; when global fails the deploy op while it is still pending, op_removed carries no " +
 		"machine state and the overlay stays until the next op_resync",
@@ -324,8 +333,14 @@ type pcWorld struct {
 
 	connected bool
 	g2w       []pcMsg
-	w2gUpd    []model.OperationUpdate
-	w2gObs    []PendingOutbox
+	// w2g holds the outbox entries (observations and op updates) sent on
+	// the current connection that global has not processed yet. Global
+	// handles them in any order (observations concurrently); the outbox
+	// keeps at most one entry of an op's ordered chain on the wire.
+	w2g []PendingOutbox
+	// lastApplied is, per op, the record position (pcRecordPos) of the
+	// newest entry of its ordered chain global has processed.
+	lastApplied map[string]uint64
 
 	dbPath string
 	db     *LocalDB
@@ -694,6 +709,54 @@ func (w *pcWorld) gHandleUpdate(u model.OperationUpdate) {
 	}
 }
 
+// pcChainOp is the oracle's statement of which outbox entries belong to an
+// op's ordered chain (docs/dev/architecture.md "Outbox handling"): every op
+// update, and the observations that complete or fail the op they name.
+func pcChainOp(p PendingOutbox) (string, bool) {
+	if p.Update != nil {
+		return p.Update.OperationID, true
+	}
+	switch p.Obs.Event {
+	case "phone_home", "commission_report", "bmc_reconcile_report":
+		return p.Obs.OperationID.String(), p.Obs.OperationID != uuid.Nil
+	}
+	return "", false
+}
+
+// pcRecordPos orders an entry among the ones its worker recorded: the
+// SQLite row ID, which AUTOINCREMENT keeps increasing across restarts, or,
+// without LocalDB (no restarts), the in-memory sequence number.
+func pcRecordPos(p PendingOutbox) uint64 {
+	if p.RowID != 0 {
+		return p.RowID
+	}
+	return p.seq
+}
+
+// gHandleEntry is global's handling of one outbox entry, and the order
+// oracle: an op's chain must reach global in record order, a resend
+// repeating at most the newest entry global already processed.
+func (w *pcWorld) gHandleEntry(p PendingOutbox) {
+	if op, ok := pcChainOp(p); ok {
+		pos := pcRecordPos(p)
+		if last := w.lastApplied[op]; pos < last {
+			w.violate("outbox-order", "global processed %s entry at record position %d after one at %d: an older update overtook a newer one",
+				op[:8], pos, last)
+		} else if pos == last {
+			pcStat.add("chan/replayed_entry")
+		}
+		w.lastApplied[op] = max(w.lastApplied[op], pos)
+	}
+	if p.Update != nil {
+		u := *p.Update
+		w.logf("G recv op_update %s status=%q phase=%q", u.OperationID[:8], u.Status, u.Phase)
+		w.gHandleUpdate(u)
+		return
+	}
+	w.logf("G recv observation %s op=%s", p.Obs.Event, pcShort(p.Obs.OperationID))
+	w.gHandleObs(p)
+}
+
 func (w *pcWorld) gHandleObs(p PendingOutbox) {
 	switch p.Obs.Event {
 	case "commission_report":
@@ -715,28 +778,31 @@ func (w *pcWorld) gHandleObs(p PendingOutbox) {
 			w.gComplete(o, model.MachineStateRunning)
 		}
 	}
-	w.c.AckObservation(p.RowID)
 }
 
 // --- connection lifecycle ---
 
+// disconnect drops the connection. Each entry still on the wire toward
+// global was either never read, or read and committed with its
+// acknowledgement lost; either way it stays in flight in the outbox and
+// the next connect resends it.
 func (w *pcWorld) disconnect(why string) {
 	if !w.connected {
 		return
 	}
-	if len(w.g2w) > 0 || len(w.w2gUpd) > 0 {
+	if len(w.g2w) > 0 {
 		w.clean, w.lossless = false, false
 	}
 	pcStat.add("chan/disconnect")
-	w.noteLostUpdates(w.w2gUpd)
-	if !w.cfg.useDB && len(w.w2gObs) > 0 {
-		// Observations are durable: a real worker reloads the unacked ones
-		// from its SQLite outbox on reconnect. The in-memory Cache has no
-		// disk to reload from, so hand them back here.
-		w.c.RequeueOutbox(w.w2gObs, nil)
+	for _, p := range w.w2g {
+		if rapid.Bool().Draw(w.t, "committedAckLost") {
+			pcStat.add("chan/committed_ack_lost")
+			w.logf("X entry committed by global, ack lost:")
+			w.gHandleEntry(p)
+		}
 	}
 	w.connected = false
-	w.g2w, w.w2gUpd, w.w2gObs = nil, nil, nil
+	w.g2w, w.w2g = nil, nil
 	w.logf("X disconnect (%s)", why)
 }
 
@@ -759,38 +825,20 @@ func (w *pcWorld) connect() {
 		w.g2w = append(w.g2w, pcMsg{kind: pcSnap, snap: w.hubSnap, at: w.hubSnapAt, hello: true})
 	}
 	w.g2w = append(w.g2w, w.buildResync())
-	w.c.ReloadOutboxFromDisk()
+	if err := w.c.ReloadOutboxFromDisk(); err != nil {
+		w.t.Fatalf("reload outbox: %v", err)
+	}
 	pcStat.add("chan/connect")
 	w.logf("X connect hello_seq=%d hub_seq=%d", hello, w.hubSnap.SeqNum)
 }
 
-// noteLostUpdates records op updates that will never reach global: the outbox
-// keeps them in memory only, so a send into a dying connection or a worker
-// restart loses them. (A deploy's completion also travels as the durable
-// phone_home observation, so losing its op_update loses nothing.)
-func (w *pcWorld) noteLostUpdates(upd []model.OperationUpdate) {
-	for _, u := range upd {
-		pcStat.add("chan/lost_op_update")
-		id, err := uuid.Parse(u.OperationID)
-		if err != nil {
-			continue
-		}
-		o := w.opByID(id)
-		if o == nil {
-			continue
-		}
-		w.logf("X op_update lost: %s status=%q phase=%q", pcShort(id), u.Status, u.Phase)
-		if u.Status == string(model.OpCompleted) && o.active() {
-			pcStat.add("chan/lost_completion")
-		}
-	}
-}
-
+// restart replaces the worker process. The outbox is in LocalDB: every
+// entry global has not acknowledged comes back with the new process.
 func (w *pcWorld) restart() {
 	w.disconnect("restart")
-	// Whatever is still queued in the outbox dies with the process.
-	_, queued := w.c.DrainOutbox()
-	w.noteLostUpdates(queued)
+	if n := w.c.OutboxDepth(); n > 0 {
+		pcStat.add("worker/restart_with_unacked_outbox")
+	}
 	pcCloseDB(w.db)
 	db, err := OpenLocalDB(w.dbPath)
 	if err != nil {
@@ -1041,29 +1089,28 @@ func (w *pcWorld) deliverable() []int {
 
 // drainOutbox moves the Cache's outbox onto the wire toward global.
 func (w *pcWorld) drainOutbox() {
-	obs, upd := w.c.DrainOutbox()
-	w.w2gObs = append(w.w2gObs, obs...)
-	w.w2gUpd = append(w.w2gUpd, upd...)
-	if len(obs)+len(upd) > 0 {
-		w.logf("W drain outbox: %d obs, %d op updates", len(obs), len(upd))
+	entries := w.c.DrainOutbox()
+	onWire := map[string]bool{}
+	for _, p := range append(append([]PendingOutbox(nil), w.w2g...), entries...) {
+		if op, ok := pcChainOp(p); ok {
+			if onWire[op] {
+				w.violate("outbox-order", "two entries of %s's ordered chain are in flight at once", op[:8])
+			}
+			onWire[op] = true
+		}
+	}
+	w.w2g = append(w.w2g, entries...)
+	if len(entries) > 0 {
+		w.logf("W drain outbox: %d entries", len(entries))
 	}
 }
 
-func (w *pcWorld) processUpdates(n int) {
-	for n > 0 && len(w.w2gUpd) > 0 {
-		u := w.w2gUpd[0]
-		w.w2gUpd = w.w2gUpd[1:]
-		w.logf("G recv op_update %s status=%q phase=%q", u.OperationID[:8], u.Status, u.Phase)
-		w.gHandleUpdate(u)
-		n--
-	}
-}
-
-func (w *pcWorld) processObs(idx int) {
-	p := w.w2gObs[idx]
-	w.w2gObs = append(w.w2gObs[:idx:idx], w.w2gObs[idx+1:]...)
-	w.logf("G recv observation %s op=%s", p.Obs.Event, pcShort(p.Obs.OperationID))
-	w.gHandleObs(p)
+// processW2G lets global handle the entry at idx and acknowledge it.
+func (w *pcWorld) processW2G(idx int) {
+	p := w.w2g[idx]
+	w.w2g = append(w.w2g[:idx:idx], w.w2g[idx+1:]...)
+	w.gHandleEntry(p)
+	w.c.AckOutbox(p)
 }
 
 func (w *pcWorld) report(o *pcOp, mi int, r model.ProgressReport) error {
@@ -1600,10 +1647,9 @@ func (w *pcWorld) checkConverged(where string, afterResync bool) {
 func (w *pcWorld) settle(where string) {
 	for i := 0; i < 64; i++ {
 		w.drainOutbox()
-		moved := len(w.w2gUpd) > 0 || len(w.w2gObs) > 0 || len(w.g2w) > 0
-		w.processUpdates(len(w.w2gUpd))
-		for len(w.w2gObs) > 0 {
-			w.processObs(0)
+		moved := len(w.w2g) > 0 || len(w.g2w) > 0
+		for len(w.w2g) > 0 {
+			w.processW2G(0)
 		}
 		for len(w.g2w) > 0 {
 			w.deliver(0, false)
@@ -1791,11 +1837,8 @@ func (w *pcWorld) step() {
 		}
 		w.deliver(idx, dup)
 	})
-	add("ch.process_updates", 14, w.connected && len(w.w2gUpd) > 0, func() {
-		w.processUpdates(rapid.IntRange(1, 3).Draw(t, "n"))
-	})
-	add("ch.process_obs", 6, w.connected && len(w.w2gObs) > 0, func() {
-		w.processObs(rapid.IntRange(0, len(w.w2gObs)-1).Draw(t, "idx"))
+	add("ch.process_w2g", 20, w.connected && len(w.w2g) > 0, func() {
+		w.processW2G(rapid.IntRange(0, len(w.w2g)-1).Draw(t, "idx"))
 	})
 	add("ch.disconnect", 2, w.connected && w.cfg.tier > 0, func() { w.disconnect("drop") })
 	add("ch.connect", 6, !w.connected, func() { w.connect() })
@@ -2118,7 +2161,7 @@ func pcNewWorld(t *rapid.T, cfg pcConfig, dir string) *pcWorld {
 		phaseAfterInstall: map[uuid.UUID]string{}, restartAfterInstall: map[uuid.UUID]bool{},
 		execAfterInstall: map[uuid.UUID]bool{}, failBeforeInstall: map[uuid.UUID]bool{}, restartAfterFail: map[uuid.UUID]bool{},
 		pendingAtInstall: map[uuid.UUID]bool{}, pendingEchoAfterInstall: map[uuid.UUID]bool{}, omittedAfterInstall: map[uuid.UUID]bool{},
-		phoneHomed: map[uuid.UUID]bool{},
+		phoneHomed: map[uuid.UUID]bool{}, lastApplied: map[string]uint64{},
 	}
 	nm := rapid.IntRange(2, 3).Draw(t, "machines")
 	for i := 0; i < nm; i++ {

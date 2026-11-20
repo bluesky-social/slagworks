@@ -11,8 +11,10 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/bluesky-social/slagworks/internal/model"
+	"github.com/bluesky-social/slagworks/internal/opsmetrics"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/store"
 	"github.com/bluesky-social/slagworks/internal/ws"
@@ -54,6 +56,7 @@ type fakeStore struct {
 
 	opByID map[uuid.UUID]*model.Operation
 
+	getErr      error
 	phaseErr    error
 	completeErr error
 	failErr     error
@@ -88,17 +91,33 @@ func (s *fakeLogStore) InsertBatch(_ context.Context, envelopes []slogkit.Envelo
 	return nil
 }
 
-func (s *fakeStore) GetOperation(id uuid.UUID) (*model.Operation, error) {
+// putOp registers an active op of the given type and returns its ID.
+func (s *fakeStore) putOp(typ model.OperationType) uuid.UUID {
+	id := uuid.New()
+	s.opByID[id] = &model.Operation{ID: id, Type: typ, Status: model.OpClaimed}
+	return id
+}
+
+func (s *fakeStore) GetOperationIfExists(id uuid.UUID) (*model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
 	op := s.opByID[id]
 	if op == nil {
-		return nil, errors.New("not found")
+		return nil, nil
 	}
 	cp := *op
 	return &cp, nil
 }
 
+func fakeTerminal(op *model.Operation) bool {
+	return op != nil && (op.Status == model.OpCompleted || op.Status == model.OpFailed)
+}
+
+// SetOperationPhase mirrors store.SetOperationPhase: a repeated phase and
+// a terminal op change nothing.
 func (s *fakeStore) SetOperationPhase(opID uuid.UUID, phase string) (store.PhaseTransition, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -106,9 +125,9 @@ func (s *fakeStore) SetOperationPhase(opID uuid.UUID, phase string) (store.Phase
 		return store.PhaseTransition{}, s.phaseErr
 	}
 	prev := s.phases[opID]
-	s.phases[opID] = phase
 	t := store.PhaseTransition{NewPhase: phase}
-	if prev != phase {
+	if prev != phase && !fakeTerminal(s.opByID[opID]) {
+		s.phases[opID] = phase
 		t.Changed = true
 		t.PrevPhase = prev
 	}
@@ -140,10 +159,14 @@ func (s *fakeStore) CompleteOperationWithState(
 	if s.completeErr != nil {
 		return nil, s.completeErr
 	}
+	if fakeTerminal(s.opByID[opID]) {
+		return nil, nil
+	}
 	s.completed[opID] = append([]byte(nil), result...)
 	s.completedState[opID] = targetState
 	op := model.Operation{ID: opID}
 	if o := s.opByID[opID]; o != nil {
+		o.Status = model.OpCompleted
 		op = *o
 	}
 	op.Status = model.OpCompleted
@@ -156,9 +179,13 @@ func (s *fakeStore) FailOperationOutcome(opID uuid.UUID, result []byte) (*store.
 	if s.failErr != nil {
 		return nil, s.failErr
 	}
+	if fakeTerminal(s.opByID[opID]) {
+		return nil, nil
+	}
 	s.failed[opID] = append([]byte(nil), result...)
 	op := model.Operation{ID: opID}
 	if o := s.opByID[opID]; o != nil {
+		o.Status = model.OpFailed
 		op = *o
 	}
 	op.Status = model.OpFailed
@@ -173,7 +200,7 @@ func (s *fakeStore) FailOperationOutcome(opID uuid.UUID, result []byte) (*store.
 func TestOpUpdate_PhaseOnly(t *testing.T) {
 	st := newFake()
 	h := NewOpUpdate(st)
-	opID := uuid.New()
+	opID := st.putOp(model.OpDeploy)
 
 	err := h.HandleOpUpdate(context.Background(), ws.OpUpdateMsg{
 		OperationID: opID.String(),
@@ -322,7 +349,7 @@ func TestOpUpdate_CompletedStatus_PowerOpLeavesStateUntouched(t *testing.T) {
 func TestOpUpdate_FailedStatus(t *testing.T) {
 	st := newFake()
 	h := NewOpUpdate(st)
-	opID := uuid.New()
+	opID := st.putOp(model.OpDeploy)
 
 	err := h.HandleOpUpdate(context.Background(), ws.OpUpdateMsg{
 		OperationID: opID.String(),
@@ -340,76 +367,176 @@ func TestOpUpdate_FailedStatus(t *testing.T) {
 	}
 }
 
-func TestOpUpdate_UnknownStatusIgnored(t *testing.T) {
+// TestOpUpdate_NeverAcceptableIsTerminal: an update no retry can apply
+// returns an error wrapping ws.ErrTerminal, so the worker drops it instead
+// of resending it forever and holding the op's later updates behind it.
+// Nothing is written.
+func TestOpUpdate_NeverAcceptableIsTerminal(t *testing.T) {
 	st := newFake()
-	h := NewOpUpdate(st)
-	opID := uuid.New()
-
-	err := h.HandleOpUpdate(context.Background(), ws.OpUpdateMsg{
-		OperationID: opID.String(),
-		Status:      "weird",
-	})
-	if err != nil {
-		t.Fatal(err)
+	known := st.putOp(model.OpDeploy)
+	for _, tc := range []struct {
+		name string
+		msg  ws.OpUpdateMsg
+	}{
+		{"malformed op_id", ws.OpUpdateMsg{OperationID: "not-a-uuid", Phase: "wat"}},
+		{"unknown op", ws.OpUpdateMsg{OperationID: uuid.NewString(), Phase: "partitioning"}},
+		{"unsupported status", ws.OpUpdateMsg{OperationID: known.String(), Status: "weird"}},
+		{"running status", ws.OpUpdateMsg{OperationID: known.String(), Status: string(model.OpRunning)}},
+		{"neither phase nor status", ws.OpUpdateMsg{OperationID: known.String()}},
+		{"NUL in phase", ws.OpUpdateMsg{OperationID: known.String(), Phase: "part\x00itioning"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := NewOpUpdate(st).HandleOpUpdate(context.Background(), tc.msg)
+			if !errors.Is(err, ws.ErrTerminal) {
+				t.Fatalf("got %v, want an error wrapping ws.ErrTerminal", err)
+			}
+		})
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if len(st.completed) != 0 || len(st.failed) != 0 {
-		t.Errorf("unknown status should not transition op")
+	if len(st.phases) != 0 || len(st.completed) != 0 || len(st.failed) != 0 {
+		t.Errorf("rejected updates wrote: phases=%v completed=%v failed=%v", st.phases, st.completed, st.failed)
 	}
 }
 
-func TestOpUpdate_MalformedOpID(t *testing.T) {
-	h := NewOpUpdate(newFake())
-	err := h.HandleOpUpdate(context.Background(), ws.OpUpdateMsg{
-		OperationID: "not-a-uuid",
-		Phase:       "wat",
-	})
-	if err == nil {
-		t.Fatal("expected error on malformed op_id")
+// TestOpUpdate_StoreErrorsAreTransient: a failed read or write returns an
+// error that does not wrap ws.ErrTerminal, so the worker keeps the update
+// and resends it.
+func TestOpUpdate_StoreErrorsAreTransient(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		inject func(*fakeStore)
+		msg    func(uuid.UUID) ws.OpUpdateMsg
+	}{
+		{"read", func(s *fakeStore) { s.getErr = errors.New("db down") },
+			func(id uuid.UUID) ws.OpUpdateMsg {
+				return ws.OpUpdateMsg{OperationID: id.String(), Phase: "partitioning"}
+			}},
+		{"phase write", func(s *fakeStore) { s.phaseErr = errors.New("db down") },
+			func(id uuid.UUID) ws.OpUpdateMsg {
+				return ws.OpUpdateMsg{OperationID: id.String(), Phase: "partitioning"}
+			}},
+		{"completion", func(s *fakeStore) { s.completeErr = errors.New("db down") },
+			func(id uuid.UUID) ws.OpUpdateMsg {
+				return ws.OpUpdateMsg{OperationID: id.String(), Status: string(model.OpCompleted)}
+			}},
+		{"failure", func(s *fakeStore) { s.failErr = errors.New("db down") },
+			func(id uuid.UUID) ws.OpUpdateMsg {
+				return ws.OpUpdateMsg{OperationID: id.String(), Status: string(model.OpFailed)}
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFake()
+			opID := st.putOp(model.OpPowerCycle)
+			tc.inject(st)
+			err := NewOpUpdate(st).HandleOpUpdate(context.Background(), tc.msg(opID))
+			if err == nil || errors.Is(err, ws.ErrTerminal) {
+				t.Fatalf("got %v, want a transient (non-terminal) error", err)
+			}
+		})
 	}
 }
 
-func TestOpUpdate_PhaseErrorNotPropagatedWhenStatusPresent(t *testing.T) {
-	// Phase-write failure shouldn't short-circuit a terminal status
-	// update: op_update is fire-and-forget, so dropping the status
-	// here would strand the machine in its transient state forever.
-	// Phase error should log but still process the status.
+// TestOpUpdate_PhaseErrorFailsWholeUpdate: when the phase write of a
+// terminal update fails, the status is not written either and the update
+// is retried; the resend then applies the phase and the status in order.
+func TestOpUpdate_PhaseErrorFailsWholeUpdate(t *testing.T) {
 	st := newFake()
 	st.phaseErr = errors.New("db down")
-	opID := uuid.New()
-	st.opByID[opID] = &model.Operation{ID: opID, Type: model.OpDeploy}
+	opID := st.putOp(model.OpDeploy)
 	h := NewOpUpdate(st)
-
-	err := h.HandleOpUpdate(context.Background(), ws.OpUpdateMsg{
+	msg := ws.OpUpdateMsg{
 		OperationID: opID.String(),
-		Phase:       "completed",
-		Status:      string(model.OpCompleted),
-	})
-	if err != nil {
-		t.Fatalf("phase error should be logged, not propagated: %v", err)
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if _, ok := st.completed[opID]; !ok {
-		t.Error("status transition should have happened despite phase failure")
-	}
-}
-
-func TestOpUpdate_PhaseOnlyErrorPropagatesWhenNoStatus(t *testing.T) {
-	// Phase-only call with no status: if the phase write fails, that
-	// IS the whole operation. Surface the error so the hub's dispatch
-	// wrapper logs it.
-	st := newFake()
-	st.phaseErr = errors.New("db down")
-	h := NewOpUpdate(st)
-
-	err := h.HandleOpUpdate(context.Background(), ws.OpUpdateMsg{
-		OperationID: uuid.NewString(),
 		Phase:       "partitioning",
-	})
-	if err == nil {
-		t.Fatal("expected error from SetOperationPhase when no status fallthrough")
+		Status:      string(model.OpFailed),
+		Result:      json.RawMessage(`{"error":"boom","phase":"partitioning"}`),
+	}
+
+	err := h.HandleOpUpdate(context.Background(), msg)
+	if err == nil || errors.Is(err, ws.ErrTerminal) {
+		t.Fatalf("phase failure must fail the update transiently, got %v", err)
+	}
+	st.mu.Lock()
+	if _, ok := st.failed[opID]; ok {
+		t.Error("status was written although the phase before it failed")
+	}
+	st.phaseErr = nil
+	st.mu.Unlock()
+
+	if err := h.HandleOpUpdate(context.Background(), msg); err != nil {
+		t.Fatalf("resend: %v", err)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.phases[opID] != "partitioning" {
+		t.Errorf("phase after resend = %q, want partitioning", st.phases[opID])
+	}
+	if _, ok := st.failed[opID]; !ok {
+		t.Error("status not written by the resend")
+	}
+}
+
+// TestOpUpdate_ResendIsIdempotent: the worker resends an update whose
+// acknowledgement it did not receive. A resend of an update already
+// applied changes nothing: no second phase-transition envelope, op_delta
+// or phase metric, no second op_removed, outcome count or identity
+// rebuild, and a phase resent after the op went terminal moves nothing.
+func TestOpUpdate_ResendIsIdempotent(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	st := newFake()
+	opID := st.putOp(model.OpDeploy)
+	logs := &bytes.Buffer{}
+	pub := &fakePublisher{}
+	invalidations := 0
+	h := NewOpUpdate(st)
+	h.SetLogger(newJSONLoggerForTest(logs))
+	h.SetPublisher(pub)
+	h.SetMetrics(opsmetrics.New(reg))
+	h.SetInvalidator(func() { invalidations++ })
+
+	send := func(msg ws.OpUpdateMsg) {
+		t.Helper()
+		if err := h.HandleOpUpdate(context.Background(), msg); err != nil {
+			t.Fatalf("%+v: %v", msg, err)
+		}
+	}
+	first := ws.OpUpdateMsg{OperationID: opID.String(), Phase: "partitioning"}
+	second := ws.OpUpdateMsg{OperationID: opID.String(), Phase: "rsyncing_os"}
+	done := ws.OpUpdateMsg{OperationID: opID.String(), Status: string(model.OpCompleted)}
+	send(first)
+	send(second)
+	send(second) // ack of second lost: resent
+	send(done)
+	send(done)  // ack of the completion lost: resent
+	send(first) // an older phase arriving after the op went terminal
+
+	transitions := 0
+	for _, r := range decodeJSONLines(t, logs) {
+		if r["msg"] == "phase transition" {
+			transitions++
+		}
+	}
+	if transitions != 2 {
+		t.Errorf("phase-transition envelopes = %d, want 2", transitions)
+	}
+	if len(pub.deltas) != 2 {
+		t.Errorf("op_deltas = %d, want 2", len(pub.deltas))
+	}
+	if len(pub.removed) != 1 || invalidations != 1 {
+		t.Errorf("op_removed = %d, identity rebuilds = %d, want 1 and 1", len(pub.removed), invalidations)
+	}
+	if got := metricValue(t, reg, "slagworks_operation_outcomes_total",
+		map[string]string{"op_type": "deploy", "outcome": "completed"}); got != 1 {
+		t.Errorf("completed outcomes counted %v times, want 1", got)
+	}
+	if got := metricValue(t, reg, "slagworks_op_phase_duration_seconds",
+		map[string]string{"op_type": "deploy", "phase": "partitioning"}); got != 1 {
+		t.Errorf("exited-phase durations observed %v times, want 1", got)
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.phases[opID] != "rsyncing_os" {
+		t.Errorf("phase = %q, want rsyncing_os", st.phases[opID])
 	}
 }
 

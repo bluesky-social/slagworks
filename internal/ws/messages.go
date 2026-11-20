@@ -50,6 +50,12 @@ type ObservationMsg struct {
 	Data        json.RawMessage `json:"data,omitempty"`
 }
 
+// OpUpdateMsg is an operation's phase change or terminal status as the
+// worker recorded it. Like an observation it is an outbox entry: the
+// worker sends it with a request_id and keeps it until global answers
+// with an rpc_response, which global sends once the update is committed
+// (see OpUpdateHandler). Result must never carry a credential: global
+// stores it verbatim in the operations table.
 type OpUpdateMsg struct {
 	OperationID string          `json:"op_id"`
 	Status      string          `json:"status,omitempty"`

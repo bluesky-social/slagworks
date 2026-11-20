@@ -16,7 +16,7 @@ func phoneHomeReport(machineID, opID uuid.UUID) *model.ProgressReport {
 // requireNoOutbox fails if the cache queued anything for global.
 func requireNoOutbox(t *testing.T, c *Cache, when string) {
 	t.Helper()
-	if obs, updates := c.DrainOutbox(); len(obs) != 0 || len(updates) != 0 {
+	if obs, updates := takeOutbox(c); len(obs) != 0 || len(updates) != 0 {
 		t.Fatalf("%s queued side effects: observations=%+v updates=%+v", when, obs, updates)
 	}
 }
@@ -62,7 +62,7 @@ func TestHandleProgressReport_PhoneHomeOnRunningMachineIsNotAckedBlind(t *testin
 					t.Fatalf("earlier deploy's phone-home: %v", err)
 				}
 				c.ApplyOpRemoved(earlier.String(), machineID.String(), 2, model.MachineStateRunning)
-				c.DrainOutbox()
+				takeOutbox(c)
 			},
 		},
 	}
@@ -108,7 +108,7 @@ func TestHandleProgressReport_StalePhoneHomeIsRecordedOnceTheViewCatchesUp(t *te
 	if err := c.HandleProgressReport(phoneHomeReport(machineID, opID)); err != nil {
 		t.Fatalf("phone-home retry after the resync: %v", err)
 	}
-	obs, _ := c.DrainOutbox()
+	obs, _ := takeOutbox(c)
 	for _, p := range obs {
 		if p.Obs.Event == "phone_home" && p.Obs.OperationID == opID && p.Obs.MachineID == machineID {
 			return
@@ -197,7 +197,7 @@ func TestHandleProgressReport_RecordedPhoneHomeRetrySurvivesResyncAndRestart(t *
 	if err := c.HandleProgressReport(phoneHomeReport(machineID, opID)); err != nil {
 		t.Fatalf("first phone-home: %v", err)
 	}
-	c.DrainOutbox()
+	takeOutbox(c)
 
 	// Global completed the op while this worker was disconnected: the
 	// reconnect resync simply no longer carries it.
@@ -214,7 +214,7 @@ func TestHandleProgressReport_RecordedPhoneHomeRetrySurvivesResyncAndRestart(t *
 	}
 	t.Cleanup(func() { closeLocalDB(t, db2) })
 	c2 := NewCache(db2)
-	c2.DrainOutbox()
+	takeOutbox(c2)
 	c2.ApplySnapshot(snapMachine(machineID, "52:54:00:e1:00:07", model.MachineStateRunning))
 	c2.ApplyOpResync(nil, nil)
 	if err := c2.HandleProgressReport(phoneHomeReport(machineID, opID)); err != nil {

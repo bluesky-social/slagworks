@@ -38,12 +38,21 @@ type kvRow struct {
 
 func (kvRow) TableName() string { return "kv" }
 
-// outboxRow persists observations that haven't been pushed to central.
+// outboxRow persists an outbox entry global has not acknowledged yet: an
+// observation or an op update, as Kind says. ID is AUTOINCREMENT, so row
+// order is record order even across restarts.
 type outboxRow struct {
 	ID        uint      `gorm:"primaryKey;autoIncrement"`
+	Kind      string    `gorm:"not null"`
 	Payload   string    `gorm:"not null"`
 	CreatedAt time.Time `gorm:"autoCreateTime"`
 }
+
+// Values of outbox.kind.
+const (
+	outboxKindObservation = "observation"
+	outboxKindOpUpdate    = "op_update"
+)
 
 func (outboxRow) TableName() string { return "outbox" }
 
@@ -191,13 +200,18 @@ func (l *LocalDB) ResetSyncState() {
 	l.db.Delete(&kvRow{}, "key IN ?", []string{"sync_cursor", "instance_id"})
 }
 
-// PendingOutbox pairs a persisted observation with the SQLite row ID
-// that persists it. The worker sends the observation with a reqID that
-// the global echoes on rpc_response; mapping reqID→rowID lets the
-// worker AckOutboxRow the correct row on success.
+// PendingOutbox is one outbox entry: an observation, or an op update when
+// Update is non-nil, paired with the SQLite row ID that persists it. The
+// worker sends it with a request_id that global echoes on rpc_response;
+// mapping request_id to entry lets the worker remove the right one when
+// global acknowledges it.
 type PendingOutbox struct {
 	RowID uint64
-	Obs   model.Observation
+	// Obs is the payload of an observation entry.
+	Obs model.Observation
+	// Update is the payload of an op update entry; nil for an
+	// observation.
+	Update *model.OperationUpdate
 
 	// Retry state for the rejection-requeue backoff. Lives
 	// in memory only — deliberately NOT persisted to SQLite. A worker
@@ -214,33 +228,43 @@ type PendingOutbox struct {
 	NextAttempt time.Time
 
 	// capWarnAt throttles the at-backoff-cap WARN log to at most once
-	// per minute per row; see WSConn.scheduleRejectionRetry.
+	// per minute per row; see outbox.requeueRejected.
 	capWarnAt time.Time
+
+	// seq identifies the entry within the outbox that holds it. Record
+	// order is the outbox's slice order, not seq: a row reloadFromDisk
+	// adds is older than the entries already in memory.
+	seq uint64
+	// inFlight is set while the entry is sent on the current connection
+	// and its acknowledgement has not arrived.
+	inFlight bool
 }
 
-// AppendOutbox persists an observation to the outbox for crash
-// recovery. Returns the SQLite row ID; pair it with the sent envelope's
-// request_id so AckOutboxRow can find it when the global's
-// rpc_response arrives.
-func (l *LocalDB) AppendOutbox(obs model.Observation) (uint64, error) {
-	payload, err := json.Marshal(obs)
+// AppendOutbox persists an outbox entry for crash recovery and returns
+// its SQLite row ID.
+func (l *LocalDB) AppendOutbox(e PendingOutbox) (uint64, error) {
+	kind, payload := outboxKindObservation, any(e.Obs)
+	if e.Update != nil {
+		kind, payload = outboxKindOpUpdate, e.Update
+	}
+	b, err := json.Marshal(payload)
 	if err != nil {
-		l.log.Error("marshaling outbox observation", "err", err)
+		l.log.Error("marshaling outbox entry", "kind", kind, "err", err)
 		return 0, err
 	}
-	row := outboxRow{Payload: string(payload)}
+	row := outboxRow{Kind: kind, Payload: string(b)}
 	if err := l.db.Create(&row).Error; err != nil {
-		l.log.Error("persisting outbox observation", "err", err)
+		l.log.Error("persisting outbox entry", "kind", kind, "err", err)
 		return 0, err
 	}
 	return uint64(row.ID), nil
 }
 
-// ListPendingOutbox returns all persisted outbox entries paired with
-// their row IDs. Does NOT delete — deletion is driven by
-// AckOutboxRow after the global acks the observation via
-// rpc_response{ok:true}. Corrupt rows are dropped with a warning
-// (and deleted from SQLite so they don't re-appear on every restart).
+// ListPendingOutbox returns all persisted outbox entries, in row order,
+// paired with their row IDs. Does NOT delete — deletion is driven by
+// AckOutboxRow after global acknowledges the entry. Corrupt rows and rows
+// of an unknown kind are dropped with a warning (and deleted from SQLite
+// so they don't re-appear on every restart).
 //
 // An error means the table could not be read, which says nothing about
 // what it holds: the caller must not take it for an empty outbox.
@@ -256,13 +280,23 @@ func (l *LocalDB) ListPendingOutbox() ([]PendingOutbox, error) {
 	var out []PendingOutbox
 	var corrupt []uint
 	for _, r := range rows {
-		var o model.Observation
-		if err := json.Unmarshal([]byte(r.Payload), &o); err != nil {
-			l.log.Warn("corrupt outbox entry, deleting", "id", r.ID, "err", err)
+		e := PendingOutbox{RowID: uint64(r.ID)}
+		var err error
+		switch r.Kind {
+		case outboxKindObservation:
+			err = json.Unmarshal([]byte(r.Payload), &e.Obs)
+		case outboxKindOpUpdate:
+			e.Update = &model.OperationUpdate{}
+			err = json.Unmarshal([]byte(r.Payload), e.Update)
+		default:
+			err = fmt.Errorf("unknown outbox kind %q", r.Kind)
+		}
+		if err != nil {
+			l.log.Warn("corrupt outbox entry, deleting", "id", r.ID, "kind", r.Kind, "err", err)
 			corrupt = append(corrupt, r.ID)
 			continue
 		}
-		out = append(out, PendingOutbox{RowID: uint64(r.ID), Obs: o})
+		out = append(out, e)
 	}
 	if len(corrupt) > 0 {
 		if err := l.db.Delete(&outboxRow{}, corrupt).Error; err != nil {
@@ -272,12 +306,13 @@ func (l *LocalDB) ListPendingOutbox() ([]PendingOutbox, error) {
 	return out, nil
 }
 
-// AckOutboxRow deletes a single outbox row. Called after the global
-// sends rpc_response{ok:true} for the corresponding observation.
-func (l *LocalDB) AckOutboxRow(rowID uint64) {
+// AckOutboxRow deletes a single outbox row. Called once global has
+// acknowledged the entry it persists, or rejected it terminally.
+func (l *LocalDB) AckOutboxRow(rowID uint64) error {
 	if err := l.db.Delete(&outboxRow{}, rowID).Error; err != nil {
-		l.log.Warn("ack outbox row", "row_id", rowID, "err", err)
+		return fmt.Errorf("delete outbox row %d of %s: %w", rowID, l.path, err)
 	}
+	return nil
 }
 
 // PersistedOpState is the op-layer half of the worker's warm-restart
@@ -295,10 +330,11 @@ type PersistedOpState struct {
 	Ops     []model.Operation             `json:"ops"`
 	Overlay map[string]model.MachineState `json:"overlay"`
 	// PhoneHomed is opState.phoneHomed: deploy op IDs whose installed OS
-	// phoned home to this worker. Global may not know yet (the completion
-	// op_update is not durable), so the first op_resync after a restart can
-	// still carry the op as claimed; the restored entry keeps the machine
-	// pinned to running instead of re-imaging it.
+	// phoned home to this worker. Global may not know yet (the outbox
+	// delivers the completion once global is reachable), so the first
+	// op_resync after a restart can still carry the op as claimed; the
+	// restored entry keeps the machine pinned to running instead of
+	// re-imaging it.
 	PhoneHomed []string `json:"phone_homed"`
 	// PhoneHomeSettled is opState.phoneHomeSettled in insertion order: the
 	// deploy ops whose phone-home retry this worker may acknowledge. It

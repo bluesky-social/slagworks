@@ -53,6 +53,26 @@ func postPhoneHome(h http.Handler, target, body string) int {
 	return w.Code
 }
 
+// drainAcked empties the cache's outbox the way a global that commits and
+// acknowledges every entry would, and returns what was queued, split by
+// kind.
+func drainAcked(c *worker.Cache) (obs []model.Observation, updates []model.OperationUpdate) {
+	for {
+		entries := c.DrainOutbox()
+		if len(entries) == 0 {
+			return obs, updates
+		}
+		for _, e := range entries {
+			c.AckOutbox(e)
+			if e.Update != nil {
+				updates = append(updates, *e.Update)
+			} else {
+				obs = append(obs, e.Obs)
+			}
+		}
+	}
+}
+
 func completedUpdate(updates []model.OperationUpdate, opID uuid.UUID) bool {
 	for _, u := range updates {
 		if u.OperationID == opID.String() && u.Status == string(model.OpCompleted) {
@@ -79,13 +99,13 @@ func TestMACOnlyPhoneHome_DoesNotCompleteAnInstallingDeploy(t *testing.T) {
 	if got := c.BootActionForMAC(phoneHomeMAC); got != model.BootDeploy {
 		t.Fatalf("precondition: boot action = %v, want BootDeploy (%v)", got, model.BootDeploy)
 	}
-	c.DrainOutbox()
+	drainAcked(c)
 
 	if code := postPhoneHome(h, "/api/v1/phone-home?mac="+phoneHomeMAC, ""); code >= 200 && code < 300 {
 		t.Errorf("MAC-only phone-home answered %d, want a non-2xx rejection", code)
 	}
 
-	if _, updates := c.DrainOutbox(); completedUpdate(updates, opID) {
+	if _, updates := drainAcked(c); completedUpdate(updates, opID) {
 		t.Errorf("MAC-only phone-home completed deploy op %s while it was in phase partitioning", opID)
 	}
 	if got := c.BootActionForMAC(phoneHomeMAC); got != model.BootDeploy {
@@ -137,13 +157,13 @@ func TestBoundPhoneHome_CompletesAFinishedDeploy(t *testing.T) {
 	if code := postPhoneHome(h, "/api/v1/report", bound("deploy_complete")); code != http.StatusOK {
 		t.Fatalf("deploy_complete report answered %d, want 200", code)
 	}
-	c.DrainOutbox()
+	drainAcked(c)
 
 	if code := postPhoneHome(h, "/api/v1/report", bound("phone_home")); code != http.StatusOK {
 		t.Fatalf("bound phone_home report answered %d, want 200", code)
 	}
 
-	if _, updates := c.DrainOutbox(); !completedUpdate(updates, opID) {
+	if _, updates := drainAcked(c); !completedUpdate(updates, opID) {
 		t.Errorf("bound phone_home did not queue op_update completed for %s; updates=%+v", opID, updates)
 	}
 	if got := c.BootActionForMAC(phoneHomeMAC); got != model.BootLocal {

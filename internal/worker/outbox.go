@@ -5,49 +5,71 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/bluesky-social/slagworks/internal/model"
 )
 
 // outbox is the site worker's durable send queue for observations and
 // operation updates. It owns crash-recovery persistence (via LocalDB),
-// the in-memory queue, the per-row rejection backoff, and the wake
-// signal the WS drain loop parks on.
+// the in-memory queue, the per-row rejection backoff, the per-operation
+// delivery order, and the wake signal the WS drain loop parks on.
 //
 // Split out of Cache (fable-review Tier 1 #4): this is one of the five
-// responsibilities Cache used to mix. Everything here is guarded by mu;
-// nothing here touches snapshot-derived read state or op-phase state, so
-// it needs no coordination with the cache's other locks.
+// responsibilities Cache used to mix. Everything here is guarded by mu
+// (appends are serialized by appendMu as well); nothing here touches
+// snapshot-derived read state or op-phase state, so it needs no
+// coordination with the cache's other locks.
 //
-// Durability contract (unchanged from the pre-split Cache):
-//   - appendObservation persists the observation to SQLite under the same
-//     critical section that enqueues it, closing the "row in SQLite but
-//     not in memory" window that reloadFromDisk would otherwise mistake
-//     for a stranded row.
-//   - opUpdates are best-effort and NOT persisted. A lost phase update
-//     is cheap; a lost terminal status leaves the op to global's timeout
-//     sweeps. A completion that must not be lost rides a durable
-//     observation as well: the deploy's phone_home carries the op ID
-//     (see Cache.RecordPhoneHome).
-//   - ackObservation deletes the SQLite row only after global confirms
-//     receipt via rpc_response{ok:true}.
-//   - reloadFromDisk re-enqueues rows that were sent but not yet acked
-//     when a connection drops, so a disconnect mid-ack-window doesn't
-//     strand the observation until the next worker restart.
+// Durability contract:
+//   - append persists the entry to SQLite, then queues it, before it
+//     returns. Appends are serialized, so SQLite row order is record
+//     order, and memory and disk hold the same entries.
+//   - entries holds every entry global has not acknowledged, in the order
+//     they were recorded, including the ones in flight: an entry leaves
+//     memory and disk together, in ack, once global acknowledged it
+//     (rpc_response without error, sent after its handler committed) or
+//     rejected it terminally.
+//   - reloadFromDisk makes every in-flight entry due again on a
+//     reconnect: the connection it went out on is gone, and global may or
+//     may not have committed it. Delivery is at least once; global's
+//     handlers are idempotent.
 //   - newOutbox rehydrates unacked rows on restart and wakes the drain
-//     loop, so they are re-sent on the first connection.
+//     loop, so they are re-sent on the first connection. Rows that
+//     startup read could not load are picked up by reloadFromDisk on a
+//     later connection.
+//
+// Order: the entries that settle an operation (every op update, and the
+// observations that complete or fail an op, see orderedOp) are delivered
+// one at a time per operation, in record order. drain hands out such an
+// entry only when no earlier entry of the same operation is still
+// unacknowledged, so global commits them in the order the worker recorded
+// them whatever order its handlers run in, and a replay after a lost ack
+// can only repeat the latest entry global saw for that op, never an older
+// one after a newer. Other entries (no op, or observations that do not
+// settle one) go out as soon as they are due.
 type outbox struct {
-	mu        sync.Mutex
-	pending   []PendingOutbox
-	opUpdates []model.OperationUpdate
+	// appendMu serializes the methods that write the SQLite table (append,
+	// ack) and reloadFromDisk, which reads it: row order then follows
+	// record order, and a reload never merges a snapshot of the table that
+	// an append or ack has since changed. It is taken before mu and never
+	// while holding it, so drain and the requeues never wait on a disk
+	// write.
+	appendMu sync.Mutex
+
+	mu      sync.Mutex
+	entries []PendingOutbox
+	nextSeq uint64
 
 	// retryTimer wakes the drain loop when the earliest backed-off row
 	// becomes due. The drain loop is otherwise purely wake-driven (wakeCh
-	// fires on rehydrate/append/requeue), so when drain holds back not-due
-	// rows and nothing else writes to the queue, no wake would ever fire and
-	// the rows would strand until the next WS reconnect. drain (re)arms this
-	// for the earliest NextAttempt whenever it holds rows back. Guarded by
-	// mu. The callback is wake(), which is idempotent and non-blocking, so
-	// a stale timer firing after a re-arm only costs one spurious drain.
+	// fires on rehydrate/append/requeue/ack), so when drain holds back
+	// not-due rows and nothing else writes to the queue, no wake would ever
+	// fire and the rows would strand until the next WS reconnect. drain
+	// (re)arms this for the earliest NextAttempt whenever it holds rows
+	// back. Guarded by mu. The callback is wake(), which is idempotent and
+	// non-blocking, so a stale timer firing after a re-arm only costs one
+	// spurious drain.
 	retryTimer *time.Timer
 
 	// wakeCh signals that new data is available for drain (logs, op
@@ -60,7 +82,7 @@ type outbox struct {
 	localDB *LocalDB
 
 	// RejectBackoffBase / RejectBackoffMax tune the per-row exponential
-	// backoff applied when global rejects an observation non-terminally.
+	// backoff applied when global rejects an entry non-terminally.
 	// Zero values default to 1s base, 60s cap. Exported so
 	// tests can inject short durations, mirroring CastPumpConfig's
 	// ReconnectBackoff/MaxReconnectBackoff convention.
@@ -72,11 +94,9 @@ type outbox struct {
 // localDB (nil disables persistence). The wake channel is buffered(1).
 //
 // Rehydrated rows get a wake like any other enqueue: the drain loop is
-// wake-driven, and reloadFromDisk on the first connection adds nothing
-// (the rows are already in memory), so without this token a row left
-// unacked by the previous process would wait for an unrelated append.
-// The token sits in the buffered channel until the first connection's
-// drain loop takes it.
+// wake-driven, so without this token a row left unacked by the previous
+// process would wait for an unrelated append. The token sits in the
+// buffered channel until the first connection's drain loop takes it.
 func newOutbox(localDB *LocalDB) *outbox {
 	o := &outbox{
 		wakeCh:  make(chan struct{}, 1),
@@ -92,8 +112,12 @@ func newOutbox(localDB *LocalDB) *outbox {
 			slog.Error("outbox rows persisted before this start could not be read; they are read again when the worker connects to global",
 				"err", err)
 		}
-		if len(pending) > 0 {
-			o.pending = pending
+		for _, e := range pending {
+			o.nextSeq++
+			e.seq = o.nextSeq
+			o.entries = append(o.entries, e)
+		}
+		if len(o.entries) > 0 {
 			o.wake()
 		}
 	}
@@ -108,82 +132,124 @@ func (o *outbox) wake() {
 	}
 }
 
-func (o *outbox) appendObservation(obs model.Observation) {
-	// Persist + enqueue under the same lock. The window where "row exists
-	// in SQLite but not in pending" is what reloadFromDisk uses to recover
-	// from disconnect, so we must close that window for the append path: a
-	// concurrent reload would otherwise see the just-persisted row as
-	// "stranded" and enqueue a duplicate.
-	o.mu.Lock()
-	var rowID uint64
-	if o.localDB != nil {
-		var err error
-		rowID, err = o.localDB.AppendOutbox(obs)
-		if err != nil {
-			slog.Warn("outbox persist failed, keeping in-memory only", "err", err)
+// orderedOp reports whether e belongs to an operation's ordered chain, and
+// which: every op update, and the observations whose handler completes or
+// fails the op they name (Cache.RecordPhoneHome, recordCommissionReport,
+// recordBMCReconcileReport). deploy_complete names its op but only
+// validates it and stores the monitor credential: it stays out of the
+// chain, so a NetBox outage that keeps rejecting it does not hold back the
+// phone_home that completes the deploy.
+func orderedOp(e PendingOutbox) (string, bool) {
+	if e.Update != nil {
+		// An agent report's op ID reaches UpdateOpPhase / MarkOpFailed as
+		// the string the agent sent; key the chain by the canonical form
+		// the observations use.
+		if id, err := uuid.Parse(e.Update.OperationID); err == nil {
+			return id.String(), true
 		}
+		return e.Update.OperationID, true
 	}
-	o.pending = append(o.pending, PendingOutbox{RowID: rowID, Obs: obs})
-	o.mu.Unlock()
-	o.wake()
+	if e.Obs.OperationID == uuid.Nil {
+		return "", false
+	}
+	switch e.Obs.Event {
+	case "phone_home", "commission_report", "bmc_reconcile_report":
+		return e.Obs.OperationID.String(), true
+	}
+	return "", false
+}
+
+func (o *outbox) appendObservation(obs model.Observation) {
+	o.append(PendingOutbox{Obs: obs})
 }
 
 func (o *outbox) appendOpUpdate(u model.OperationUpdate) {
+	o.append(PendingOutbox{Update: &u})
+}
+
+// append persists e and queues it; it returns once both are done. A
+// failed persist keeps the entry in memory only: it is still delivered and
+// acknowledged, but a restart loses it.
+func (o *outbox) append(e PendingOutbox) {
+	o.appendMu.Lock()
+	defer o.appendMu.Unlock()
+	if o.localDB != nil {
+		rowID, err := o.localDB.AppendOutbox(e)
+		if err != nil {
+			slog.Warn("outbox persist failed, keeping in-memory only", "err", err)
+		}
+		e.RowID = rowID
+	}
 	o.mu.Lock()
-	o.opUpdates = append(o.opUpdates, u)
+	o.nextSeq++
+	e.seq = o.nextSeq
+	o.entries = append(o.entries, e)
 	o.mu.Unlock()
 	o.wake()
 }
 
-// depth returns the number of in-memory observations awaiting drain+ack.
+// depth returns the number of entries global has not acknowledged yet,
+// in flight included.
 func (o *outbox) depth() int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return len(o.pending)
+	return len(o.entries)
 }
 
-// drain returns pending observations (paired with SQLite row IDs for
-// later acking) and operation updates, clearing the in-memory queues.
-// SQLite rows remain until ackObservation fires on receipt of a
-// successful rpc_response from global.
+// indexLocked returns the position of the entry with sequence number seq,
+// or -1. Caller must hold mu.
+func (o *outbox) indexLocked(seq uint64) int {
+	for i := range o.entries {
+		if o.entries[i].seq == seq {
+			return i
+		}
+	}
+	return -1
+}
+
+// drain returns the entries to send now, in record order, and marks them
+// in flight: they stay in the outbox until ack, requeue, requeueRejected
+// or reloadFromDisk.
 //
-// Rows whose NextAttempt is in the future (backed off after a
-// non-terminal rejection, see requeueRejected) are NOT returned: they
-// stay queued, in order, until due. Whenever rows are held back, the
-// retry timer is (re)armed for the earliest NextAttempt so the
-// wake-driven drain loop is guaranteed a future wake even if nothing else
-// touches the outbox — without it, held-back rows would strand until the
-// next WS reconnect's reloadFromDisk.
-func (o *outbox) drain() ([]PendingOutbox, []model.OperationUpdate) {
+// An entry is returned when it is not already in flight, is due (rows
+// backed off after a non-terminal rejection wait for their NextAttempt),
+// and, for an entry of an operation's ordered chain, when no earlier entry
+// of that chain is still unacknowledged. Whenever rows are held back for
+// their NextAttempt, the retry timer is (re)armed for the earliest one so
+// the wake-driven drain loop is guaranteed a future wake even if nothing
+// else touches the outbox.
+func (o *outbox) drain() []PendingOutbox {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	updates := o.opUpdates
-	o.opUpdates = nil
-
-	if len(o.pending) == 0 {
-		o.pending = nil
-		return nil, updates
-	}
-
 	now := time.Now()
-	var due, held []PendingOutbox
+	var out []PendingOutbox
 	var earliest time.Time
-	for _, p := range o.pending {
-		if p.NextAttempt.After(now) {
-			held = append(held, p)
-			if earliest.IsZero() || p.NextAttempt.Before(earliest) {
-				earliest = p.NextAttempt
-			}
+	blocked := map[string]bool{}
+	for i := range o.entries {
+		e := &o.entries[i]
+		op, ordered := orderedOp(*e)
+		if ordered && blocked[op] {
 			continue
 		}
-		due = append(due, p)
+		switch {
+		case e.inFlight:
+		case e.NextAttempt.After(now):
+			if earliest.IsZero() || e.NextAttempt.Before(earliest) {
+				earliest = e.NextAttempt
+			}
+		default:
+			e.inFlight = true
+			out = append(out, *e)
+		}
+		if ordered {
+			blocked[op] = true
+		}
 	}
-	o.pending = held
-	if len(held) > 0 {
+	if !earliest.IsZero() {
 		o.armRetryTimerLocked(earliest)
 	}
-	return due, updates
+	return out
 }
 
 // armRetryTimerLocked schedules a wake() at the given time so the drain
@@ -217,133 +283,161 @@ func (o *outbox) rejectBackoffDefaults() (base, maxDelay time.Duration) {
 	return base, maxDelay
 }
 
-// requeueRejected returns a non-terminally rejected observation to the
-// outbox with per-row exponential backoff: attempt N waits
-// base*2^(N-1) plus up to 20% jitter, capped at RejectBackoffMax. Without
-// this, a persistent transient rejection (e.g. NetBox down on the global
-// side) re-sent the row as fast as the WS round-trip allowed — observed at
-// ~2.3 retries/second, each one driving a NetBox call and a WARN log line
-// on both ends.
+// requeueRejected returns a non-terminally rejected in-flight entry to the
+// queue with per-row exponential backoff: attempt N waits base*2^(N-1)
+// plus up to 20% jitter, capped at RejectBackoffMax. Without this, a
+// persistent transient rejection (e.g. NetBox down on the global side)
+// re-sent the row as fast as the WS round-trip allowed — observed at ~2.3
+// retries/second, each one driving a NetBox call and a WARN log line on
+// both ends.
 //
-// The row is appended rather than prepended: with per-row due-times,
-// strict cross-row ordering is no longer meaningful. A NEWER observation
-// for the same machine can therefore overtake a backed-off rejected row;
-// that's acceptable because global's observation handlers are idempotent
-// (see internal/commission/handler.go) — when the old row finally lands,
-// re-applying it is harmless.
+// The entry keeps its place in record order. An unordered entry queued
+// after it can overtake it while it waits; that's acceptable because
+// global's observation handlers are idempotent (see
+// internal/commission/handler.go). The later entries of its operation's
+// ordered chain wait for it.
 //
 // Returns the updated attempt count, the computed delay, and whether the
 // caller should log this rejection at WARN (first rejection of a row, or
 // at most once per minute while pinned at the backoff cap) instead of
-// Debug.
+// Debug. An entry the outbox no longer holds changes nothing.
 func (o *outbox) requeueRejected(entry PendingOutbox) (attempts int, delay time.Duration, warn bool) {
 	base, capMax := o.rejectBackoffDefaults()
 
-	entry.Attempts++
-	raw := nextBackoff(base, capMax, entry.Attempts-1)
+	o.mu.Lock()
+	i := o.indexLocked(entry.seq)
+	if i < 0 {
+		o.mu.Unlock()
+		return entry.Attempts, 0, false
+	}
+	e := &o.entries[i]
+	e.Attempts++
+	raw := nextBackoff(base, capMax, e.Attempts-1)
 	atCap := raw >= capMax
 	delay = applyJitter(raw, 0.2)
 
 	now := time.Now()
-	warn = entry.Attempts == 1
-	if atCap && now.Sub(entry.capWarnAt) >= time.Minute {
+	warn = e.Attempts == 1
+	if atCap && now.Sub(e.capWarnAt) >= time.Minute {
 		warn = true
-		entry.capWarnAt = now
+		e.capWarnAt = now
 	}
-	entry.NextAttempt = now.Add(delay)
-
-	o.mu.Lock()
-	o.pending = append(o.pending, entry)
+	e.NextAttempt = now.Add(delay)
+	e.inFlight = false
+	attempts = e.Attempts
 	o.mu.Unlock()
 	// Wake the drain loop even though the row isn't due: the resulting
 	// drain pass holds it back and arms the retry timer, so timer arming
 	// lives in exactly one place (drain).
 	o.wake()
-	return entry.Attempts, delay, warn
+	return attempts, delay, warn
 }
 
-// requeue prepends unsent items back onto the in-memory queues. Called
-// from the WS drain path when a send fails mid-batch: the caller hands
-// back the remainder of whatever drain returned and the next wake retries.
-// Items added after the drain (via appendObservation / appendOpUpdate
-// during the failed send) are preserved and appear after the requeued
-// prefix — same effective ordering as "had the drain not happened yet."
-func (o *outbox) requeue(obs []PendingOutbox, updates []model.OperationUpdate) {
-	if len(obs) == 0 && len(updates) == 0 {
+// requeue returns in-flight entries that were never sent to the queue.
+// Called from the WS drain path when a send fails mid-batch: the caller
+// hands back the remainder of whatever drain returned and the next wake
+// retries. The entries keep their place in record order.
+func (o *outbox) requeue(entries []PendingOutbox) {
+	if len(entries) == 0 {
 		return
 	}
 	o.mu.Lock()
-	defer o.mu.Unlock()
-	if len(obs) > 0 {
-		o.pending = append(obs, o.pending...)
+	for _, e := range entries {
+		if i := o.indexLocked(e.seq); i >= 0 {
+			o.entries[i].inFlight = false
+		}
 	}
-	if len(updates) > 0 {
-		o.opUpdates = append(updates, o.opUpdates...)
-	}
+	o.mu.Unlock()
 	o.wake()
 }
 
-// ackObservation removes an observation from durable storage after global
-// has acked its receipt via rpc_response{ok:true}. The in-memory queue
-// entry is already gone (drain removed it and the WS layer has been
-// holding it until ack arrived).
-func (o *outbox) ackObservation(rowID uint64) {
-	if o.localDB != nil && rowID != 0 {
-		o.localDB.AckOutboxRow(rowID)
-	}
-}
-
-// reloadFromDisk repopulates the in-memory outbox with any SQLite rows
-// whose row IDs are not already present in memory.
+// reloadFromDisk is the reset for a new WS connection, called on every
+// (re)connect before the drain loop starts.
 //
-// Called on every WS reconnect so observations that were in-flight when a
-// previous connection dropped — sent to the wire but never acked — come
-// back into the drain queue and get re-sent. Without this, a disconnect
-// during the ack window would strand the observation in SQLite until the
-// next worker restart.
+// Every in-flight entry becomes due again: whatever went out on the
+// previous connection got no acknowledgement the new one could carry, and
+// global may or may not have committed it.
 //
-// Holds mu across the SQLite read so a concurrent appendObservation can't
-// finish its persist between our ListPending and the membership check —
-// which would otherwise make us enqueue a duplicate when append later adds
-// the same row to the in-memory slice.
+// The table is also read again, and a row memory lacks is queued ahead of
+// everything in memory, in row order. In-process appends always reach
+// memory (appendMu is held here, so none is between its SQLite write and
+// its queueing), so such a row is one the startup read could not load:
+// older than anything this process recorded.
 //
-// An error means the table could not be read and nothing was re-enqueued.
-// The rows it holds are then neither in memory nor on their way to global,
-// so the caller must not start draining as if the outbox were complete.
+// An error means the table could not be read and nothing was added. Rows
+// a failed startup read left behind are then neither in memory nor on
+// their way to global, so the caller must not start draining as if the
+// outbox were complete.
 func (o *outbox) reloadFromDisk() error {
-	if o.localDB == nil {
-		return nil
+	o.appendMu.Lock()
+	defer o.appendMu.Unlock()
+	var disk []PendingOutbox
+	if o.localDB != nil {
+		var err error
+		if disk, err = o.localDB.ListPendingOutbox(); err != nil {
+			return err
+		}
 	}
 	o.mu.Lock()
-	pending, err := o.localDB.ListPendingOutbox()
-	if err != nil {
-		o.mu.Unlock()
-		return err
+	inMemory := make(map[uint64]bool, len(o.entries))
+	for i := range o.entries {
+		if o.entries[i].RowID != 0 {
+			inMemory[o.entries[i].RowID] = true
+		}
+		o.entries[i].inFlight = false
 	}
-	if len(pending) == 0 {
-		o.mu.Unlock()
-		return nil
-	}
-	seen := make(map[uint64]struct{}, len(o.pending))
-	for _, p := range o.pending {
-		if p.RowID != 0 {
-			seen[p.RowID] = struct{}{}
+	var missing []PendingOutbox
+	for _, e := range disk {
+		if !inMemory[e.RowID] {
+			o.nextSeq++
+			e.seq = o.nextSeq
+			missing = append(missing, e)
 		}
 	}
-	added := 0
-	for _, p := range pending {
-		if p.RowID == 0 {
-			continue
-		}
-		if _, dup := seen[p.RowID]; dup {
-			continue
-		}
-		o.pending = append(o.pending, p)
-		added++
+	if len(missing) > 0 {
+		o.entries = append(missing, o.entries...)
 	}
+	queued := len(o.entries)
 	o.mu.Unlock()
-	if added > 0 {
+	if queued > 0 {
 		o.wake()
 	}
 	return nil
+}
+
+// ack removes an entry from durable storage and then from memory once
+// global acknowledged it (or rejected it terminally, or the worker cannot
+// send it at all). Removing an entry of an ordered chain unblocks the next
+// one of its operation, so ack wakes the drain loop for it.
+//
+// The row goes first: a row left on disk after its entry left memory would
+// come back on the next restart or reload after the later entries of its
+// chain, and replay an older phase over a newer one. So a failed delete
+// keeps the entry, backed off like a transient rejection: the resend is
+// answered without effect (global already committed it) and ack tries the
+// delete again. appendMu keeps ack out of reloadFromDisk's window between
+// reading the table and merging it.
+func (o *outbox) ack(entry PendingOutbox) {
+	o.appendMu.Lock()
+	defer o.appendMu.Unlock()
+	if o.localDB != nil && entry.RowID != 0 {
+		if err := o.localDB.AckOutboxRow(entry.RowID); err != nil {
+			slog.Error("outbox entry acknowledged but its row could not be deleted; keeping it and sending it again after a backoff",
+				append(outboxLogAttrs(entry), "row_id", entry.RowID, "err", err)...)
+			o.requeueRejected(entry)
+			return
+		}
+	}
+	o.mu.Lock()
+	i := o.indexLocked(entry.seq)
+	if i >= 0 {
+		o.entries = append(o.entries[:i], o.entries[i+1:]...)
+	}
+	o.mu.Unlock()
+	if i < 0 {
+		return
+	}
+	if _, ordered := orderedOp(entry); ordered {
+		o.wake()
+	}
 }

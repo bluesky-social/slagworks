@@ -48,7 +48,7 @@ func TestHandleProgressReport_OperationOverIsFinal(t *testing.T) {
 		if !errors.Is(err, model.ErrOperationNotActive) {
 			t.Fatalf("report for a removed operation: got %v, want model.ErrOperationNotActive", err)
 		}
-		if _, updates := c.DrainOutbox(); len(updates) != 1 || updates[0].Phase != "finalizing" {
+		if _, updates := takeOutbox(c); len(updates) != 1 || updates[0].Phase != "finalizing" {
 			t.Fatalf("the refused report must queue nothing; op updates = %+v", updates)
 		}
 	})
@@ -63,7 +63,7 @@ func TestHandleProgressReport_OperationOverIsFinal(t *testing.T) {
 		if !errors.Is(err, model.ErrOperationNotActive) {
 			t.Fatalf("deploy_complete for a removed operation: got %v, want model.ErrOperationNotActive", err)
 		}
-		if obs, _ := c.DrainOutbox(); len(obs) != 0 {
+		if obs, _ := takeOutbox(c); len(obs) != 0 {
 			t.Fatalf("the refused deploy_complete queued observations: %+v", obs)
 		}
 	})
@@ -100,7 +100,7 @@ func TestHandleProgressReport_OperationOverIsFinal(t *testing.T) {
 		if op := c.GetOperation(redeploy.String()); op == nil || op.Phase == "awaiting_phone_home" || op.Status != model.OpClaimed {
 			t.Fatalf("the stale agent's report changed the new operation: %+v", op)
 		}
-		if obs, _ := c.DrainOutbox(); len(obs) != 0 {
+		if obs, _ := takeOutbox(c); len(obs) != 0 {
 			t.Fatalf("the stale agent's report queued observations: %+v", obs)
 		}
 	})

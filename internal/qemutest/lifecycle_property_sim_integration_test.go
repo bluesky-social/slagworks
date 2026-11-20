@@ -271,6 +271,16 @@ func propNamedHistories() []propHistory {
 			{Do: "vm_reset"},
 			{Do: "settle", Flag: true},
 		}},
+		// Global crashes with the power op's completion read off the wire but
+		// not committed. The worker keeps the op update in its outbox and
+		// sends it again once global is back, so the op completes instead of
+		// failing at the stuck-op timeout over a host that was power-cycled
+		// (P5).
+		{Name: "power-result-across-hub-crash", Steps: []propStep{
+			{Do: "power", Arg: "cycle"},
+			{Do: "hub_crash", Ms: 150},
+			{Do: "settle", Flag: true},
+		}},
 		{Name: "power-ops-around-deploy", Steps: []propStep{
 			{Do: "power", Arg: "off"},
 			{Do: "settle", Flag: true},

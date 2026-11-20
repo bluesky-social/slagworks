@@ -390,7 +390,7 @@ func TestExecutor_FailedOp(t *testing.T) {
 
 	// The outbox carries the execution-start phase, then the failure with
 	// its error.
-	_, updates := cache.DrainOutbox()
+	_, updates := takeOutbox(cache)
 	if len(updates) != 2 {
 		t.Fatalf("expected phase + failed updates in outbox, got %+v", updates)
 	}

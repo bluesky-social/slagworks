@@ -137,7 +137,7 @@ func TestExecutor_OpRemovedMidRun_NoFurtherHostWrites(t *testing.T) {
 					cache.ApplyOpRemoved(removedID.String(), machineID.String(), op.Version+1, model.MachineStateFailed)
 					// Drop what was queued before the removal: only reports
 					// queued after it are under test.
-					cache.DrainOutbox()
+					takeOutbox(cache)
 				}
 				exec := NewExecutor(ExecutorConfig{
 					Cache: cache,
@@ -174,7 +174,7 @@ func TestExecutor_OpRemovedMidRun_NoFurtherHostWrites(t *testing.T) {
 						t.Errorf("the executor issued %s after it had applied op_removed for the op during %s (calls: %v)", c, tc.during, log.calls)
 					}
 				}
-				obs, updates := cache.DrainOutbox()
+				obs, updates := takeOutbox(cache)
 				if len(obs) != 0 || len(updates) != 0 {
 					t.Errorf("the executor reported on an op global had already ended: %d observations, op_updates %+v", len(obs), updates)
 				}

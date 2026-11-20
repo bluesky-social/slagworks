@@ -163,7 +163,7 @@ func TestExecutor_BMCReconcile_Success(t *testing.T) {
 		t.Errorf("no stored password on the op, but reconcile was handed %q; want \"\" (generate)", rec.monitorPasswords[0])
 	}
 
-	obs, updates := cache.DrainOutbox()
+	obs, updates := takeOutbox(cache)
 	if len(obs) != 1 || obs[0].Obs.Event != "bmc_reconcile_report" || obs[0].Obs.OperationID != op.ID || obs[0].Obs.MachineID != op.MachineID {
 		t.Fatalf("expected one bmc_reconcile_report observation for the op, got %+v", obs)
 	}
@@ -251,7 +251,7 @@ func testStoredPasswordReasserted(t *testing.T, result *bmcreconcile.Result, wan
 	if len(rec.monitorPasswords) != 1 || rec.monitorPasswords[0] != testStoredMonitorPW {
 		t.Fatalf("reconcile must be handed the stored monitor password, got %q", rec.monitorPasswords)
 	}
-	obs, updates := cache.DrainOutbox()
+	obs, updates := takeOutbox(cache)
 	if len(obs) != 1 {
 		t.Fatalf("expected the report, got %+v", obs)
 	}
@@ -323,7 +323,7 @@ func TestExecutor_BMCReconcile_SerialMismatch(t *testing.T) {
 	if len(rec.calls) != 0 {
 		t.Fatal("reconcile ran despite a chassis-serial mismatch")
 	}
-	obs, updates := cache.DrainOutbox()
+	obs, updates := takeOutbox(cache)
 	if len(obs) != 0 {
 		t.Errorf("no report expected, got %+v", obs)
 	}
@@ -341,7 +341,7 @@ func TestExecutor_BMCReconcile_FailsBeforeWrite(t *testing.T) {
 
 	exec.runBMCReconcile(context.Background(), op)
 
-	obs, updates := cache.DrainOutbox()
+	obs, updates := takeOutbox(cache)
 	if len(obs) != 0 {
 		t.Errorf("no report expected when nothing was written, got %+v", obs)
 	}
@@ -359,7 +359,7 @@ func TestExecutor_BMCReconcile_PartialFailure(t *testing.T) {
 
 	exec.runBMCReconcile(context.Background(), op)
 
-	obs, updates := cache.DrainOutbox()
+	obs, updates := takeOutbox(cache)
 	if len(obs) != 1 {
 		t.Fatalf("expected the report, got %+v", obs)
 	}
@@ -407,7 +407,7 @@ func TestExecutor_BMCReconcile_RefusesWithoutAdminRuntime(t *testing.T) {
 			if len(rec.calls) != 0 || *factoryCalls != 0 {
 				t.Fatalf("refused op still reached the BMC: reconciles=%d factory=%d", len(rec.calls), *factoryCalls)
 			}
-			_, updates := cache.DrainOutbox()
+			_, updates := takeOutbox(cache)
 			if !hasFailedUpdate(updates, "") {
 				t.Errorf("expected a failed op_update, got %+v", updates)
 			}
@@ -427,7 +427,7 @@ func TestExecutor_BMCReconcile_RoutedFromExecuteOp(t *testing.T) {
 	if len(rec.calls) != 1 {
 		t.Fatalf("executeOp did not run the reconcile (calls=%d)", len(rec.calls))
 	}
-	if obs, _ := cache.DrainOutbox(); len(obs) != 1 || obs[0].Obs.Event != "bmc_reconcile_report" {
+	if obs, _ := takeOutbox(cache); len(obs) != 1 || obs[0].Obs.Event != "bmc_reconcile_report" {
 		t.Errorf("expected the report observation, got %+v", obs)
 	}
 }
@@ -436,7 +436,7 @@ func TestExecutor_BMCReconcile_RoutedFromExecuteOp(t *testing.T) {
 // op_updates beside it.
 func drainReport(t *testing.T, cache *Cache) (model.BMCReconcileReport, []model.OperationUpdate) {
 	t.Helper()
-	obs, updates := cache.DrainOutbox()
+	obs, updates := takeOutbox(cache)
 	if len(obs) != 1 || obs[0].Obs.Event != "bmc_reconcile_report" {
 		t.Fatalf("expected one bmc_reconcile_report observation, got %+v", obs)
 	}
@@ -603,7 +603,7 @@ func TestExecutor_BMCReconcile_UnconfirmedPassword_Reported(t *testing.T) {
 
 	exec.runBMCReconcile(context.Background(), op)
 
-	obs, updates := cache.DrainOutbox()
+	obs, updates := takeOutbox(cache)
 	if len(obs) != 1 {
 		t.Fatalf("expected the report, got %+v", obs)
 	}
@@ -640,7 +640,7 @@ func TestExecutor_BMCReconcile_UnconfirmedCarried_Adopted(t *testing.T) {
 		rec.monitorPasswords[0] != testStoredMonitorPW {
 		t.Fatalf("reconcile must be handed the stored password and the unconfirmed ones in order; got %d unconfirmed", len(rec.unconfirmed))
 	}
-	obs, updates := cache.DrainOutbox()
+	obs, updates := takeOutbox(cache)
 	if len(obs) != 1 {
 		t.Fatalf("expected the report, got %+v", obs)
 	}

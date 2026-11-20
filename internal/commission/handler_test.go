@@ -481,10 +481,9 @@ func phoneHomeFixture() (*Handler, *fakeStore, *fakeOpPublisher, *fakeInvalidato
 
 // TestHandlePhoneHome_CompletesDeployOp: a phone_home observation that
 // names the deploy op completes it and moves the machine to running. The
-// worker's op_update for the same completion is memory-only and
-// unacknowledged; this observation is the copy that survives a worker
-// restart or a dropped connection, so global must act on it rather than
-// ack and ignore it (which left the op to fail at PhoneHomeTimeout).
+// worker delivers it ahead of its op_update for the same completion, so
+// global must act on it rather than ack and ignore it (which left the op
+// to fail at PhoneHomeTimeout).
 func TestHandlePhoneHome_CompletesDeployOp(t *testing.T) {
 	h, st, pub, inv := phoneHomeFixture()
 	machineID, opID := uuid.New(), uuid.New()
@@ -558,7 +557,7 @@ func TestHandlePhoneHome_BindingRejectedIsTerminal(t *testing.T) {
 
 // TestHandlePhoneHome_StoreErrorIsRetried: a transient store failure
 // returns a non-terminal error, so the worker keeps the outbox row and
-// replays it. This is the case the op_update path drops on the floor.
+// replays it.
 func TestHandlePhoneHome_StoreErrorIsRetried(t *testing.T) {
 	h, st, pub, _ := phoneHomeFixture()
 	st.finalizeErr = errors.New("connection reset by peer")
