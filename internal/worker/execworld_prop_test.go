@@ -212,9 +212,21 @@ type epOpFacts struct {
 	// phoneHomeAckedUnrecorded: one answered with success and queued nothing,
 	// with no earlier recorded phone-home to justify that.
 	phoneHomeRecorded, phoneHomeAckedUnrecorded bool
-	reportLossy                                 bool         // a report for this op was dropped by an injected lossy fault
-	hubFailedBy                                 string       // abort | orphan | stuck | phonehome | pending | worker | observation
-	running                                     map[int]bool // worker idx -> currently inside a won attempt
+	reportLossy                                 bool   // a report for this op was dropped by an injected lossy fault
+	hubFailedBy                                 string // abort | orphan | stuck | phonehome | pending | worker | observation
+	// deployCompleteAtHub: global has handled this deploy's durable
+	// deploy_complete observation.
+	deployCompleteAtHub bool
+	// overlap: an executor instance sent a claim for this op while an earlier
+	// instance of the same worker was still inside its own attempt on it (the
+	// VIP was lost and regained under the first one).
+	overlap bool
+	running map[int]bool // worker idx -> currently inside a won attempt
+	// stateOvertaken: worker idx -> the op_delta that carried the claim's
+	// transient machine state reached the worker after a later delta of the
+	// same op and was dropped as stale, and nothing has restored the state
+	// since (a resync or a re-send after a snapshot push would).
+	stateOvertaken map[int]bool
 }
 
 type epWorld struct {
@@ -236,6 +248,13 @@ type epWorld struct {
 	attemptLog []*epAttempt
 	deferred   []func() // hub-side events that land later (a late claim commit)
 	agentEpoch int      // bumped by every agent/phone-home action
+
+	// ha, when set, adds the HA-pair host model (hapair_prop_test.go): real
+	// PXE boot decisions and agent reports over the workers' boot HTTP API.
+	ha *haWorld
+	// forced is a queue of interrupts the next executor wait must take
+	// (targeted patterns embedded in a random history).
+	forced []func(pw *epWorker)
 }
 
 // pick draws an approximately uniform int in [0,n). rapid's own integer and
@@ -381,7 +400,7 @@ func (h *epHub) buildSnapshot() *model.SiteSnapshot {
 			continue
 		}
 		members[m.id] = true
-		snap.Machines = append(snap.Machines, model.MachineSnapshot{
+		ms := model.MachineSnapshot{
 			ID:           m.id,
 			NetBoxSerial: m.serial,
 			Hostname:     fmt.Sprintf("m%d.pop", m.idx),
@@ -391,7 +410,13 @@ func (h *epHub) buildSnapshot() *model.SiteSnapshot {
 			Locked:       m.locked,
 			PXEEligible:  true,
 			Interfaces:   []model.SnapshotInterface{{Name: "eth0", MAC: m.mac, Type: "physical"}},
-		})
+		}
+		if h.w.ha != nil {
+			// What the boot-script handler needs to serve an installer.
+			ms.KernelParams = "none"
+			ms.SystemUUID = haSystemUUID(m)
+		}
+		snap.Machines = append(snap.Machines, ms)
 	}
 	h.members = members
 	h.snap = snap
@@ -487,7 +512,7 @@ func (h *epHub) create(spec epOpSpec, params json.RawMessage) *epHubOp {
 	}
 	h.ops[rec.op.ID] = rec
 	h.order = append(h.order, rec.op.ID)
-	h.w.byOp[rec.op.ID] = &epOpFacts{id: rec.op.ID, spec: spec, removedSeen: map[int]bool{}, running: map[int]bool{}}
+	h.w.byOp[rec.op.ID] = &epOpFacts{id: rec.op.ID, spec: spec, removedSeen: map[int]bool{}, running: map[int]bool{}, stateOvertaken: map[int]bool{}}
 	h.publishDelta(rec.op, "")
 	return rec
 }
@@ -632,7 +657,10 @@ func (h *epHub) applyOpUpdate(u model.OperationUpdate) {
 		return
 	}
 	facts := h.w.byOp[id]
-	if u.Phase != "" && rec.op.Phase != u.Phase && !epTerminal(rec.op.Status) {
+	// A deploy at awaiting_phone_home is held there against a later phase
+	// write, as the worker's own guard does (only "failed" leaves it).
+	held := rec.op.Phase == "awaiting_phone_home" && u.Phase != "failed"
+	if u.Phase != "" && rec.op.Phase != u.Phase && !epTerminal(rec.op.Status) && !held {
 		// A phase write leaves a terminal row as it is; on an active one it
 		// bumps the version and publishes the post-mutation row.
 		rec.op.Phase = u.Phase
@@ -692,6 +720,16 @@ func (h *epHub) applyObservation(obs model.Observation) (error, bool) {
 	case "deploy_complete":
 		if rec.op.Status == model.OpFailed {
 			return errors.New("operation is terminal"), true
+		}
+		h.w.byOp[obs.OperationID].deployCompleteAtHub = true
+		if !epTerminal(rec.op.Status) && rec.op.Phase != "awaiting_phone_home" {
+			// The durable observation carries the latch, not only the
+			// memory-only phase op_update.
+			rec.op.Phase = "awaiting_phone_home"
+			rec.phaseAt = h.w.now
+			rec.op.Version++
+			h.w.byOp[obs.OperationID].everAwait = true
+			h.publishDelta(rec.op, "")
 		}
 		return nil, false
 	case "phone_home":
@@ -826,12 +864,19 @@ type epWorker struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	connUp    bool
+	connUp bool
+	// downAt is the virtual time this worker's op stream went down, -1 once
+	// an op_resync has been applied since (see syncStreamClock).
+	downAt    int64
 	connGen   int // bumped on every connect and disconnect
 	viewEpoch int // bumped whenever a snapshot is applied to the cache
 	inbox     []epMsg
 
-	cur     *epAttempt
+	cur *epAttempt
+	// outer holds the attempts of this worker that are on the stack beneath
+	// the current processOps pass: an executor that lost the VIP inside a
+	// claim or a BMC call, with a later executor's pass nested in it.
+	outer   []*epAttempt
 	inTick  int
 	crashed bool
 	// viewAtPass is the set of machines in the worker's view when the
@@ -899,6 +944,28 @@ func (pw *epWorker) releaseVIP() {
 	pw.active = false
 	pw.cancel()
 	pw.w.logf("w%d: VIP released (executor #%d cancelled)", pw.idx, pw.execID)
+}
+
+// streamDownFor is how long, in virtual seconds, this worker's op stream has
+// been down without an op_resync since; 0 while it is up to date.
+func (pw *epWorker) streamDownFor() int64 {
+	if pw.downAt < 0 {
+		return 0
+	}
+	return pw.w.now - pw.downAt
+}
+
+// syncStreamClock carries the world's virtual time into the cache's
+// wall-clock record of when its op stream went down, so that the trust
+// window of a frozen op set (opStreamTrustWindow) elapses in virtual time.
+// Called before a boot decision is read.
+func (pw *epWorker) syncStreamClock() {
+	o := pw.cache.opState
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if pw.downAt >= 0 && !o.streamDownSince.IsZero() {
+		o.streamDownSince = time.Now().Add(-time.Duration(pw.streamDownFor()) * time.Second)
+	}
 }
 
 // untrusted peeks the op layer's rehydrated-not-resynced flag.
@@ -975,6 +1042,10 @@ func (pw *epWorker) disconnect() {
 	pw.connUp = false
 	pw.connGen++
 	pw.inbox = nil
+	pw.cache.OpStreamDown(time.Now()) // as WSConn.Run does when a connection ends
+	if pw.downAt < 0 {
+		pw.downAt = pw.w.now
+	}
 	pw.w.logf("w%d: disconnected", pw.idx)
 	pw.w.stat("conn.disconnect")
 }
@@ -1004,11 +1075,19 @@ func (pw *epWorker) deliver(i int) {
 	case epMsgDelta:
 		w.stat("stream.delta")
 		w.logf("w%d <- op_delta %s status=%s phase=%q v%d", pw.idx, w.opName(msg.op.ID), msg.op.Status, msg.op.Phase, msg.op.Version)
+		if f := w.byOp[msg.op.ID]; f != nil && msg.state != "" {
+			held := pw.cache.GetOperation(msg.op.ID.String())
+			f.stateOvertaken[pw.idx] = held != nil && msg.op.Version <= held.Version
+		}
 		pw.cache.ApplyOpDelta(msg.op, msg.state)
 	case epMsgResync:
 		w.stat("stream.resync")
 		w.logf("w%d <- op_resync (%d ops)", pw.idx, len(msg.ops))
 		pw.cache.ApplyOpResync(append([]model.Operation(nil), msg.ops...), msg.states)
+		pw.downAt = -1
+		for _, f := range w.byOp {
+			delete(f.stateOvertaken, pw.idx)
+		}
 	case epMsgRemoved:
 		w.stat("stream.removed")
 		w.logf("w%d <- op_removed %s v%d state=%q", pw.idx, w.opName(msg.op.ID), msg.op.Version, msg.state)
@@ -1120,6 +1199,10 @@ func (pw *epWorker) restart(why string) {
 	pw.cur = nil
 	pw.updSent = map[uuid.UUID][]model.OperationUpdate{}
 	pw.obsSent = map[uuid.UUID]int{}
+	pw.downAt = -1 // a new process: its op set is untrusted until a resync
+	for _, f := range w.byOp {
+		delete(f.stateOvertaken, pw.idx)
+	}
 	pw.openCache()
 	if pw.active {
 		pw.startExecutor()
@@ -1163,6 +1246,11 @@ func (pw *epWorker) tick() {
 	}
 	exec, ctx, exec0 := pw.exec, pw.ctx, pw.execID
 	crashed := false
+	nOuter := len(pw.outer)
+	if saved != nil && !saved.ended {
+		pw.outer = append(pw.outer, saved)
+	}
+	defer func() { pw.outer = pw.outer[:nOuter] }()
 	pw.inTick++
 	func() {
 		defer func() {
@@ -1226,6 +1314,11 @@ func (pw *epWorker) ClaimOp(ctx context.Context, id uuid.UUID) (*model.Operation
 	if prev := pw.cur; prev != nil && prev.exec == pw.execID {
 		pw.endAttempt(prev)
 	}
+	for _, prev := range pw.outer {
+		if facts != nil && prev.exec != pw.execID && prev.op == id && !prev.ended {
+			facts.overlap = true
+		}
+	}
 	a := &epAttempt{worker: pw.idx, exec: pw.execID, op: id, outcome: "err", agentEpoch: w.agentEpoch}
 	w.attemptLog = append(w.attemptLog, a)
 	pw.cur = a
@@ -1267,6 +1360,11 @@ func (pw *epWorker) ClaimOp(ctx context.Context, id uuid.UUID) (*model.Operation
 	mode := "ok"
 	if !w.quiet {
 		mode = epChoose(w, epClaimModes, "claimMode")
+		if w.ha != nil && w.ha.bothActive && strings.HasPrefix(mode, "cancel") {
+			// No VIP to lose: a both-active worker's executor context is
+			// cancelled only at shutdown.
+			mode = "ok"
+		}
 		w.stat("claim.mode." + mode)
 	} else {
 		w.stat("settle.claim")
@@ -1497,6 +1595,7 @@ func (c *epCtrl) PowerOn(ctx context.Context) error {
 	r := c.call(ctx, "PowerOn", "", true)
 	if r.issued {
 		c.m.powerOn = true
+		c.pw.w.hostPower(c.m, "on")
 	}
 	return r.err
 }
@@ -1505,6 +1604,7 @@ func (c *epCtrl) PowerOff(ctx context.Context) error {
 	r := c.call(ctx, "PowerOff", "", true)
 	if r.issued {
 		c.m.powerOn = false
+		c.pw.w.hostPower(c.m, "off")
 	}
 	return r.err
 }
@@ -1513,6 +1613,7 @@ func (c *epCtrl) PowerCycle(ctx context.Context) error {
 	r := c.call(ctx, "PowerCycle", "", true)
 	if r.issued {
 		c.m.powerOn = true
+		c.pw.w.hostPower(c.m, "cycle")
 	}
 	return r.err
 }

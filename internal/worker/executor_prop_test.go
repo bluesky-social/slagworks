@@ -214,6 +214,7 @@ func newEpWorld(t *rapid.T, dir string) *epWorld {
 			dbPath:  filepath.Join(dir, fmt.Sprintf("c%d-w%d.db", caseNo, i)),
 			updSent: map[uuid.UUID][]model.OperationUpdate{},
 			obsSent: map[uuid.UUID]int{},
+			downAt:  -1,
 		}
 		pw.openCache()
 		w.wk = append(w.wk, pw)
@@ -314,7 +315,7 @@ func (w *epWorld) step(name string, cur *epWorker) {
 		pw := w.pickWorker("nestedWorker")
 		if cur == nil || pw.inTick == 0 {
 			pw.tick()
-		} else if pw == cur && w.depth == 1 {
+		} else if pw == cur && w.depth == 1 && (w.ha == nil || !w.ha.bothActive) {
 			pw.releaseVIP()
 			pw.acquireVIP()
 			pw.tick()
@@ -378,6 +379,10 @@ func (w *epWorld) step(name string, cur *epWorker) {
 		w.agent()
 	case "late":
 		w.runDeferred()
+	default:
+		if w.ha != nil {
+			w.ha.step(name, cur)
+		}
 	}
 }
 
@@ -409,6 +414,15 @@ func init() {
 // blocked inside a claim RPC or a controller call.
 func (w *epWorld) interrupt(pw *epWorker, where string) {
 	if w.quiet || w.depth >= 2 {
+		return
+	}
+	if len(w.forced) > 0 && w.depth == 0 {
+		f := w.forced[0]
+		w.forced = w.forced[1:]
+		w.depth++
+		defer func() { w.depth-- }()
+		w.stat("interrupt.forced@" + where)
+		f(pw)
 		return
 	}
 	k := w.pick(16, "interrupt@"+where)
@@ -572,7 +586,7 @@ func (w *epWorld) checkAttempt(pw *epWorker, a *epAttempt) {
 			otherWon = true
 		}
 	}
-	twoExecutors := len(workers) == 1 && len(execs) > 1
+	twoExecutors := len(workers) == 1 && (len(execs) > 1 || facts.overlap)
 
 	if a.outcome != "won" {
 		if a.factoryCalls != 0 || len(a.calls) != 0 || a.reconcileCalls != 0 {
@@ -850,6 +864,22 @@ func (w *epWorld) checkAttempt(pw *epWorker, a *epAttempt) {
 		}
 		w.stat("attempt.completed.setboot")
 	case spec.lifecycle():
+		// A host can run the agent on the pending-op boot clause before the
+		// claim lands, and the agent can fail the op while the executor is
+		// still driving it. The executor re-reads the op before each write
+		// to the host and stops, without a report of its own, once this
+		// worker has accepted the agent's failure.
+		agentFailed := w.ha != nil && w.ha.agentFailed[a.op][pw.idx]
+		stoppedForAgent := func(before string) bool {
+			if !agentFailed || len(calls) != 0 {
+				return false
+			}
+			w.stat("attempt.stopped_agent_failed@" + before)
+			return true
+		}
+		if stoppedForAgent("SetBootDevice") {
+			return
+		}
 		c := want("SetBootDevice", "pxe")
 		if c == nil {
 			return
@@ -866,6 +896,9 @@ func (w *epWorld) checkAttempt(pw *epWorker, a *epAttempt) {
 		if st.err == nil && st.arg == "off" {
 			act = "PowerOn"
 		}
+		if stoppedForAgent(act) {
+			return
+		}
 		c = want(act, "")
 		if c == nil {
 			return
@@ -877,7 +910,11 @@ func (w *epWorld) checkAttempt(pw *epWorker, a *epAttempt) {
 		if !done() {
 			return
 		}
-		if !agentTouched {
+		// A host can install on the pending-op boot clause before the claim
+		// lands; the executor then drives an op already at
+		// awaiting_phone_home, whose phase it must not move.
+		latched := w.ha != nil && len(w.ha.installed[a.op]) > 0
+		if !agentTouched && !latched {
 			if len(terminal) != 0 {
 				bad("lifecycle op booted: the executor must not report a terminal status, got %v", terminal)
 			}
@@ -1056,6 +1093,13 @@ func (w *epWorld) checkQuiescence() {
 				// Claim committed, reply lost, and the machine left the
 				// site before the retry: nobody here may drive it.
 				w.stat("final.claimed.out_of_site")
+			case !ran && rec.op.Phase != "" && claimant != nil && claimant.active && claimant.gen == facts.grantGen:
+				// The host PXE-booted on the pending-op clause and its boot
+				// recorded a phase before the claim committed; the claim's
+				// reply was then lost. The re-claim (opstate.CanReclaim) and
+				// the orphaned-claim sweep both require an empty phase.
+				w.violate("claim-reply-lost-after-boot-phase", "%s is claimed by w%d with its claim reply lost; its row already carried phase %q (the host booted on the pending-op clause), so the executor can never resume the claim and the orphaned-claim sweep never fails it",
+					name, claimant.idx, rec.op.Phase)
 			case !ran && claimant != nil && claimant.active && claimant.gen == facts.grantGen:
 				w.violate("stall-claimed-not-driven", "%s is claimed by w%d (which holds the VIP and is connected and resynced) but w%d never drove it and never will: nothing re-claims a claimed row; it waits for the orphaned-claim sweep",
 					name, claimant.idx, claimant.idx)
