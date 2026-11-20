@@ -30,7 +30,8 @@ import (
 //   - one address per interface: a bound machine's interface with more than
 //     one active address never fails the build; its facts carry the
 //     device's primary_ip4 when that is one of them, else the numerically
-//     lowest IPv4 address, else the lowest IPv6 address;
+//     lowest IPv4 address, else the lowest IPv6 address, preferring within
+//     a family addresses whose NetBox role is unset or loopback;
 //   - relay pools: one per /31 link seen on an active physical-class
 //     interface address, offering the higher address of the ends present;
 //   - metamorphic: permuting Devices, Interfaces, IPs, OOB prefixes and the
@@ -203,6 +204,11 @@ func drawSite(t *rapid.T, opts genOpts) genSite {
 				ipID++
 				if status != "" {
 					ip.Status = &netbox.NestedValue{Value: status}
+				}
+				// NetBox IP role: mostly unset; loopback counts as the
+				// interface's own address, the rest do not.
+				if r := rapid.SampledFrom([]string{"", "", "", "loopback", "secondary", "anycast", "vip"}).Draw(t, fmt.Sprintf("%siprole%d", pre, j)); r != "" {
+					ip.Role = &netbox.NestedValue{Value: r}
 				}
 				in.IPs = append(in.IPs, ip)
 				devIPs = append(devIPs, ip.ID)
@@ -391,8 +397,9 @@ func refFacts(in Inputs, devID int) []refIface {
 
 // refChoose is the model's one-address rule: the device's primary_ip4 when
 // it is one of the interface's active addresses; otherwise the first of
-// them ordered IPv4 before IPv6, then by address value, then by prefix
-// length, then by NetBox ID.
+// them ordered IPv4 before IPv6, then the interface's own addresses (NetBox
+// role unset or loopback) before the rest, then by address value, then by
+// prefix length, then by NetBox ID.
 func refChoose(active []netbox.IPAddress, primary int) string {
 	if len(active) == 0 {
 		return ""
@@ -402,12 +409,17 @@ func refChoose(active []netbox.IPAddress, primary int) string {
 			return ip.Address
 		}
 	}
+	own := func(ip netbox.IPAddress) bool {
+		return ip.Role == nil || ip.Role.Value == "loopback"
+	}
 	sorted := append([]netbox.IPAddress(nil), active...)
 	sort.Slice(sorted, func(i, j int) bool {
 		a, b := netip.MustParsePrefix(sorted[i].Address), netip.MustParsePrefix(sorted[j].Address)
 		switch {
 		case a.Addr().Is4() != b.Addr().Is4():
 			return a.Addr().Is4()
+		case own(sorted[i]) != own(sorted[j]):
+			return own(sorted[i])
 		case a.Addr() != b.Addr():
 			return a.Addr().Less(b.Addr())
 		case a.Bits() != b.Bits():

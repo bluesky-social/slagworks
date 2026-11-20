@@ -354,7 +354,11 @@ empty (`builder.go:68`). A machine's interface facts hold one address:
 when an interface of a bound machine carries more than one active IP
 address, Build keeps the device's `primary_ip4` if it is one of them,
 else the numerically lowest IPv4 address (the lowest IPv6 address when
-the interface has no IPv4), independent of NetBox list order. The
+the interface has no IPv4), independent of NetBox list order. Within a
+family, an address whose NetBox role is unset or `loopback` comes before
+one NetBox marks as `secondary` or shared (`anycast`, `vip`, `vrrp`,
+`hsrp`, `glbp`, `carp`), so a router's anycast /32 on `lo` never displaces
+its identity /32. The
 dispatcher logs the affected interfaces in one warning per site, repeated
 only when the set or a chosen address changes.
 Its inputs (`Inputs`, `builder.go:31`) are

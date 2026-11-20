@@ -103,20 +103,26 @@ type AddressChoice struct {
 //
 //   - the device's primary IPv4 (NetBox primary_ip4, matched by address ID;
 //     0 for none) when it is one of them;
-//   - otherwise the numerically lowest IPv4 address, ties broken by the
-//     shorter prefix length, then the lower NetBox ID;
-//   - an interface with no IPv4 address gets its lowest IPv6 address by the
-//     same ordering. An address that does not parse sorts after every one
-//     that does.
+//   - otherwise an IPv4 address, preferring the interface's own addresses
+//     (NetBox role unset or loopback, see netbox.IPAddress.IsOwnAddress)
+//     over secondary and shared (anycast, VIP, FHRP) ones, and among those
+//     the numerically lowest, ties broken by the shorter prefix length, then
+//     the lower NetBox ID;
+//   - an interface with no IPv4 address gets an IPv6 address by the same
+//     ordering. An address that does not parse sorts after every one that
+//     does.
 //
 // IPv4 comes first because the facts hold one address per interface and
 // every shipped network script and the worker's DHCP reservation read it as
 // IPv4. The primary comes first because it is the address the operator
 // already named as the host's own; on a storage host's ten-address data
-// interface it is the host address and the rest are service addresses.
+// interface it is the host address and the rest are service addresses. An
+// own address comes before a lower shared one because NetBox already says
+// the shared one is not this host's: the shipped L3 scripts render lo's /32
+// as the BGP router-id, which must not be a router's anycast address.
 func chooseInterfaceAddress(addrs []netbox.IPAddress, primaryIP4 int) netbox.IPAddress {
 	type key struct {
-		class int // 0 IPv4, 1 IPv6, 2 unparseable
+		class int // 0 own IPv4, 1 other IPv4, 2 own IPv6, 3 other IPv6, 4 unparseable
 		addr  netip.Addr
 		bits  int
 	}
@@ -128,12 +134,16 @@ func chooseInterfaceAddress(addrs []netbox.IPAddress, primaryIP4 int) netbox.IPA
 		} else if a, err := netip.ParseAddr(ip.Address); err == nil {
 			addr, bits = a.Unmap(), a.Unmap().BitLen()
 		} else {
-			return key{class: 2}
+			return key{class: 4}
 		}
-		if addr.Is4() {
-			return key{0, addr, bits}
+		class := 0
+		if !addr.Is4() {
+			class = 2
 		}
-		return key{1, addr, bits}
+		if !ip.IsOwnAddress() {
+			class++
+		}
+		return key{class, addr, bits}
 	}
 	best, bestKey := addrs[0], keyOf(addrs[0])
 	for _, ip := range addrs {

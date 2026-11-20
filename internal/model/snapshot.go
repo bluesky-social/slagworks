@@ -142,7 +142,9 @@ type SnapshotInterface struct {
 	// form. When the interface has several, Build picks the device's
 	// primary_ip4 if it is among them, else the numerically lowest IPv4
 	// address (the lowest IPv6 address when there is no IPv4), whatever
-	// order NetBox listed them in.
+	// order NetBox listed them in. Within a family, addresses whose NetBox
+	// role is unset or loopback come before those with another role
+	// (secondary, anycast, vip, vrrp, hsrp, glbp, carp).
 	IP string `json:"ip,omitempty"`
 
 	// The fields below carry the extra topology an L2 bond host needs and
