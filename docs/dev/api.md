@@ -59,7 +59,11 @@ request's `Authorization` header, never in the URL, and a bad token gets
 401 or 403 before the upgrade. An upgrade with no `Origin` header
 (`slagctl`) is accepted; a browser upgrade is accepted only from the API's
 own origin (its `Origin` host equals the request `Host`), and any other
-origin gets 403.
+origin gets 403. The server sends a WebSocket ping on each operator stream
+every 30 seconds, so a stream with nothing new to send still carries
+traffic through a proxy's idle timeout. An unanswered ping does not end the
+stream: a client that has stopped reading is still connected. The stream
+ends when the client closes or drops the connection or a write fails.
 
 ## Conventions
 

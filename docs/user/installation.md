@@ -190,6 +190,13 @@ operators reach it over HTTP(S); the default listen address is `:8081`
   [`configuration.md`](configuration.md#operator-authentication).
 - **Tailscale** (optional) — an OAuth client for deploy-time tailnet
   enrollment.
+- **A proxy or load balancer** (optional) in front of global must pass
+  WebSocket upgrades and the `Authorization` header through, with an idle
+  timeout of at least 60 seconds. Global pings the operator streams
+  (`slagctl machine logs -f`, `slagctl machine logs --sol -f` and the watch
+  view) every 30 seconds so that a quiet stream stays open; a shorter idle
+  timeout can still close one. 60 seconds is the default for an AWS ALB and
+  for nginx's `proxy_read_timeout`.
 
 ### `slagworksd site`
 

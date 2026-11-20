@@ -88,6 +88,9 @@ type Server struct {
 	// server restart, which is fine: a 5-minute preflight window never
 	// survives a restart in practice, and fail-closed on expiry is correct.
 	preflightKey []byte
+	// streamKeepalive is how often the logs and console streams ping their
+	// client; zero means operatorStreamKeepalive. Tests shorten it.
+	streamKeepalive time.Duration
 }
 
 type Config struct {

@@ -132,6 +132,7 @@ func (s *Server) handleConsoleStream(c *echo.Context) error {
 	// this is the documented one-shot API for doing exactly that on
 	// a write-only stream.
 	ctx := conn.CloseRead(c.Request().Context())
+	go s.keepOperatorStreamAlive(ctx, conn)
 
 	// Send the asciicast v2 header.
 	header := map[string]any{

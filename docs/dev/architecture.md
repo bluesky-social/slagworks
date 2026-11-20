@@ -855,7 +855,9 @@ OIDC-protected under `/api/v1` (middleware in `internal/api/oidcauth.go`):
 - Streams (WebSocket upgrades, token in the `Authorization` header):
   `GET /logs/stream`, `GET /console/stream`. They accept an upgrade
   with no `Origin` header or a same-origin one and refuse any other
-  origin (`acceptOperatorStream` in `logs_stream.go`).
+  origin (`acceptOperatorStream` in `logs_stream.go`), and ping the
+  client every 30 seconds so a proxy's idle timeout does not close a
+  quiet stream (`keepOperatorStreamAlive`).
 - Machine writes: `PATCH /machines/:id`;
   `POST /machines/:id/deploy` / `commission` / `lock` / `unlock` /
   `activate` / `deactivate` / `power` / `boot` / `bmc-reconcile` /
