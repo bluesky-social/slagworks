@@ -5,7 +5,7 @@
       "release-type": "go",
       "component": "slagctl",
       "include-component-in-tag": false,
-      "changelog-type": "github",
+      "changelog-type": "default",
       "changelog-path": "CHANGELOG.md",
       "bump-minor-pre-major": true,
       "exclude-paths": [
