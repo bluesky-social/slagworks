@@ -23,7 +23,7 @@ type opTimeline struct {
 }
 
 func (tl *opTimeline) drain() {
-	_, updates := tl.cache.DrainOutbox()
+	_, updates := takeOutbox(tl.cache)
 	for _, u := range updates {
 		if u.OperationID != tl.opID {
 			continue

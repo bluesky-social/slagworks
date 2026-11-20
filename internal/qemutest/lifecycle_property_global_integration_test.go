@@ -143,9 +143,9 @@ type propGlobal struct {
 	// down refuses WebSocket upgrades (global unreachable).
 	down atomic.Bool
 	// blackhole models a global that crashes after reading frames off the
-	// wire but before committing: op_updates vanish (the worker never
-	// retries them — they are unacked fire-and-forget), observations are
-	// not acked (the worker replays them from its durable outbox).
+	// wire but before committing: op_updates and observations are refused
+	// uncommitted, and the worker keeps them in its durable outbox and
+	// sends them again.
 	blackhole atomic.Bool
 	// holdPush queues identity pushes instead of sending them.
 	holdPush   atomic.Bool
@@ -221,7 +221,7 @@ func (g *propGlobal) Skew() time.Duration {
 func (g *propGlobal) record(e propHubEvent) {
 	e.At = time.Now()
 	g.events = append(g.events, e)
-	if e.Kind != "obs" && e.Kind != "dropped_update" {
+	if e.Kind != "obs" && e.Kind != "uncommitted_update" {
 		g.lastProgress = e.At
 	}
 }
@@ -405,12 +405,12 @@ type propStore struct{ g *propGlobal }
 
 var errPropNotFound = errors.New("record not found")
 
-func (s propStore) GetOperation(id uuid.UUID) (*model.Operation, error) {
+func (s propStore) GetOperationIfExists(id uuid.UUID) (*model.Operation, error) {
 	s.g.mu.Lock()
 	defer s.g.mu.Unlock()
 	op, ok := s.g.ops[id]
 	if !ok {
-		return nil, errPropNotFound
+		return nil, nil
 	}
 	cp := *op
 	return &cp, nil
@@ -671,10 +671,10 @@ func (h propOpUpdateHandler) HandleOpUpdate(ctx context.Context, msg ws.OpUpdate
 	if h.g.blackhole.Load() {
 		id, _ := uuid.Parse(msg.OperationID)
 		h.g.mu.Lock()
-		h.g.record(propHubEvent{Kind: "dropped_update", OpID: id, Phase: msg.Phase, Cause: "blackhole",
+		h.g.record(propHubEvent{Kind: "uncommitted_update", OpID: id, Phase: msg.Phase, Cause: "blackhole",
 			Detail: "status=" + msg.Status})
 		h.g.mu.Unlock()
-		return nil
+		return errors.New("propGlobal: blackhole (not committed)")
 	}
 	return h.g.opUpdate.HandleOpUpdate(ctx, msg)
 }

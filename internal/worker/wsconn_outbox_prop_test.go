@@ -1,24 +1,26 @@
 package worker
 
 // End-to-end property test: the real WSConn (connectAndRun, drainLoop,
-// drainOnce, handleObservationAck, the reconnect reset) against a real
-// ws.Hub over a loopback HTTP server, with the hub's observation handler
-// scripted to accept, reject transiently, or reject terminally, connections
-// killed from either side, and the worker process crashed and restarted
-// on the same SQLite file. Concurrency makes the interleaving vary, so the
-// properties are eventual ones checked at quiescence:
+// drainOnce, handleOutboxAck, the reconnect reset) against a real ws.Hub
+// over a loopback HTTP server, with the hub's observation and op_update
+// handlers scripted to accept, reject transiently, or reject terminally,
+// connections killed from either side, and the worker process crashed and
+// restarted on the same SQLite file. Concurrency makes the interleaving
+// vary, so the properties are eventual ones checked at quiescence:
 //
-//   - every observation the worker accepted is eventually acked by global,
-//     unless global rejected it terminally;
+//   - every observation and op update the worker accepted is eventually
+//     acked by global, unless global rejected it terminally;
 //   - once quiescent (worker outbox empty), further reconnects deliver
 //     nothing again (nothing acked is redelivered forever);
-//   - op updates reach global without duplication or reordering, and every
-//     update appended while no fault could intervene is delivered.
+//   - each op's updates reach global in the order they were appended: a
+//     resend (a lost ack, a dropped connection, a crash) repeats the newest
+//     update global has seen for the op, never an older one after a newer.
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http/httptest"
@@ -76,15 +78,33 @@ type e2eGlobal struct {
 	deliveries map[uuid.UUID]int
 	okAcked    map[uuid.UUID]bool // handler returned nil at least once
 	termAcked  map[uuid.UUID]bool
-	updates    []model.OperationUpdate
 	sizes      []int
+
+	// Op updates are keyed by the n their Result carries ({"n":N}), with
+	// the same scripting as observations.
+	updReject     map[int]int
+	updTerminal   map[int]bool
+	updDeliveries map[int]int
+	updAcked      map[int]bool // handler returned nil, or a terminal error
+	updOrder      map[string][]int
 }
 
 func newE2EGlobal() *e2eGlobal {
 	return &e2eGlobal{
 		reject: map[uuid.UUID]int{}, terminal: map[uuid.UUID]bool{},
 		deliveries: map[uuid.UUID]int{}, okAcked: map[uuid.UUID]bool{}, termAcked: map[uuid.UUID]bool{},
+		updReject: map[int]int{}, updTerminal: map[int]bool{}, updDeliveries: map[int]int{},
+		updAcked: map[int]bool{}, updOrder: map[string][]int{},
 	}
+}
+
+// e2eUpdateN reads the key an op update's Result carries.
+func e2eUpdateN(r json.RawMessage) int {
+	var v struct {
+		N int `json:"n"`
+	}
+	_ = json.Unmarshal(r, &v)
+	return v.N
 }
 
 func (g *e2eGlobal) HandleObservation(_ context.Context, obs model.Observation) error {
@@ -107,7 +127,18 @@ func (g *e2eGlobal) HandleObservation(_ context.Context, obs model.Observation) 
 func (g *e2eGlobal) HandleOpUpdate(_ context.Context, msg ws.OpUpdateMsg) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.updates = append(g.updates, model.OperationUpdate{OperationID: msg.OperationID, Status: msg.Status, Phase: msg.Phase, Result: msg.Result})
+	n := e2eUpdateN(msg.Result)
+	g.updDeliveries[n]++
+	g.updOrder[msg.OperationID] = append(g.updOrder[msg.OperationID], n)
+	if g.updTerminal[n] {
+		g.updAcked[n] = true
+		return fmt.Errorf("operation not found: %w", ws.ErrTerminal)
+	}
+	if g.updReject[n] > 0 {
+		g.updReject[n]--
+		return errors.New("database unavailable")
+	}
+	g.updAcked[n] = true
 	return nil
 }
 
@@ -116,6 +147,9 @@ func (g *e2eGlobal) totalDeliveries() int {
 	defer g.mu.Unlock()
 	n := 0
 	for _, v := range g.deliveries {
+		n += v
+	}
+	for _, v := range g.updDeliveries {
 		n += v
 	}
 	return n
@@ -144,15 +178,24 @@ type e2eEnv struct {
 }
 
 func newE2EEnv(t fataler, dir string) *e2eEnv {
+	return newE2EEnvWith(t, dir, nil)
+}
+
+// newE2EEnvWith is newE2EEnv with the hub's op_update handler replaced by
+// opHandler (nil keeps the scripted e2eGlobal).
+func newE2EEnvWith(t fataler, dir string, opHandler ws.OpUpdateHandler) *e2eEnv {
 	g := newE2EGlobal()
 	token := "tok-" + uuid.NewString()
 	sum := sha256.Sum256([]byte(token))
 	auth := &e2eAuth{hash: hex.EncodeToString(sum[:]), slug: "site-a", workerID: "worker-a"}
+	if opHandler == nil {
+		opHandler = g
+	}
 	hub := ws.NewHub(ws.HubConfig{
 		Auth:            auth,
 		Rebuilder:       e2eRebuilder{},
 		ObsHandler:      g,
-		OpUpdateHandler: g,
+		OpUpdateHandler: opHandler,
 		Logger:          quietLog,
 	})
 	srv := httptest.NewServer(hub)
@@ -222,10 +265,10 @@ func (e *e2eEnv) workerState() string {
 	o.mu.Lock()
 	now := time.Now()
 	var pend []string
-	for _, p := range o.pending {
-		pend = append(pend, fmt.Sprintf("row%d(next=%v,attempts=%d)", p.RowID, p.NextAttempt.Sub(now).Round(time.Millisecond), p.Attempts))
+	for _, p := range o.entries {
+		pend = append(pend, fmt.Sprintf("row%d(update=%v,inflight=%v,next=%v,attempts=%d)",
+			p.RowID, p.Update != nil, p.inFlight, p.NextAttempt.Sub(now).Round(time.Millisecond), p.Attempts))
 	}
-	updates := len(o.opUpdates)
 	o.mu.Unlock()
 	e.w.ackPendingMu.Lock()
 	var ap []string
@@ -233,8 +276,8 @@ func (e *e2eEnv) workerState() string {
 		ap = append(ap, fmt.Sprintf("%s->row%d", id[:8], p.RowID))
 	}
 	e.w.ackPendingMu.Unlock()
-	return fmt.Sprintf("connected=%v pending=%v opUpdates=%d wakeTokens=%d ackPending=%v",
-		e.w.Connected(), pend, updates, len(e.cache.Wake), ap)
+	return fmt.Sprintf("connected=%v entries=%v wakeTokens=%d ackPending=%v",
+		e.w.Connected(), pend, len(e.cache.Wake), ap)
 }
 
 // outboxRows counts the worker's persisted outbox rows. The read runs
@@ -294,13 +337,8 @@ func TestWSConnOutboxE2E_Prop(t *testing.T) {
 
 		var keys []uuid.UUID
 		terminal := map[uuid.UUID]bool{}
-		var appended []model.OperationUpdate // every update appended
-		lostFloor := 0                       // updates[:lostFloor] may be lost to a crash/kill
-		// faultHellos is the hub's hello count at the last connection kill
-		// (-1: none outstanding). Until a later hello shows the worker has
-		// reconnected, an update can be written into the dying socket and
-		// lost (op updates are fire-and-forget), so it joins the lossy prefix.
-		faultHellos := int64(-1)
+		appended := map[string][]int{} // op -> update keys in append order
+		nUpd := 0
 		var trace []string
 
 		steps := rapid.IntRange(1, 25).Draw(rt, "steps")
@@ -324,35 +362,35 @@ func TestWSConnOutboxE2E_Prop(t *testing.T) {
 				st.appends.Add(1)
 				trace = append(trace, "append")
 			case 3, 4:
+				nUpd++
+				n := nUpd
 				u := genOpUpdate(rt)
-				// Sampled before the update is queued: once it is, the drain
-				// goroutine may already have written it to the dying socket
-				// by the time a new hello is counted.
-				mayBeLost := faultHellos >= 0 && e.auth.hellos.Load() <= faultHellos
-				e.cache.appendOpUpdate(u)
-				appended = append(appended, u)
-				if mayBeLost {
-					lostFloor = len(appended)
+				u.Result = json.RawMessage(fmt.Sprintf(`{"n":%d}`, n))
+				e.global.mu.Lock()
+				switch rapid.IntRange(0, 5).Draw(rt, "updFate") {
+				case 0:
+					e.global.updTerminal[n] = true
+					st.terminals.Add(1)
+				case 1, 2:
+					e.global.updReject[n] = rapid.IntRange(1, 3).Draw(rt, "updRejects")
+					st.rejects.Add(1)
 				}
+				e.global.mu.Unlock()
+				e.cache.appendOpUpdate(u)
+				appended[u.OperationID] = append(appended[u.OperationID], n)
 				st.updates.Add(1)
-				trace = append(trace, "update")
+				trace = append(trace, fmt.Sprintf("update %d op=%s", n, u.OperationID[len(u.OperationID)-1:]))
 			case 5:
 				e.w.ForceDisconnect()
-				lostFloor = len(appended)
-				faultHellos = e.auth.hellos.Load()
 				st.kills.Add(1)
 				trace = append(trace, "worker-side kill")
 			case 6:
 				e.hub.Close()
-				lostFloor = len(appended)
-				faultHellos = e.auth.hellos.Load()
 				st.hubKills.Add(1)
 				trace = append(trace, "hub-side kill")
 			case 7:
 				e.stopWorker()
 				e.startWorker()
-				lostFloor = len(appended)
-				faultHellos = -1
 				st.crashes.Add(1)
 				trace = append(trace, "crash+restart")
 			default:
@@ -361,7 +399,8 @@ func TestWSConnOutboxE2E_Prop(t *testing.T) {
 			}
 		}
 
-		// Quiesce: every key acked (or terminally dropped), outbox empty.
+		// Quiesce: every observation and op update acked (or terminally
+		// dropped), outbox empty.
 		ok := e2eWaitFor(20*time.Second, func() bool {
 			if e.outboxRows() != 0 {
 				return false
@@ -377,6 +416,11 @@ func TestWSConnOutboxE2E_Prop(t *testing.T) {
 					return false
 				}
 			}
+			for n := 1; n <= nUpd; n++ {
+				if !e.global.updAcked[n] {
+					return false
+				}
+			}
 			return true
 		})
 		if !ok {
@@ -387,40 +431,39 @@ func TestWSConnOutboxE2E_Prop(t *testing.T) {
 					missing = append(missing, fmt.Sprintf("%s(deliveries=%d,rejectsLeft=%d)", k.String()[:8], e.global.deliveries[k], e.global.reject[k]))
 				}
 			}
+			for n := 1; n <= nUpd; n++ {
+				if !e.global.updAcked[n] {
+					missing = append(missing, fmt.Sprintf("update %d(deliveries=%d,rejectsLeft=%d)", n, e.global.updDeliveries[n], e.global.updReject[n]))
+				}
+			}
 			e.global.mu.Unlock()
 			rt.Fatalf("not quiescent after 20s: outbox rows=%d unacked=%v\nworker state: %s\ntrace=%v", e.outboxRows(), missing, e.workerState(), trace)
 		}
 
-		// Op updates: no duplicates, no reordering; the tail appended after
-		// the last fault must all arrive.
-		// Wait for the tail itself to arrive: updates from before the last
-		// fault may also have arrived, so a count alone races the drain.
-		_ = e2eWaitFor(5*time.Second, func() bool {
-			e.global.mu.Lock()
-			defer e.global.mu.Unlock()
-			tail := appended[lostFloor:]
-			n := len(e.global.updates)
-			return n >= len(tail) && sameUpdates(e.global.updates[n-len(tail):], tail)
-		})
+		// Op updates: per op, global saw them in append order, each one
+		// possibly more than once in a row (resends of the newest update it
+		// had seen), never an older one after a newer one.
 		e.global.mu.Lock()
-		got := append([]model.OperationUpdate(nil), e.global.updates...)
+		for op, want := range appended {
+			got := e.global.updOrder[op]
+			j := -1
+			for _, n := range got {
+				switch {
+				case j >= 0 && n == want[j]:
+					// resend of the newest update global has seen
+				case j+1 < len(want) && n == want[j+1]:
+					j++
+				default:
+					e.global.mu.Unlock()
+					rt.Fatalf("op %s: global received update %d out of order\ngot=%v\nappended=%v\ntrace=%v", op, n, got, want, trace)
+				}
+			}
+			if j != len(want)-1 {
+				e.global.mu.Unlock()
+				rt.Fatalf("op %s: global received %v, appended %v: updates missing\ntrace=%v", op, got, want, trace)
+			}
+		}
 		e.global.mu.Unlock()
-		// got must be a subsequence of appended (order preserved, nothing
-		// invented), and must contain appended[lostFloor:] as its suffix.
-		j := 0
-		for _, u := range got {
-			for j < len(appended) && !sameUpdates([]model.OperationUpdate{u}, []model.OperationUpdate{appended[j]}) {
-				j++
-			}
-			if j == len(appended) {
-				rt.Fatalf("hub received update %+v out of order, duplicated, or never appended\ngot=%+v\nappended=%+v\ntrace=%v", u, got, appended, trace)
-			}
-			j++
-		}
-		tail := appended[lostFloor:]
-		if len(got) < len(tail) || !sameUpdates(got[len(got)-len(tail):], tail) {
-			rt.Fatalf("updates appended after the last fault were not all delivered\ngot=%+v\ntail=%+v\ntrace=%v", got, tail, trace)
-		}
 		// Nothing acked is redelivered: one more reconnect and a crash
 		// must not put anything back on the wire.
 		// Each reconnect is confirmed by a new hello on the hub: Connected

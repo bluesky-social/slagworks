@@ -211,9 +211,10 @@ func newEpWorld(t *rapid.T, dir string) *epWorld {
 	for i, serial := range []string{"WK-0", "wk-1"} {
 		pw := &epWorker{
 			w: w, idx: i, id: fmt.Sprintf("worker-%d", i), serial: serial,
-			dbPath:  filepath.Join(dir, fmt.Sprintf("c%d-w%d.db", caseNo, i)),
-			updSent: map[uuid.UUID][]model.OperationUpdate{},
-			obsSent: map[uuid.UUID]int{},
+			dbPath:        filepath.Join(dir, fmt.Sprintf("c%d-w%d.db", caseNo, i)),
+			updSent:       map[uuid.UUID][]model.OperationUpdate{},
+			obsSent:       map[uuid.UUID]int{},
+			lastDelivered: map[string]uint64{},
 		}
 		pw.openCache()
 		w.wk = append(w.wk, pw)
@@ -1006,13 +1007,16 @@ func (w *epWorld) checkQuiescence() {
 				claimant = pw
 			}
 		}
-		crashed := false
+		// finished: a won attempt ran to its end (did not crash). Every way
+		// executeOp ends records the outcome in the outbox, which holds it
+		// until the hub acknowledges it.
+		finished := false
 		ran := false
 		durableReport := false
 		for _, a := range w.attemptLog {
 			if a.op == id && a.outcome == "won" {
 				ran = true
-				crashed = crashed || a.crashed
+				finished = finished || !a.crashed
 				// A reconcile that wrote to the BMC reports through an
 				// observation persisted in LocalDB: it survives restarts
 				// and dropped connections.
@@ -1066,10 +1070,14 @@ func (w *epWorld) checkQuiescence() {
 			case durableReport:
 				w.violate("report-missing", "%s: the worker queued a durable bmc_reconcile_report, yet at quiescence the hub still holds the op claimed (phase %q)", name, rec.op.Phase)
 			case rec.op.Phase == "" || !epLifecycle(spec.typ):
-				if facts.reportLossy || crashed {
-					w.violate("report-lost", "%s was driven but its report never reached the hub (dropped write / restart); the op stays claimed until a sweep fails it", name)
+				if finished {
+					w.violate("report-lost", "%s was driven to the end and its outcome recorded in the outbox, yet at quiescence the hub still holds it claimed (phase %q): the report did not survive the dropped writes, lost acks, hub rejections and restarts in this history",
+						name, rec.op.Phase)
 				} else {
-					w.violate("report-missing", "%s was driven to the end and nothing was lost in transit, yet the hub still holds it claimed (phase %q)", name, rec.op.Phase)
+					// Every won attempt died mid-actuation (kill -9) before
+					// recording anything: there is no outcome to deliver. The
+					// orphaned-claim or stuck sweep fails the op.
+					w.stat("final.claimed.crashed_before_report")
 				}
 			default:
 				w.stat("final.claimed.awaiting_agent")

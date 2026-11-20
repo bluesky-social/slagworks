@@ -116,7 +116,7 @@ func raceRound(t *testing.T, seed int64) {
 				return
 			case <-cache.Wake:
 			}
-			_, updates := cache.DrainOutbox()
+			_, updates := takeOutbox(cache)
 			for _, u := range updates {
 				id, err := uuid.Parse(u.OperationID)
 				if err != nil || (u.Status != string(model.OpCompleted) && u.Status != string(model.OpFailed)) {

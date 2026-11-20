@@ -125,14 +125,10 @@ func (s *bindSim) do(method, target string, body []byte) (int, string) {
 	return w.Code, w.Body.String()
 }
 
-// drain returns what the cache queued for global since the last drain.
+// drain returns what the cache queued for global since the last drain,
+// acknowledging it the way global does once it has committed it.
 func (s *bindSim) drain() ([]model.Observation, []model.OperationUpdate) {
-	pend, upd := s.cache.DrainOutbox()
-	obs := make([]model.Observation, 0, len(pend))
-	for _, p := range pend {
-		obs = append(obs, p.Obs)
-	}
-	return obs, upd
+	return drainAcked(s.cache)
 }
 
 // bootClass fetches the boot script and classifies it.

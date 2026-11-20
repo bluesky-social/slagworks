@@ -220,7 +220,7 @@ func TestApplyOpDelta_LateClaimKeepsPhoneHomedRunning(t *testing.T) {
 	if got := c.MachineByID(id); got == nil || got.State != model.MachineStateRunning {
 		t.Fatalf("after phone-home the machine must be running, got %+v", got)
 	}
-	_, before := c.DrainOutbox()
+	_, before := takeOutbox(c)
 
 	// The claim's delta arrives late.
 	c.ApplyOpDelta(model.Operation{ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Version: 1},
@@ -261,7 +261,7 @@ func TestApplyOpDelta_LateClaimKeepsPhoneHomedRunning(t *testing.T) {
 	// The installed OS retries a phone-home whose answer it lost: an
 	// acknowledgement, with no second completion.
 	report("phone_home")
-	obs, updates := c.DrainOutbox()
+	obs, updates := takeOutbox(c)
 	for _, u := range updates {
 		if u.Status == string(model.OpCompleted) {
 			t.Errorf("the retried phone-home queued a second completion (the first drain held %d updates)", len(before))

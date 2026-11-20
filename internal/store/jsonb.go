@@ -15,8 +15,8 @@ import (
 // verbatim: a config script's stderr, a BMC's or PDU's error body, tool
 // output, lldpctl's JSON. Writing such a document unchanged makes the whole
 // transaction fail, and none of the writers' callers can recover from that:
-// a worker's op_update is fire-and-forget, and a commission report is
-// retried until its op times out. Every write of operations.result and
+// the worker resends an op_update or a commission report the write
+// refused until its op times out. Every write of operations.result and
 // machines.commission_data therefore goes through jsonbSafe.
 //
 // raw is returned unchanged, without a copy, when it holds no such escape.

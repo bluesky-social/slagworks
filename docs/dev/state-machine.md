@@ -258,6 +258,16 @@ It reads the op row `FOR
 UPDATE`, so two overlapping deliveries of the same report serialize:
 the second sees the phase the first wrote and returns `Changed=false`.
 
+That same-phase no-op is what makes the worker's resends safe. Op
+updates are delivered at least once (see [Op updates](#op-updates-durable-acknowledged-ordered-per-op)):
+a phase whose acknowledgement was lost is sent again. The worker sends
+an op's updates one at a time and the next only after global
+acknowledged the one before, so a resend is always of the newest phase
+global has seen for that op: it finds the op already at that phase and
+changes nothing (no `phase_entered_at` bump, no envelope, no
+`op_delta`). The guard against an older phase replayed after a newer one
+is that ordering on the worker, not a check in the store.
+
 The site worker maintains its own view of the phase in
 `Cache.UpdateOpPhase` (`internal/worker/cache.go:1321`). The write
 sites for that helper are:
@@ -490,6 +500,43 @@ secrets) and must survive membership loss (a machine deleted from NetBox
 is in no snapshot, but its drift-failed op must still be dropped on the
 worker driving it).
 
+### Op updates: durable, acknowledged, ordered per op
+
+The other direction carries what the worker records about an op: each
+phase change (`Cache.UpdateOpPhase`) and terminal status
+(`RecordOpUpdate`, `MarkOpFailed`) is an `op_update`, and it travels in
+the worker's durable outbox beside the observations
+(`internal/worker/outbox.go`; architecture doc, "Outbox handling"):
+
+- **Persisted before the call returns.** The update is written to the
+  worker's SQLite outbox before `UpdateOpPhase` / `RecordOpUpdate` /
+  `MarkOpFailed` return, so a worker restart resends it.
+- **Acknowledged after the commit.** The worker sends it with a
+  `request_id`; the hub runs `hubhandlers.OpUpdate.HandleOpUpdate` and
+  only then answers with an `rpc_response`. The worker drops the update
+  on a success or a terminal error (`ws.ErrTerminal`: unknown op,
+  malformed op ID, unsupported status, neither phase nor status, a NUL
+  in the phase) and
+  retries it with backoff on any other error. A global that crashes
+  between reading the update and committing it never answers, and the
+  worker's next connection sends the update again.
+- **Ordered per op.** An op's updates, together with the observations
+  that settle it (`phone_home`, `commission_report`,
+  `bmc_reconcile_report`), reach global one at a time in the order the
+  worker recorded them: the next is sent only once the one before it is
+  acknowledged. A failure the agent reports after its commission report
+  therefore lands after the report has completed the op (a no-op), never
+  before it (which would fail the op and refuse the inventory).
+- **Idempotent on global.** A resend repeats the newest update global
+  has seen for that op: a repeated phase is no transition (see [Phase
+  write sites](#phase-write-sites)) and a terminal op takes no further
+  writes, so it is acknowledged without effect.
+
+What this does not cover: order between two site workers. The VIP
+holder records an op's updates; a worker that lost the VIP with an
+update unacknowledged can still deliver it after the new holder's newer
+phase, which then moves the phase back until the holder's next update.
+
 ### Credentials in operations
 
 The runtime blocks global stamps into `Operation.Params` at op-create
@@ -661,16 +708,15 @@ Path depends on the op type.
   auto-locks the machine: the op update through
   `hubhandlers.OpUpdate.HandleOpUpdate`, the observation through
   the observation handler (`internal/commission/handler.go`,
-  `handlePhoneHome`). Whichever lands first completes the op; the
-  other is a no-op. The observation is the one that must arrive:
-  the installed OS phones home only until its first 2xx, op updates
-  live only in the worker's memory and are never acknowledged, and
-  the observation stays in the worker's SQLite outbox until global
-  acks it. Without it, a worker restart, a dropped connection or a
-  failed op-update handler between the 2xx and delivery would leave
-  the op at `awaiting_phone_home` until `PhoneHomeTimeout` fails a
-  healthy host. A `phone_home` with no op ID (the worker held no
-  active deploy op) changes nothing.
+  `handlePhoneHome`). Both sit in the worker's SQLite outbox until
+  global acknowledges them, so a worker restart, a dropped connection
+  or a failed handler between the 2xx and delivery cannot lose the
+  completion; the installed OS phones home only until its first 2xx,
+  and without that the op would stay at `awaiting_phone_home` until
+  `PhoneHomeTimeout` failed a healthy host. The observation is in the
+  op's ordered chain ahead of the op update, so it completes the op and
+  the op update that follows is a no-op. A `phone_home` with no op ID
+  (the worker held no active deploy op) changes nothing.
 - **Commission** completes via the commission report path, not the
   op-update path. The observation handler calls
   `Store.CommitCommissionResult(opID, machineID, data)`, which revalidates
@@ -771,12 +817,14 @@ The worker's local failure holds until global's `op_removed` for the op.
 Global applies the failure as separate writes, and each phase write
 publishes an `op_delta` whose row is still `claimed` before the failure
 publishes `op_removed`; a reconnect's `op_resync` can also still show the
-op claimed when the best-effort `op_update` never reached global. The
-worker keeps such an op failed (`keepLocalFailure` in
-`internal/worker/opstate_cache.go`): the host is not booted into the agent
-again and reports for the op are refused as terminal. When the failure
-never reached global, the op stays active there until a timeout sweep
-fails it.
+op claimed, because the hub builds it before it reads the failure the
+worker resends on that connection. The worker keeps such an op failed
+(`keepLocalFailure` in `internal/worker/opstate_cache.go`): the host is
+not booted into the agent again and reports for the op are refused as
+terminal. The failure itself stays in the worker's outbox until global
+acknowledges it. The failed mark does not survive a worker restart: a
+restarted worker rehydrates the op as active, and global's `op_removed`
+for the resent failure is what ends it.
 
 Each sweep fails its ops one transaction at a time and keeps going past
 a per-op error, returning both the ops it failed and the joined error.
@@ -983,9 +1031,9 @@ completion path described earlier, and the op transitions to
 `completed` with `machine.state = running`.
 
 The latch has to survive a worker restart. The phase and the completion
-reach global only as op_updates, which the outbox keeps in memory, so
-global can still hold the op claimed at a pre-install phase when the
-install finishes during a WAN outage. `Cache.UpdateOpPhase` therefore
+reach global only once global is reachable (they wait in the worker's
+outbox), so global can still hold the op claimed at a pre-install phase
+when the install finishes during a WAN outage. `Cache.UpdateOpPhase` therefore
 writes the op layer to LocalDB when it sets `awaiting_phone_home`, and
 `Cache.RecordPhoneHome` writes it with the running overlay and the
 `phoneHomed` pin. After a restart the first `op_resync` (built from

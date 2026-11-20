@@ -152,7 +152,7 @@ func TestExecutor_ClaimCommittedReplyLost_IsReclaimed(t *testing.T) {
 			if ctrl.cycles != 1 {
 				t.Errorf("power cycles = %d, want 1", ctrl.cycles)
 			}
-			_, updates := cache.DrainOutbox()
+			_, updates := takeOutbox(cache)
 			completed := 0
 			for _, u := range updates {
 				if u.OperationID == op.ID.String() && u.Status == string(model.OpCompleted) {

@@ -661,9 +661,13 @@ func (r *propRun) settle(drive bool) {
 	for {
 		// A BMC call or a boot-server request in flight is the worker at
 		// work: it takes seconds, never the 30 minutes a driven timeout
-		// stands for.
+		// stands for. So is an outbox entry global has not acknowledged:
+		// the worker resends it within its rejection backoff (at most a
+		// minute), and an outbox that never drains trips the rest limit
+		// below.
 		if (healed && (!r.w.Alive() || !r.w.Connected())) || r.pendingFaults.Load() > 0 ||
-			r.w.actuating.Load() > 0 || r.w.rec.inflight.Load() > 0 {
+			r.w.actuating.Load() > 0 || r.w.rec.inflight.Load() > 0 ||
+			(r.w.Alive() && r.w.OutboxDepth() > 0) {
 			healthy = time.Now()
 		}
 		active := len(r.g.ActiveOps(uuid.Nil))
@@ -684,11 +688,11 @@ func (r *propRun) settle(drive bool) {
 			break
 		}
 		if time.Since(begin) > limit {
-			r.violate("P6", "the system did not come to rest within %s: requests in flight=%d, BMC calls in flight=%d, faults in flight=%d, active ops %v",
-				limit, r.w.rec.inflight.Load(), r.w.actuating.Load(), r.pendingFaults.Load(), propOpSummaries(r.g.ActiveOps(uuid.Nil)))
+			r.violate("P6", "the system did not come to rest within %s: requests in flight=%d, BMC calls in flight=%d, unacknowledged outbox entries=%d, faults in flight=%d, active ops %v",
+				limit, r.w.rec.inflight.Load(), r.w.actuating.Load(), r.w.OutboxDepth(), r.pendingFaults.Load(), propOpSummaries(r.g.ActiveOps(uuid.Nil)))
 			break
 		}
-		busy := r.w.actuating.Load() > 0 || r.w.rec.inflight.Load() > 0
+		busy := r.w.actuating.Load() > 0 || r.w.rec.inflight.Load() > 0 || (r.w.Alive() && r.w.OutboxDepth() > 0)
 		quiet := (active == 0 && since >= r.timing.Quiet) || (active > 0 && since >= r.timing.Idle) || (over && !busy)
 		if quiet && !healed {
 			// Faults stop here. If lifting them changed anything, the
@@ -1305,12 +1309,6 @@ func (r *propRun) checkPower(lives map[string]*propOpLife) {
 	}
 	// A power op global recorded as completed must have been actuated; one
 	// it recorded as failed by a sweep must not have been.
-	resultLost := map[uuid.UUID]bool{}
-	for _, e := range hub {
-		if e.Kind == "dropped_update" && e.Detail != "status=" {
-			resultLost[e.OpID] = true
-		}
-	}
 	for _, l := range lives {
 		var want string
 		switch l.op.Type {
@@ -1336,15 +1334,6 @@ func (r *propRun) checkPower(lives map[string]*propOpLife) {
 			r.violate("P5", "global completed power op %s (%s) but the executor never actuated it", propShortID(l.op.ID), l.op.Type)
 		}
 		if l.status == "failed" && strings.HasPrefix(l.cause, "timeout") && acted {
-			if resultLost[l.op.ID] {
-				// Known defect: a power op's result rides only the unacked
-				// op_update, so when global crashes before committing it the
-				// op is failed at the stuck timeout although the host was
-				// actuated (deploys are covered by the durable phone_home
-				// observation; power ops have no such record).
-				r.stat("power_result_lost")
-				continue
-			}
 			r.violate("P5", "power op %s (%s) was actuated on the host but global recorded it failed (%s)", propShortID(l.op.ID), l.op.Type, l.cause)
 		}
 	}

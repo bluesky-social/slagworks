@@ -29,7 +29,7 @@ func hideOutboxTable(t *testing.T, db *LocalDB) (restore func()) {
 
 func appendTestObservation(t *testing.T, db *LocalDB, event string) uint64 {
 	t.Helper()
-	id, err := db.AppendOutbox(model.Observation{MachineID: uuid.New(), Event: event, Timestamp: time.Now()})
+	id, err := db.AppendOutbox(PendingOutbox{Obs: model.Observation{MachineID: uuid.New(), Event: event, Timestamp: time.Now()}})
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}

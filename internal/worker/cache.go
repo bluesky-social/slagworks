@@ -403,16 +403,14 @@ func (c *Cache) recordBMCReconcileReport(machineID, operationID uuid.UUID, rep m
 // booted successfully. It completes the active deploy op and updates
 // the local cache state.
 //
-// The completion travels on two channels. The phone_home observation
-// carries the deploy op's ID and is the durable one: it sits in the
-// SQLite outbox until global acks it, and global's observation handler
-// completes the op (deploying → running) from it. That matters because
-// the installed OS phones home exactly once after a 2xx, so nothing
-// re-sends the completion if it is lost after we answer. The op_update
-// with status=completed is memory-only (lost on a worker restart, on a
-// connection that dies before the hub reads it, or on a failed hub
-// handler call); it stays as the existing path, and whichever of the
-// two reaches global first completes the op while the other is a no-op.
+// The completion is the phone_home observation, which carries the deploy
+// op's ID: it sits in the SQLite outbox until global acks it, and global's
+// observation handler completes the op (deploying → running) from it.
+// That matters because the installed OS phones home exactly once after a
+// 2xx, so nothing re-sends the completion if it is lost after we answer.
+// The op_update with status=completed queued after it is in the same
+// outbox and the same per-op order, so it reaches global after the
+// observation and is a no-op there.
 //
 // If no active deploy op is found (late phone-home, op already
 // completed by timeout, etc.), the observation still goes out with no
@@ -436,12 +434,11 @@ func (c *Cache) RecordPhoneHome(machineID uuid.UUID) {
 		c.RecordOpUpdate(deployOpID.String(), string(model.OpCompleted), nil)
 	}
 
-	// The completion op_update is not durable, and global may be
-	// unreachable: persist the running overlay and the phoneHomed latch so a
-	// restart before global completes the op does not lose them. The first
-	// op_resync after the restart can still carry the op as
-	// claimed-deploying, and applyOpResync pins the machine running only if
-	// phoneHomed survived.
+	// Global may be unreachable: persist the running overlay and the
+	// phoneHomed latch so a restart before global completes the op does not
+	// lose them. The first op_resync after the restart can still carry the
+	// op as claimed-deploying, and applyOpResync pins the machine running
+	// only if phoneHomed survived.
 	c.persistOpState()
 }
 
@@ -739,8 +736,9 @@ func (c *Cache) OnSnapshotApplied(cb func()) (unsubscribe func()) {
 	}
 }
 
-// OutboxDepth returns the number of in-memory observations awaiting
-// drain+ack. Scrape-time gauge for the site worker's /metrics.
+// OutboxDepth returns the number of outbox entries (observations and op
+// updates) global has not acknowledged yet. Scrape-time gauge for the
+// site worker's /metrics.
 func (c *Cache) OutboxDepth() int {
 	return c.outbox.depth()
 }
@@ -754,35 +752,37 @@ func (c *Cache) ActiveOpCount() int {
 
 // --- Outbox draining (delegated to the outbox component) ---
 
-// DrainOutbox returns pending observations (paired with SQLite row IDs
-// for later acking) and operation updates, clearing the in-memory queues.
-// See outbox.drain.
-func (c *Cache) DrainOutbox() ([]PendingOutbox, []model.OperationUpdate) {
+// DrainOutbox returns the outbox entries (observations and op updates)
+// to send now, in record order, and marks them in flight until AckOutbox,
+// RequeueOutbox, RequeueRejected or ReloadOutboxFromDisk. See outbox.drain
+// for which entries are due and the per-operation order.
+func (c *Cache) DrainOutbox() []PendingOutbox {
 	return c.outbox.drain()
 }
 
-// RequeueRejected returns a non-terminally rejected observation to the
-// outbox with per-row exponential backoff. See
-// outbox.requeueRejected.
+// RequeueRejected returns a non-terminally rejected entry to the outbox
+// with per-row exponential backoff. See outbox.requeueRejected.
 func (c *Cache) RequeueRejected(entry PendingOutbox) (attempts int, delay time.Duration, warn bool) {
 	return c.outbox.requeueRejected(entry)
 }
 
-// RequeueOutbox prepends unsent items back onto the in-memory queues after
-// a mid-batch send failure. See outbox.requeue.
-func (c *Cache) RequeueOutbox(obs []PendingOutbox, updates []model.OperationUpdate) {
-	c.outbox.requeue(obs, updates)
+// RequeueOutbox returns drained entries that were never sent to the queue
+// after a mid-batch send failure. See outbox.requeue.
+func (c *Cache) RequeueOutbox(entries []PendingOutbox) {
+	c.outbox.requeue(entries)
 }
 
-// AckObservation removes an observation from durable storage after global
-// acked its receipt via rpc_response{ok:true}. See outbox.ackObservation.
-func (c *Cache) AckObservation(rowID uint64) {
-	c.outbox.ackObservation(rowID)
+// AckOutbox removes an entry from the outbox and from durable storage once
+// global acknowledged it or rejected it terminally. See outbox.ack.
+func (c *Cache) AckOutbox(entry PendingOutbox) {
+	c.outbox.ack(entry)
 }
 
-// ReloadOutboxFromDisk repopulates the in-memory outbox with unacked
-// SQLite rows on WS reconnect. See outbox.reloadFromDisk; an error means
-// the rows could not be read and the outbox is incomplete.
+// ReloadOutboxFromDisk is the outbox's reset for a new WS connection: every
+// entry sent on a previous connection and not acknowledged is due again,
+// and the SQLite table is read again for rows memory lacks (rows a failed
+// read at startup could not load). See outbox.reloadFromDisk; an error
+// means the rows could not be read and the outbox is incomplete.
 func (c *Cache) ReloadOutboxFromDisk() error {
 	return c.outbox.reloadFromDisk()
 }
@@ -1045,7 +1045,8 @@ func (c *Cache) MarkOpStatus(opID string, status model.OperationStatus) {
 	c.opState.setStatus(opID, status)
 }
 
-// RecordOpUpdate queues an operation status update for push to central.
+// RecordOpUpdate queues an operation status update for global in the
+// durable outbox.
 func (c *Cache) RecordOpUpdate(opID, status string, result json.RawMessage) {
 	c.opState.setStatus(opID, model.OperationStatus(status))
 
@@ -1086,21 +1087,21 @@ func (c *Cache) PrepareDeployLogs(machineID, operationID string) {
 }
 
 // UpdateOpPhase updates the phase of an operation in-memory, writes a
-// source:"phase" log entry, and queues the update for push to central.
-// If the operation has been marked failed, the update is rejected. The
-// awaiting_phone_home clobber guard and same-phase dedup live in
-// opState.updatePhase (opstate_cache.go), which documents why.
+// source:"phase" log entry, and queues the update for global in the
+// durable outbox. If the operation has been marked failed, the update is
+// rejected. The awaiting_phone_home clobber guard and same-phase dedup
+// live in opState.updatePhase (opstate_cache.go), which documents why.
 func (c *Cache) UpdateOpPhase(opID, phase string) {
 	upd := c.opState.updatePhase(opID, phase)
 	if phase == "awaiting_phone_home" {
-		// The latch is the op row's phase, and the phase op_update below is
-		// not durable: if global is unreachable and the worker restarts
-		// before global echoes the phase back, LocalDB still holds the
-		// pre-latch row, keepTerminalWait has nothing to keep when the
-		// first op_resync carries global's row, and the installed host's
-		// next PXE gets BootDeploy. Persist it now. Not gated on proceed:
-		// updatePhase writes the row's phase before its same-phase dedup
-		// returns proceed=false, and that write must reach disk too.
+		// The latch is the op row's phase. The phase op_update below
+		// reaches global only once global is reachable: if the worker
+		// restarts before global echoes the phase back, LocalDB still holds
+		// the pre-latch row, keepTerminalWait has nothing to keep when the
+		// first op_resync carries global's stale row, and the installed
+		// host's next PXE gets BootDeploy. Persist it now. Not gated on
+		// proceed: updatePhase writes the row's phase before its same-phase
+		// dedup returns proceed=false, and that write must reach disk too.
 		c.persistOpState()
 	}
 	if !upd.proceed {

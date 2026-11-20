@@ -382,7 +382,7 @@ func TestProp_HubSurvivesMalformedTraffic(t *testing.T) {
 			}
 			garbageStats.msgs.Add(1)
 			// Requests the hub answers by request_id.
-			if reqID != "" && (typ == TypeObservation || typ == TypeClaimOp || typ == TypeCastResume) {
+			if reqID != "" && (typ == TypeObservation || typ == TypeOpUpdate || typ == TypeClaimOp || typ == TypeCastResume) {
 				wantReplies[reqID] = true
 			}
 		}

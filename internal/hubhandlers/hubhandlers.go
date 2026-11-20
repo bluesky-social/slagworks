@@ -2,9 +2,11 @@
 // ws.LogBatchHandler implementations that persist worker-emitted
 // progress into slagworks's Postgres state.
 //
-// These handlers live behind the same fire-and-forget contract the ws
-// hub uses: they return errors for logging, not for protocol
-// acknowledgement. The worker doesn't wait for a reply.
+// OpUpdate's error is the worker's acknowledgement: the hub answers the
+// op_update's request_id with it, and the worker keeps the update in its
+// outbox until it gets an answer that is not a transient error (see
+// ws.OpUpdateHandler). LogBatch's errors are only logged: log batches are
+// fire-and-forget.
 package hubhandlers
 
 import (
@@ -13,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -28,7 +31,10 @@ import (
 // Version + the durable machine state, if any) so the handler publishes
 // the authoritative row on the op stream rather than a hand-assembled one.
 type Store interface {
-	GetOperation(id uuid.UUID) (*model.Operation, error)
+	// GetOperationIfExists returns (nil, nil) for an op that does not
+	// exist, so the handler can tell an update no retry can apply from a
+	// failed read.
+	GetOperationIfExists(id uuid.UUID) (*model.Operation, error)
 	SetOperationPhase(opID uuid.UUID, phase string) (store.PhaseTransition, error)
 	CompleteOperationWithState(opID uuid.UUID, targetState model.MachineState, result []byte) (*store.OpOutcome, error)
 	FailOperationOutcome(opID uuid.UUID, result []byte) (*store.OpOutcome, error)
@@ -54,11 +60,11 @@ type LogStore interface {
 // completed when phone-home arrives at the site worker (see
 // Cache.RecordPhoneHome). deploy_complete from the agent only updates
 // phase to awaiting_phone_home; the op stays claimed until phone-home
-// completes it. The same phone-home also sends a durable phone_home
+// completes it. The same phone-home first queues a phone_home
 // observation naming the op, which internal/commission completes the op
-// from; whichever arrives first wins and the other is a no-op. That
-// observation is what survives when this fire-and-forget op_update is
-// lost.
+// from; the worker delivers an op's entries in the order it recorded
+// them, so this completion normally finds the op already terminal and
+// changes nothing.
 //
 // commission is handled through internal/commission's observation
 // path, not here, but we include it for completeness against ad-hoc
@@ -82,13 +88,21 @@ func completionState(opType model.OperationType) model.MachineState {
 // OpUpdate persists OpUpdateMsg into the operation row.
 //
 // Semantics by incoming field:
-//   - Phase set, no Status    → SetOperationPhase (keeps status/result untouched)
-//   - Status = "completed"    → CompleteOperation with Result
-//   - Status = "failed"       → FailOperation with Result (also transitions machine)
-//   - Status = anything else  → warn-and-ignore (protocol extension)
+//   - Phase set               → SetOperationPhase (keeps status/result untouched)
+//   - Status = "completed"    → CompleteOperationWithState with Result
+//   - Status = "failed"       → FailOperationOutcome with Result (also transitions machine)
 //
-// Phase updates before a terminal status land first; tests assert
-// phase is visible during running before being overwritten.
+// The phase lands before the status of the same update. HandleOpUpdate
+// returns nil only once every write the update asks for has committed or
+// changed nothing (the op is already terminal, or already at that phase),
+// which is what makes a resend of an update global already applied
+// harmless: a repeated phase is not a transition (no phase_entered_at
+// bump, no envelope, no op_delta) and a terminal op takes no further
+// writes. An update no retry can apply (malformed op ID, unknown status,
+// no phase and no status, a NUL in the phase, unknown op) returns an
+// error wrapping
+// ws.ErrTerminal; every other error is transient and the worker resends
+// the whole update.
 type OpUpdate struct {
 	store   Store
 	log     *slog.Logger
@@ -154,37 +168,44 @@ func (h *OpUpdate) publishRemoved(op model.Operation, st model.MachineState) {
 func (h *OpUpdate) HandleOpUpdate(_ context.Context, msg ws.OpUpdateMsg) error {
 	opID, err := uuid.Parse(msg.OperationID)
 	if err != nil {
-		return fmt.Errorf("parse op_id %q: %w", msg.OperationID, err)
+		return fmt.Errorf("parse op_id %q: %v: %w", msg.OperationID, err, ws.ErrTerminal)
+	}
+	switch msg.Status {
+	case "", string(model.OpCompleted), string(model.OpFailed):
+	default:
+		return fmt.Errorf("op_update for %s carries unsupported status %q: %w", opID, msg.Status, ws.ErrTerminal)
+	}
+	if msg.Phase == "" && msg.Status == "" {
+		return fmt.Errorf("op_update for %s carries neither a phase nor a status: %w", opID, ws.ErrTerminal)
+	}
+	if strings.ContainsRune(msg.Phase, 0) {
+		// Postgres text cannot hold a NUL: the phase write would fail on
+		// every resend and hold back the op's later updates.
+		return fmt.Errorf("op_update for %s carries a NUL in its phase: %w", opID, ws.ErrTerminal)
+	}
+	op, err := h.store.GetOperationIfExists(opID)
+	if err != nil {
+		return fmt.Errorf("read op %s: %w", opID, err)
+	}
+	if op == nil {
+		return fmt.Errorf("operation %s not found: %w", opID, ws.ErrTerminal)
 	}
 
 	// Phase update is independent of status: a worker may emit a
 	// phase-only op_update ("partitioning") mid-run, AND a terminal
-	// update carrying a final phase + completed status. Apply phase
-	// first so even the terminal update's phase lands before status.
-	//
-	// When both phase AND status are present and the phase write
-	// fails, we log-and-continue rather than short-circuit: op_update
-	// is fire-and-forget, so aborting would strand the machine in
-	// its transient state forever. A phase-only update whose write
-	// fails surfaces the error — it's the whole operation.
+	// update carrying a final phase + failed status. Apply phase first so
+	// even the terminal update's phase lands before status. A failed
+	// phase write fails the whole update, so the worker resends it: the
+	// phase then applies, and the status after it.
 	if msg.Phase != "" {
 		t, err := h.store.SetOperationPhase(opID, msg.Phase)
 		switch {
 		case err != nil:
-			if msg.Status == "" {
-				return fmt.Errorf("set phase %q on %s: %w", msg.Phase, opID, err)
-			}
-			h.log.Warn("set phase failed, continuing to status update",
-				"op_id", opID, "phase", msg.Phase, "err", err)
+			return fmt.Errorf("set phase %q on %s: %w", msg.Phase, opID, err)
 		case t.Changed:
 			if h.metrics != nil && t.PrevPhase != "" {
-				// Label by the phase EXITED and the op type; one extra
-				// GetOperation per real transition (~10/deploy) is cheap.
-				opType := "unknown"
-				if op, oerr := h.store.GetOperation(opID); oerr == nil {
-					opType = string(op.Type)
-				}
-				h.metrics.PhaseDuration.WithLabelValues(opType, t.PrevPhase).
+				// Label by the phase EXITED and the op type.
+				h.metrics.PhaseDuration.WithLabelValues(string(op.Type), t.PrevPhase).
 					Observe(t.Duration.Seconds())
 			}
 			// One canonical "phase transition" envelope per real change.
@@ -212,73 +233,52 @@ func (h *OpUpdate) HandleOpUpdate(_ context.Context, msg ws.OpUpdateMsg) error {
 	// Result may be present on either terminal status OR on a plain
 	// phase update (unusual but valid). We only write Result as part
 	// of the status transition so we don't clobber it post-completion.
+	// Terminal transition: the op left the active set — publish op_removed
+	// so the worker drops it. If it wrote DURABLE machines.state
+	// (deploy→running, commission→commissioned, a fail → failed/new), the
+	// message carries that state (worker overlay tracks it) AND we fire an
+	// identity rebuild so the baseline catches up. A power-op completion or
+	// a pending-op fail carries no state and rides the stream alone.
+	// outcome is nil on a no-op (already terminal / lost race, a resend of
+	// an update already applied): publish, count and log nothing.
+	var outcome *store.OpOutcome
 	switch msg.Status {
 	case "":
 		return nil
 	case string(model.OpCompleted):
-		// Look up the op to decide which machine state follows.
-		// Deploy → deployed, recovery → recovery, etc. Power ops
-		// don't transition the machine, so we pass "" and the store
-		// will skip the state update.
-		op, err := h.store.GetOperation(opID)
-		if err != nil {
-			return fmt.Errorf("get op for completion: %w", err)
-		}
+		// Deploy → running, commission → commissioned. Power ops don't
+		// transition the machine, so we pass "" and the store skips the
+		// state update.
 		target := completionState(op.Type)
-		outcome, err := h.store.CompleteOperationWithState(opID, target, resultBytes(msg.Result))
+		outcome, err = h.store.CompleteOperationWithState(opID, target, resultBytes(msg.Result))
 		if err != nil {
-			return err
+			return fmt.Errorf("complete op %s: %w", opID, err)
 		}
-		if h.metrics != nil {
-			h.metrics.Outcomes.WithLabelValues(string(op.Type), "completed").Inc()
+		if outcome == nil {
+			return nil
 		}
 		h.log.Info("operation completed",
 			"op_id", opID, "type", op.Type, "machine_id", op.MachineID,
 			"target_state", target)
-		// Terminal transition: the op left the active set — publish
-		// op_removed so the worker drops it. If it wrote DURABLE
-		// machines.state (deploy→running, commission→commissioned), the
-		// message carries that state (worker overlay tracks it) AND we
-		// fire an identity rebuild so the baseline catches up. A power-op
-		// completion (target "") rides the stream alone. outcome is nil
-		// on a no-op (already terminal / lost race) — publish nothing.
-		if outcome != nil {
-			h.publishRemoved(outcome.Op, outcome.MachineState)
-			if outcome.MachineState != "" {
-				h.invalidateIdentity()
-			}
-		}
-		return nil
-	case string(model.OpFailed):
-		outcome, err := h.store.FailOperationOutcome(opID, resultBytes(msg.Result))
+	default: // model.OpFailed, checked above
+		outcome, err = h.store.FailOperationOutcome(opID, resultBytes(msg.Result))
 		if err != nil {
-			return err
+			return fmt.Errorf("fail op %s: %w", opID, err)
 		}
-		if h.metrics != nil {
-			opType := "unknown"
-			if op, oerr := h.store.GetOperation(opID); oerr == nil {
-				opType = string(op.Type)
-			}
-			h.metrics.Outcomes.WithLabelValues(opType, "failed").Inc()
+		if outcome == nil {
+			return nil
 		}
 		h.log.Info("operation failed",
-			"op_id", opID, "result", string(msg.Result))
-		// Same rule as completion: publish op_removed; fire an identity
-		// rebuild only when the fail wrote durable state (failed/new). A
-		// pending-op fail (rule 1) or power-op fail carries no state and
-		// no rebuild.
-		if outcome != nil {
-			h.publishRemoved(outcome.Op, outcome.MachineState)
-			if outcome.MachineState != "" {
-				h.invalidateIdentity()
-			}
-		}
-		return nil
-	default:
-		h.log.Warn("op_update with unsupported status, ignoring",
-			"op_id", opID, "status", msg.Status)
-		return nil
+			"op_id", opID, "type", op.Type, "machine_id", op.MachineID)
 	}
+	if h.metrics != nil {
+		h.metrics.Outcomes.WithLabelValues(string(op.Type), msg.Status).Inc()
+	}
+	h.publishRemoved(outcome.Op, outcome.MachineState)
+	if outcome.MachineState != "" {
+		h.invalidateIdentity()
+	}
+	return nil
 }
 
 // LogBatch persists structured log envelopes from site workers and

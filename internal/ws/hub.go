@@ -60,8 +60,9 @@ type Rebuilder interface {
 // A nil-error return from Handle signals the hub to send
 // rpc_response{ok:true} to the worker, which in turn acks the
 // observation out of its local SQLite outbox. A non-nil return sends
-// rpc_response{error:"..."} and the worker leaves the outbox row for
-// the next reconnect to replay. Handlers MUST be idempotent — see
+// rpc_response{error:"..."}: the worker drops the row when the error
+// wraps ErrTerminal and retries it with backoff otherwise. Handlers MUST
+// be idempotent — see
 // internal/commission for the commission-report path.
 type ObservationHandler interface {
 	HandleObservation(ctx context.Context, obs model.Observation) error
@@ -77,10 +78,17 @@ func (noopObservationHandler) HandleObservation(_ context.Context, _ model.Obser
 }
 
 // OpUpdateHandler persists worker-emitted operation updates (phase
-// transitions, terminal status with result). Fire-and-forget from the
-// worker's perspective — there's no rpc_response contract — so errors
-// are logged at the hub, not propagated back. MUST be idempotent:
-// workers may resend the same op_update after a reconnect.
+// transitions, terminal status with result). The contract is the
+// observation one: the worker keeps the update in its durable outbox
+// until the hub answers its request_id. A nil return MUST mean the update
+// is committed (or changes nothing, e.g. its op is already terminal); the
+// hub then sends rpc_response without an error and the worker drops the
+// update. An error wrapping ErrTerminal means no retry can ever apply it
+// (unknown op, malformed update) and the worker drops it too; any other
+// error makes the worker retry it with backoff. MUST be idempotent: the
+// worker resends an update whose answer it did not receive, and it sends
+// an op's updates one at a time in the order it recorded them, so the
+// resend is always of the latest update global saw for that op.
 type OpUpdateHandler interface {
 	HandleOpUpdate(ctx context.Context, msg OpUpdateMsg) error
 }
@@ -271,7 +279,7 @@ type HubConfig struct {
 	// a no-op handler that acks everything — useful for tests.
 	ObsHandler ObservationHandler
 	// OpUpdateHandler receives worker-origin op_update messages. Nil
-	// becomes a no-op (messages are logged and dropped).
+	// becomes a no-op handler that acks everything — useful for tests.
 	OpUpdateHandler OpUpdateHandler
 	// LogBatchHandler receives worker-origin log_batch envelopes. Nil
 	// becomes a no-op.
@@ -1508,14 +1516,12 @@ func (c *workerConn) dispatch(ctx context.Context, env Envelope) error {
 		go c.handleObservation(ctx, env)
 		return nil
 	case TypeOpUpdate:
-		// Process synchronously. Spawning a goroutine would break
-		// worker-side ordering: a sequence of phase updates followed
-		// by a terminal status could race, landing the terminal state
-		// before an earlier phase that then stomps on it, or marking
-		// an op completed before the phase that preceded it arrives.
-		// Handler is fast (one Postgres round-trip) so blocking the
-		// read loop briefly is fine. Slow handlers would need a
-		// per-connection serial queue, not a goroutine-per-message.
+		// Process synchronously, in read order. The worker already
+		// sends one op's updates one at a time (each waits for the ack
+		// of the one before), so this is not what orders them; it keeps
+		// an op_update ordered with the log batches around it, and the
+		// handler is fast (a Postgres read and one transaction), so
+		// blocking the read loop briefly is fine.
 		c.handleOpUpdate(ctx, env)
 		return nil
 	case TypeLogBatch:
@@ -1601,7 +1607,7 @@ func (c *workerConn) handleObservation(parent context.Context, env Envelope) {
 	var msg ObservationMsg
 	if err := unmarshalData(env.Data, &msg); err != nil {
 		c.log.Warn("malformed observation", "req_id", reqID, "err", err)
-		c.replyObservation(reqID, fmt.Errorf("decode observation: %w", err))
+		c.replyAck(reqID, fmt.Errorf("decode observation: %w", err))
 		return
 	}
 	obs := model.Observation{
@@ -1629,24 +1635,26 @@ func (c *workerConn) handleObservation(parent context.Context, env Envelope) {
 		c.log.Warn("observation handler failed",
 			"event", obs.Event, "machine_id", obs.MachineID, "err", handlerErr)
 	}
-	c.replyObservation(reqID, handlerErr)
+	c.replyAck(reqID, handlerErr)
 }
 
-// handleOpUpdate decodes an op_update envelope and routes it to the
-// configured OpUpdateHandler. Fire-and-forget — no rpc_response
-// contract with the worker. Errors are logged at the hub so they
-// surface in operator-visible logs without blocking the worker.
+// handleOpUpdate decodes an op_update envelope, routes it to the
+// configured OpUpdateHandler, and then answers its request_id with the
+// handler's outcome, as handleObservation does: the worker keeps the
+// update in its outbox until that answer arrives, so the answer is sent
+// only once the handler returned, i.e. after it committed. A payload that
+// does not decode is answered terminally; resending it cannot help.
 //
-// Uses context.WithoutCancel to detach from the connection's ctx:
-// once we've read the bytes off the wire, the worker considers the
-// update delivered and won't retry. If the connection drops mid-
-// handle (and we were still attached), we'd abort the DB write and
-// the op would hang. The per-handler timeout caps cost; shutdown
-// still gets a bounded wait.
+// Uses context.WithoutCancel to detach from the connection's ctx: a
+// write that the connection's drop aborted halfway would have to be
+// redone on the resend anyway, and the per-handler timeout still caps
+// cost.
 func (c *workerConn) handleOpUpdate(parent context.Context, env Envelope) {
+	reqID := env.RequestID
 	var msg OpUpdateMsg
 	if err := unmarshalData(env.Data, &msg); err != nil {
-		c.log.Warn("malformed op_update", "err", err)
+		c.log.Warn("malformed op_update", "req_id", reqID, "err", err)
+		c.replyAck(reqID, fmt.Errorf("decode op_update: %v: %w", err, ErrTerminal))
 		return
 	}
 	ctx, cancel := context.WithTimeout(
@@ -1654,11 +1662,13 @@ func (c *workerConn) handleOpUpdate(parent context.Context, env Envelope) {
 		c.hub.cfg.OpUpdateTimeout,
 	)
 	defer cancel()
-	if err := c.hub.cfg.OpUpdateHandler.HandleOpUpdate(ctx, msg); err != nil {
+	err := c.hub.cfg.OpUpdateHandler.HandleOpUpdate(ctx, msg)
+	if err != nil {
 		c.log.Warn("op_update handler failed",
 			"op_id", msg.OperationID, "phase", msg.Phase, "status", msg.Status,
-			"err", err)
+			"terminal", errors.Is(err, ErrTerminal), "err", err)
 	}
+	c.replyAck(reqID, err)
 }
 
 // handleLogBatch decodes a log_batch envelope and routes to the
@@ -1972,12 +1982,12 @@ func (c *workerConn) registeredWorkerSerials() (map[string]bool, error) {
 	return set, nil
 }
 
-// replyObservation sends the rpc_response that the worker's ackPending
-// map is waiting on. reqID == "" means the worker didn't ask for an
-// ack, so we skip the write. Errors that wrap ErrTerminal mark the
-// response as terminal so the worker drops the outbox row instead of
-// retrying indefinitely.
-func (c *workerConn) replyObservation(reqID string, handlerErr error) {
+// replyAck sends the rpc_response that the worker's ackPending map is
+// waiting on for an outbox entry (an observation or an op_update).
+// reqID == "" means the worker didn't ask for an ack, so we skip the
+// write. Errors that wrap ErrTerminal mark the response as terminal so
+// the worker drops the outbox row instead of retrying indefinitely.
+func (c *workerConn) replyAck(reqID string, handlerErr error) {
 	if reqID == "" {
 		return
 	}
@@ -1989,13 +1999,13 @@ func (c *workerConn) replyObservation(reqID string, handlerErr error) {
 		resp.Terminal = errors.Is(handlerErr, ErrTerminal)
 	}
 	if err := c.writeTyped(ctx, TypeRPCResponse, reqID, resp); err != nil {
-		c.log.Warn("observation rpc_response write failed", "req_id", reqID, "err", err)
+		c.log.Warn("outbox rpc_response write failed", "req_id", reqID, "err", err)
 	}
 }
 
-// ErrTerminal is the sentinel observation handlers wrap to tell the
-// hub (and in turn the worker) that retrying won't help. The worker
-// sees Terminal=true in the rpc_response and drops the outbox row.
+// ErrTerminal is the sentinel observation and op_update handlers wrap to
+// tell the hub (and in turn the worker) that retrying won't help. The
+// worker sees Terminal=true in the rpc_response and drops the outbox row.
 var ErrTerminal = errors.New("terminal")
 
 // enqueue adds write to the conn's outbound queue without blocking.

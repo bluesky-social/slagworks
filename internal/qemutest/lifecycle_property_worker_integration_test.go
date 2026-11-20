@@ -485,6 +485,16 @@ func (w *propWorker) Connected() bool {
 	return c != nil && c.Connected()
 }
 
+// OutboxDepth is the number of observations and op updates the worker has
+// recorded and global has not acknowledged yet.
+func (w *propWorker) OutboxDepth() int {
+	c := w.cache.Load()
+	if c == nil {
+		return 0
+	}
+	return c.OutboxDepth()
+}
+
 func (w *propWorker) powerFactory(_ context.Context, m *model.MachineSnapshot, _ model.BMCRuntime, pduRT *model.PDURuntime, amtRT *model.AMTRuntime) (power.Controller, error) {
 	if pduRT != nil || amtRT != nil {
 		return nil, errors.New("prop factory: only the BMC transport is modeled")

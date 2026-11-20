@@ -246,7 +246,7 @@ func TestUpdateOpPhase_AwaitingPhoneHomeOnlyLeftByFailure(t *testing.T) {
 		if got := c.BootActionForMAC(mac); got != model.BootLocal {
 			t.Fatalf("precondition: latched op got %d, want BootLocal", got)
 		}
-		c.DrainOutbox()
+		takeOutbox(c)
 		return c, mid, opID, mac
 	}
 	stillLatched := func(t *testing.T, c *Cache, opID uuid.UUID, mac, after string) {
@@ -257,7 +257,7 @@ func TestUpdateOpPhase_AwaitingPhoneHomeOnlyLeftByFailure(t *testing.T) {
 		if got := c.BootActionForMAC(mac); got != model.BootLocal {
 			t.Errorf("after %s: post-install PXE got %d, want BootLocal (%d)", after, got, model.BootLocal)
 		}
-		_, updates := c.DrainOutbox()
+		_, updates := takeOutbox(c)
 		for _, u := range updates {
 			if u.Phase != "" {
 				t.Errorf("after %s: queued phase update %+v for global, want none", after, u)
@@ -298,7 +298,7 @@ func TestUpdateOpPhase_AwaitingPhoneHomeOnlyLeftByFailure(t *testing.T) {
 		if op := c.GetOperation(opID.String()); op == nil || op.Status != model.OpFailed {
 			t.Fatalf("op = %+v, want status failed", op)
 		}
-		_, updates := c.DrainOutbox()
+		_, updates := takeOutbox(c)
 		var sawFailedPhase bool
 		for _, u := range updates {
 			if u.Phase == "failed" && u.Status == "" {
@@ -550,7 +550,7 @@ func TestCacheRecordDeployComplete(t *testing.T) {
 	if m == nil || m.State != model.MachineStateDeploying {
 		t.Fatalf("local state should stay deploying until phone-home, got %+v", m)
 	}
-	obs, _ := c.DrainOutbox()
+	obs, _ := takeOutbox(c)
 	if len(obs) != 1 || obs[0].Obs.Event != "deploy_complete" {
 		t.Fatalf("outbox: got %+v", obs)
 	}
@@ -577,7 +577,7 @@ func TestCacheRecordPhoneHome_CompletesDeployOp(t *testing.T) {
 	if m == nil || m.State != model.MachineStateRunning {
 		t.Fatalf("phone-home should advance state to running, got %+v", m)
 	}
-	obs, updates := c.DrainOutbox()
+	obs, updates := takeOutbox(c)
 	foundPhoneHome := false
 	for _, o := range obs {
 		if o.Obs.Event == "phone_home" {
@@ -605,7 +605,7 @@ func TestCacheRecordPhoneHome_NoActiveOpStillEmitsObs(t *testing.T) {
 
 	c.RecordPhoneHome(id)
 
-	obs, updates := c.DrainOutbox()
+	obs, updates := takeOutbox(c)
 	if len(obs) != 1 || obs[0].Obs.Event != "phone_home" {
 		t.Fatalf("phone_home obs missing: %+v", obs)
 	}
@@ -616,12 +616,12 @@ func TestCacheRecordPhoneHome_NoActiveOpStillEmitsObs(t *testing.T) {
 
 // TestRecordPhoneHome_CompletionSurvivesRestart pins that the deploy's
 // completion is durable once the worker has answered the phone-home. The
-// installed OS stops phoning home after its first 2xx, so if the only
-// record of the completion is the memory-only op_update, a worker restart
-// before the drain loop sends it loses the completion for good: global
-// keeps the op at awaiting_phone_home and fails the healthy host at
-// PhoneHomeTimeout. The phone_home observation is persisted in the SQLite
-// outbox, so it must name the deploy op for global to complete it from.
+// installed OS stops phoning home after its first 2xx, so a worker restart
+// before the drain loop sends the completion must not lose it: global
+// would keep the op at awaiting_phone_home and fail the healthy host at
+// PhoneHomeTimeout. The phone_home observation and the op update behind it
+// are both persisted in the SQLite outbox, and the observation must name
+// the deploy op for global to complete it from.
 func TestRecordPhoneHome_CompletionSurvivesRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "worker.db")
 	db, err := OpenLocalDB(path)
@@ -650,8 +650,11 @@ func TestRecordPhoneHome_CompletionSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { closeLocalDB(t, db2) })
-	obs, updates := NewCache(db2).DrainOutbox()
+	obs, updates := takeOutbox(NewCache(db2))
 
+	if len(updates) != 1 || updates[0].OperationID != opID.String() || updates[0].Status != string(model.OpCompleted) {
+		t.Errorf("after a restart the completion op update is %+v, want completed for %s", updates, opID)
+	}
 	for _, p := range obs {
 		if p.Obs.Event == "phone_home" && p.Obs.OperationID == opID && p.Obs.MachineID == id {
 			return
@@ -689,7 +692,7 @@ func TestHandleProgressReport_DeployComplete_WithBMCCreds(t *testing.T) {
 		t.Fatalf("HandleProgressReport: %v", err)
 	}
 
-	obs, _ := c.DrainOutbox()
+	obs, _ := takeOutbox(c)
 	if len(obs) != 1 {
 		t.Fatalf("expected 1 observation, got %d", len(obs))
 	}
@@ -736,7 +739,7 @@ func TestHandleProgressReport_DeployComplete_NoBMCCreds(t *testing.T) {
 		t.Fatalf("HandleProgressReport: %v", err)
 	}
 
-	obs, _ := c.DrainOutbox()
+	obs, _ := takeOutbox(c)
 	if len(obs) != 1 {
 		t.Fatalf("expected 1 observation, got %d", len(obs))
 	}
@@ -759,7 +762,7 @@ func TestCachePhoneHome(t *testing.T) {
 	if m == nil || m.State != model.MachineStateRunning {
 		t.Fatalf("local state: got %+v, want Verified", m)
 	}
-	obs, _ := c.DrainOutbox()
+	obs, _ := takeOutbox(c)
 	if len(obs) != 1 || obs[0].Obs.Event != "phone_home" {
 		t.Fatalf("outbox: got %+v", obs)
 	}
@@ -780,7 +783,7 @@ func TestCacheRecordCommissionReport_QueuesOutboxKeepsState(t *testing.T) {
 	if m == nil || m.State != model.MachineStateCommissioning {
 		t.Fatalf("state: got %+v, want unchanged (commissioning)", m)
 	}
-	obs, _ := c.DrainOutbox()
+	obs, _ := takeOutbox(c)
 	if len(obs) != 1 || obs[0].Obs.Event != "commission_report" {
 		t.Fatalf("outbox: got %+v", obs)
 	}
@@ -850,7 +853,7 @@ func TestCacheApplySnapshot_OutboxPreserved(t *testing.T) {
 	// Apply another snapshot — outbox must survive.
 	c.ApplySnapshot(snapMachine(id, "aa:aa:aa:00:00:01", model.MachineStateDeploying))
 
-	obs, _ := c.DrainOutbox()
+	obs, _ := takeOutbox(c)
 	if len(obs) != 1 || obs[0].Obs.Event != "deploy_complete" {
 		t.Fatalf("outbox not preserved across apply: got %+v", obs)
 	}
@@ -1010,7 +1013,7 @@ func TestCacheHandleProgressReport_RejectsMachineOperationMismatch(t *testing.T)
 	if err == nil {
 		t.Fatal("expected mismatched machine/op binding to be rejected")
 	}
-	obs, updates := c.DrainOutbox()
+	obs, updates := takeOutbox(c)
 	if len(obs) != 0 || len(updates) != 0 {
 		t.Fatalf("rejected report produced side effects: observations=%+v updates=%+v", obs, updates)
 	}
@@ -1033,7 +1036,7 @@ func TestCacheHandleProgressReport_RejectsWrongOperationType(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected commission report on deploy operation to be rejected")
 	}
-	obs, _ := c.DrainOutbox()
+	obs, _ := takeOutbox(c)
 	if len(obs) != 0 {
 		t.Fatalf("rejected report queued observations: %+v", obs)
 	}
@@ -1055,7 +1058,7 @@ func TestCacheHandleProgressReport_RejectsPhoneHomeForCommissionOperation(t *tes
 	if err == nil {
 		t.Fatal("expected phone-home on commission operation to be rejected")
 	}
-	observations, updates := c.DrainOutbox()
+	observations, updates := takeOutbox(c)
 	if len(observations) != 0 || len(updates) != 0 {
 		t.Fatalf("rejected phone-home produced side effects: observations=%+v updates=%+v", observations, updates)
 	}
@@ -1081,7 +1084,7 @@ func TestCacheHandleProgressReport_CommissionUsesBoundMachine(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("HandleProgressReport: %v", err)
 	}
-	obs, _ := c.DrainOutbox()
+	obs, _ := takeOutbox(c)
 	if len(obs) != 1 {
 		t.Fatalf("observations=%+v, want one", obs)
 	}
@@ -1112,7 +1115,7 @@ func TestCacheHandleProgressReport_RejectsForeignPhysicalMAC(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected another machine's physical MAC to be rejected")
 	}
-	obs, _ := c.DrainOutbox()
+	obs, _ := takeOutbox(c)
 	if len(obs) != 0 {
 		t.Fatalf("rejected inventory queued observations: %+v", obs)
 	}
@@ -1138,7 +1141,7 @@ func TestCacheHandleProgressReport_RejectsDiskOwnedByAnotherMachine(t *testing.T
 	if err == nil {
 		t.Fatal("expected another machine's disk to be rejected")
 	}
-	obs, _ := c.DrainOutbox()
+	obs, _ := takeOutbox(c)
 	if len(obs) != 0 {
 		t.Fatalf("rejected inventory queued observations: %+v", obs)
 	}
@@ -1199,7 +1202,7 @@ func TestCacheHandleProgressReport_TerminalDeployComplete(t *testing.T) {
 	if op != nil && (op.Status == model.OpCompleted || op.Status == model.OpFailed) {
 		t.Errorf("op should not be terminal yet, got status=%s", op.Status)
 	}
-	obs, updates := c.DrainOutbox()
+	obs, updates := takeOutbox(c)
 	foundComplete := false
 	for _, o := range obs {
 		if o.Obs.Event == "deploy_complete" {
@@ -1234,11 +1237,11 @@ func TestCacheHandleProgressReport_PhoneHomeReplayAfterCompletionIsIdempotent(t 
 	if err := c.HandleProgressReport(report); err != nil {
 		t.Fatalf("first phone-home: %v", err)
 	}
-	c.DrainOutbox()
+	takeOutbox(c)
 	if err := c.HandleProgressReport(report); err != nil {
 		t.Fatalf("phone-home replay after local completion: %v", err)
 	}
-	if observations, updates := c.DrainOutbox(); len(observations) != 0 || len(updates) != 0 {
+	if observations, updates := takeOutbox(c); len(observations) != 0 || len(updates) != 0 {
 		t.Fatalf("completed-op replay produced side effects: observations=%+v updates=%+v", observations, updates)
 	}
 
@@ -1249,7 +1252,7 @@ func TestCacheHandleProgressReport_PhoneHomeReplayAfterCompletionIsIdempotent(t 
 	if err := c.HandleProgressReport(report); err != nil {
 		t.Fatalf("phone-home replay after op removal: %v", err)
 	}
-	if observations, updates := c.DrainOutbox(); len(observations) != 0 || len(updates) != 0 {
+	if observations, updates := takeOutbox(c); len(observations) != 0 || len(updates) != 0 {
 		t.Fatalf("removed-op replay produced side effects: observations=%+v updates=%+v", observations, updates)
 	}
 }
@@ -1288,7 +1291,7 @@ func TestCacheRecordOpUpdate(t *testing.T) {
 	if got := c.GetOperation(opID.String()); got == nil || got.Status != model.OpCompleted {
 		t.Fatalf("in-memory: got %+v", got)
 	}
-	_, updates := c.DrainOutbox()
+	_, updates := takeOutbox(c)
 	if len(updates) != 1 || updates[0].Status != "completed" {
 		t.Fatalf("outbox: got %+v", updates)
 	}
@@ -1309,44 +1312,55 @@ func TestCacheGetDHCPConfig(t *testing.T) {
 	}
 }
 
-// TestCacheReloadOutboxFromDisk_UnackedRowsComeBack covers the
-// reconnect-recovery path: after a disconnect drops an in-flight
-// observation out of memory, the SQLite row is still there and
-// ReloadOutboxFromDisk must put it back so the next send retries.
-func TestCacheReloadOutboxFromDisk_NoOpWithoutLocalDB(t *testing.T) {
+// TestCacheReloadOutboxFromDisk_ResendsWithoutLocalDB covers the reconnect
+// path without persistence: an entry sent on a connection that died, and
+// never acknowledged, is due again after the reconnect reset, also when the
+// outbox has no SQLite file behind it.
+func TestCacheReloadOutboxFromDisk_ResendsWithoutLocalDB(t *testing.T) {
 	c := NewCache(nil)
-	c.ReloadOutboxFromDisk() // must not panic
+	if err := c.ReloadOutboxFromDisk(); err != nil { // nothing in flight
+		t.Fatal(err)
+	}
+	c.RecordOpUpdate(uuid.NewString(), string(model.OpCompleted), nil)
+	if got := c.DrainOutbox(); len(got) != 1 {
+		t.Fatalf("first drain: got %d entries, want 1", len(got))
+	}
+	if got := c.DrainOutbox(); len(got) != 0 {
+		t.Fatalf("an in-flight entry was drained again before a reconnect: %+v", got)
+	}
+	if err := c.ReloadOutboxFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.DrainOutbox(); len(got) != 1 || got[0].Update == nil || got[0].Update.Status != string(model.OpCompleted) {
+		t.Fatalf("after reconnect: got %+v, want the unacknowledged completion again", got)
+	}
 }
 
-// TestCacheRequeueOutbox_PrependsItems verifies the failed-send
-// recovery path: if drainOnce's send fails mid-batch, the remaining
-// items are put back at the head of the queue so the next drain sees
-// them before any items enqueued in the interim.
-func TestCacheRequeueOutbox_PrependsItems(t *testing.T) {
+// TestCacheRequeueOutbox_KeepsRecordOrder verifies the failed-send
+// recovery path: if drainOnce's send fails mid-batch, the unsent entries
+// go back to the queue in their recorded place, ahead of anything recorded
+// in the interim.
+func TestCacheRequeueOutbox_KeepsRecordOrder(t *testing.T) {
 	c := NewCache(nil)
 	id := uuid.New()
 	c.ApplySnapshot(snapMachine(id, "aa:aa:aa:00:00:01", model.MachineStateDeploying))
 
-	// Drain an empty queue, then requeue two items.
-	c.RequeueOutbox(
-		[]PendingOutbox{
-			{Obs: model.Observation{MachineID: id, Event: "deploy_complete"}},
-			{Obs: model.Observation{MachineID: id, Event: "phone_home"}},
-		},
-		[]model.OperationUpdate{
-			{OperationID: "op-1", Status: "running"},
-		},
-	)
-
-	// Append one more observation AFTER requeue. It should land at the tail.
-	c.recordDeployComplete(id, uuid.New(), nil) // appends a third observation
-
-	obs, updates := c.DrainOutbox()
-	if len(obs) != 3 {
-		t.Fatalf("got %d obs, want 3", len(obs))
+	c.recordDeployComplete(id, uuid.New(), nil)
+	c.RecordInventoryReport(id, []byte(`{}`))
+	c.RecordOpUpdate("op-1", string(model.OpCompleted), nil)
+	drained := c.DrainOutbox()
+	if len(drained) != 3 {
+		t.Fatalf("drained %d entries, want 3", len(drained))
 	}
-	// Requeued items come first; appended item at the tail.
-	if obs[0].Obs.Event != "deploy_complete" || obs[1].Obs.Event != "phone_home" || obs[2].Obs.Event != "deploy_complete" {
+	// The first send succeeded and was acked; the rest failed.
+	c.AckOutbox(drained[0])
+	c.RequeueOutbox(drained[1:])
+
+	// Recorded AFTER the failed send: it lands at the tail.
+	c.recordDeployComplete(id, uuid.New(), nil)
+
+	obs, updates := takeOutbox(c)
+	if len(obs) != 2 || obs[0].Obs.Event != "inventory_import" || obs[1].Obs.Event != "deploy_complete" {
 		t.Fatalf("wrong order: %+v", obs)
 	}
 	if len(updates) != 1 || updates[0].OperationID != "op-1" {
@@ -1357,7 +1371,7 @@ func TestCacheRequeueOutbox_PrependsItems(t *testing.T) {
 func TestCacheRequeueOutbox_EmptyIsNoOp(t *testing.T) {
 	c := NewCache(nil)
 	// No panic, no wake emitted.
-	c.RequeueOutbox(nil, nil)
+	c.RequeueOutbox(nil)
 	select {
 	case <-c.Wake:
 		t.Fatal("empty requeue should not wake")

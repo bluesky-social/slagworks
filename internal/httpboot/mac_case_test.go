@@ -96,7 +96,7 @@ func TestMACKeyedEndpoints_UpperCaseMACResolvesSameMachine(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("POST /api/v1/inventory: got %d, want 200: %s", w.Code, w.Body.String())
 		}
-		obs, _ := c.DrainOutbox()
+		obs, _ := takeOutbox(c)
 		var found bool
 		for _, o := range obs {
 			if o.Obs.Event != "inventory_import" {

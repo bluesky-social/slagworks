@@ -32,7 +32,9 @@ func TestDHCPLeaseForwarder_Model_Prop(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		// Each case starts from an empty outbox.
 		for _, p := range mustListOutbox(rt, db) {
-			db.AckOutboxRow(p.RowID)
+			if err := db.AckOutboxRow(p.RowID); err != nil {
+				rt.Fatalf("clear outbox: %v", err)
+			}
 		}
 		c := NewCache(db)
 		// macs[0] belongs to a machine reserved at ips[0]; macs[1] has an
