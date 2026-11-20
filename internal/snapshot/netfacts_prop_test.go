@@ -552,19 +552,12 @@ func permutedInputs(t *rapid.T, in Inputs) Inputs {
 
 // coverage counters (reported in -v output).
 var (
-	cvCases, cvFacts, cvMultiIP, cvLAG, cvGateway, cvPools, cvBothEnds, cvIPv6, cvFQDNEmpty, cvOOBReject, cvMgmtLag atomic.Int64
+	cvCases, cvFacts, cvMultiIP, cvLAG, cvGateway, cvPools, cvBothEnds, cvIPv6, cvFQDNEmpty, cvMgmtLag atomic.Int64
 )
 
 func checkFacts(t *rapid.T, gs genSite) {
 	in := gs.in
 	snap, err := Build(in)
-	// The MAC pool is small, so two interfaces can share a MAC while both
-	// carry an OOB address; buildOOBReservations rejects that by design
-	// (covered by oob_reservations_test.go). Discard the case.
-	if err != nil && strings.Contains(err.Error(), "OOB reservations:") {
-		cvOOBReject.Add(1)
-		t.Skip("conflicting OOB reservation set (rejected by design)")
-	}
 	// A machine's facts carry one address per interface. A site with
 	// several active addresses on a bound machine's interface still
 	// builds; the per-interface check below holds the facts to the one
@@ -687,8 +680,8 @@ func ifaceMgmtOnly(in Inputs, id int) bool {
 }
 
 func reportCoverage(t *testing.T) {
-	t.Logf("coverage: cases=%d facts=%d lagMembers=%d mgmtOnlyLags=%d gateways=%d ipv6=%d multiIPSites=%d pools=%d leafInScope=%d fqdnEmpty=%d oobRejected=%d",
-		cvCases.Load(), cvFacts.Load(), cvLAG.Load(), cvMgmtLag.Load(), cvGateway.Load(), cvIPv6.Load(), cvMultiIP.Load(), cvPools.Load(), cvBothEnds.Load(), cvFQDNEmpty.Load(), cvOOBReject.Load())
+	t.Logf("coverage: cases=%d facts=%d lagMembers=%d mgmtOnlyLags=%d gateways=%d ipv6=%d multiIPSites=%d pools=%d leafInScope=%d fqdnEmpty=%d",
+		cvCases.Load(), cvFacts.Load(), cvLAG.Load(), cvMgmtLag.Load(), cvGateway.Load(), cvIPv6.Load(), cvMultiIP.Load(), cvPools.Load(), cvBothEnds.Load(), cvFQDNEmpty.Load())
 }
 
 // TestProp_NetFacts checks the facts contract on sites with at most one

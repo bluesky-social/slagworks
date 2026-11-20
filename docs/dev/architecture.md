@@ -361,6 +361,16 @@ one NetBox marks as `secondary` or shared (`anycast`, `vip`, `vrrp`,
 its identity /32. The
 dispatcher logs the affected interfaces in one warning per site, repeated
 only when the set or a chosen address changes.
+OOB reservations are keyed by MAC: a MAC gets one only when its
+interfaces carry exactly one address inside the `slagworks-oob` prefix
+and no other MAC carries that address. Build leaves any other MAC out
+and keeps every other reservation; unless the MAC is a machine's NIC
+(whose static lease comes from the machine's interface facts), the
+worker then treats it as an unknown MAC with no static lease. A
+`slagworks-oob-dynamic` range with no `slagworks_oob_owner`, or whose
+owner another range also names, is left out the same way. Build logs
+what it left out on every build; neither fails the site. More than one
+`slagworks-oob` prefix, or one that does not parse, still does.
 Its inputs (`Inputs`, `builder.go:31`) are
 NetBox reads (site, config, prefixes, OOB prefixes and ranges,
 devices, device-types, interfaces, IPs), Postgres reads (machines,
