@@ -150,7 +150,7 @@ func TestTokenCache_Property_ConcurrentInvocations(t *testing.T) {
 					defer wg.Done()
 					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer cancel()
-					tok, err := newPersistingTokenSource(ctx, p.config(), path).Token()
+					tok, err := newPersistingTokenSource(ctx, p.srv.URL, p.config(), path).Token()
 					results[i] = res{tok, err}
 				}(i)
 			}

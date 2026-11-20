@@ -92,8 +92,9 @@ func (c Config) validate() error {
 
 // Bearer returns a valid access token for the API client, performing a silent
 // refresh if the cached token is expired, or a full interactive login if there
-// is no usable cached token. This is the entrypoint a CLI's root command calls
-// before every server-touching subcommand.
+// is no usable cached token. An identity provider that does not answer is an
+// error, not a reason to log in. This is the entrypoint a CLI's root command
+// calls before every server-touching subcommand.
 func Bearer(ctx context.Context, cfg Config) (string, error) {
 	if err := cfg.validate(); err != nil {
 		return "", err
@@ -105,6 +106,11 @@ func Bearer(ctx context.Context, cfg Config) (string, error) {
 	tok, err := loadFromCacheOrRefresh(ctx, cfg, cache)
 	if err == nil && tok.Valid() {
 		return tok.AccessToken, nil
+	}
+	// A provider that did not answer the refresh will not answer a login
+	// either; report it rather than open a browser against it.
+	if isNoAnswer(err) {
+		return "", err
 	}
 	// No usable cached/refreshed token — full interactive login.
 	tok, err = Login(ctx, cfg)
@@ -159,7 +165,7 @@ func loadFromCacheOrRefresh(ctx context.Context, cfg Config, cachePath string) (
 	if err != nil {
 		return nil, err
 	}
-	ts := newPersistingTokenSource(ctx, oc, cachePath)
+	ts := newPersistingTokenSource(ctx, cfg.Issuer, oc, cachePath)
 	return ts.Token()
 }
 

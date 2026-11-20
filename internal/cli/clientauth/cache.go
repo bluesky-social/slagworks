@@ -141,18 +141,19 @@ func removeToken(ctx context.Context, path string) error {
 // writes a successfully-rotated token back before unlocking.
 type persistingTokenSource struct {
 	ctx       context.Context
+	issuer    string // named when the refresh gets no answer
 	oc        *oauth2.Config
 	cachePath string
 }
 
-func newPersistingTokenSource(ctx context.Context, oc *oauth2.Config, cachePath string) *persistingTokenSource {
-	return &persistingTokenSource{ctx: ctx, oc: oc, cachePath: cachePath}
+func newPersistingTokenSource(ctx context.Context, issuer string, oc *oauth2.Config, cachePath string) *persistingTokenSource {
+	return &persistingTokenSource{ctx: ctx, issuer: issuer, oc: oc, cachePath: cachePath}
 }
 
 func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
-	// Acquire the lock under the context: if the operator Ctrl-C's (or a
-	// timeout fires) while a concurrent invocation is holding the lock through
-	// a slow/hung refresh, we abort instead of blocking indefinitely.
+	// Acquire the lock under the context, so Ctrl-C (or a caller's deadline)
+	// aborts the wait. A concurrent invocation holding the lock through a
+	// slow refresh lets go within providerTimeout, when its refresh gives up.
 	unlock, err := lockCache(p.ctx, p.cachePath)
 	if err != nil {
 		return nil, err
@@ -173,10 +174,15 @@ func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
 	}
 
 	// Refresh from the on-disk token (NOT a pre-captured one).
-	refreshed, err := p.oc.TokenSource(p.ctx, cur).Token()
+	refreshed, err := askProvider(p.ctx, p.issuer, func(ctx context.Context) (*oauth2.Token, error) {
+		return p.oc.TokenSource(ctx, cur).Token()
+	})
 	if err != nil {
 		// Do NOT touch the cache on failure — a revoked/expired/unreachable
 		// refresh must not overwrite the cache with a bad token.
+		if isNoAnswer(err) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("refreshing token (re-login may be required): %w", err)
 	}
 	if err := writeCache(p.cachePath, refreshed); err != nil {

@@ -208,7 +208,7 @@ func TestPersistingTokenSource_RefreshAndWriteBack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ts := newPersistingTokenSource(context.Background(), fe.config(), path)
+	ts := newPersistingTokenSource(context.Background(), fe.srv.URL, fe.config(), path)
 	tok, err := ts.Token()
 	if err != nil {
 		t.Fatalf("Token(): %v", err)
@@ -243,7 +243,7 @@ func TestPersistingTokenSource_ValidTokenNoRefresh(t *testing.T) {
 	}
 	_ = writeCache(path, valid)
 
-	ts := newPersistingTokenSource(context.Background(), fe.config(), path)
+	ts := newPersistingTokenSource(context.Background(), fe.srv.URL, fe.config(), path)
 	tok, err := ts.Token()
 	if err != nil {
 		t.Fatal(err)
@@ -272,7 +272,7 @@ func TestPersistingTokenSource_RefreshErrorPreservesCache(t *testing.T) {
 	}
 	_ = writeCache(path, expired)
 
-	ts := newPersistingTokenSource(context.Background(), fe.config(), path)
+	ts := newPersistingTokenSource(context.Background(), fe.srv.URL, fe.config(), path)
 	if _, err := ts.Token(); err == nil {
 		t.Fatal("expected refresh error for a consumed refresh token")
 	}
@@ -309,7 +309,7 @@ func TestPersistingTokenSource_ConcurrentRefreshSingleRotation(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			ts := newPersistingTokenSource(context.Background(), fe.config(), path)
+			ts := newPersistingTokenSource(context.Background(), fe.srv.URL, fe.config(), path)
 			toks[i], errs[i] = ts.Token()
 		}(i)
 	}
@@ -423,7 +423,7 @@ func (p *gatedProvider) startRefresh(t *testing.T, path string) <-chan error {
 	oc := &oauth2.Config{ClientID: "cid", Endpoint: oauth2.Endpoint{TokenURL: p.srv.URL + "/token"}}
 	done := make(chan error, 1)
 	go func() {
-		_, err := newPersistingTokenSource(context.Background(), oc, path).Token()
+		_, err := newPersistingTokenSource(context.Background(), p.srv.URL, oc, path).Token()
 		done <- err
 	}()
 	select {

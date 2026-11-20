@@ -313,7 +313,11 @@ and `slagctl auth login` saves the answer next to the API URL. An
 operator therefore configures one value, the API URL.
 
 - The issuer must be reachable from the operator's laptop; the OpenID
-  configuration is fetched from it.
+  configuration is fetched from it. slagctl gives up on any request the
+  issuer does not answer within 30 seconds (discovery, a token refresh,
+  the code exchange, the device-authorization request) with an error
+  that names the issuer; an unanswered refresh does not fall back to a
+  login.
 - slagctl is a public client using PKCE, and the client ID is global's
   OIDC audience.
 - **`SLAGWORKS_OIDC_ISSUER`** and **`SLAGWORKS_OIDC_CLIENT_ID`**, when
@@ -506,6 +510,10 @@ example files are installed mode 0640, group `slagworks`.
 - **AWS region for Secrets Manager** — `us-east-2`.
 - **OIDC loopback redirect port** for `slagctl auth login` — fixed at
   `8765`.
+- **Identity-provider request timeout** for slagctl — 30 seconds per
+  request (`internal/cli/clientauth/flows.go`, `providerTimeout`). The
+  browser callback waits 5 minutes; device-approval polling lasts as
+  long as the device code the provider issued.
 - **Operation timeouts** — a pending operation fails after 24 hours, a
   claimed or running one after 30 minutes, a deploy waiting for phone-home
   after 30 minutes in that phase, and a claim with no progress after 2
