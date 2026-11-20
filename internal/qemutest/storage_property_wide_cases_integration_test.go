@@ -64,6 +64,19 @@ func propWideCases() []propCase {
 		propRootMovesCase("uefi-root-moves-off-old-install", "uefi", false, false),
 		propRootMovesCase("bios-root-moves-off-old-install", "bios", false, false),
 		propRootMovesCase("uefi-root-moves-wipe-all", "uefi", true, true),
+		{
+			// bios-raid1-single's first two steps under UEFI: the second
+			// layout has no array at all, and d1 keeps a stale half of the
+			// old root mirror outside it. The installed system must not
+			// assemble it.
+			Name: "uefi-raid1-then-single", Firmware: "uefi",
+			Disks: []propDisk{propD("d0", "virtio", 8, 0, 512, ""), propD("d1", "virtio", 8, 1, 512, "")},
+			Steps: []propStep{
+				{Attach: propAll("d0", "d1"), Layout: propRAID1Layout("d0", "d1", "ext4"), Expect: "ok", Why: "blank disks"},
+				{Attach: propAll("d0", "d1"), Layout: propSingleLayout("d0", "ext4"), Destructive: true, Expect: "ok",
+					Why: "destructive redeploy without an array; d1 keeps a stale RAID half outside the layout"},
+			},
+		},
 		propParityRootCase("uefi-root-raid5", "uefi", 5, 3),
 		propParityRootCase("bios-root-raid5", "bios", 5, 3),
 		propParityRootCase("uefi-root-raid6", "uefi", 6, 4),
