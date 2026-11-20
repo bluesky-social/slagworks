@@ -34,7 +34,9 @@ package netbox_test
 // generator features to disable so the search continues past a finding:
 // dup-bay (two components sharing a bay name), asset-tag (a programmed
 // asset tag two hosts share), bmc-row (BMC rows that are MAC-less, named
-// ipmi0, or whose BMC MAC changes; and faults on runs with a BMC). Unset,
+// ipmi0, or whose BMC MAC changes; and faults on runs with a BMC),
+// stale-serial (the module-serial oracle: a part with no readable serial
+// keeps its predecessor's). Unset,
 // it defaults to defaultSkip; "none" enables everything. exotic-dimm
 // (LPDDR5/RAM memory classes outside the NetBox Memory profile enum) is a
 // coverage feature, not a finding: real NetBox accepts them. The
@@ -192,7 +194,7 @@ type features struct {
 // defaultSkip gates the findings still open on main, so the discovery
 // suite stays green; set COMMISSION_E2E_SKIP=none to search with every
 // feature enabled.
-const defaultSkip = "dup-bay,asset-tag,bmc-row"
+const defaultSkip = "dup-bay,asset-tag,bmc-row,stale-serial"
 
 func skipped(key string) bool {
 	list, set := os.LookupEnv("COMMISSION_E2E_SKIP")
@@ -993,6 +995,36 @@ func (w *world) checkDevice(t *rapid.T, i int, before, after globalSnap) {
 		fmt.Sscanf(b, "%d:", &id)
 		if occupied[id] != 1 {
 			t.Fatalf("device %d: module bay %s holds %d modules (bays %v)", dev, b, occupied[id], ds.Bays)
+		}
+	}
+	// Module serials are the reported ones: a component with no readable
+	// serial must not keep the serial of the part it replaced.
+	if !skipped("stale-serial") {
+		wantSerials := map[string][]string{}
+		for _, d := range m.DIMMs {
+			if d.MB > 0 {
+				wantSerials["Memory"] = append(wantSerials["Memory"], d.Serial)
+			}
+		}
+		for _, d := range m.Disks {
+			wantSerials["Hard disk"] = append(wantSerials["Hard disk"], d.Serial)
+		}
+		for _, p := range m.PSUs {
+			wantSerials["Power supply"] = append(wantSerials["Power supply"], p.Serial)
+		}
+		gotSerials := map[string][]string{}
+		for _, mod := range ds.Modules {
+			if _, tracked := wantSerials[mod.Profile]; tracked {
+				gotSerials[mod.Profile] = append(gotSerials[mod.Profile], mod.Serial)
+			}
+		}
+		for prof, ws := range wantSerials {
+			gs := gotSerials[prof]
+			sort.Strings(ws)
+			sort.Strings(gs)
+			if fmt.Sprint(ws) != fmt.Sprint(gs) {
+				t.Fatalf("device %d: %s module serials %q, want %q", dev, prof, gs, ws)
+			}
 		}
 	}
 }

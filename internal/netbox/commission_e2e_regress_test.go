@@ -56,6 +56,7 @@ type moduleStub struct {
 	next    int
 	bays    map[int]string // id -> name
 	modules map[int]int    // module id -> bay id
+	patches map[int][]map[string]any
 }
 
 func (s *moduleStub) server(t *testing.T) *httptest.Server {
@@ -131,6 +132,11 @@ func (s *moduleStub) server(t *testing.T) *httptest.Server {
 			if r.Method == http.MethodPost {
 				s.next++
 				id = s.next
+			} else {
+				if s.patches == nil {
+					s.patches = map[int][]map[string]any{}
+				}
+				s.patches[id] = append(s.patches[id], body)
 			}
 			s.modules[id] = bay
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
@@ -274,5 +280,34 @@ func TestReconcileInterfaces_BMCNICRecognisesOperatorIPMI0Row(t *testing.T) {
 	}
 	if ps := f.patches[91]; len(ps) != 0 {
 		t.Errorf("row 91 (operator BMC row) PATCHes = %v, want none", ps)
+	}
+}
+
+// A replaced disk, DIMM or PSU whose serial (or firmware version) the
+// agent cannot read must not keep the serial of the part it replaced: the
+// device fields are written authoritatively for the same reason
+// (SyncCommissionData clears what inventory no longer reports).
+func TestReconcileModules_ClearsSerialAndFirmwareOfReplacedPart(t *testing.T) {
+	stub := &moduleStub{next: 100, bays: map[int]string{1: "NVMe_0"}, modules: map[int]int{50: 1}}
+	srv := stub.server(t)
+	defer srv.Close()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+
+	err := c.ReconcileModules(context.Background(), 1, []ModuleData{
+		{BayName: "NVMe_0", ProfileName: "Hard disk", Manufacturer: "Unknown", Model: "NVME 3576GB"},
+	})
+	if err != nil {
+		t.Fatalf("ReconcileModules: %v", err)
+	}
+	ps := stub.patches[50]
+	if len(ps) != 1 {
+		t.Fatalf("module 50 PATCHes = %v, want exactly one", ps)
+	}
+	if serial, ok := ps[0]["serial"]; !ok || serial != "" {
+		t.Errorf("module 50 PATCH serial = %v (present=%v), want \"\" to clear the replaced part's serial", serial, ok)
+	}
+	cf, _ := ps[0]["custom_fields"].(map[string]any)
+	if fw, ok := cf["firmware_version"]; !ok || fw != nil {
+		t.Errorf("module 50 PATCH custom_fields = %v, want firmware_version: null", ps[0]["custom_fields"])
 	}
 }
