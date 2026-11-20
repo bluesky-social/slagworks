@@ -111,15 +111,15 @@ All paths are under `/api/v1`.
 | GET | `/machines` | read | List machines. Filters: `?state=`, `?serial=` (exact NetBox serial), `?hostname=` (case-insensitive substring of the NetBox device name; needs NetBox, 503 without). Rows carry a transient `hostname` from NetBox. |
 | GET | `/machines/:id` | read | One machine, with `hostname` filled from NetBox when available. |
 | PATCH | `/machines/:id` | admin | Update slagworks-owned fields. Only `desired_os` is applied; a body containing `state` is rejected with 400. Identity (name, MACs, BMC IP, site) is edited in NetBox. |
-| GET | `/machines/:id/power` | read | Read power state through a synchronous RPC to a connected site worker; no operation is created. Returns `{"machine_id","state","transport","hint"}`, `state` one of `on`/`off`/`unknown`. 15 s budget. 422 when no credential resolves, 503 when no worker for the site is connected, 502 when the read fails. |
-| POST | `/machines/:id/power` | admin | Create a power operation. Body `{"action": "on"\|"off"\|"cycle", "boot_device": "pxe"\|"disk", "via": "bmc"\|"pdu"\|"amt"}`; `boot_device` and `via` are optional. `boot_device` is rejected with `via=pdu`, and `disk` is rejected over AMT. Not gated on machine state or lock; 409 when the machine already has an active operation (of any type, a deploy or commission included). |
+| GET | `/machines/:id/power` | read | Read power state through a synchronous RPC to a connected site worker; no operation is created. Returns `{"machine_id","state","transport","hint"}`, `state` one of `on`/`off`/`unknown`. 15 s budget. 422 when no BMC credential, or no AMT endpoint or credential, resolves, 503 when no worker for the site is connected, 502 when the read fails. |
+| POST | `/machines/:id/power` | admin | Create a power operation. Body `{"action": "on"\|"off"\|"cycle", "boot_device": "pxe"\|"disk", "via": "bmc"\|"pdu"\|"amt"}`; `boot_device` and `via` are optional. `boot_device` is rejected with `via=pdu`, and `disk` is rejected over AMT. 422 or 503 when the transport does not resolve (see `via` below). Not gated on machine state or lock; 409 when the machine already has an active operation (of any type, a deploy or commission included). |
 | GET | `/machines/:id/boot` | read | Read the BMC boot-device override over the same RPC path. Returns `{"machine_id","supported","device","persistent","valid","raw","transport","hint"}`. Only the SMCIPMITool controller implements boot reads, so `supported` is false for every other host (and always for AMT). |
 | POST | `/machines/:id/boot` | admin | Create a `set_boot_device` operation. Body `{"device": "pxe"\|"disk"\|"default", "persistent": bool}`; `persistent` is invalid with `default`. BMC only: 422 for an AMT machine. 409 when the machine already has an active operation. The worker fails the operation if the host's controller cannot set a boot override (only SMCIPMITool can). |
 | GET | `/machines/:id/preflight` | read | Run the deploy (default) or commission (`?op=commission`) preflight without creating an operation. Returns `{"machine","op_type","ok","gaps"}`; 200 whenever the check ran, 503 when it could not run. |
 | GET | `/machines/:id/match` | read | Report the network and storage scripts the host matches, read from a freshly built snapshot of its owning site. Returns `{"machine","hostname","network_script":{"name"},"storage_script":{"name"}}`; an absent script field means no script of that kind matched. 503 when the match cannot be computed. |
 | GET | `/machines/:id/netbox-diff` | read | Compare the slagworks machine row with its NetBox device. `:id` must be a UUID. Returns `{"machine_id","missing","message","matched","fields":[{"name","slagworks","netbox","comparable","match"}]}`; `missing` is `netbox` or `slagworks` when one side is absent. Needs NetBox. |
 | GET | `/machines/:id/console-probe` | read | `?nonce=<hex>&lookback=<seconds>` (lookback default 300, max 3600): report whether the nonce appeared in the machine's console stream. Returns `{"observed": bool}`. Registered only with the console store. |
-| POST | `/machines/:id/deploy` | admin | Create a deploy operation. Body (all optional) `{"destructive": bool, "wipe_all_disks": bool, "recovery": bool, "via": "bmc"\|"pdu"\|"amt"}`. `wipe_all_disks` requires `destructive`. 424 when no SSH keys are registered; 422 when no credential resolves or preflight finds gaps; 409 when the machine's state, lock or an active operation forbids it. Allowed from `commissioned`, `failed` and `running`. |
+| POST | `/machines/:id/deploy` | admin | Create a deploy operation. Body (all optional) `{"destructive": bool, "wipe_all_disks": bool, "recovery": bool, "via": "bmc"\|"pdu"\|"amt"}`. `wipe_all_disks` requires `destructive`. 424 when no SSH keys are registered; 422 when the transport does not resolve (see `via` below) or preflight finds gaps; 409 when the machine's state, lock or an active operation forbids it. Allowed from `commissioned`, `failed` and `running`. |
 | POST | `/machines/:id/commission` | admin | Create a commission operation. Body `{"via": ...}`. Same credential and preflight checks as deploy. Allowed from `new`, `commissioned`, `failed` and `running`. |
 | POST | `/machines/:id/bmc-reconcile` | admin | Create a `bmc_reconcile` operation: the owning site worker brings the BMC's IPMI user table into line over the LAN using the device's `bmc-creds-admin` entry (one `monitor` account at USER privilege, every other non-reserved account disabled), then sets NTP, UTC and the clock over Redfish. Body `{"rotate_monitor": bool}`. Without `rotate_monitor` the password stored in `pop/<pop>/bmc-creds-monitor` is re-asserted; a new one is generated only when none is stored or on rotate. 422 for an AMT machine, without NetBox, without an admin entry, when the pop's monitor secret is missing, or when the stored monitor entry cannot be re-asserted. Not gated on state or lock; 409 when the machine already has an active operation. |
 | POST | `/machines/:id/lock` | admin | Set `locked=true`. Returns the machine. |
@@ -132,6 +132,17 @@ All paths are under `/api/v1`.
 `bmc-creds-admin` entry has `kind: "amt"` and `bmc` otherwise. `pdu`
 switches the device's PDU outlets and is the only option for a host with
 no BMC.
+
+Power, deploy and commission resolve the transport before creating
+anything. When the device's NetBox record or admin entry rules it out, the
+answer is 422 with the reason: no usable `kind: "bmc"` credential; for
+`pdu`, a power path that is not modeled (no power-ports, a power-port not
+cabled to exactly one outlet, a PDU with no mgmt IP, serial or complete
+`kind: "pdu"` entry); for `amt`, no active `oob_ip` or complete
+`kind: "amt"` entry. Fix the record before retrying. A 503 means a
+dependency could not be asked: NetBox did not answer, the secret store did
+not answer for `pdu` or `amt`, or `pdu` or `amt` was requested from a server
+without NetBox. A 503 can succeed on retry.
 
 ## PDU outlets and device credentials
 
