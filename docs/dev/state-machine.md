@@ -590,6 +590,18 @@ completed. `runSetBootDevice` (`executor.go:259`) routes to the
 `power.BootManager` capability which today is only implemented for
 Supermicro.
 
+The executor drives the op from the copy it took before the claim, while
+the WS read loop, a separate goroutine, keeps applying the op stream. An
+abort, a NetBox drift fail or a timeout sweep can therefore land an
+`op_removed` for the op while the executor is inside a BMC round trip.
+Before each write to the host or its BMC (the PXE or boot-device arm, the
+power action, `bmc_reconcile`'s account pass and its time pass) the
+executor re-reads the op layer (`Executor.opRemoved`); if the op is gone
+it stops there and reports nothing, since global already holds the
+terminal row. An `op_removed` that lands after a write does not undo it:
+a lifecycle op aborted just after its power cycle still reboots the host,
+which then boots from disk (`BootLocal`: no active op authorizes it).
+
 ### Complete
 
 Path depends on the op type.
@@ -756,7 +768,10 @@ Handler calls `store.AbortMachine(id)` (`server.go:1008`).
 The handler publishes `op_removed` for each failed op (and fires the
 identity rebuild for a durable state write) before it checks the error,
 because `AbortMachine` also returns the ops it failed when a later step
-errors, and a retried abort no longer finds them.
+errors, and a retried abort no longer finds them. A site worker already
+driving one of those ops stops before its next write to the host once the
+`op_removed` reaches it, but does not undo a write already issued (see
+[Claim and drive](#claim-and-drive)).
 
 Effect on machine state follows the four `FailOperation` rules
 uniformly:
@@ -779,7 +794,8 @@ that returns the current row if no ops are active.
 
 Abort writes rows in global and sends nothing to the host: it does not
 power the host off (the operator follows with `machine power off` for
-that) and the worker takes no BMC action when an op is removed. An
+that) and the worker takes no BMC action when an op is removed; an
+executor still driving the op stops before its next BMC write. An
 agent that is still running finds out from its own reports.
 
 Once the worker has applied the `op_removed`, `opState.validateReportBinding`

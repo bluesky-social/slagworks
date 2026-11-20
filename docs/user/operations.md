@@ -75,7 +75,11 @@ Source: `cmd/slagctl/cmd/machine.go` (`machineDeployCmd`).
 Cancel all active operations for a machine and reset its state so a
 fresh operation can be issued. Used to unstick a machine wedged in
 `commissioning` or `deploying`. Aborting does not power the host
-off; if you need that, follow with `machine power off`.
+off; if you need that, follow with `machine power off`. If the site
+worker is already driving the operation, it stops before it next changes
+the host (boot device, power, BMC users), but a change it has already
+made stands: a deploy aborted just after its power cycle still reboots
+the host, which then boots from its disk.
 
 An agent that is running on the host when you abort stops by itself:
 it reports to its site worker at least every 5 seconds, is told the
