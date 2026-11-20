@@ -1065,7 +1065,7 @@ func (w *epWorld) checkQuiescence() {
 				w.stat("final.claimed.claimant_gone")
 			case durableReport:
 				w.violate("report-missing", "%s: the worker queued a durable bmc_reconcile_report, yet at quiescence the hub still holds the op claimed (phase %q)", name, rec.op.Phase)
-			case rec.op.Phase == "" || (spec.typ == model.OpBMCReconcile):
+			case rec.op.Phase == "" || !epLifecycle(spec.typ):
 				if facts.reportLossy || crashed {
 					w.violate("report-lost", "%s was driven but its report never reached the hub (dropped write / restart); the op stays claimed until a sweep fails it", name)
 				} else {

@@ -712,9 +712,12 @@ func (s *Store) failOpBatch(ops []model.Operation, reason string, guard func(*go
 
 // ExpireOrphanedClaims fails operations that have sat in `claimed`
 // with NO phase for longer than the grace window (B4). Phase is the
-// first execution evidence a worker records (power_cycle lands seconds
-// after a healthy claim), so claimed-no-phase past the grace means the
-// claim reply was lost AND the claiming worker hasn't re-claimed —
+// first execution evidence a worker records: the executor writes one
+// (power_cycle for deploy/commission, the op type for power and
+// bmc_reconcile ops) as soon as it holds the claim, before its first
+// BMC/PDU/AMT call, so it lands within seconds however slow the
+// actuation. Claimed-no-phase past the grace therefore means the claim
+// reply was lost AND the claiming worker hasn't re-claimed —
 // i.e. the worker died right after the claim committed. Failing fast
 // surfaces it to the operator instead of stranding the op for the full
 // stuck-op timeout (30 min).

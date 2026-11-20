@@ -388,15 +388,19 @@ func TestExecutor_FailedOp(t *testing.T) {
 		t.Fatalf("expected failed, got %s", op.Status)
 	}
 
-	// Check error was recorded in outbox
+	// The outbox carries the execution-start phase, then the failure with
+	// its error.
 	_, updates := cache.DrainOutbox()
-	if len(updates) == 0 {
-		t.Fatal("expected operation update in outbox")
+	if len(updates) != 2 {
+		t.Fatalf("expected phase + failed updates in outbox, got %+v", updates)
 	}
-	if updates[0].Status != "failed" {
-		t.Fatalf("expected failed update, got %s", updates[0].Status)
+	if updates[0].Phase != string(model.OpPowerOn) {
+		t.Fatalf("expected phase %s first, got %+v", model.OpPowerOn, updates[0])
 	}
-	if len(updates[0].Result) == 0 {
+	if updates[1].Status != "failed" {
+		t.Fatalf("expected failed update, got %s", updates[1].Status)
+	}
+	if len(updates[1].Result) == 0 {
 		t.Fatal("expected error in result")
 	}
 }

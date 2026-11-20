@@ -154,6 +154,15 @@ func (e *Executor) processOps(ctx context.Context) {
 		}
 		e.executeOp(ctx, op)
 	}
+	// Claims that committed on global but whose reply was lost, where
+	// global's claimed row reached the cache after executeOp's rollback and
+	// replaced its pending mark (B4).
+	for _, op := range e.cache.ReclaimableOps(e.workerID) {
+		if ctx.Err() != nil {
+			return
+		}
+		e.executeOp(ctx, op)
+	}
 }
 
 func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
@@ -161,7 +170,8 @@ func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
 
 	// Mark as claimed locally first to prevent PendingPowerOps and
 	// PendingLifecycleOps from returning it on the next tick while
-	// we're still executing.
+	// we're still executing. This also forgets an earlier unanswered
+	// claim: this attempt's outcome decides.
 	e.cache.MarkOpClaimed(op.ID.String())
 
 	// Claim the operation via central API
@@ -182,9 +192,14 @@ func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
 		// the claim actually COMMITTED and only the reply was lost:
 		// ClaimOperation's idempotent re-claim branch hands back an op
 		// this worker already holds (claimed, by us, no phase yet), so
-		// the retry resumes the op instead of stalling it (B4).
+		// the retry resumes the op instead of stalling it (B4). Global's
+		// row for such a claim (the reconnect's op_resync, or the late
+		// claim's op_delta) can reach the cache after this rollback and
+		// replace the pending mark; RollBackClaim records the claim as
+		// unanswered so ReclaimableOps still returns the op for the
+		// retry.
 		log.Warn("failed to claim operation", "err", err)
-		e.cache.MarkOpStatus(op.ID.String(), model.OpPending)
+		e.cache.RollBackClaim(op.ID.String())
 		return
 	}
 
@@ -199,6 +214,13 @@ func (e *Executor) executeOp(ctx context.Context, op model.Operation) {
 }
 
 // runPowerOp executes a power operation after it has been claimed.
+//
+// It records the op type as the op's phase before opening the controller,
+// as runBMCReconcile does: the phase is the execution evidence the
+// orphaned-claim sweep (store.ExpireOrphanedClaims) looks for, and a power
+// op can outlive the sweep's 2-minute claimed-no-phase grace while the
+// worker is still driving it (bmclib calls of up to 30s each on a slow BMC,
+// a PDU cycle's 60s off-window plus up to 150s of polling).
 func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 	log := e.log.With("op_id", op.ID, "type", op.Type, "machine_id", op.MachineID)
 
@@ -208,6 +230,8 @@ func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 		e.cache.RecordOpUpdate(op.ID.String(), "failed", json.RawMessage(`{"error":"machine not in cache"}`))
 		return
 	}
+
+	e.cache.UpdateOpPhase(op.ID.String(), string(op.Type))
 
 	ctrl, ok := e.openController(ctx, log, op, m)
 	if !ok {
@@ -235,6 +259,9 @@ func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 				marshalError(fmt.Errorf("unknown boot_device %q", params.BootDevice)))
 			return
 		}
+		if e.opRemoved(log, op, "set boot device") {
+			return
+		}
 		if err := ctrl.SetBootDevice(ctx, dev); err != nil {
 			log.Error("setting boot device", "err", err, "device", params.BootDevice)
 			e.cache.RecordOpUpdate(op.ID.String(), "failed", marshalError(err))
@@ -242,6 +269,9 @@ func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 		}
 	}
 
+	if e.opRemoved(log, op, string(op.Type)) {
+		return
+	}
 	log.Info("executing power operation")
 	switch op.Type {
 	case model.OpPowerOn:
@@ -354,6 +384,19 @@ func (e *Executor) openController(ctx context.Context, log *slog.Logger, op mode
 // runLifecycleOp drives a commission or deploy operation: set PXE boot and
 // power cycle the machine. The agent running on the machine reports completion
 // back to the site worker asynchronously; the executor's job ends here.
+//
+// Phases: power_cycle is recorded before the controller is opened and covers
+// every BMC/PDU/AMT call up to and including the cycle; pxe_booting follows
+// once the cycle has returned. power_cycle comes first because the phase is
+// the execution evidence the orphaned-claim sweep (store.ExpireOrphanedClaims)
+// looks for, and the controller calls can outlast its 2-minute
+// claimed-no-phase grace while the worker is still driving the op (bmclib
+// calls of up to 30s each on a slow BMC, a PDU cycle's 60s off-window plus up
+// to 150s of polling). Both deploy and commission boot the machine the same
+// way and share the boot-prefix spine (lifecycle.go: commissionSpine reuses
+// phases 1-6), so both emit these markers. PrepareDeployLogs sets the
+// current-op pointer for stale-insert rejection on the per-machine log ring;
+// it applies to any booting op, not just deploy.
 func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 	log := e.log.With("op_id", op.ID, "type", op.Type, "machine_id", op.MachineID)
 
@@ -363,12 +406,19 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 		e.cache.RecordOpUpdate(op.ID.String(), "failed", json.RawMessage(`{"error":"machine not in cache"}`))
 		return
 	}
+
+	e.cache.PrepareDeployLogs(op.MachineID.String(), op.ID.String())
+	e.cache.UpdateOpPhase(op.ID.String(), "power_cycle")
+
 	ctrl, ok := e.openController(ctx, log, op, m)
 	if !ok {
 		return
 	}
 	defer func() { _ = ctrl.Close(ctx) }()
 
+	if e.opRemoved(log, op, "set PXE boot device") {
+		return
+	}
 	if err := ctrl.SetBootDevice(ctx, power.BootPXE); err != nil {
 		log.Error("setting PXE boot device", "err", err)
 		e.cache.RecordOpUpdate(op.ID.String(), "failed", marshalError(err))
@@ -381,6 +431,9 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 		state = power.StateOn
 	}
 
+	if e.opRemoved(log, op, "power on or cycle") {
+		return
+	}
 	if state == power.StateOff {
 		log.Info("PXE boot set, powering on", "op_type", op.Type)
 		if err := ctrl.PowerOn(ctx); err != nil {
@@ -399,21 +452,30 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 
 	// The agent on the machine will report back completion via the reporter.
 	// Mark op as running so the executor doesn't re-drive it on the next tick.
-	// Set the initial boot-prefix phases (power_cycle -> pxe_booting) so the
-	// watch TUI's lifecycle pane animates from the moment we cycle power,
-	// rather than sitting all-pending until the agent's first phone-home.
-	// Both deploy and commission boot the machine the same way and share the
-	// boot-prefix spine (lifecycle.go: commissionSpine reuses phases 1-6), so
-	// both emit these markers. PrepareDeployLogs sets the current-op pointer
-	// for stale-insert rejection on the per-machine log ring; it applies to
-	// any booting op, not just deploy.
-	if op.Type == model.OpDeploy || op.Type == model.OpCommission {
-		e.cache.PrepareDeployLogs(op.MachineID.String(), op.ID.String())
-		e.cache.UpdateOpPhase(op.ID.String(), "power_cycle")
-		e.cache.UpdateOpPhase(op.ID.String(), "pxe_booting")
-	}
+	// pxe_booting keeps the watch TUI's lifecycle pane moving until the
+	// target's first DHCP or the agent's first report.
+	e.cache.UpdateOpPhase(op.ID.String(), "pxe_booting")
 	e.cache.MarkOpStatus(op.ID.String(), model.OpRunning)
 	log.Info("machine booting to PXE, waiting for agent report", "op_type", op.Type)
+}
+
+// opRemoved re-reads the op layer, the sole authority for actuation, and
+// reports whether op has left it since the claim. The executor works from
+// the copy of the op it took before the claim, but the WS read loop, a
+// separate goroutine, can apply global's op_removed (or an op_resync
+// without the op) while the executor is inside a BMC round trip: the
+// operator aborted the machine, or a NetBox drift fail or a timeout sweep
+// failed the op. The executor calls this before each write to the host or
+// its BMC and, when the op is gone, stops without reporting: global already
+// holds the op's terminal row. A write that went out before the removal is
+// not undone.
+func (e *Executor) opRemoved(log *slog.Logger, op model.Operation, next string) bool {
+	if e.cache.GetOperation(op.ID.String()) != nil {
+		return false
+	}
+	log.Warn("global ended the operation while this worker was driving it (aborted, or failed by a drift check or a timeout sweep); stopping before the next host write",
+		"next", next)
+	return true
 }
 
 // errClaimLost signals the op was already claimed (another worker

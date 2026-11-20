@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,7 +49,7 @@ type OutletResolution struct {
 	// Downstream is populated when Connected is true.
 	DownstreamDevice string `json:"downstream_device,omitempty"`
 	DownstreamSerial string `json:"downstream_serial,omitempty"`
-	DownstreamPort   string `json:"downstream_port,omitempty"` // power-port name on the downstream device
+	DownstreamPort   string `json:"downstream_port,omitempty"` // power-port name(s) on the downstream device, ", "-joined
 
 	// Classification is the feed-topology verdict:
 	//   "unconnected"          - no cabled downstream device
@@ -251,23 +252,48 @@ func (s *Server) resolveOutlet(ctx context.Context, ident string, outletN int) (
 		return r, nil
 	}
 
-	downstreamPort := found.ConnectedEndpoints[0]
-	downstreamDev := downstreamPort.Device
-	if downstreamDev == nil {
-		// The cable traces to a port with no parent device — a modeling gap.
-		// Treat as unconnected (fail-closed).
-		r.Connected = false
-		r.Classification = "unconnected"
-		r.Warning = fmt.Sprintf(
-			"Outlet %d on %s: downstream power-port %q has no parent device in NetBox; "+
-				"cannot determine downstream identity.",
-			outletN, pduDev.Name, downstreamPort.Name)
-		return r, nil
+	// One cable end can carry several terminations in NetBox (a Y-cable), so
+	// the outlet may reach several power-ports, and cutting it cuts all of
+	// them. Every endpoint must name a parent device.
+	for _, port := range found.ConnectedEndpoints {
+		if port.Device == nil {
+			// The cable traces to a port with no parent device — a modeling gap.
+			// Treat as unconnected (fail-closed).
+			r.Connected = false
+			r.Classification = "unconnected"
+			r.Warning = fmt.Sprintf(
+				"Outlet %d on %s: downstream power-port %q has no parent device in NetBox; "+
+					"cannot determine downstream identity.",
+				outletN, pduDev.Name, port.Name)
+			return r, nil
+		}
+	}
+	// The warning, the preflight token and the self-power interlock (INV-1 /
+	// INV-2, at creation and at claim) all reason about ONE downstream device,
+	// so an outlet feeding several devices is refused rather than resolved
+	// from one of them. Several ports of the same device (two PSUs on one
+	// Y-cable) still identify one device.
+	var devices, ports []string
+	seen := make(map[int]bool)
+	for _, port := range found.ConnectedEndpoints {
+		ports = append(ports, port.Name)
+		if !seen[port.Device.ID] {
+			seen[port.Device.ID] = true
+			devices = append(devices, port.Device.Name)
+		}
+	}
+	if len(devices) > 1 {
+		return outletResolution{}, echo.NewHTTPError(http.StatusUnprocessableEntity,
+			fmt.Sprintf("outlet %d on %s feeds %d devices in NetBox (%s); refusing because the warning, "+
+				"preflight token and self-power interlock each cover exactly one downstream device — "+
+				"if NetBox is wrong, fix the cabling there; otherwise give each device its own outlet",
+				outletN, pduDev.Name, len(devices), strings.Join(devices, ", ")))
 	}
 
+	downstreamDev := found.ConnectedEndpoints[0].Device
 	r.Connected = true
 	r.DownstreamDevice = downstreamDev.Name
-	r.DownstreamPort = downstreamPort.Name
+	r.DownstreamPort = strings.Join(ports, ", ")
 
 	// Fetch the downstream device's full record to get its serial. A failure
 	// here is non-fatal for the topology read, but the serial IS required for

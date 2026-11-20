@@ -636,21 +636,32 @@ first in line again.
 The executor (`Executor`, line 47) is the drive loop for pending
 operations. `Run` (85) ticks every 5 seconds and calls `processOps`
 (99): first `PendingPowerOps` from the cache, then
-`PendingLifecycleOps`. Per-op:
+`PendingLifecycleOps`, then `ReclaimableOps` (claims that went
+unanswered, see below). Per-op:
 
 - `MarkOpClaimed` locally in the cache first (line 120) to prevent
   the next tick re-driving.
 - WS `claimOp` RPC (`Claimer` interface, implemented by
   `WSConn.ClaimOp`).
 - On lost race: keep the local claimed mark, do nothing more.
-- On transport failure: roll back to `OpPending` in the cache.
+- On transport failure: roll back to `OpPending` in the cache and
+  record the claim as unanswered (`RollBackClaim`). If the claim
+  committed and only the reply was lost, global's claimed row can
+  replace the pending mark before the next tick; `ReclaimableOps`
+  returns such an op (claimed by this worker, no phase) so the
+  executor re-claims it. In memory only, so a restart leaves it to
+  the orphaned-claim sweep.
 - On success: dispatch to `runLifecycleOp` (288) for deploy /
   commission, or `runPowerOp` (151) for power ops.
 
-`runLifecycleOp` sets the BMC PXE boot device, power-cycles (or powers
-on if off), emits phases `power_cycle` and `pxe_booting`, and marks
-the op running. The agent's phone-home is what eventually completes
-the op — the executor exits early and does not block on the deploy.
+`runLifecycleOp` emits phase `power_cycle`, sets the BMC PXE boot
+device, power-cycles (or powers on if off), emits phase `pxe_booting`,
+and marks the op running. The agent's phone-home is what eventually
+completes the op — the executor exits early and does not block on the
+deploy. `runPowerOp` emits the op type as its phase before it opens the
+controller. Each records its first phase before any BMC, PDU or AMT
+call, because global's orphaned-claim sweep fails an op still claimed
+with no phase 2 minutes after the claim.
 
 Power ops decode the runtime blob out of `op.Params`. The
 `PowerControllerFactory` (`cmd/slagworksd/site.go:1123`) picks:
