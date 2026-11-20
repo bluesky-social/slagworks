@@ -259,6 +259,9 @@ func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 				marshalError(fmt.Errorf("unknown boot_device %q", params.BootDevice)))
 			return
 		}
+		if e.opRemoved(log, op, "set boot device") {
+			return
+		}
 		if err := ctrl.SetBootDevice(ctx, dev); err != nil {
 			log.Error("setting boot device", "err", err, "device", params.BootDevice)
 			e.cache.RecordOpUpdate(op.ID.String(), "failed", marshalError(err))
@@ -266,6 +269,9 @@ func (e *Executor) runPowerOp(ctx context.Context, op model.Operation) {
 		}
 	}
 
+	if e.opRemoved(log, op, string(op.Type)) {
+		return
+	}
 	log.Info("executing power operation")
 	switch op.Type {
 	case model.OpPowerOn:
@@ -410,6 +416,9 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 	}
 	defer func() { _ = ctrl.Close(ctx) }()
 
+	if e.opRemoved(log, op, "set PXE boot device") {
+		return
+	}
 	if err := ctrl.SetBootDevice(ctx, power.BootPXE); err != nil {
 		log.Error("setting PXE boot device", "err", err)
 		e.cache.RecordOpUpdate(op.ID.String(), "failed", marshalError(err))
@@ -422,6 +431,9 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 		state = power.StateOn
 	}
 
+	if e.opRemoved(log, op, "power on or cycle") {
+		return
+	}
 	if state == power.StateOff {
 		log.Info("PXE boot set, powering on", "op_type", op.Type)
 		if err := ctrl.PowerOn(ctx); err != nil {
@@ -445,6 +457,25 @@ func (e *Executor) runLifecycleOp(ctx context.Context, op model.Operation) {
 	e.cache.UpdateOpPhase(op.ID.String(), "pxe_booting")
 	e.cache.MarkOpStatus(op.ID.String(), model.OpRunning)
 	log.Info("machine booting to PXE, waiting for agent report", "op_type", op.Type)
+}
+
+// opRemoved re-reads the op layer, the sole authority for actuation, and
+// reports whether op has left it since the claim. The executor works from
+// the copy of the op it took before the claim, but the WS read loop, a
+// separate goroutine, can apply global's op_removed (or an op_resync
+// without the op) while the executor is inside a BMC round trip: the
+// operator aborted the machine, or a NetBox drift fail or a timeout sweep
+// failed the op. The executor calls this before each write to the host or
+// its BMC and, when the op is gone, stops without reporting: global already
+// holds the op's terminal row. A write that went out before the removal is
+// not undone.
+func (e *Executor) opRemoved(log *slog.Logger, op model.Operation, next string) bool {
+	if e.cache.GetOperation(op.ID.String()) != nil {
+		return false
+	}
+	log.Warn("global ended the operation while this worker was driving it (aborted, or failed by a drift check or a timeout sweep); stopping before the next host write",
+		"next", next)
+	return true
 }
 
 // errClaimLost signals the op was already claimed (another worker
