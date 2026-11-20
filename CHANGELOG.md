@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/bluesky-social/slagworks/compare/v0.6.1...v0.6.2) (2026-11-20)
+
+
+### Bug Fixes
+
+* **snapshot:** choose one address for a multi-address interface instead of failing the site ([#178](https://github.com/bluesky-social/slagworks/issues/178)) ([037c36c](https://github.com/bluesky-social/slagworks/commit/037c36c1c6439f50733cb4506b329ab8b1e13f01))
+
 ## [0.6.1](https://github.com/bluesky-social/slagworks/compare/v0.6.0...v0.6.1) (2026-11-20)
 
 
