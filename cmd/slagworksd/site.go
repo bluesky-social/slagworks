@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -606,10 +607,18 @@ func logSnapshotSummary(log *slog.Logger, cache *worker.Cache, localDB *worker.L
 	)
 }
 
-// buildPoolConfig translates the snapshot's DHCPConfig into the
-// handler's hot-reloadable PoolConfig. Called at service start AND on
-// every snapshot apply (via the OnSnapshotApplied subscription), so
-// pool / relay-pool / promiscuous edits take effect without a restart.
+// buildPoolConfig translates the snapshot's DHCPConfig into this worker's
+// hot-reloadable PoolConfig. Called at service start AND on every snapshot
+// apply (via the OnSnapshotApplied subscription), so pool / relay-pool /
+// promiscuous edits take effect without a restart.
+//
+// Every worker of the site builds from the same snapshot, so the dynamic
+// ranges are narrowed to this worker's share: the share at workerID's
+// position in snap.Workers (dhcp.PoolConfig.WorkerShare). listed is false
+// when snap.Workers names other workers but not workerID; this worker then
+// takes no share and serves only reservations and /31 relay pools, because
+// any address it allocated could be one a listed worker owns. An empty
+// snap.Workers (no registered worker) leaves the ranges whole.
 //
 // An error means the whole pool set is unusable. Neither caller treats
 // it as fatal: the gateway is the gateway_ip custom field on a NetBox
@@ -617,7 +626,19 @@ func logSnapshotSummary(log *slog.Logger, cache *worker.Cache, localDB *worker.L
 // carrying it is persisted and re-served, so failing the process would
 // fail every restart too. Service start runs without a fabric pool and
 // reload keeps the pools it has.
-func buildPoolConfig(snap model.DHCPConfig) (dhcp.PoolConfig, error) {
+func buildPoolConfig(snap model.DHCPConfig, workerID string) (pc dhcp.PoolConfig, listed bool, err error) {
+	pc, err = parsePoolConfig(snap)
+	if err != nil || len(snap.Workers) == 0 {
+		return pc, true, err
+	}
+	index := slices.Index(snap.Workers, workerID)
+	return pc.WorkerShare(index, len(snap.Workers)), index >= 0, nil
+}
+
+// parsePoolConfig parses the snapshot's DHCPConfig into a PoolConfig with
+// the site's full ranges, before buildPoolConfig narrows them to one
+// worker's share.
+func parsePoolConfig(snap model.DHCPConfig) (dhcp.PoolConfig, error) {
 	var pc dhcp.PoolConfig
 	_, subnet, err := net.ParseCIDR(snap.Subnet)
 	if err != nil {
@@ -679,7 +700,7 @@ func reloadFabricPools(sc *siteServiceConfig, h *dhcp.Handler) {
 	if snap.Subnet == "" {
 		return
 	}
-	pc, err := buildPoolConfig(snap)
+	pc, listed, err := buildPoolConfig(snap, sc.cfg.workerID)
 	if err != nil {
 		if old := sc.fabricPoolErr.Load(); old != nil {
 			reason := fabricPoolReason(err)
@@ -688,8 +709,31 @@ func reloadFabricPools(sc *siteServiceConfig, h *dhcp.Handler) {
 		sc.log.Error("snapshot DHCP config invalid; fabric DHCP pools unchanged. "+fabricPoolFix, "err", err)
 		return
 	}
+	if !listed {
+		warnWorkerNotListed(sc.log, sc.cfg.workerID, snap.Workers)
+	}
 	h.UpdatePools(pc)
 	sc.fabricPoolErr.Store(nil)
+}
+
+// warnWorkerNotListed reports a snapshot whose worker list lacks this
+// worker (see buildPoolConfig). Global lists every worker registered to
+// the site config and rebuilds the snapshot when one is registered, so
+// this lasts until a snapshot built after this worker's registration
+// arrives.
+func warnWorkerNotListed(log *slog.Logger, workerID string, workers []string) {
+	log.Warn("snapshot does not list this worker among the site's workers; serving reservations and /31 relay pools only, no dynamic addresses from shared ranges. "+
+		"Check that this worker is registered to the site config (slagctl worker list)",
+		"worker_id", workerID, "workers", workers)
+}
+
+// rangeString formats an inclusive pool range for logs, "none" when the
+// range is empty.
+func rangeString(start, end net.IP) string {
+	if start == nil {
+		return "none"
+	}
+	return start.String() + "-" + end.String()
 }
 
 // buildDHCPConfig constructs the DHCP handler configuration from the
@@ -774,7 +818,7 @@ func buildDHCPConfig(sc *siteServiceConfig, serverIP net.IP) (dhcp.Config, error
 	snap := sc.cache.GetDHCPConfig()
 	if snap.Subnet == "" {
 		log.Info("snapshot has no DHCP config, DHCP will not serve leases until one arrives")
-	} else if pc, err := buildPoolConfig(snap); err != nil {
+	} else if pc, listed, err := buildPoolConfig(snap, sc.cfg.workerID); err != nil {
 		// Same outcome as a cold cache: the handler starts with no pool
 		// and reloadFabricPools installs one from the first snapshot that
 		// parses. Everything else (OOB, TFTP, HTTP boot, agent endpoints,
@@ -785,10 +829,15 @@ func buildDHCPConfig(sc *siteServiceConfig, serverIP net.IP) (dhcp.Config, error
 			"until a snapshot with a valid config arrives. "+fabricPoolFix, "err", err)
 	} else {
 		dhcpCfg.PoolConfig = pc
+		if !listed {
+			warnWorkerNotListed(log, sc.cfg.workerID, snap.Workers)
+		}
 
 		log.Info("DHCP configured from snapshot",
 			"subnet", snap.Subnet,
 			"pool", snap.EphemeralPoolStart+"-"+snap.EphemeralPoolEnd,
+			"my_share", rangeString(pc.RangeStart, pc.RangeEnd),
+			"workers", snap.Workers,
 			"gateway", snap.Gateway,
 			"relay_pools", len(snap.RelayPools),
 			"promiscuous", snap.Promiscuous,

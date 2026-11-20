@@ -298,6 +298,21 @@ func (s *Server) invalidateSite(slug string) {
 	s.invalidator.Invalidate(slug)
 }
 
+// invalidateConfiguredSite is invalidateSite for a slug that may have no
+// site config: a worker can be registered before its config is created.
+// A rebuild for a slug without a config fails, and its actor retries it
+// until global restarts, so skip the slug; creating the config builds its
+// snapshot from the workers registered by then.
+func (s *Server) invalidateConfiguredSite(slug string) {
+	if s.invalidator == nil || slug == "" {
+		return
+	}
+	if _, err := s.store.GetSiteConfig(slug); err != nil {
+		return
+	}
+	s.invalidator.Invalidate(slug)
+}
+
 // invalidateAllSites fans out Invalidate across every configured
 // site. Used by machine mutations where we don't have the slug to
 // hand — machines carry NetBoxDeviceID, not a site binding — and by
@@ -2578,7 +2593,9 @@ func (s *Server) listWorkers(c *echo.Context) error {
 // registerSiteWorker mints a new bearer token for a (site_slug, worker_id) pair,
 // returning the plaintext token in the response exactly once. Re-registration
 // rotates the token. The operator hands the plaintext to the site worker via
-// its SLAGWORKS_TOKEN env var.
+// its SLAGWORKS_TOKEN env var. The site's snapshot lists its registered
+// workers (model.DHCPConfig.Workers, which assigns each its share of the
+// fabric dynamic ranges), so a registration rebuilds it.
 func (s *Server) registerSiteWorker(c *echo.Context) error {
 	var req struct {
 		SiteSlug string `json:"site_slug"`
@@ -2595,6 +2612,7 @@ func (s *Server) registerSiteWorker(c *echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
+	s.invalidateConfiguredSite(w.SiteSlug)
 	return c.JSON(http.StatusCreated, map[string]any{
 		"id":            w.ID,
 		"site_slug":     w.SiteSlug,
@@ -2611,7 +2629,8 @@ func (s *Server) registerSiteWorker(c *echo.Context) error {
 // non-terminal operation is claimed by it — deleting the row that
 // authenticates the claiming worker would orphan the claim. Motivated by
 // the router1.pop3 teardown, which needed a raw DB delete because this
-// verb didn't exist.
+// verb didn't exist. A delete rebuilds the site's snapshot, which lists its
+// registered workers (see registerSiteWorker).
 func (s *Server) deleteSiteWorker(c *echo.Context) error {
 	ident := c.Param("ident")
 	w, err := s.store.ResolveSiteWorker(ident)
@@ -2649,6 +2668,7 @@ func (s *Server) deleteSiteWorker(c *echo.Context) error {
 		}
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
+	s.invalidateConfiguredSite(w.SiteSlug)
 	return c.NoContent(http.StatusNoContent)
 }
 

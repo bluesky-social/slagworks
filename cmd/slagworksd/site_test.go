@@ -646,3 +646,67 @@ func TestSMCToolWarner_InstalledAndOff(t *testing.T) {
 		t.Fatalf("off mode is a deliberate operator choice and must not warn, got: %q", buf.String())
 	}
 }
+
+// Every worker of a site builds its pools from the same snapshot. Each one
+// must take a disjoint share of the ephemeral range and of each multi-
+// address relay pool, chosen by its position in the snapshot's worker list,
+// so no two workers can lease one address to two hosts. A /31 relay pool
+// stays whole on every worker, and a worker the list does not name takes
+// no share at all.
+func TestBuildDHCPConfig_WorkersShareTheDynamicRanges(t *testing.T) {
+	t.Parallel()
+	cache := worker.NewCache(nil)
+	applyDHCP(cache, model.DHCPConfig{
+		Subnet:             "10.99.1.0/24",
+		Gateway:            "10.99.1.1",
+		EphemeralPoolStart: "10.99.1.100",
+		EphemeralPoolEnd:   "10.99.1.150",
+		RelayPools: []model.RelayPool{
+			{Subnet: "10.99.2.0/24", RangeStart: "10.99.2.100", RangeEnd: "10.99.2.160", Gateway: "10.99.2.1"},
+			{Subnet: "10.99.3.4/31", RangeStart: "10.99.3.5", RangeEnd: "10.99.3.5", Gateway: "10.99.3.4"},
+		},
+		Workers: []string{"worker-a", "worker-b"},
+	})
+	build := func(workerID string) (start, end, relayStart, relayEnd, p2pStart string) {
+		t.Helper()
+		sc := &siteServiceConfig{
+			cfg:   siteConfig{httpPort: 8080, iface: loopbackIface(), workerID: workerID},
+			cache: cache,
+			log:   slog.Default(),
+		}
+		cfg, err := buildDHCPConfig(sc, net.ParseIP("10.99.1.2"))
+		if err != nil {
+			t.Fatalf("buildDHCPConfig(%s): %v", workerID, err)
+		}
+		str := func(ip net.IP) string {
+			if ip == nil {
+				return "none"
+			}
+			return ip.String()
+		}
+		return str(cfg.RangeStart), str(cfg.RangeEnd),
+			str(cfg.RelaySubnets[0].RangeStart), str(cfg.RelaySubnets[0].RangeEnd),
+			str(cfg.RelaySubnets[1].RangeStart)
+	}
+
+	for _, tc := range []struct {
+		workerID                              string
+		start, end, relayStart, relayEnd, p2p string
+	}{
+		// 51 ephemeral addresses split 25 + 26, 61 relay addresses 30 + 31.
+		{"worker-a", "10.99.1.100", "10.99.1.124", "10.99.2.100", "10.99.2.129", "10.99.3.5"},
+		{"worker-b", "10.99.1.125", "10.99.1.150", "10.99.2.130", "10.99.2.160", "10.99.3.5"},
+		{"worker-unlisted", "none", "none", "none", "none", "10.99.3.5"},
+	} {
+		start, end, relayStart, relayEnd, p2p := build(tc.workerID)
+		if start != tc.start || end != tc.end {
+			t.Errorf("%s: ephemeral share %s-%s, want %s-%s", tc.workerID, start, end, tc.start, tc.end)
+		}
+		if relayStart != tc.relayStart || relayEnd != tc.relayEnd {
+			t.Errorf("%s: relay share %s-%s, want %s-%s", tc.workerID, relayStart, relayEnd, tc.relayStart, tc.relayEnd)
+		}
+		if p2p != tc.p2p {
+			t.Errorf("%s: /31 relay pool address %s, want %s", tc.workerID, p2p, tc.p2p)
+		}
+	}
+}

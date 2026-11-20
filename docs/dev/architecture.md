@@ -350,7 +350,9 @@ only when the set or a chosen address changes.
 Its inputs (`Inputs`, `builder.go:31`) are
 NetBox reads (site, config, prefixes, OOB prefixes and ranges,
 devices, device-types, interfaces, IPs), Postgres reads (machines,
-images, storage scripts, network scripts, SSH keys), and
+images, storage scripts, network scripts, SSH keys, and the config's
+registered site workers, whose sorted IDs become `DHCP.Workers` and
+assign each worker its share of the fabric dynamic ranges), and
 an optional `BMCAdminSecret` from AWS Secrets for admin-cred
 prestamping.
 

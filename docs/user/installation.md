@@ -228,7 +228,10 @@ Requirements on the host and its position:
 - **Redundancy (optional).** Two workers can serve one site config,
   either active/standby with a VIP (`SLAGWORKS_STANDBY`, `SLAGWORKS_VIP`)
   or both active, with the OOB dynamic pool split into per-worker slices
-  defined in NetBox. Register and configure each worker separately.
+  defined in NetBox. The fabric ephemeral range and relay pools are split
+  into per-worker shares automatically, one per registered worker, so
+  delete the registration of a worker you retire. Register and configure
+  each worker separately.
 
 State:
 

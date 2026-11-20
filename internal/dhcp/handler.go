@@ -1,6 +1,7 @@
 package dhcp
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -30,7 +31,7 @@ type RelaySubnet struct {
 // host-local env) and legitimately requires a restart.
 type PoolConfig struct {
 	Subnet     net.IPNet
-	RangeStart net.IP // First IP in pool (inclusive)
+	RangeStart net.IP // First IP in pool (inclusive); nil = no dynamic range (reservations only)
 	RangeEnd   net.IP // Last IP in pool (inclusive)
 	Gateway    net.IP
 
@@ -45,6 +46,67 @@ type PoolConfig struct {
 	// The filter func itself lives in Config (it's a process-lifetime
 	// callback into the cache); this flag is what the snapshot toggles.
 	Promiscuous bool
+}
+
+// WorkerShare returns p with each dynamic range narrowed to one worker's
+// share: the base range and every relay pool's range are split into
+// workers contiguous parts, and the worker keeps part index. Every worker
+// of a site builds p from the same snapshot, and a relayed DISCOVER
+// reaches all of them. If each allocated from the whole range (the lowest
+// address free in its own lease table), two workers would lease one
+// address to two hosts: their tables diverge as soon as a host takes one
+// worker's offer and not the other's, and the ARP probe cannot see a
+// relayed subnet. With disjoint shares each address has one allocating
+// worker. A REQUEST for an address in another worker's share that this
+// worker holds no lease for is NAKed (classifyRequest), so the client
+// re-DISCOVERs.
+//
+// A /31 relay pool is left whole: relayPoolForRequest derives its one
+// client address from giaddr, so it serves one host per link and cannot
+// lease that address to two hosts, and halving it would leave the host
+// with no offer while the owning worker is down.
+//
+// An index outside [0, workers) leaves every split range empty (nil
+// bounds): the worker then serves reservations and /31 pools only. A part
+// smaller than one address is empty too, when a range has fewer addresses
+// than there are workers.
+func (p PoolConfig) WorkerShare(index, workers int) PoolConfig {
+	out := p
+	out.RangeStart, out.RangeEnd = shareOfRange(p.RangeStart, p.RangeEnd, index, workers)
+	out.RelaySubnets = make([]RelaySubnet, len(p.RelaySubnets))
+	for i, rs := range p.RelaySubnets {
+		if ones, bits := rs.Subnet.Mask.Size(); ones != 31 || bits != 32 {
+			rs.RangeStart, rs.RangeEnd = shareOfRange(rs.RangeStart, rs.RangeEnd, index, workers)
+		}
+		out.RelaySubnets[i] = rs
+	}
+	return out
+}
+
+// shareOfRange returns part index of the inclusive IPv4 range [start, end]
+// split into n contiguous parts whose sizes differ by at most one, or
+// nil, nil when that part is empty or the inputs are not a valid range.
+// Identical ranges give identical parts, so a range listed both as the
+// base pool and as a relay pool is split the same way in both places.
+func shareOfRange(start, end net.IP, index, n int) (net.IP, net.IP) {
+	s4, e4 := start.To4(), end.To4()
+	if s4 == nil || e4 == nil || n < 1 || index < 0 || index >= n {
+		return nil, nil
+	}
+	s, e := binary.BigEndian.Uint32(s4), binary.BigEndian.Uint32(e4)
+	if e < s {
+		return nil, nil
+	}
+	size := uint64(e-s) + 1
+	lo := size * uint64(index) / uint64(n)
+	hi := size * uint64(index+1) / uint64(n) // exclusive
+	if hi == lo {
+		return nil, nil
+	}
+	first, last := make(net.IP, net.IPv4len), make(net.IP, net.IPv4len)
+	binary.BigEndian.PutUint32(first, s+uint32(lo))
+	binary.BigEndian.PutUint32(last, s+uint32(hi-1))
+	return first, last
 }
 
 // Config holds all configuration for the DHCP handler. All fields are explicit;
@@ -957,11 +1019,13 @@ const (
 //  5. Free dynamic address, no lease for this MAC: adopt-in-place ONLY when
 //     this segment has split dynamic slices (view.dynamicSlices non-empty)
 //     — adoption requires a deterministic single owner, which slice
-//     ownership provides. An unsliced segment has no such owner: two active
-//     workers adopting from purely local state could grant the same
-//     address to different MACs (roast finding, 2026-07-13). Unsliced
-//     segments NAK instead, forcing DISCOVER where server-id selection (+
-//     ARP probe) arbitrates. No ARP probe on the adopt path itself: a
+//     ownership provides. A segment without DynamicSlices (the base view:
+//     the fabric and relay pools) NAKs instead, forcing DISCOVER. That is
+//     safe because DISCOVER allocates only from p's range: when several
+//     workers serve a site, each one's ranges are its own share
+//     (PoolConfig.WorkerShare), so no two workers can offer one address
+//     even though their lease tables differ and the ARP probe cannot see a
+//     relayed subnet. No ARP probe on the adopt path itself: a
 //     RENEWING/REBINDING client already has reqIP configured and answers
 //     ARP for it, so a probe would detect the requester and wrongly refuse
 //     its own address.
@@ -1007,7 +1071,7 @@ func (h *Handler) classifyRequest(mac net.HardwareAddr, reqIP, reserved net.IP, 
 	}
 
 	if len(view.dynamicSlices) == 0 {
-		return requestNAK, "unsliced segment, no deterministic owner"
+		return requestNAK, "no lease here for this address, and only a segment with split-pool slices adopts one"
 	}
 
 	h.setLease(macStr, mac, reqIP, now.Add(view.leaseDuration))

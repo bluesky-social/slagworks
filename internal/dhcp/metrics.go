@@ -61,7 +61,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 
 		PoolSize: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "slagworks_site_dhcp_pool_size",
-			Help: "Total allocatable IPs in the pool range, by pool subnet. leases_active/pool_size near 1 = exhaustion imminent.",
+			Help: "IPs this worker can allocate from the pool range (its own share when several workers serve the site), by pool subnet. leases_active/pool_size near 1 = exhaustion imminent.",
 		}, []string{"pool"}),
 	}
 	reg.MustRegister(
@@ -102,13 +102,14 @@ func (m *Metrics) ack(poolLabel string) {
 // setPoolGauges resets and repopulates PoolSize for the given pool
 // state. Called from NewHandler and UpdatePools; reset-then-set so
 // pools removed by a snapshot edit don't leave stale series behind.
-// Nil-safe.
+// A pool with no dynamic range (nil RangeStart: this worker's share of a
+// range too small to split) reports 0. Nil-safe.
 func (m *Metrics) setPoolGauges(p PoolConfig) {
 	if m == nil {
 		return
 	}
 	m.PoolSize.Reset()
-	if p.RangeStart == nil {
+	if p.Subnet.IP == nil {
 		return
 	}
 	m.PoolSize.WithLabelValues(p.Subnet.String()).Set(rangeSize(p.RangeStart, p.RangeEnd))

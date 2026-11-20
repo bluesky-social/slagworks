@@ -102,7 +102,15 @@ a machine ever gets booted:
   a peer's slice — or outside the subnet entirely — the local worker NAKs
   it to force a re-DISCOVER onto whichever slice-owner picks it up
   (`splitPoolNAK`, `handler.go:680`). Reservations are unsliced and are
-  ACKed by either worker.
+  ACKed by either worker. The fabric ephemeral range and each relay pool's
+  range are split the same way without operator data: the snapshot lists
+  the workers registered to the site config (`DHCPConfig.Workers`), and
+  each worker allocates only from its share by position in that list
+  (`PoolConfig.WorkerShare`). Each worker keeps its own lease table and
+  cannot ARP-probe a relayed subnet, so without the split two workers
+  answering one relayed DISCOVER stream could lease one address to two
+  hosts. A /31 relay pool is not split: its one client address comes from
+  `giaddr`.
 - **On-ACK phase advance.** `OnACK(mac, client)` fires after a DHCPACK with
   the kind of client it went to; the site worker uses it to promote a
   booting op's phase to `dhcp_ack` for PXE or HTTP-boot firmware and

@@ -366,7 +366,11 @@ Fields:
   configs; the next reconcile (every five minutes) clears the flags and
   rebuilds the configs that remain.
 - **`ephemeral_pool_start`**, **`ephemeral_pool_end`** — the fabric DHCP
-  pool. Required, IPv4, start no greater than end.
+  pool. Required, IPv4, start no greater than end. When several workers
+  are registered to the config, each hands out addresses only from its own
+  contiguous share of this range and of each relay pool's range (a /31
+  relay pool is not split); see
+  [adding a site worker](adding-a-site-worker.md#notes--gotchas).
 - **`relay_pools`** — pools for subnets reached through a DHCP relay,
   selected by the relay's `giaddr`. A client renewing its lease sends the
   renew straight to the worker rather than through the relay, so the

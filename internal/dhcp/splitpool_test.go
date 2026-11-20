@@ -1,8 +1,11 @@
 package dhcp
 
 import (
+	"io"
+	"log/slog"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 )
@@ -232,5 +235,254 @@ func TestSplitPool_NoSlicesUnknownDynamicNAKs(t *testing.T) {
 	reply := h.HandlePacket(initReboot(t, mac, "10.99.1.120"))
 	if !isNAK(reply) {
 		t.Fatalf("unsliced segment must NAK an unknown dynamic REQUEST, got %v", reply)
+	}
+}
+
+// pairSitePool is the fabric PoolConfig every worker of one site builds
+// from the site snapshot: a base range and a relayed /24 pool, both shared,
+// plus a generated /31 relay pool.
+func pairSitePool() PoolConfig {
+	return PoolConfig{
+		Subnet:     net.IPNet{IP: net.IPv4(10, 9, 0, 0).To4(), Mask: net.CIDRMask(24, 32)},
+		RangeStart: net.IPv4(10, 9, 0, 100).To4(),
+		RangeEnd:   net.IPv4(10, 9, 0, 120).To4(),
+		Gateway:    net.IPv4(10, 9, 0, 1).To4(),
+		RelaySubnets: []RelaySubnet{{
+			Subnet:     net.IPNet{IP: net.IPv4(10, 9, 1, 0).To4(), Mask: net.CIDRMask(24, 32)},
+			RangeStart: net.IPv4(10, 9, 1, 100).To4(),
+			RangeEnd:   net.IPv4(10, 9, 1, 120).To4(),
+			Gateway:    net.IPv4(10, 9, 1, 1).To4(),
+		}, {
+			Subnet:     net.IPNet{IP: net.IPv4(10, 9, 2, 0).To4(), Mask: net.CIDRMask(31, 32)},
+			RangeStart: net.IPv4(10, 9, 2, 1).To4(),
+			RangeEnd:   net.IPv4(10, 9, 2, 1).To4(),
+			Gateway:    net.IPv4(10, 9, 2, 0).To4(),
+		}},
+	}
+}
+
+// pairWorker builds worker index of a two-worker site the way the site
+// worker does: the site pool narrowed to its share, its own server address,
+// and an ARP probe on its own link, which cannot see a relayed subnet.
+func pairWorker(serverIP net.IP, lease time.Duration, index int) *Handler {
+	h := NewHandler(Config{
+		ServerIP:      serverIP,
+		DNS:           []net.IP{net.IPv4(10, 9, 0, 1).To4()},
+		LeaseDuration: lease,
+		HTTPBootPort:  8080,
+		ARPProbe:      func(net.IP) bool { return false },
+		PoolConfig:    pairSitePool().WorkerShare(index, 2),
+	})
+	h.SetLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return h
+}
+
+func pairPacket(t *testing.T, mt dhcpv4.MessageType, mac net.HardwareAddr, giaddr net.IP, mods ...dhcpv4.Modifier) *dhcpv4.DHCPv4 {
+	t.Helper()
+	p, err := dhcpv4.New(append([]dhcpv4.Modifier{
+		dhcpv4.WithMessageType(mt), dhcpv4.WithHwAddr(mac), dhcpv4.WithGatewayIP(giaddr),
+	}, mods...)...)
+	if err != nil {
+		t.Fatalf("build packet: %v", err)
+	}
+	return p
+}
+
+// pairRequest sends a SELECTING REQUEST for addr naming serverIP to both
+// workers, as a dual-target relay does, and returns the address ACKed.
+func pairRequest(t *testing.T, workers []*Handler, mac net.HardwareAddr, giaddr, addr, serverIP net.IP) net.IP {
+	t.Helper()
+	req := pairPacket(t, dhcpv4.MessageTypeRequest, mac, giaddr,
+		dhcpv4.WithOption(dhcpv4.OptRequestedIPAddress(addr)),
+		dhcpv4.WithOption(dhcpv4.OptServerIdentifier(serverIP)))
+	var got net.IP
+	for _, h := range workers {
+		if rep := h.HandlePacket(req); rep != nil && rep.MessageType() == dhcpv4.MessageTypeAck {
+			got = rep.YourIPAddr.To4()
+		}
+	}
+	if got == nil {
+		t.Fatalf("no ACK for %s", mac)
+	}
+	return got
+}
+
+// Two active workers of one site never lease one relayed address to two
+// hosts. A relayed DISCOVER reaches both workers (dual-target relay); each
+// offers and the host takes one offer. The worker whose offer was not taken
+// forgets it after one lease time, because the host renews by unicast with
+// the worker that granted the lease, so the two lease tables disagree about
+// which addresses are free, and the ARP probe cannot see a relayed subnet.
+// When both allocated from the whole range, the forgetful worker leased
+// host 1's address to the next host that took its offer. The same happens
+// when a VIP moves to a worker that starts from its own lease table.
+func TestFabricShares_PairDoesNotReleaseRenewedAddress(t *testing.T) {
+	const lease = 10 * time.Minute
+	relay := net.IPv4(10, 9, 0, 250).To4() // giaddr: the leaf's address in the base subnet
+	serverA, serverB := net.IPv4(10, 9, 0, 2).To4(), net.IPv4(10, 9, 0, 3).To4()
+	workerA, workerB := pairWorker(serverA, lease, 0), pairWorker(serverB, lease, 1)
+	both := []*Handler{workerA, workerB}
+
+	// selecting runs DISCOVER against both workers and accepts the offer of
+	// the one named, as a host does with the first OFFER it receives.
+	selecting := func(mac net.HardwareAddr, take *Handler, takeServerIP net.IP) net.IP {
+		t.Helper()
+		var offered net.IP
+		for _, h := range both {
+			offer := h.HandlePacket(pairPacket(t, dhcpv4.MessageTypeDiscover, mac, relay))
+			if offer == nil || offer.MessageType() != dhcpv4.MessageTypeOffer {
+				t.Fatalf("no OFFER for %s", mac)
+			}
+			if h == take {
+				offered = offer.YourIPAddr.To4()
+			}
+		}
+		return pairRequest(t, both, mac, relay, offered, takeServerIP)
+	}
+	// elapse moves both workers' clocks forward (the handler compares
+	// time.Now() with lease expiries only).
+	elapse := func(d time.Duration) {
+		for _, h := range both {
+			h.mu.Lock()
+			for _, l := range h.leases {
+				l.Expiry = l.Expiry.Add(-d)
+			}
+			h.mu.Unlock()
+		}
+	}
+
+	host1 := net.HardwareAddr{0x02, 0, 0, 0, 0x60, 0x01}
+	host2 := net.HardwareAddr{0x02, 0, 0, 0, 0x60, 0x02}
+
+	addr1 := selecting(host1, workerA, serverA)
+
+	// Host 1 renews with worker A at half the lease time, twice; worker B,
+	// whose offer was not taken, sees none of it and its offer expires.
+	for range 2 {
+		elapse(lease / 2)
+		renew := workerA.HandlePacket(pairPacket(t, dhcpv4.MessageTypeRequest, host1, relay, dhcpv4.WithClientIP(addr1)))
+		if renew == nil || renew.MessageType() != dhcpv4.MessageTypeAck || !renew.YourIPAddr.Equal(addr1) {
+			t.Fatalf("host 1's renewal of %s with the worker that granted it was not ACKed: %v", addr1, renew)
+		}
+	}
+	elapse(time.Minute)
+
+	addr2 := selecting(host2, workerB, serverB)
+	if addr2.Equal(addr1) {
+		t.Fatalf("host 1 holds a current lease on %s from worker A (renewed a minute ago) and worker B leased the same address to host 2", addr1)
+	}
+}
+
+// The same property with no time passing, on a relay pool that is not the
+// base subnet: two hosts boot together, their relayed DISCOVERs reach the
+// two workers in opposite orders, and each host takes the offer of the
+// worker that heard it first. When both allocated the lowest address free
+// in their own table, both hosts were ACKed the first address of the range.
+func TestFabricShares_PairDoesNotLeaseOneAddressTwiceInABootWave(t *testing.T) {
+	relay := net.IPv4(10, 9, 1, 1).To4() // giaddr inside the relay pool's subnet
+	serverA, serverB := net.IPv4(10, 9, 0, 2).To4(), net.IPv4(10, 9, 0, 3).To4()
+	workerA, workerB := pairWorker(serverA, 10*time.Minute, 0), pairWorker(serverB, 10*time.Minute, 1)
+	both := []*Handler{workerA, workerB}
+
+	host1 := net.HardwareAddr{0x02, 0, 0, 0, 0x61, 0x01}
+	host2 := net.HardwareAddr{0x02, 0, 0, 0, 0x61, 0x02}
+
+	discover := func(h *Handler, mac net.HardwareAddr) net.IP {
+		t.Helper()
+		offer := h.HandlePacket(pairPacket(t, dhcpv4.MessageTypeDiscover, mac, relay))
+		if offer == nil || offer.MessageType() != dhcpv4.MessageTypeOffer {
+			t.Fatalf("no OFFER for %s", mac)
+		}
+		return offer.YourIPAddr.To4()
+	}
+
+	// Worker A hears host 1 first, worker B hears host 2 first.
+	offerA1 := discover(workerA, host1)
+	offerB2 := discover(workerB, host2)
+	discover(workerA, host2)
+	discover(workerB, host1)
+
+	addr1 := pairRequest(t, both, host1, relay, offerA1, serverA)
+	addr2 := pairRequest(t, both, host2, relay, offerB2, serverB)
+	if addr2.Equal(addr1) {
+		t.Fatalf("worker A leased %s to host 1 and worker B leased the same address to host 2 in the same boot wave", addr1)
+	}
+}
+
+// A worker NAKs a REBINDING for an address in its peer's share that it
+// holds no lease for, so the host re-DISCOVERs into a share instead of being
+// ACKed an address the peer may have leased to someone else.
+func TestFabricShares_RebindingIntoPeerShareIsNAKed(t *testing.T) {
+	relay := net.IPv4(10, 9, 1, 1).To4()
+	workerB := pairWorker(net.IPv4(10, 9, 0, 3).To4(), 10*time.Minute, 1)
+	host := net.HardwareAddr{0x02, 0, 0, 0, 0x62, 0x01}
+	// 10.9.1.100 is the first address of worker A's share.
+	rebind := pairPacket(t, dhcpv4.MessageTypeRequest, host, relay, dhcpv4.WithClientIP(net.IPv4(10, 9, 1, 100).To4()))
+	if reply := workerB.HandlePacket(rebind); !isNAK(reply) {
+		t.Fatalf("expected NAK for a REBINDING into the peer's share, got %v", reply)
+	}
+}
+
+func TestWorkerShare_SplitsSharedRangesAndKeepsSlash31Whole(t *testing.T) {
+	site := pairSitePool()
+	a, b := site.WorkerShare(0, 2), site.WorkerShare(1, 2)
+
+	ip := func(s string) net.IP { return net.ParseIP(s).To4() }
+	checkRange := func(name string, gotStart, gotEnd net.IP, wantStart, wantEnd string) {
+		t.Helper()
+		if !gotStart.Equal(ip(wantStart)) || !gotEnd.Equal(ip(wantEnd)) {
+			t.Errorf("%s = %v-%v, want %s-%s", name, gotStart, gotEnd, wantStart, wantEnd)
+		}
+	}
+	// 21 addresses split 10 + 11, contiguous and covering the range.
+	checkRange("worker 0 base", a.RangeStart, a.RangeEnd, "10.9.0.100", "10.9.0.109")
+	checkRange("worker 1 base", b.RangeStart, b.RangeEnd, "10.9.0.110", "10.9.0.120")
+	checkRange("worker 0 relay /24", a.RelaySubnets[0].RangeStart, a.RelaySubnets[0].RangeEnd, "10.9.1.100", "10.9.1.109")
+	checkRange("worker 1 relay /24", b.RelaySubnets[0].RangeStart, b.RelaySubnets[0].RangeEnd, "10.9.1.110", "10.9.1.120")
+	// The /31 pool's one client address is derived from giaddr: both keep it.
+	checkRange("worker 0 relay /31", a.RelaySubnets[1].RangeStart, a.RelaySubnets[1].RangeEnd, "10.9.2.1", "10.9.2.1")
+	checkRange("worker 1 relay /31", b.RelaySubnets[1].RangeStart, b.RelaySubnets[1].RangeEnd, "10.9.2.1", "10.9.2.1")
+
+	// The site pool itself is not modified.
+	checkRange("site base", site.RangeStart, site.RangeEnd, "10.9.0.100", "10.9.0.120")
+	checkRange("site relay /24", site.RelaySubnets[0].RangeStart, site.RelaySubnets[0].RangeEnd, "10.9.1.100", "10.9.1.120")
+
+	// A worker without a position takes no share of a split range.
+	none := site.WorkerShare(-1, 2)
+	if none.RangeStart != nil || none.RangeEnd != nil || none.RelaySubnets[0].RangeStart != nil {
+		t.Errorf("index -1 kept a share: base %v-%v, relay %v", none.RangeStart, none.RangeEnd, none.RelaySubnets[0].RangeStart)
+	}
+	checkRange("index -1 relay /31", none.RelaySubnets[1].RangeStart, none.RelaySubnets[1].RangeEnd, "10.9.2.1", "10.9.2.1")
+
+	// One worker keeps the whole range.
+	solo := site.WorkerShare(0, 1)
+	checkRange("sole worker base", solo.RangeStart, solo.RangeEnd, "10.9.0.100", "10.9.0.120")
+}
+
+func TestShareOfRange_PartsAreContiguousAndCoverTheRange(t *testing.T) {
+	for _, tc := range []struct {
+		start, end string
+		n          int
+	}{
+		{"10.0.0.100", "10.0.0.150", 2}, // 51 addresses
+		{"10.0.0.100", "10.0.0.160", 3},
+		{"10.0.0.7", "10.0.0.7", 2}, // fewer addresses than workers
+		{"10.0.0.250", "10.0.1.5", 4},
+	} {
+		start, end := net.ParseIP(tc.start).To4(), net.ParseIP(tc.end).To4()
+		next := start
+		for i := range tc.n {
+			lo, hi := shareOfRange(start, end, i, tc.n)
+			if lo == nil {
+				continue
+			}
+			if !lo.Equal(next) {
+				t.Errorf("%s-%s/%d part %d starts at %s, want %s", tc.start, tc.end, tc.n, i, lo, next)
+			}
+			next = nextIP(hi)
+		}
+		if !next.Equal(nextIP(end)) {
+			t.Errorf("%s-%s/%d parts end before %s, want them to reach %s", tc.start, tc.end, tc.n, next, end)
+		}
 	}
 }
