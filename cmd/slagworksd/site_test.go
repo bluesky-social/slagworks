@@ -315,6 +315,76 @@ func TestBuildDHCPConfig_EmptySnapshotIsNoOp(t *testing.T) {
 	}
 }
 
+// The fabric resolvers come from a free-text NetBox custom field
+// (dns_servers on the slagworks-production prefix) that global copies into
+// the snapshot unvalidated. An entry that is not an IP address must cost
+// that entry, as it does on the OOB segment (parseIPs), not the site: the
+// worker reads these at service start only, so a failure would not show
+// when the field is edited but at the worker's next restart or VIP
+// takeover, as a start-up error that systemd repeats until the field is
+// fixed. The dropped entry is logged at error level, naming the field.
+func TestBuildDHCPConfig_MalformedDNSEntryCostsThatEntryNotTheSite(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		dns  []string
+		want []string
+		bad  []string
+	}{
+		{
+			// "10.99.1.2, 10.99.1.3 10.99.1.4" in NetBox: the second
+			// separator is a space, so the builder's comma split yields one
+			// bad entry.
+			name: "bad entry dropped, good one kept",
+			dns:  []string{"10.99.1.2", "10.99.1.3 10.99.1.4"},
+			want: []string{"10.99.1.2"},
+			bad:  []string{"10.99.1.3 10.99.1.4"},
+		},
+		{
+			name: "no good entry keeps the default",
+			dns:  []string{"resolver.example", "10.99.1.3/32"},
+			want: []string{"1.1.1.1"},
+			bad:  []string{"resolver.example", "10.99.1.3/32"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cache := worker.NewCache(nil)
+			applyDHCP(cache, model.DHCPConfig{
+				Subnet:             "10.99.1.0/24",
+				Gateway:            "10.99.1.1",
+				EphemeralPoolStart: "10.99.1.100",
+				EphemeralPoolEnd:   "10.99.1.200",
+				DNS:                tt.dns,
+			})
+			var logs bytes.Buffer
+			sc := &siteServiceConfig{
+				cfg:   siteConfig{httpPort: 8080, iface: loopbackIface()},
+				cache: cache,
+				log:   slog.New(slog.NewTextHandler(&logs, nil)),
+			}
+			cfg, err := buildDHCPConfig(sc, net.ParseIP("10.99.1.1"))
+			if err != nil {
+				t.Fatalf("a malformed dns_servers entry stops the site's services from starting: %v", err)
+			}
+			var got []string
+			for _, ip := range cfg.DNS {
+				got = append(got, ip.String())
+			}
+			if strings.Join(got, ",") != strings.Join(tt.want, ",") {
+				t.Errorf("DNS = %v, want %v", got, tt.want)
+			}
+			out := logs.String()
+			for _, b := range tt.bad {
+				if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "dns_servers") || !strings.Contains(out, b) {
+					t.Errorf("no error-level log naming dns_servers and the dropped entry %q; logs:\n%s", b, out)
+				}
+			}
+		})
+	}
+}
+
 func TestBuildDHCPConfig_PromiscuousMode(t *testing.T) {
 	t.Parallel()
 	cache := worker.NewCache(nil)
