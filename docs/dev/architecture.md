@@ -340,8 +340,13 @@ Types are in `internal/model/snapshot.go`:
 
 `internal/snapshot/builder.go:66` is `Build(in Inputs) (SiteSnapshot,
 error)`. It is pure — no I/O — and fails loudly if `Prefixes` is
-empty (`builder.go:68`) or if an interface of a bound machine carries
-more than one active IP address (a machine's interface facts hold one).
+empty (`builder.go:68`). A machine's interface facts hold one address:
+when an interface of a bound machine carries more than one active IP
+address, Build keeps the device's `primary_ip4` if it is one of them,
+else the numerically lowest IPv4 address (the lowest IPv6 address when
+the interface has no IPv4), independent of NetBox list order. The
+dispatcher logs the affected interfaces in one warning per site, repeated
+only when the set or a chosen address changes.
 Its inputs (`Inputs`, `builder.go:31`) are
 NetBox reads (site, config, prefixes, OOB prefixes and ranges,
 devices, device-types, interfaces, IPs), Postgres reads (machines,

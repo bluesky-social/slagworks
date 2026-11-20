@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/bluesky-social/slagworks/internal/awssecrets"
@@ -64,6 +66,39 @@ type Dispatcher struct {
 	bmcSecrets BMCSecretsReader // optional; nil = no admin-cred prestamp
 	metrics    *Metrics         // optional; nil disables Prometheus instrumentation
 	hostnames  HostnameTemplate // zero value = FQDN is the NetBox device name
+
+	// reportedChoices is, per config slug, the multi-address interface
+	// list last logged, so a rebuild over unchanged NetBox data does not
+	// log it again. Guarded by choicesMu: slugs rebuild concurrently.
+	choicesMu       sync.Mutex
+	reportedChoices map[string]string
+}
+
+// addressChoicesToReport returns the lines to log for a build's
+// multi-address interfaces, or nil when the same list was already reported
+// for this slug (or there is nothing to report). A slug whose list empties
+// is forgotten, so the list is reported again if it comes back.
+func (d *Dispatcher) addressChoicesToReport(slug string, choices []AddressChoice) []string {
+	lines := make([]string, len(choices))
+	for i, c := range choices {
+		lines[i] = fmt.Sprintf("%s %s (NetBox interface %d): using %s of %d active addresses",
+			c.Device, c.Interface, c.InterfaceID, c.Chosen, c.Active)
+	}
+	key := strings.Join(lines, "\n")
+	d.choicesMu.Lock()
+	defer d.choicesMu.Unlock()
+	if d.reportedChoices[slug] == key {
+		return nil
+	}
+	if key == "" {
+		delete(d.reportedChoices, slug)
+		return nil
+	}
+	if d.reportedChoices == nil {
+		d.reportedChoices = make(map[string]string)
+	}
+	d.reportedChoices[slug] = key
+	return lines
 }
 
 // NewDispatcher constructs a Dispatcher.
@@ -393,7 +428,7 @@ func (d *Dispatcher) gatherAndBuild(ctx context.Context, slug string, outcome *s
 		}
 	}
 
-	snap, err := Build(Inputs{
+	snap, choices, err := buildWithChoices(Inputs{
 		Site:             *siteRef,
 		Config:           *cfg,
 		Prefixes:         prefixes,
@@ -415,6 +450,14 @@ func (d *Dispatcher) gatherAndBuild(ctx context.Context, slug string, outcome *s
 	})
 	if err != nil {
 		return model.SiteConfig{}, model.SiteSnapshot{}, err
+	}
+	// One warning per site, and only when the list changes: these
+	// interfaces are legitimate (service addresses on a storage host's
+	// data interface), so the log records the choice without repeating it
+	// on every rebuild.
+	if lines := d.addressChoicesToReport(slug, choices); lines != nil {
+		slog.Warn("snapshot: interfaces with more than one active address; each machine interface's facts carry one (the device's primary_ip4 if on the interface, else its lowest IPv4 address). To use a different address, make it the device's primary IPv4 in NetBox",
+			"config", slug, "netbox_site", nbSite, "count", len(lines), "interfaces", lines)
 	}
 	return *cfg, snap, nil
 }

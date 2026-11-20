@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -429,33 +430,38 @@ func (p *propPipe) modelBuildError(slug string) string {
 	if len(p.w.modelProdPrefixes(*cfg)) == 0 {
 		return "no production prefix"
 	}
-	// A machine interface with more than one active address is refused:
-	// the snapshot carries one address per interface and will not pick.
-	for _, m := range p.db.machines {
-		if m.NetBoxDeviceID == nil {
-			continue
-		}
-		d := p.w.devs[*m.NetBoxDeviceID]
-		if d == nil || !p.w.modelClaims(*cfg, d) {
-			continue
-		}
-		for _, i := range p.w.ifaces {
-			if i.Dev == d.ID && len(p.activeIPs(i.ID)) > 1 {
-				return "interface with two active addresses"
-			}
-		}
-	}
+	// A machine interface with more than one active address does not stop
+	// the build: the snapshot carries the one modelIP picks.
 	return ""
 }
 
-func (p *propPipe) activeIPs(iface int) []string {
-	var out []string
+// modelIP is the one address a machine's facts carry for an interface of
+// device d, "" when the interface has no active address: the device's
+// primary_ip4 (nbDevice gives a Primary device the address ID 2) when that
+// is one of the interface's active addresses, otherwise the numerically
+// lowest of them, ties by prefix length and then NetBox ID. Every address
+// this world draws is IPv4.
+func (p *propPipe) modelIP(d *pwDev, iface int) string {
+	var best *pwIP
+	var bestPfx netip.Prefix
 	for _, id := range propSortedIDs(p.w.ips) {
-		if ip := p.w.ips[id]; ip.Iface == iface && !ip.Reserved {
-			out = append(out, ip.Addr)
+		ip := p.w.ips[id]
+		if ip.Iface != iface || ip.Reserved {
+			continue
+		}
+		if d.Primary && ip.ID == 2 {
+			return ip.Addr
+		}
+		pfx := netip.MustParsePrefix(ip.Addr)
+		// IDs ascend, so an equal address and length keeps the earlier one.
+		if best == nil || pfx.Addr().Less(bestPfx.Addr()) || (pfx.Addr() == bestPfx.Addr() && pfx.Bits() < bestPfx.Bits()) {
+			best, bestPfx = ip, pfx
 		}
 	}
-	return out
+	if best == nil {
+		return ""
+	}
+	return best.Addr
 }
 
 func (p *propPipe) modelClaimers(d *pwDev) []string {
@@ -510,8 +516,7 @@ func (p *propPipe) modelMachines(cfg model.SiteConfig) map[string]string {
 			if i.Mgmt && d.OOB != "" {
 				typ = "ipmi"
 			}
-			// A buildable config has at most one (modelBuildError).
-			ip := strings.Join(p.activeIPs(i.ID), "+")
+			ip := p.modelIP(d, i.ID)
 			ifs = append(ifs, fmt.Sprintf("%d/%s/%s/%s/%s", i.ID, i.Name, strings.ToLower(i.MAC), typ, ip))
 		}
 		kp := ""
@@ -1117,7 +1122,7 @@ func (p *propPipe) opIP() {
 			}
 		}
 	}
-	const limit = 2 // a second active address makes the config unbuildable
+	const limit = 2 // up to two active addresses: the snapshot must pick one
 	switch act := rapid.IntRange(0, 2).Draw(p.rt, "ipAct"); {
 	case act == 0 && len(mine) < 2:
 		reserved := active >= limit || rapid.IntRange(0, 3).Draw(p.rt, "reserved") == 0

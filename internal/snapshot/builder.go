@@ -12,10 +12,13 @@
 package snapshot
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 
@@ -74,9 +77,89 @@ type Inputs struct {
 // commission data is matched against script rules. The winning script
 // is attached to MachineSnapshot.StorageScript. Workers never run the
 // match; they just carry the pre-chosen script to the deploy agent.
+//
+// A bound machine's interface with more than one active address never
+// fails the build: chooseInterfaceAddress picks one. Build drops the record
+// of those choices; the dispatcher builds through buildWithChoices and
+// reports them.
 func Build(in Inputs) (model.SiteSnapshot, error) {
+	snap, _, err := buildWithChoices(in)
+	return snap, err
+}
+
+// AddressChoice records one bound machine's interface that carried more
+// than one active NetBox address, and the one address its facts got.
+type AddressChoice struct {
+	Device      string // NetBox device name
+	Interface   string // NetBox interface name
+	InterfaceID int    // NetBox interface ID
+	Chosen      string // the address in SnapshotInterface.IP, CIDR form
+	Active      int    // how many active addresses the interface carries
+}
+
+// chooseInterfaceAddress picks the one address a machine's interface facts
+// carry out of the interface's active addresses (at least one). The rule
+// depends only on the addresses, never on the order NetBox listed them in:
+//
+//   - the device's primary IPv4 (NetBox primary_ip4, matched by address ID;
+//     0 for none) when it is one of them;
+//   - otherwise the numerically lowest IPv4 address, ties broken by the
+//     shorter prefix length, then the lower NetBox ID;
+//   - an interface with no IPv4 address gets its lowest IPv6 address by the
+//     same ordering. An address that does not parse sorts after every one
+//     that does.
+//
+// IPv4 comes first because the facts hold one address per interface and
+// every shipped network script and the worker's DHCP reservation read it as
+// IPv4. The primary comes first because it is the address the operator
+// already named as the host's own; on a storage host's ten-address data
+// interface it is the host address and the rest are service addresses.
+func chooseInterfaceAddress(addrs []netbox.IPAddress, primaryIP4 int) netbox.IPAddress {
+	type key struct {
+		class int // 0 IPv4, 1 IPv6, 2 unparseable
+		addr  netip.Addr
+		bits  int
+	}
+	keyOf := func(ip netbox.IPAddress) key {
+		var addr netip.Addr
+		var bits int
+		if p, err := netip.ParsePrefix(ip.Address); err == nil {
+			addr, bits = p.Addr().Unmap(), p.Bits()
+		} else if a, err := netip.ParseAddr(ip.Address); err == nil {
+			addr, bits = a.Unmap(), a.Unmap().BitLen()
+		} else {
+			return key{class: 2}
+		}
+		if addr.Is4() {
+			return key{0, addr, bits}
+		}
+		return key{1, addr, bits}
+	}
+	best, bestKey := addrs[0], keyOf(addrs[0])
+	for _, ip := range addrs {
+		if primaryIP4 != 0 && ip.ID == primaryIP4 {
+			return ip
+		}
+		k := keyOf(ip)
+		c := cmp.Or(
+			cmp.Compare(k.class, bestKey.class),
+			k.addr.Compare(bestKey.addr),
+			cmp.Compare(k.bits, bestKey.bits),
+			cmp.Compare(ip.Address, best.Address), // orders unparseable addresses
+			cmp.Compare(ip.ID, best.ID),
+		)
+		if c < 0 {
+			best, bestKey = ip, k
+		}
+	}
+	return best
+}
+
+// buildWithChoices is Build plus the list of multi-address interfaces it
+// had to choose an address for, ordered by NetBox interface ID.
+func buildWithChoices(in Inputs) (model.SiteSnapshot, []AddressChoice, error) {
 	if len(in.Prefixes) == 0 {
-		return model.SiteSnapshot{}, fmt.Errorf("site %s: no slagworks-production prefix", in.Site.Slug)
+		return model.SiteSnapshot{}, nil, fmt.Errorf("site %s: no slagworks-production prefix", in.Site.Slug)
 	}
 	primary := in.Prefixes[0]
 	gateway := prefixGatewayIP(primary)
@@ -124,13 +207,13 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 	}
 	// Every active address per interface, not just the last row NetBox
 	// listed: a machine's facts carry one address per interface, so the
-	// machine loop rejects an interface with more than one rather than
+	// machine loop picks one with chooseInterfaceAddress rather than
 	// letting list order pick the survivor.
-	activeIPsByIfaceID := make(map[int][]string, len(in.IPs))
+	activeIPsByIfaceID := make(map[int][]netbox.IPAddress, len(in.IPs))
 	for _, ip := range in.IPs {
 		if ip.AssignedObjectID != nil && ip.AssignedObjectType == "dcim.interface" && ip.IsActive() {
 			id := *ip.AssignedObjectID
-			activeIPsByIfaceID[id] = append(activeIPsByIfaceID[id], ip.Address)
+			activeIPsByIfaceID[id] = append(activeIPsByIfaceID[id], ip)
 		}
 	}
 
@@ -177,9 +260,10 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 	consoleByDev := buildConsoleEndpoints(in.ConsolePorts, in.ConsoleServers)
 
 	machines := make([]model.MachineSnapshot, 0, len(in.Machines))
-	// multiAddr collects every bound-machine interface with more than one
-	// active address; any entry fails the build after the loop.
-	var multiAddr []string
+	// choices collects every bound-machine interface with more than one
+	// active address, keyed by NetBox interface ID (two machines bound to
+	// one device see the same interface), for the caller to report.
+	choiceByIface := make(map[int]AddressChoice)
 	for _, m := range in.Machines {
 		// Resolve the NetBox device (if bound) up front: its name is the
 		// hostname both the storage and network matchers scope on.
@@ -252,22 +336,26 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 				}
 				ms.Console = consoleByDev[d.ID]
 			}
+			primaryIP4 := 0
+			if dev != nil && dev.PrimaryIP4 != nil {
+				primaryIP4 = dev.PrimaryIP4.ID
+			}
 			for _, ni := range ifacesByDev[*m.NetBoxDeviceID] {
 				addrs := activeIPsByIfaceID[ni.ID]
-				if len(addrs) > 1 {
-					slices.Sort(addrs)
-					multiAddr = append(multiAddr, fmt.Sprintf("device %q interface %s (NetBox interface %d) has %d active IP addresses: %s",
-						hostname, ni.Name, ni.ID, len(addrs), strings.Join(addrs, ", ")))
-					continue
-				}
 				iface := model.SnapshotInterface{
 					NetBoxID: ni.ID,
 					Name:     ni.Name,
 					MAC:      strings.ToLower(ni.GetMAC()),
 					Type:     classifyMachineInterface(ni, ms.BMCIP != ""),
 				}
-				if len(addrs) == 1 {
-					iface.IP = addrs[0]
+				if len(addrs) > 0 {
+					iface.IP = chooseInterfaceAddress(addrs, primaryIP4).Address
+				}
+				if len(addrs) > 1 {
+					choiceByIface[ni.ID] = AddressChoice{
+						Device: hostname, Interface: ni.Name, InterfaceID: ni.ID,
+						Chosen: iface.IP, Active: len(addrs),
+					}
 				}
 				// L2-bond facts (additive; absent/zero on L3 hosts whose
 				// interfaces carry none of these in NetBox). LAG is the
@@ -320,16 +408,9 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 		}
 		machines = append(machines, ms)
 	}
-	// Fail the whole build, as buildOOBReservations does for an interface
-	// with two OOB addresses: keeping one address would hand the
-	// network-config script and the worker's DHCP reservation whichever
-	// address NetBox listed last. Only bound machines' interfaces count:
-	// no other device's addresses reach a SnapshotInterface.
-	if len(multiAddr) > 0 {
-		slices.Sort(multiAddr)
-		multiAddr = slices.Compact(multiAddr) // two machines bound to one device
-		return model.SiteSnapshot{}, fmt.Errorf("site %s: %s; slagworks gives each machine interface exactly one address, for its network-config script facts and DHCP reservation, and will not guess which. In NetBox, keep one address active per interface and set the others to reserved or deprecated",
-			in.Site.Slug, strings.Join(multiAddr, "; "))
+	choices := make([]AddressChoice, 0, len(choiceByIface))
+	for _, id := range slices.Sorted(maps.Keys(choiceByIface)) {
+		choices = append(choices, choiceByIface[id])
 	}
 
 	// OOB DHCP reservations: every interface (INCLUDING mgmt_only) whose
@@ -339,7 +420,7 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 	// half-bad one. Empty in.OOBPrefixes (pre-cutover) → no reservations.
 	reservations, err := buildOOBReservations(in.OOBPrefixes, in.Interfaces, in.IPs)
 	if err != nil {
-		return model.SiteSnapshot{}, fmt.Errorf("site %s: OOB reservations: %w", in.Site.Slug, err)
+		return model.SiteSnapshot{}, nil, fmt.Errorf("site %s: OOB reservations: %w", in.Site.Slug, err)
 	}
 
 	// OOB segment config (subnet/gateway/DNS/NTP/dynamic-pool), sourced from
@@ -348,7 +429,7 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 	// iface host-locally from OOB.Subnet.
 	oob, err := buildOOBConfig(in.OOBPrefixes, in.OOBRanges)
 	if err != nil {
-		return model.SiteSnapshot{}, fmt.Errorf("site %s: OOB config: %w", in.Site.Slug, err)
+		return model.SiteSnapshot{}, nil, fmt.Errorf("site %s: OOB config: %w", in.Site.Slug, err)
 	}
 
 	return model.SiteSnapshot{
@@ -362,7 +443,7 @@ func Build(in Inputs) (model.SiteSnapshot, error) {
 		Images:       in.Images,
 		SSHKeys:      in.SSHKeys,
 		Reservations: reservations,
-	}, nil
+	}, choices, nil
 }
 
 // buildOOBConfig assembles the OOB-segment DHCP config from the
@@ -491,8 +572,8 @@ func iprangeStringCF(r netbox.IPRange, field string) string {
 // whole point — the OOB net is mostly BMCs/PDUs/switch-mgmt ports). The
 // MAC is taken via Interface.GetMAC (NetBox 4.x primary_mac_address); the
 // IPs come from the raw IPAddress list, filtered to OOB addresses, because
-// reservations cover every site device and the machine loop's multi-address
-// check covers only bound machines.
+// reservations cover every site device and the machine loop's one-address
+// choice covers only bound machines.
 //
 // Fails loudly (per the plan's conflict-rejection rule) on:
 //   - more than one OOB IP on a single interface,
