@@ -374,8 +374,11 @@ Notes:
 
 - The active-op selection loop (`cache.go:262`) skips terminal ops
   and power ops when picking "the active op for this machine". A
-  machine can have a queued `power_cycle` alongside a pending
-  deploy; the deploy still wins the boot decision.
+  power op is never queued alongside a pending deploy:
+  `idx_one_active_op_per_machine` admits one active op per machine
+  of any type, and `CreatePowerOp` refuses a power, `set_boot_device`
+  or `bmc_reconcile` request while another op is in flight, naming
+  it so the operator can watch it or abort it first.
 - Commission and deploy both require an exact active operation. The boot
   script derives `machine_id`, `op_id`, and `trace_id` from that single
   binding; inventory can validate identity but cannot select another machine.

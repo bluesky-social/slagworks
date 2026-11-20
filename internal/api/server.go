@@ -1032,7 +1032,7 @@ type opCreateSpec struct {
 	// create persists the op with the resolved params. This is the one
 	// genuine behavioral branch: deploy/commission call CreateMachineOp with
 	// their allowed-source states (active-op + lock + state guards), power
-	// calls CreatePowerOp (no state guard, so a power op is always issuable).
+	// calls CreatePowerOp (active-op guard only: no state or lock guard).
 	create func(params json.RawMessage) (*model.Operation, error)
 	// logAttrs are extra structured-log key/value pairs for the "operation
 	// created" line (power's boot_device). nil for deploy/commission.
@@ -1387,8 +1387,9 @@ func (s *Server) powerMachine(c *echo.Context) error {
 		logAttrs:   []any{"boot_device", body.BootDevice},
 		create: func(params json.RawMessage) (*model.Operation, error) {
 			// Power ops (on/off/cycle) go through CreatePowerOp: no state
-			// guard, so a power op is always issuable even with a lifecycle
-			// op pending — that's how an operator recovers a stuck machine.
+			// or lock guard, so they work on an in-service host. With any op
+			// in flight (a deploy included) it refuses with that op's ID;
+			// the operator watches or aborts it first.
 			return s.store.CreatePowerOp(id, opType, params)
 		},
 	})
