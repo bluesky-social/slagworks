@@ -28,6 +28,10 @@ type ModuleData struct {
 // guarantees it): a bay holds one module, so two modules with one name
 // cannot both be stored. Every existing bay that does not hold a wanted
 // module is deleted, including extra bays that share a wanted name.
+//
+// A module's serial and firmware_version are authoritative, like the
+// device fields in SyncCommissionData: an empty reading clears the stored
+// value, so re-commission after a part swap leaves no stale serial behind.
 func (c *Client) ReconcileModules(ctx context.Context, deviceID int, modules []ModuleData) error {
 	// Step 1: Resolve all ModuleTypes
 	typeIDs := make(map[string]int) // key: profileName + "/" + model
@@ -95,19 +99,19 @@ func (c *Client) ReconcileModules(ctx context.Context, deviceID int, modules []M
 		typeKey := m.ProfileName + "/" + m.Model
 		moduleTypeID := typeIDs[typeKey]
 
+		// serial and firmware_version are written even when empty: this
+		// body also PATCHes the module already in the bay, and NetBox
+		// keeps any field a PATCH omits, so skipping an empty reading
+		// would leave a replaced part's values on the part in its bay.
 		body := map[string]any{
 			"device":      deviceID,
 			"module_bay":  bayID,
 			"module_type": moduleTypeID,
 			"status":      "active",
-		}
-		if m.Serial != "" {
-			body["serial"] = m.Serial
-		}
-		if m.FWVersion != "" {
-			body["custom_fields"] = map[string]string{
-				"firmware_version": m.FWVersion,
-			}
+			"serial":      m.Serial,
+			"custom_fields": map[string]any{
+				"firmware_version": emptyToNil(m.FWVersion),
+			},
 		}
 
 		if existing, ok := moduleByBay[bayID]; ok {
