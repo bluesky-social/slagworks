@@ -66,7 +66,7 @@ func TestConnReadWriteRoundTrip(t *testing.T) {
 type slowConn struct{ net.Conn }
 
 func (c slowConn) Read(p []byte) (int, error) {
-	time.Sleep(time.Millisecond)
+	time.Sleep(3 * time.Millisecond)
 	if len(p) > 4<<10 {
 		p = p[:4<<10]
 	}
@@ -80,7 +80,11 @@ func (c slowConn) Read(p []byte) (int, error) {
 // in the middle of every large upload, and its replay after the reconnect
 // would be cut the same way.
 func TestConnReadMessageIdle(t *testing.T) {
-	const idle = 150 * time.Millisecond
+	// The idle window also covers the wait for the large message's first
+	// bytes, which the server has to encode first; under the race detector
+	// on a busy machine that took longer than 150ms. The 2 MiB payload at
+	// 4 KiB per 3ms read still takes over three windows to arrive.
+	const idle = 500 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
