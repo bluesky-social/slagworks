@@ -29,6 +29,9 @@ type Client struct {
 	// asking again would only call the identity provider on every request:
 	// a watch loop would rotate the refresh token on every tick.
 	refreshOff bool
+	// refreshErr is the refresher's error when that is why refreshing
+	// stopped. Every later 401 carries it (APIError.Unwrap).
+	refreshErr error
 }
 
 // Config holds client configuration.
@@ -54,7 +57,18 @@ type Config struct {
 type APIError struct {
 	StatusCode int
 	Message    string
+	// refreshErr is why a 401 could not be answered with a refreshed
+	// token, when the refresher failed; see Unwrap.
+	refreshErr error
 }
+
+// Unwrap returns, for a 401 the client could not answer with a refreshed
+// token because the refresher failed, the refresher's error. Error does not
+// show it (the 401 already names the next step), but a caller that retries
+// requests can match it with errors.Is to tell a sign-in that is gone, which
+// no retry clears, from a server that is refusing a token it should accept,
+// which may pass.
+func (e *APIError) Unwrap() error { return e.refreshErr }
 
 // Error renders message-first: the server's explanation is what the
 // operator acts on; the status code is diagnostic trivia that used to
@@ -229,7 +243,13 @@ func (c *Client) do(req *http.Request, out any) error {
 		if json.Unmarshal(b, &errBody) == nil && errBody.Message != "" {
 			msg = errBody.Message
 		}
-		return &APIError{StatusCode: status, Message: msg}
+		apiErr := &APIError{StatusCode: status, Message: msg}
+		if status == http.StatusUnauthorized {
+			c.mu.Lock()
+			apiErr.refreshErr = c.refreshErr
+			c.mu.Unlock()
+		}
+		return apiErr
 	}
 
 	if out != nil && len(b) > 0 {
@@ -266,9 +286,10 @@ func (c *Client) send(req *http.Request, token string) (int, []byte, error) {
 // refresh is possible, and the caller reports the 401. Resending is safe for
 // every method: the API refuses a bearer before any handler runs.
 //
-// A failed refresh is not reported on its own. The operator's next step is
+// A failed refresh is not shown on its own. The operator's next step is
 // the same either way (sign in again, which reports any provider trouble
-// itself), and the 401 says that.
+// itself), and the 401 says that. The failure is kept, and this 401 and
+// every later one wrap it, for callers that retry (APIError.Unwrap).
 func (c *Client) refreshFor(req *http.Request, sent string) (*http.Request, string) {
 	c.mu.Lock()
 	off := c.refresh == nil || c.refreshOff
@@ -281,7 +302,9 @@ func (c *Client) refreshFor(req *http.Request, sent string) (*http.Request, stri
 	}
 	fresh, err := c.refresh(req.Context(), sent)
 	if err != nil {
-		c.stopRefreshing()
+		c.mu.Lock()
+		c.refreshOff, c.refreshErr = true, err
+		c.mu.Unlock()
 		return nil, ""
 	}
 	retry := req.Clone(req.Context())

@@ -239,7 +239,9 @@ func TestUnauthorized_RefreshesAndResendsOnce(t *testing.T) {
 // the API refuses the refreshed token too, the client stops asking: one
 // refresh per client, not one per request (a watch loop would otherwise call
 // the identity provider on every tick). Every refusal names the command that
-// fixes it.
+// fixes it, and wraps the refresher's error when there was one, so a caller
+// that retries can tell a sign-in that is gone from a server refusing a
+// token it should accept.
 func TestUnauthorized_StopsRefreshingWhenItDoesNotHelp(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -272,6 +274,9 @@ func TestUnauthorized_StopsRefreshingWhenItDoesNotHelp(t *testing.T) {
 					if !strings.Contains(err.Error(), want) {
 						t.Errorf("request %d: error %q does not contain %q", i, err, want)
 					}
+				}
+				if got := errors.Unwrap(apiErr); got != tc.refreshErr {
+					t.Errorf("request %d: the 401 wraps %v, want the refresher's error %v", i, got, tc.refreshErr)
 				}
 			}
 			if refreshes != 1 {

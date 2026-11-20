@@ -280,6 +280,29 @@ func TestOperationWatch_EndsWhenTheSignInCannotBeRefreshed(t *testing.T) {
 	}
 }
 
+// TestOperationWatch_EndsWhenARefusedTokenCannotBeRefreshed: the API starts
+// refusing an access token the cache still holds as valid (the session was
+// revoked) and the identity provider refuses the refresh token too. No retry
+// clears that, so the watch ends on its next poll with an error naming
+// `slagctl auth login` instead of polling into 401s until --timeout.
+func TestOperationWatch_EndsWhenARefusedTokenCannotBeRefreshed(t *testing.T) {
+	w := newTokenWatchWorld(t, false)
+	result := w.watch(time.Minute)
+	w.mu.Lock()
+	delete(w.valid, "at-0")
+	w.mu.Unlock()
+
+	var err error
+	select {
+	case err = <-result:
+	case <-time.After(3 * plainWatchPollInterval):
+		t.Fatal("the watch was still running after the API and the identity provider both refused its session")
+	}
+	if !errors.Is(err, clientauth.ErrLoginRequired) || !strings.Contains(err.Error(), "slagctl auth login") {
+		t.Fatalf("watch error = %v, want a sign-in error naming `slagctl auth login`", err)
+	}
+}
+
 // errSignedOut is what apiClient returns once the sign-in cannot be
 // refreshed (see bearerSource).
 var errSignedOut = fmt.Errorf("%w: the identity provider refused the refresh token", clientauth.ErrLoginRequired)
