@@ -119,6 +119,13 @@ func genRuns(t *rapid.T) []propRun {
 			idx := rapid.IntRange(0, 14).Draw(t, fmt.Sprintf("fidx%d_%d", i, f))
 			r.faults[idx] = rapid.SampledFrom([]string{faultBefore, faultAfter, faultDown}).Draw(t, fmt.Sprintf("fkind%d_%d", i, f))
 		}
+		// A response lost with the BMC gone right after it: when the call is
+		// a password write, the write is applied and no test can confirm
+		// it. Independent faults almost never line up this way.
+		if rapid.IntRange(0, 3).Draw(t, fmt.Sprintf("lostThenDown%d", i)) == 0 {
+			idx := rapid.IntRange(1, 5).Draw(t, fmt.Sprintf("lostIdx%d", i))
+			r.faults[idx], r.faults[idx+1] = faultAfter, faultDown
+		}
 		runs[i] = r
 	}
 	return runs
