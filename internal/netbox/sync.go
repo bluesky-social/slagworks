@@ -167,7 +167,24 @@ func (c *Client) SyncCommissionData(ctx context.Context, sync CommissionSync) er
 	// msn2700 type mid-rebuild (2026-10-23). ResolveDevice still sets a type
 	// when it creates a brand-new device.
 
-	if err := c.UpdateDevice(ctx, sync.DeviceID, deviceFields); err != nil {
+	err = c.UpdateDevice(ctx, sync.DeviceID, deviceFields)
+	if err != nil && sync.AssetTag != "" && rejectsField(err, "asset_tag") {
+		// NetBox requires a device's asset_tag to be unique across every
+		// device and at most 50 characters. The tag is firmware DMI data: a
+		// placeholder missing from the junk list, the same tag programmed on
+		// two hosts, or a board moved between chassis reports a tag another
+		// device already holds. NetBox validates the whole PATCH before
+		// writing any of it, so drop the one field it refused and send the
+		// rest again; the device keeps whatever asset_tag it had. Failing
+		// instead would fail every retry of the commission report the same
+		// way until the operation expired.
+		c.log.Warn("NetBox refused the commissioned asset tag; leaving the device's asset_tag unchanged and writing its other fields. "+
+			"If another device holds this tag, clear it there or correct it in the firmware, then recommission",
+			"device_id", sync.DeviceID, "machine_id", sync.SlagworksID, "asset_tag", sync.AssetTag, "err", err)
+		delete(deviceFields, "asset_tag")
+		err = c.UpdateDevice(ctx, sync.DeviceID, deviceFields)
+	}
+	if err != nil {
 		return fmt.Errorf("updating device: %w", err)
 	}
 

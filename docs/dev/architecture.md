@@ -275,7 +275,12 @@ direction. On a commission report, slagworks PATCHes the Device with
 the fields it discovered:
 
 - Top-level: `serial`, `asset_tag`, `name` (hostname), `status`
-  (`active` on deploy), `device_type`.
+  (`active` on deploy), `device_type`. NetBox requires `asset_tag` to be
+  unique across all devices and at most 50 characters; when it refuses
+  the reported tag, the sync logs a warning in global's log naming the
+  device, machine and tag, leaves the device's `asset_tag` unchanged and
+  writes the other fields, so one bad firmware tag never fails a
+  commission.
 - Tags: adds `slagworks-managed` and keeps every operator tag. NetBox
   replaces the whole tag set on PATCH, so the sync reads the device's
   tags first and writes them back with `slagworks-managed` added; once

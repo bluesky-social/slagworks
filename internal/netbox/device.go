@@ -2,7 +2,9 @@ package netbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 )
@@ -271,6 +273,18 @@ func (c *Client) FindDeviceByMAC(ctx context.Context, macs []string) (*Device, e
 func isConflictError(err error) bool {
 	apiErr, ok := err.(*APIError)
 	return ok && apiErr.StatusCode == 400
+}
+
+// rejectsField reports whether err is a NetBox 400 validation error that
+// names field. NetBox keys field errors by name, e.g.
+// {"asset_tag":["device with this asset tag already exists."]}. The body is
+// searched rather than decoded so a model-level error that names the field
+// ({"__all__":["asset_tag: ..."]}) matches too: a caller drops the field and
+// retries, and a false match costs one retry that fails the same way.
+func rejectsField(err error, field string) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusBadRequest &&
+		strings.Contains(apiErr.Body, field)
 }
 
 // slugify creates a URL-safe slug from a name.
