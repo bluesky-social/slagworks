@@ -144,3 +144,62 @@ func TestWSConn_UnreadableOutboxFailsTheConnectionAndIsRetried(t *testing.T) {
 		t.Fatal("the delivered observation's row was never acked")
 	}
 }
+
+// TestWSConn_OpStreamDownRunsFromTheFirstFailedAttempt: the reload-failure
+// loop above completes a hello on every attempt and never reads the op_resync
+// that follows it, so the op set stays frozen for as long as the loop lasts.
+// The cache must count that outage from the first failed attempt, keep that
+// time across the retries, and end it only when a connection's op_resync is
+// applied.
+func TestWSConn_OpStreamDownRunsFromTheFirstFailedAttempt(t *testing.T) {
+	const wait = 2 * time.Minute // bounds a failing run; a passing one returns on the event
+	poll := func(cond func() bool) bool {
+		for deadline := time.Now().Add(wait); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			if cond() {
+				return true
+			}
+		}
+		return cond()
+	}
+
+	g := &uplinkGlobal{}
+	hub := ws.NewHub(ws.HubConfig{Auth: g, Rebuilder: g, ObsHandler: g, OpUpdateHandler: g})
+	srv := httptest.NewServer(hub)
+	t.Cleanup(srv.Close)
+	t.Cleanup(hub.Close)
+
+	localDB := openTestDB(t)
+	localDB.SetLogger(quietLog)
+	cache := NewCache(localDB)
+	restore := hideOutboxTable(t, localDB)
+
+	wsc := NewWSConn(WSConnConfig{GlobalURL: srv.URL, Token: "tok-1", WorkerID: "worker-1"}, cache, localDB, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = wsc.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	if !poll(func() bool { return !streamDownSince(cache).IsZero() }) {
+		t.Fatal("the first failed connection attempt was not recorded as the op stream going down")
+	}
+	first := streamDownSince(cache)
+	// A third hello means the second attempt has ended too.
+	if !poll(func() bool { hellos, _, _ := g.counts(); return hellos >= 3 }) {
+		hellos, _, _ := g.counts()
+		t.Fatalf("the worker did not keep retrying (hellos %d)", hellos)
+	}
+	if got := streamDownSince(cache); !got.Equal(first) {
+		t.Fatalf("a later failed attempt moved the start of the outage from %v to %v; the trust window would never run out", first, got)
+	}
+
+	restore()
+	if !poll(func() bool { return streamDownSince(cache).IsZero() }) {
+		t.Fatalf("the op stream still counts as down since %v after a connection that applied its op_resync", streamDownSince(cache))
+	}
+}

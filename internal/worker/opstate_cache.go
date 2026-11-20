@@ -68,6 +68,16 @@ import (
 //     outage). While untrusted the op set may force BootLocal (conservative)
 //     but never actuate (BootDeploy/BootCommission) and the executor is
 //     paused. The first op_resync clears it.
+//   - streamDownSince: when the worker's connection to global ended, or the
+//     zero time while the op stream is current. Set by OpStreamDown each
+//     time the WS client's connection ends, keeping the first time of an
+//     outage; cleared only by an op_resync, not by a hello that succeeds
+//     without one. A set frozen by a disconnect is stale for the same reason
+//     a rehydrated one is, so once the outage outlasts opStreamTrustWindow
+//     it may force BootLocal but never actuate, like an untrusted set.
+//     Reports are still accepted and the executor is not paused (a claim
+//     needs global, which settles it), so an install that finishes during
+//     the outage completes. In memory only: a restart rehydrates untrusted.
 //   - resynced: true once an op_resync has been applied in this process, so
 //     the op set is global's active set and not merely "nothing received
 //     yet". An agent report for an op the set does not hold is refused as
@@ -115,6 +125,8 @@ type opState struct {
 	untrusted bool
 	resynced  bool
 
+	streamDownSince time.Time
+
 	// wake is fired (buffered, non-blocking) when a delta/resync adds a
 	// PENDING op, so the executor picks it up in ms instead of waiting on
 	// its 5s backstop tick. nil in tests that don't wire an executor.
@@ -132,6 +144,30 @@ type opState struct {
 	// case-insensitively, so the match is model.SameHardwareSerial.
 	// Immutable after construction.
 	selfSerial string
+}
+
+// opStreamTrustWindow is how long a worker whose connection to global ended
+// keeps actuating from the op set it held (streamDownSince). It is the
+// default of global's OpTimeout: global fails every claimed or running op
+// within that time of its claim unless it is at awaiting_phone_home, which
+// boots locally anyway, and every op the frozen set holds as claimed was
+// claimed before the outage began. Past the window none of them can still be
+// one global is driving. An op the set holds as pending can still be live on
+// global, pending (up to PendingOpTimeout) or claimed by the peer since, and
+// withholding its boot until the worker reconnects is the safe direction. A
+// global configured with a longer OpTimeout only makes the worker withhold
+// earlier than needed.
+const opStreamTrustWindow = 30 * time.Minute
+
+// markStreamDown records that the worker's connection to global ended at
+// since. The first call of an outage wins: the WS client calls it after
+// every failed attempt, and a later time would restart the window.
+func (o *opState) markStreamDown(since time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.streamDownSince.IsZero() {
+		o.streamDownSince = since
+	}
 }
 
 // tombstoneCap bounds the tombstone set (opID -> terminal version). FIFO
@@ -356,6 +392,7 @@ func (o *opState) applyOpResync(ops []model.Operation, states map[string]model.M
 
 	o.untrusted = false
 	o.resynced = true
+	o.streamDownSince = time.Time{}
 	// fireWake is a lock-free channel send, so calling it while mu is held
 	// (before the deferred Unlock) is safe.
 	if anyPending {
@@ -525,25 +562,48 @@ func (o *opState) effectiveState(id uuid.UUID, base model.MachineState) model.Ma
 // --- Combined readers (view + op overlay, one generation under mu) ---
 
 // bootAction is the internal result of the boot-action decision, carrying
-// an optional fail-closed warning to emit AFTER releasing the lock (slow
-// slog IO must not block a pending writer under RLock).
+// an optional warning to emit AFTER releasing the lock (slow slog IO must
+// not block a pending writer under RLock): warn for the fail-closed rule,
+// withheldOp for an op a long-frozen op set held (actuateLocked).
 type bootAction struct {
 	action model.BootAction
 	warn   bool
 	mac    string
 	state  model.MachineState
+
+	withheldOp uuid.UUID
+	downSince  time.Time
 }
 
 // bootActionForMAC returns the boot action for a MAC. See the doc on
 // Cache.BootActionForMAC for the decision table and the two re-wipe-guard
-// clauses, plus the Tier-2 fail-closed + untrusted rules.
+// clauses, plus the Tier-2 fail-closed rule and the untrusted and frozen-set
+// rules (actuateLocked).
 func (o *opState) bootActionForMAC(mac string) model.BootAction {
 	r := o.bootActionLocked(mac)
 	if r.warn {
 		slog.Warn("boot fail-closed: transient machine state with no active op (op/identity mismatch); serving BootLocal — resync or next op_delta heals it",
 			"mac", r.mac, "effective_state", string(r.state))
 	}
+	if r.withheldOp != uuid.Nil {
+		slog.Warn("boot withheld: this worker has had no connection to global for longer than the operation timeout, so the operation it holds for this host may be over; serving BootLocal until a reconnect resyncs the op set. Restore the worker's connection to global to resume lifecycle boots",
+			"mac", r.mac, "op_id", r.withheldOp, "op_stream_down_since", r.downSince, "trust_window", opStreamTrustWindow)
+	}
 	return r.action
+}
+
+// actuateLocked returns the agent boot an active op authorizes, unless the
+// op set is not global's current word: a rehydrated set (untrusted), or one
+// frozen by a connection to global that ended more than opStreamTrustWindow
+// ago. Either may force BootLocal but never actuate. Caller holds mu.
+func (o *opState) actuateLocked(mac string, op *model.Operation, action model.BootAction) bootAction {
+	if o.untrusted {
+		return bootAction{action: model.BootLocal}
+	}
+	if !o.streamDownSince.IsZero() && time.Since(o.streamDownSince) > opStreamTrustWindow {
+		return bootAction{action: model.BootLocal, mac: mac, withheldOp: op.ID, downSince: o.streamDownSince}
+	}
+	return bootAction{action: action}
 }
 
 func (o *opState) bootActionLocked(mac string) bootAction {
@@ -579,50 +639,35 @@ func (o *opState) bootActionLocked(mac string) bootAction {
 		// baseline alone must never actuate (a dropped/late delta could
 		// leave a stale transient baseline via a kept identity trigger).
 		if activeOp != nil && activeOp.Type == model.OpCommission {
-			if o.untrusted {
-				return bootAction{action: model.BootLocal}
-			}
-			return bootAction{action: model.BootCommission}
+			return o.actuateLocked(mac, activeOp, model.BootCommission)
 		}
 		return bootAction{action: model.BootLocal, warn: true, mac: mac, state: state}
 	case model.MachineStateDeploying:
 		if activeOp != nil && activeOp.Type == model.OpDeploy {
-			if o.untrusted {
-				return bootAction{action: model.BootLocal}
-			}
-			return bootAction{action: model.BootDeploy}
+			return o.actuateLocked(mac, activeOp, model.BootDeploy)
 		}
 		return bootAction{action: model.BootLocal, warn: true, mac: mac, state: state}
 	case model.MachineStateNew:
 		// Commission is destructive-adjacent inventory authority, so even a
 		// new machine must have an explicit operation before it receives the
 		// agent. This guarantees every boot carries one machine/op binding.
-		if activeOp != nil && activeOp.Type == model.OpCommission && !o.untrusted {
-			return bootAction{action: model.BootCommission}
+		if activeOp != nil && activeOp.Type == model.OpCommission {
+			return o.actuateLocked(mac, activeOp, model.BootCommission)
 		}
 		return bootAction{action: model.BootLocal}
 	case model.MachineStateFailed:
 		// Failed retries require an explicit op (operator chose commission
 		// or deploy as the recovery path).
 		if activeOp != nil && activeOp.Type == model.OpCommission {
-			if o.untrusted {
-				return bootAction{action: model.BootLocal}
-			}
-			return bootAction{action: model.BootCommission}
+			return o.actuateLocked(mac, activeOp, model.BootCommission)
 		}
 		if activeOp != nil && activeOp.Type == model.OpDeploy {
-			if o.untrusted {
-				return bootAction{action: model.BootLocal}
-			}
-			return bootAction{action: model.BootDeploy}
+			return o.actuateLocked(mac, activeOp, model.BootDeploy)
 		}
 		return bootAction{action: model.BootLocal}
 	case model.MachineStateCommissioned:
 		if activeOp != nil && activeOp.Type == model.OpDeploy {
-			if o.untrusted {
-				return bootAction{action: model.BootLocal}
-			}
-			return bootAction{action: model.BootDeploy}
+			return o.actuateLocked(mac, activeOp, model.BootDeploy)
 		}
 		return bootAction{action: model.BootLocal}
 	case model.MachineStateRunning:

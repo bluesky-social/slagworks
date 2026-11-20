@@ -359,6 +359,10 @@ func (w *WSConn) Run(ctx context.Context) error {
 		}
 
 		w.connected.Store(false)
+		// Every op_delta and op_removed from here on is lost until the next
+		// connection's op_resync; the cache stops actuating from what it
+		// holds once the outage runs long.
+		w.cache.OpStreamDown(time.Now())
 		if wasConnected && time.Since(start) >= reconnectBackoffMax {
 			backoff = reconnectBackoffMin
 		}
@@ -488,7 +492,9 @@ func (w *WSConn) connectAndRun(ctx context.Context) (connected bool, err error) 
 	// retried until it succeeds; a table that never reads again keeps the
 	// worker off global, with this error on every attempt, until the
 	// operator repairs the local database. Boot and DHCP serving do not
-	// depend on the connection and continue from the cache.
+	// depend on the connection and continue from the cache, except that the
+	// op set stops actuating boots once the outage outlasts
+	// opStreamTrustWindow: this loop never reads the op_resync.
 	if err := w.cache.ReloadOutboxFromDisk(); err != nil {
 		w.drainMu.Unlock()
 		w.log.Error("cannot read the persisted outbox; dropping this connection and retrying. If this repeats, the outbox table of the worker's local database is damaged and needs repair (sqlite3 PRAGMA integrity_check on the file named in err)",

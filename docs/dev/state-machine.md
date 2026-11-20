@@ -549,6 +549,21 @@ resurrect a zombie op, and — the re-wipe-window fix — clears its op-driven
 machine-state overlay on an identity apply ONLY where the applied baseline
 equals the overlay value. A rehydrated-from-LocalDB op set is UNTRUSTED
 until the first `op_resync`: it may force `BootLocal` but never actuate.
+An op set frozen by a lost connection is stale for the same reason
+(global can complete, abort or sweep any op in it unheard), so once the
+worker's connection to global has been down for longer than
+`opStreamTrustWindow` (30 minutes, the default `OpTimeout`: by then global
+has ended every op the set holds as claimed) the same rule applies until
+the next `op_resync`. The clock starts when the WS client sees the first
+connection end of the outage; a hello that succeeds without delivering an
+`op_resync` (the proto refusal, the outbox-reload failure loop) does not
+stop it. Agent reports are still accepted, so an install already under way
+finishes through the outage, and the executor's claims still go to
+global, which settles them. A pending op can still be live on global past
+the window; its boot is withheld until the worker reconnects. A shorter
+outage leaves the frozen set actuating: a host whose op ended unheard less
+than 30 minutes ago can still be served its agent by the cut-off worker.
+Each withheld boot logs a `boot withheld` warning naming the op.
 The worker persists its op layer (`worker.db`, kv key `op_state`) after
 every stream apply and after the two local writes that protect an
 installed host, a deploy op reaching `awaiting_phone_home` and a
