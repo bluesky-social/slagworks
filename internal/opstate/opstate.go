@@ -96,10 +96,10 @@ func ClaimTransition(opType model.OperationType) (model.MachineState, []model.Ma
 // CanReclaim reports whether workerID may idempotently re-claim op (B4). The
 // claim RPC is at-least-once: a worker whose claim COMMITTED but whose reply
 // was lost on a WS drop retries on its next executor tick. If it already holds
-// the claim and no execution progress has been recorded (phase lands only
-// after actuation starts), the op is handed back so the deploy proceeds
-// instead of stalling until a sweep. A different worker, or any recorded
-// phase, is not a re-claim.
+// the claim and no execution progress has been recorded (the executor records
+// a phase once it holds the claim, before its first BMC/PDU/AMT call), the op
+// is handed back so the deploy proceeds instead of stalling until a sweep. A
+// different worker, or any recorded phase, is not a re-claim.
 func CanReclaim(op *model.Operation, workerID string) bool {
 	return op.Status == model.OpClaimed && op.ClaimedBy == workerID && op.Phase == ""
 }

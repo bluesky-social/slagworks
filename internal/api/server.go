@@ -103,9 +103,10 @@ type Config struct {
 	// OrphanedClaimGrace bounds ops in status=claimed with NO phase
 	// from claimed_at (B4: the claiming worker died between the claim
 	// commit and its first actuation). Default 2m — a healthy claim
-	// records phase power_cycle within seconds, and a lost-reply
-	// worker re-claims within one executor tick (5s), so 2m of
-	// claimed-no-phase means the worker is gone.
+	// records its first phase within seconds, before the worker's first
+	// BMC/PDU/AMT call, and a lost-reply worker re-claims within one
+	// executor tick (5s), so 2m of claimed-no-phase means the worker is
+	// gone.
 	OrphanedClaimGrace time.Duration
 	// PhoneHomeTimeout bounds deploy ops in phase=awaiting_phone_home
 	// from phase_entered_at. Default 30m.

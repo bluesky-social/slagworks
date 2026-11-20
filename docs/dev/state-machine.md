@@ -264,8 +264,12 @@ sites for that helper are:
 
 - `Cache.HandleProgressReport` (`cache.go:1509`, `1525`, `1504`) —
   the intake for `POST /api/v1/report` from the on-target agent.
-- `Executor.runLifecycleOp` (`internal/worker/executor.go:374`) —
-  emits `power_cycle` then `pxe_booting` before waking the target.
+- `Executor.runLifecycleOp` (`internal/worker/executor.go`) —
+  emits `power_cycle` before its first controller call and
+  `pxe_booting` once the power cycle has returned.
+- `Executor.runPowerOp` and `Executor.runBMCReconcile` — emit the op
+  type (`power_on`, `power_off`, `power_cycle`, `set_boot_device`,
+  `bmc_reconcile`) before their first controller call.
 - `dhcpCfg.OnACK` (`cmd/slagworksd/site.go:646`) — emits
   `dhcp_ack` (firmware DHCP) or `ipxe_dhcp` (iPXE second DHCP).
 - `httpboot.Handler.ServeHTTP` (`internal/httpboot/handler.go:190`)
@@ -577,6 +581,10 @@ worker, the executor's pending-op wake fires (or its 5s backstop tick),
 
 `runLifecycleOp` does:
 
+- Emit phase `power_cycle`, before the controller is opened. It covers
+  every BMC, PDU or AMT call up to and including the cycle, and is the
+  execution evidence the orphaned-claim sweep looks for (see
+  [Timeouts](#timeouts-and-phase-based-expiration)).
 - `verifyChassisSerial` gate (guards against acting on the wrong
   physical host).
 - `Controller.SetBootDevice(pxe)`, so the next boot lands on PXE: a
@@ -588,16 +596,17 @@ worker, the executor's pending-op wake fires (or its 5s backstop tick),
   BootNext, which is why the agent arms BootNext only for a deploy the
   site worker has accepted as complete (see
   [the latch](#the-awaiting_phone_home-latch)).
-- Emit phase `power_cycle`.
 - Call the power controller's `PowerCycle` (or `PowerOn` when off).
 - Emit phase `pxe_booting`.
 - Mark the op `OpRunning` in the cache.
 - Return. The executor does not block on the deploy; the agent
   drives phases from here on.
 
-`runPowerOp` is straightforward: build the controller, run
-`PowerOn` / `PowerOff` / `PowerCycle` / `SetBootDevice`, mark the op
-completed. `runSetBootDevice` (`executor.go:259`) routes to the
+`runPowerOp` is straightforward: emit the op type as its phase
+(`power_on`, `power_off`, `power_cycle`, `set_boot_device`; the
+orphaned-claim sweep's execution evidence again), build the controller,
+run `PowerOn` / `PowerOff` / `PowerCycle` / `SetBootDevice`, mark the op
+completed. `runBMCReconcile` records `bmc_reconcile` the same way. `runSetBootDevice` (`executor.go:259`) routes to the
 `power.BootManager` capability which today is only implemented for
 Supermicro.
 
@@ -692,6 +701,20 @@ lands after the pending sweep's read keeps its op claimed, and a deploy
 that enters `awaiting_phone_home` after the stuck sweep's read is
 spared. `ExpireOrphanedClaims`, which fails claims whose worker died
 before recording a phase, guards the same way.
+
+`ExpireOrphanedClaims` (default grace 2 minutes, `OrphanedClaimGrace`)
+selects `status = 'claimed' AND phase = '' AND claimed_at < cutoff`
+for every op type, so the executor records a phase as soon as it holds
+the claim, before its first call to the BMC, PDU or AMT endpoint. A
+live actuation can outlast the grace: a deploy's run of bmclib calls
+(open, chassis serial, boot device, power status, cycle) at up to 30s
+each on a slow BMC, or a PDU cycle's 60s off-window plus up to 150s of
+polling. Recording the phase only once those calls returned would let
+the sweep fail a live op as "claiming worker disconnected before
+execution started" while the worker went on to cycle the host. The
+phase reaches global as an `op_update`, so a worker that loses its
+connection for the whole grace right after the claim is still failed
+by this sweep.
 
 The `awaiting_phone_home` phase is explicitly excluded from
 `ExpireStuckOperations` (`store.go:867`) and covered separately by
