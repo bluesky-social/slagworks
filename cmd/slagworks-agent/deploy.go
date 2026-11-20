@@ -100,8 +100,17 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 
 	if p.destructive {
 		ctx.Log.Info("--destructive set, skipping disk safety check")
-	} else if err := storageapply.CheckDisksClean(ctx, layout); err != nil {
-		fatal("safety check", err)
+	} else {
+		if err := storageapply.CheckDisksClean(ctx, layout); err != nil {
+			fatal("safety check", err)
+		}
+		// Without --destructive nothing stops an array the deploy
+		// environment assembled from disks outside the layout, and
+		// mdadm --create cannot take a /dev/mdN such an array holds. Refuse
+		// now rather than after the layout's disks are partitioned.
+		if err := storageapply.CheckMDNamesFree(ctx, layout); err != nil {
+			fatal("md name check", err)
+		}
 	}
 
 	// A raid that pins its array UUID is identified at boot by that UUID

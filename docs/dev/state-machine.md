@@ -998,6 +998,17 @@ and consumes them:
 
 - Skip the boot-disk safety check when `--destructive`
   (`main.go:303`).
+- Without `--destructive`, after the boot-disk safety check and before
+  any disk is touched, refuse the deploy when an md array is already
+  assembled at a `/dev/mdN` node the plan creates a raid device at
+  (`storageapply.CheckMDNamesFree`). The deploy environment assembles
+  every array it finds, the layout's own disks are blank on this path,
+  so such an array lives on disks the deploy does not write, and
+  `mdadm --create` cannot take a node in use. The agent refuses rather
+  than stopping the array, which only `--destructive` authorizes, and
+  rather than failing at `mdadm --create` with the layout's disks
+  already partitioned. A layout with a preserve device is not checked:
+  the preserve preflight releases every auto-assembled array.
 - Wipe stale RAID / filesystem state on the target disks in the
   layout (`main.go:324`, `wipeStaleState`).
 - Wipe bystander disks when `--wipe-all-disks`, gated by
