@@ -408,7 +408,8 @@ What the agent actually does, in order:
     that directory; GRUB 2.12 cannot read past one and stops at
     `error: not a correct XFS inode.`
   - **RAID** (layouts with md arrays): `target.ConfigureRAID` writes
-    `/etc/mdadm/mdadm.conf` with `AUTO -all` and an `ARRAY` line, by UUID,
+    `/etc/mdadm/mdadm.conf` with `AUTO -all`, `MAILADDR root` (without
+    it `mdmonitor.service` fails at boot) and an `ARRAY` line, by UUID,
     for each array the layout names, regenerates the target's initramfs so
     it carries that file, and on UEFI replaces the ESP's
     `/slagworks/initrd.img` with it. The installed system then assembles

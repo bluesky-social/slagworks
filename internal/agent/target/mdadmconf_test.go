@@ -69,9 +69,9 @@ func rootAndPreserveLayout() storage.Layout {
 	}
 }
 
-// TestGenerateMDADMConf pins the policy: auto-assembly off, then one ARRAY
-// line per array identified by UUID alone, so the installed system
-// assembles those arrays and no others.
+// TestGenerateMDADMConf pins the policy: auto-assembly off, the monitor's
+// mail address, then one ARRAY line per array identified by UUID alone, so
+// the installed system assembles those arrays and no others.
 func TestGenerateMDADMConf(t *testing.T) {
 	conf := GenerateMDADMConf([]mdArray{
 		{Dev: "/dev/md0", UUID: "e8c9aa81:11112222:33334444:55556666"},
@@ -87,6 +87,7 @@ func TestGenerateMDADMConf(t *testing.T) {
 	}
 	want := []string{
 		"AUTO -all",
+		"MAILADDR root",
 		"ARRAY /dev/md0 UUID=e8c9aa81:11112222:33334444:55556666",
 		"ARRAY /dev/md1 UUID=0a1b2c3d:4e5f6a7b:8c9d0e1f:2a3b4c5d",
 	}
@@ -97,6 +98,31 @@ func TestGenerateMDADMConf(t *testing.T) {
 	if !strings.HasSuffix(conf, "\n") {
 		t.Fatal("mdadm.conf must end with a newline")
 	}
+}
+
+// TestGenerateMDADMConf_LetsTheArrayMonitorStart: the installed system's
+// mdmonitor.service runs `mdadm --monitor --scan`, which exits 1 with "No
+// mail address or alert command - not monitoring." unless mdadm.conf names
+// where events go (MAILADDR or PROGRAM). udev starts that unit for every
+// RAID1 or higher array, and the image's own mdadm.conf, which this file
+// replaces, carries MAILADDR root. Without it every host deployed onto a
+// mirror boots with a failed unit and nothing watching the array.
+func TestGenerateMDADMConf_LetsTheArrayMonitorStart(t *testing.T) {
+	conf := GenerateMDADMConf([]mdArray{{Dev: "/dev/md0", UUID: "e8c9aa81:11112222:33334444:55556666"}})
+
+	for line := range strings.SplitSeq(conf, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		// mdadm matches config keywords without regard to case.
+		switch strings.ToUpper(fields[0]) {
+		case "MAILADDR", "PROGRAM":
+			return
+		}
+	}
+	t.Fatalf("mdadm.conf has neither MAILADDR nor PROGRAM, so `mdadm --monitor --scan` "+
+		"(mdmonitor.service) refuses to start on the installed system:\n%s", conf)
 }
 
 // TestLayoutMDADMConf_NamesOnlyTheLayoutsArrays is the regression for an
