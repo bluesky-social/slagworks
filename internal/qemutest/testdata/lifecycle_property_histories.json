@@ -1,0 +1,33 @@
+[
+  {
+    "name": "global-crash-at-phone-home",
+    "about": "Global crashes with the worker's op_update{completed} read but not committed. The durable phone_home observation must still complete the deploy.",
+    "setup": {},
+    "steps": [
+      {"do": "hub_crash", "ms": 15000, "at": {"before": true, "host": 0, "kind": "report", "event": "phone_home"}},
+      {"do": "deploy", "flag": true},
+      {"do": "settle", "flag": true}
+    ]
+  },
+  {
+    "name": "mac-only-phone-home-mid-install",
+    "about": "A phone-home that names no operation arrives mid-install. It must be refused and change nothing.",
+    "setup": {},
+    "steps": [
+      {"do": "mac_phone_home", "at": {"host": 0, "kind": "report", "phase": "partitioning"}},
+      {"do": "deploy", "flag": true},
+      {"do": "settle", "flag": true}
+    ]
+  },
+  {
+    "name": "slow-bmc-resets-host-that-booted-the-installer-on-its-own",
+    "about": "The host is already PXE-booting when the deploy is created and installs on its own while the executor's power cycle waits on a slow BMC. The late cycle and its phase writes must not reopen the installer after deploy_complete.",
+    "setup": {},
+    "steps": [
+      {"do": "deploy", "ms": 2, "at": {"before": true, "host": 0, "kind": "dhcp", "phase": "ipxe_dhcp"}},
+      {"do": "bmc_slow", "ms": 60000},
+      {"do": "vm_reset"},
+      {"do": "settle", "flag": true}
+    ]
+  }
+]
