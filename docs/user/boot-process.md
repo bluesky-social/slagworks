@@ -208,7 +208,12 @@ policy lives. `Handler.ServeHTTP`
   (global does not mint a key for such a name in the first place).
   Every kernel boot (deploy, commission, kernel-only) likewise refuses a
   `slagworks_kernel_params` value iPXE would read as more than kernel
-  arguments (see `hardware/adding-new-hardware.md`).
+  arguments (see `hardware/adding-new-hardware.md`), and a command line
+  longer than the 2047 bytes the kernel keeps: the kernel drops the rest
+  without failing the boot, and the end of the line holds what the
+  installer cannot run without (`slagworks.expect-uuid` on a deploy). The
+  length counts each iPXE setting at its longest and the image name iPXE
+  puts in front of the line for an EFI kernel.
 Each generated script sets `BOOTIF=01-${net0/mac:hexhyp}` and `ip=dhcp` so
 stock Ubuntu `/init` (via `configure_networking`) knows which NIC iPXE
 chainloaded on and will DHCP on the correct port. `boot=slagworks` is the
