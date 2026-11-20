@@ -22,8 +22,8 @@ import (
 // filters overlap. The model restates the documented filter semantics
 // independently: machine OR op when both are set, otherwise equality;
 // machine_name on the payload; sources IN; min level and above, in any
-// case (an unknown level is an error, not a missing filter); ts >= since,
-// or with SinceOrReceived ts >= since OR global_received_at >= since;
+// case (an unknown level is an error, not a missing filter); ts >= since
+// OR global_received_at >= since;
 // id > last_seen; id ASC; LIMIT. Pagination is exercised by re-querying
 // with LastSeenID = last id returned until a short page, and must
 // reproduce the unpaged result.
@@ -80,7 +80,7 @@ func modelQuery(rows []modelRow, f logstore.QueryFilter) ([]int64, bool) {
 		if f.MinLevel != "" && levelRank[string(e.Level)] < minR {
 			continue
 		}
-		if !f.Since.IsZero() && e.TS.Before(f.Since) && (!f.SinceOrReceived || r.received.Before(f.Since)) {
+		if !f.Since.IsZero() && e.TS.Before(f.Since) && r.received.Before(f.Since) {
 			continue
 		}
 		if r.id <= f.LastSeenID {
@@ -167,7 +167,6 @@ func TestQuery_Property_MatchesModel(t *testing.T) {
 			}
 			if rapid.Bool().Draw(rt, "fSince") {
 				f.Since = base.Add(time.Duration(rapid.IntRange(-6, 6).Draw(rt, "sinceOff")) * time.Minute)
-				f.SinceOrReceived = rapid.Bool().Draw(rt, "fSinceOrReceived")
 			}
 			want, valid := modelQuery(rows, f)
 			if vErr := logstore.ValidateMinLevel(f.MinLevel); (vErr == nil) != valid {
