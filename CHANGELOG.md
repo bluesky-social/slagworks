@@ -1,5 +1,70 @@
 # Changelog
 
+## [0.7.0](https://github.com/bluesky-social/slagworks/compare/v0.6.2...v0.7.0) (2026-11-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **slagctl:** bind the cached token to the server it was issued for
+
+### Bug Fixes
+
+* **agent:** keep MAILADDR in the generated mdadm.conf so mdmonitor starts ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **api:** ping idle operator streams so proxy idle timeouts do not close them ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **api:** push a snapshot to every site when an image row is deleted ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **api:** refuse unmodeled PDU/AMT transports with 422, not 503 ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **api:** say a locked machine is locked when refusing a deploy or commission ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **boot:** renew the deploy environment's DHCP lease instead of letting its address expire ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **clientauth:** refresh a token issued without expires_in once its JWT exp passes ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+* **cli:** stop device login at once when the provider's device page is missing ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+* **commission:** carry the phone-home latch to global's op row and hold it there ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **dhcp:** give each site worker its own share of the fabric dynamic ranges ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **dhcp:** stop the initrd's own DHCP from rewinding ops to dhcp_ack ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **global:** bound the database pool so an outbox replay queues instead of exhausting connections ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **httpboot:** boot the image the site's image rows pin, not a directory by name ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **imagepull:** keep one image version per boot across a re-pin ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **imagepull:** keep syncing other images after one image fails ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **imagepull:** keep the previous image when a tarball lacks a boot file ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **imagepull:** let a duplicate tar entry replace the earlier file ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **imagepull:** refuse an image named after the bootloader in the images dir ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **imagepull:** remove temp files left by an image sync killed mid-pull ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **imagepull:** sync an image whose sha256 is pinned in upper case ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **netbox:** clear a replaced module's serial and firmware when the new part reports none ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **netbox:** keep location-scoped prefixes out of a whole-site config ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **netbox:** keep one module bay per PSU and DIMM when firmware repeats a name ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **netbox:** leave a refused asset tag unchanged instead of failing the commission ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **netbox:** recognise the BMC's own row by MAC on commission, adopt a MAC-less ipmi row ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **site:** report READY=1 once site services run, not once global accepts the hello ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **site:** skip a malformed fabric DNS server instead of failing service start ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **site:** start without the fabric pool when the snapshot DHCP config does not parse ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **slagctl:** answer a 401 with one token refresh, and name the fix when that fails ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+* **slagctl:** bind the cached token to the server it was issued for ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+* **slagctl:** give up on an identity provider that does not answer instead of hanging ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+* **slagctl:** name `slagctl auth login` when auth whoami finds no session ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+* **slagctl:** pass doctor's token check when a refresh token is cached ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+* **slagctl:** read operator stream messages up to ws.MaxMessageBytes ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+* **slagctl:** redial the watch TUI console stream after a drop ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+* **slagctl:** refresh the access token during long watches instead of reusing the startup one ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+* **slagctl:** resume machine logs -f from last_seen_id after a dropped stream ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+* **slagctl:** show the pinned sha256 in image list ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **snapshot:** count a rebuild that fails in Build under error_netbox ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **snapshot:** leave out an ambiguous OOB reservation instead of failing the site ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **snapshot:** prefer an interface's own address over a shared-role one ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **snapshot:** serve the fabric DHCP subnet from the prefix holding the ephemeral pool ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **store:** refuse power and BMC ops during another op with an actionable message ([a7077dc](https://github.com/bluesky-social/slagworks/commit/a7077dcc5314d25cb480cc673f117ce769ba3245))
+* **worker:** complete the deploy op a phone-home names, not the machine's first ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **worker:** do not answer 410 for an unknown op while disconnected from global ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **worker:** do not revive a deploy the agent failed while its claim was out ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **worker:** download snapshot images off the WebSocket read loop ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **worker:** keep the reconnect backoff climbing when global drops each accepted hello ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **worker:** retry a boot-image download that failed to fetch ([a6cfbd7](https://github.com/bluesky-social/slagworks/commit/a6cfbd72063056cdede48c8ef97d55ac795cc9b6))
+* **worker:** stop actuating boots from an op set frozen by a long disconnect ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **worker:** stop workers dropped together from redialing in lockstep ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **ws:** answer a cold hello from the cache when its rebuild wait fails ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **ws:** detect a silent site-worker link at both ends ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **ws:** handle a worker's dhcp_lease observations in arrival order ([b6e4b12](https://github.com/bluesky-social/slagworks/commit/b6e4b12015a91a371a31b402d46b862ae4b29ef7))
+* **ws:** say why a worker connection was refused, on both ends ([1599af0](https://github.com/bluesky-social/slagworks/commit/1599af07070f3068f3e9a782ea42aea3349ad97d))
+
 ## [0.6.2](https://github.com/bluesky-social/slagworks/compare/v0.6.1...v0.6.2) (2026-11-20)
 
 
