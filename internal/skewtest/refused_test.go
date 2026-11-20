@@ -122,12 +122,9 @@ func TestRefusedNewWorker(t *testing.T) {
 	if !strings.Contains(res.workerLog, "401") {
 		t.Errorf("the worker's log does not carry the status global refused it with:\n%s", warnLines(res.workerLog))
 	}
-	t.Run("log_carries_the_reason", func(t *testing.T) {
-		// The worker's dial error keeps only the handshake status and drops
-		// the response body, which holds the reason global gave.
-		t.Skip("a refused worker logs a bare 401 without the reason global sent")
-		if !strings.Contains(res.workerLog, "token") && !strings.Contains(res.workerLog, "upgrade") {
-			t.Errorf("the worker's log does not say what global refused or what to do about it:\n%s", warnLines(res.workerLog))
-		}
-	})
+	// The dial error carries the body of the refused handshake, which holds
+	// the reason global gave.
+	if !strings.Contains(res.workerLog, "token") && !strings.Contains(res.workerLog, "upgrade") {
+		t.Errorf("the worker's log does not say what global refused or what to do about it:\n%s", warnLines(res.workerLog))
+	}
 }

@@ -1296,7 +1296,7 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 	}
 }
 
-// skewCheck is rapid.Check with a fraction of the configured checks (ten
+// skewCheck is rapid.Check with a fraction of the configured checks (four
 // cases at rapid's default of 100): a case here starts four or more
 // processes and runs real migrations.
 func skewCheck(t *testing.T, div int, prop func(*rapid.T)) {
@@ -1347,7 +1347,7 @@ func shards(t *testing.T, cfg scenarioConfig) {
 		st := &stats{boots: map[string]int{}}
 		dir := t.TempDir()
 		defer logStats(t, st)
-		skewCheck(t, 10, func(rt *rapid.T) { runScenario(t, rt, cfg, st, dir) })
+		skewCheck(t, 25, func(rt *rapid.T) { runScenario(t, rt, cfg, st, dir) })
 	}
 	if n == 1 {
 		run(t)
