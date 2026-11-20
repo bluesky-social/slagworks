@@ -18,8 +18,8 @@
 //     profile schema (required keys, JSON types, enums) only with
 //     ValidateAttributeData
 //   - module bay position <= 30, name <= 64 (names are NOT unique per
-//     device: NetBox's constraint includes the nullable parent module, and
-//     production holds devices with two same-named bays)
+//     device: NetBox's constraint includes the nullable parent module, so
+//     a device can hold two same-named bays)
 //   - a module's bay must exist on the module's device and be unoccupied;
 //     module status must be a NetBox choice; serial <= 50
 //   - a cable's terminations must exist, be distinct, be uncabled, and not

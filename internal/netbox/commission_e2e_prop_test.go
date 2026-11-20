@@ -18,7 +18,10 @@ package netbox_test
 // built from the hardware model (never from production helpers):
 //
 //   - a report the agent can produce commissions without error, possibly
-//     after the at-least-once outbox replay of a run a fault interrupted;
+//     after the at-least-once outbox replay of a run a fault interrupted.
+//     The one documented refusal is modelled: a row named "ipmi" carrying
+//     a MAC the BMC no longer reports is a modeling conflict, and the
+//     commission succeeds once the operator removes that row;
 //   - the device converges to the report: serial, asset tag and custom
 //     fields; one unprotected interface per reported NIC, by name, with its
 //     MAC primary; operator rows (lag, virtual, mgmt) untouched; one module
@@ -30,18 +33,12 @@ package netbox_test
 //     a cable on another device is removed only when the commissioned
 //     device's own interface is deleted because its NIC left the report.
 //
-// Known-finding gates: COMMISSION_E2E_SKIP is a comma-separated list of
-// generator features to disable so the search continues past a finding:
-// dup-bay (two components sharing a bay name), asset-tag (a programmed
-// asset tag two hosts share), bmc-row (BMC rows that are MAC-less, named
-// ipmi0, or whose BMC MAC changes; and faults on runs with a BMC),
-// stale-serial (the module-serial oracle: a part with no readable serial
-// keeps its predecessor's). Unset,
-// it defaults to defaultSkip; "none" enables everything. exotic-dimm
-// (LPDDR5/RAM memory classes outside the NetBox Memory profile enum) is a
-// coverage feature, not a finding: real NetBox accepts them. The
-// regression tests for each finding are in commission_e2e_regress_test.go
-// (build tag commissionfindings).
+// The memory classes outside the NetBox Memory profile enum (LPDDR5, RAM)
+// are generated on purpose: NetBox does not validate a module type's
+// attribute_data against the profile's enum, so they must commission.
+//
+// The default check count keeps the package fast; raise it with
+// -rapid.checks for a deep run.
 
 import (
 	"context"
@@ -49,7 +46,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -101,7 +97,7 @@ type machine struct {
 	CPUs                                                    []string
 	GPUs                                                    [][2]string // vendor, device
 	// junk records which identity values the generator drew from the
-	// placeholder pool, so the oracle never consults production's list.
+	// placeholder pool, so the oracle never consults the code under test.
 	junk map[string]bool
 }
 
@@ -191,31 +187,13 @@ type features struct {
 	dupBay, exoticDIMM, bmc, bmcMACChange, assetTag, lldp, operatorRows bool
 }
 
-// defaultSkip gates the findings still open on main, so the discovery
-// suite stays green; set COMMISSION_E2E_SKIP=none to search with every
-// feature enabled.
-const defaultSkip = "dup-bay,asset-tag,bmc-row,stale-serial"
-
-func skipped(key string) bool {
-	list, set := os.LookupEnv("COMMISSION_E2E_SKIP")
-	if !set {
-		list = defaultSkip
-	}
-	for _, k := range strings.Split(list, ",") {
-		if strings.TrimSpace(k) == key {
-			return true
-		}
-	}
-	return false
-}
-
 func drawFeatures(t *rapid.T) features {
 	f := features{
-		dupBay:       rapid.IntRange(0, 3).Draw(t, "f.dupBay") == 0 && !skipped("dup-bay"),
-		exoticDIMM:   rapid.IntRange(0, 4).Draw(t, "f.exoticDIMM") == 0 && !skipped("exotic-dimm"),
+		dupBay:       rapid.IntRange(0, 3).Draw(t, "f.dupBay") == 0,
+		exoticDIMM:   rapid.IntRange(0, 4).Draw(t, "f.exoticDIMM") == 0,
 		bmc:          rapid.Bool().Draw(t, "f.bmc"),
-		bmcMACChange: rapid.Bool().Draw(t, "f.bmcMACChange") && !skipped("bmc-row"),
-		assetTag:     rapid.IntRange(0, 3).Draw(t, "f.assetTag") == 0 && !skipped("asset-tag"),
+		bmcMACChange: rapid.Bool().Draw(t, "f.bmcMACChange"),
+		assetTag:     rapid.IntRange(0, 3).Draw(t, "f.assetTag") == 0,
 		lldp:         rapid.Bool().Draw(t, "f.lldp"),
 		operatorRows: rapid.Bool().Draw(t, "f.operatorRows"),
 	}
@@ -447,7 +425,7 @@ type stats struct {
 	renames, creates, deletes, cablesMade, cablesCascade     int
 	moduleCreates, moduleDeletes, bayDeletes, mutations      int
 	maxNICs, maxModules                                      int
-	bmcRuns, lldpRuns, switchRuns, pagedRuns, errsOnValid    int
+	bmcRuns, lldpRuns, switchRuns, pagedRuns, bmcConflicts   int
 	nicsMoved, boardSwaps, idempotentWrites, idempotentCases int
 }
 
@@ -570,14 +548,11 @@ func (w *world) seedRows(t *rapid.T, i, dev int, m *machine, role string) {
 		}
 	}
 	if m.BMC != nil && rapid.Bool().Draw(t, label+".ipmi") {
-		shapes := []string{"ipmi"}
-		if !skipped("bmc-row") {
-			// ipmi0 carrying the BMC MAC is the production operator shape;
-			// a MAC-less ipmi row is what an operator models before the
-			// MAC is known (and what a failed MAC write leaves).
-			shapes = append(shapes, "ipmi0", "ipmi-nomac")
-		}
-		switch rapid.SampledFrom(shapes).Draw(t, label+".ipmishape") {
+		// ipmi0 carrying the BMC MAC is the shape the hardware docs tell
+		// operators to model; a MAC-less ipmi row is what an operator
+		// models before the MAC is known (and what a failed MAC write
+		// leaves).
+		switch rapid.SampledFrom([]string{"ipmi", "ipmi0", "ipmi-nomac"}).Draw(t, label+".ipmishape") {
 		case "ipmi":
 			prot = append(prot, w.nb.AddIface(dev, "ipmi", "1000base-t", true, m.BMC.MAC))
 		case "ipmi0":
@@ -962,7 +937,7 @@ func (w *world) checkDevice(t *rapid.T, i int, before, after globalSnap) {
 			if found == 0 {
 				t.Fatalf("device %d: no management interface carries BMC MAC %s; rows %+v", dev, m.BMC.MAC, ds.Ifaces)
 			}
-			if found > 1 && !skipped("bmc-row") {
+			if found > 1 {
 				t.Fatalf("device %d: %d management interfaces carry BMC MAC %s (a duplicate BMC row); rows %v", dev, found, m.BMC.MAC, ifaceNames(ds))
 			}
 		}
@@ -999,32 +974,30 @@ func (w *world) checkDevice(t *rapid.T, i int, before, after globalSnap) {
 	}
 	// Module serials are the reported ones: a component with no readable
 	// serial must not keep the serial of the part it replaced.
-	if !skipped("stale-serial") {
-		wantSerials := map[string][]string{}
-		for _, d := range m.DIMMs {
-			if d.MB > 0 {
-				wantSerials["Memory"] = append(wantSerials["Memory"], d.Serial)
-			}
+	wantSerials := map[string][]string{}
+	for _, d := range m.DIMMs {
+		if d.MB > 0 {
+			wantSerials["Memory"] = append(wantSerials["Memory"], d.Serial)
 		}
-		for _, d := range m.Disks {
-			wantSerials["Hard disk"] = append(wantSerials["Hard disk"], d.Serial)
+	}
+	for _, d := range m.Disks {
+		wantSerials["Hard disk"] = append(wantSerials["Hard disk"], d.Serial)
+	}
+	for _, p := range m.PSUs {
+		wantSerials["Power supply"] = append(wantSerials["Power supply"], p.Serial)
+	}
+	gotSerials := map[string][]string{}
+	for _, mod := range ds.Modules {
+		if _, tracked := wantSerials[mod.Profile]; tracked {
+			gotSerials[mod.Profile] = append(gotSerials[mod.Profile], mod.Serial)
 		}
-		for _, p := range m.PSUs {
-			wantSerials["Power supply"] = append(wantSerials["Power supply"], p.Serial)
-		}
-		gotSerials := map[string][]string{}
-		for _, mod := range ds.Modules {
-			if _, tracked := wantSerials[mod.Profile]; tracked {
-				gotSerials[mod.Profile] = append(gotSerials[mod.Profile], mod.Serial)
-			}
-		}
-		for prof, ws := range wantSerials {
-			gs := gotSerials[prof]
-			sort.Strings(ws)
-			sort.Strings(gs)
-			if fmt.Sprint(ws) != fmt.Sprint(gs) {
-				t.Fatalf("device %d: %s module serials %q, want %q", dev, prof, gs, ws)
-			}
+	}
+	for prof, ws := range wantSerials {
+		gs := gotSerials[prof]
+		sort.Strings(ws)
+		sort.Strings(gs)
+		if fmt.Sprint(ws) != fmt.Sprint(gs) {
+			t.Fatalf("device %d: %s module serials %q, want %q", dev, prof, gs, ws)
 		}
 	}
 }
@@ -1408,9 +1381,9 @@ func (s *stats) String() string {
 	defer s.mu.Unlock()
 	return fmt.Sprintf("coverage: cases=%d commissions=%d faultsHit=%d faultErrs=%d replays=%d ifaceCreates=%d ifaceRenames=%d ifaceDeletes=%d "+
 		"cablesMade=%d cablesCascadeDeleted=%d moduleCreates=%d moduleDeletes=%d bayDeletes=%d mutations=%d maxNICs=%d maxModules=%d "+
-		"bmcRuns=%d lldpRuns=%d switchRuns=%d pagedCases=%d nicsMoved=%d boardSwaps=%d idempotentReplays=%d writesOnReplay=%d",
+		"bmcRuns=%d bmcConflicts=%d lldpRuns=%d switchRuns=%d pagedCases=%d nicsMoved=%d boardSwaps=%d idempotentReplays=%d writesOnReplay=%d",
 		s.cases, s.commissions, s.faults, s.faultErrs, s.replays, s.creates, s.renames, s.deletes, s.cablesMade, s.cablesCascade,
-		s.moduleCreates, s.moduleDeletes, s.bayDeletes, s.mutations, s.maxNICs, s.maxModules, s.bmcRuns, s.lldpRuns, s.switchRuns,
+		s.moduleCreates, s.moduleDeletes, s.bayDeletes, s.mutations, s.maxNICs, s.maxModules, s.bmcRuns, s.bmcConflicts, s.lldpRuns, s.switchRuns,
 		s.pagedRuns, s.nicsMoved, s.boardSwaps, s.idempotentCases, s.idempotentWrites)
 }
 
@@ -1437,7 +1410,7 @@ func (w *world) runCommission(t *rapid.T, i, step int, trace []string) {
 	})
 
 	// Optional fault on one write, then the outbox replay.
-	if rapid.IntRange(0, 2).Draw(t, fmt.Sprintf("step%d.fault", step)) == 0 && (m.BMC == nil || !skipped("bmc-row")) {
+	if rapid.IntRange(0, 2).Draw(t, fmt.Sprintf("step%d.fault", step)) == 0 {
 		// Draw outside the lock: a Draw can abort the case during shrinking.
 		at := rapid.IntRange(1, 16).Draw(t, fmt.Sprintf("step%d.faultAt", step))
 		status := rapid.SampledFrom([]int{500, 502, 503}).Draw(t, fmt.Sprintf("step%d.faultStatus", step))
@@ -1460,6 +1433,37 @@ func (w *world) runCommission(t *rapid.T, i, step int, trace []string) {
 		}
 		w.stats.add(func(s *stats) { s.replays++ })
 	}
+	// The documented refusal: the BMC reports a MAC no management row
+	// carries while a row named "ipmi" holds another MAC. Commission must
+	// fail loudly rather than re-MAC, rename or delete that row, and must
+	// succeed once the operator removes it.
+	if row, conflict := w.bmcConflict(i, w.snapshot()); conflict {
+		err := w.commission(i, report)
+		if err == nil || !strings.Contains(err.Error(), "modeling conflict") {
+			t.Fatalf("commission of host%d with a changed BMC MAC %s and a stale ipmi row: err = %v, want a modeling-conflict error\ntrace: %v", i+1, m.BMC.MAC, err, trace)
+		}
+		held := w.snapshot()
+		for _, s := range held.Devices[dev].Ifaces {
+			if s.ID == row.ID && (s.Name != row.Name || s.MAC != row.MAC || s.AllMACs != row.AllMACs) {
+				t.Fatalf("commission of host%d refused the stale ipmi row but changed it: %+v -> %+v", i+1, row, s)
+			}
+			if s.ID != row.ID && s.Mgmt && strings.Contains(s.AllMACs, upper(m.BMC.MAC)) {
+				t.Fatalf("commission of host%d refused the stale ipmi row but created management row %q for the new BMC MAC", i+1, s.Name)
+			}
+		}
+		if err := w.client.Delete(context.Background(), fmt.Sprintf("/api/dcim/interfaces/%d/", row.ID)); err != nil {
+			t.Fatalf("operator delete of the stale ipmi row: %v", err)
+		}
+		var kept []int
+		for _, id := range w.protRows[dev] {
+			if id != row.ID {
+				kept = append(kept, id)
+			}
+		}
+		w.protRows[dev] = kept
+		before = w.snapshot()
+		w.stats.add(func(s *stats) { s.bmcConflicts++ })
+	}
 	w.nb.Lock()
 	w.nb.Rejected = nil
 	w.nb.Writes = nil
@@ -1468,7 +1472,6 @@ func (w *world) runCommission(t *rapid.T, i, step int, trace []string) {
 		w.nb.Lock()
 		rej := append([]string(nil), w.nb.Rejected...)
 		w.nb.Unlock()
-		w.stats.add(func(s *stats) { s.errsOnValid++ })
 		t.Fatalf("commission of host%d (device %d) failed on a report the agent can produce: %v\nNetBox 400s: %v\ntrace: %v\nNICs: %v\nreport: %s", i+1, dev, err, rej, trace, nicList(m), report)
 	}
 	w.nb.Lock()
@@ -1511,6 +1514,30 @@ func (w *world) runCommission(t *rapid.T, i, step int, trace []string) {
 	if !snapEqual(after, again) {
 		t.Fatalf("replaying host%d's report changed NetBox:\n%s\ntrace: %v", i+1, snapDiff(after, again), trace)
 	}
+}
+
+// bmcConflict reports the stale row when host i's report must be refused:
+// a server whose BMC MAC no management row carries, while a row named
+// "ipmi" (the name the BMC reconciles under) carries some other MAC.
+func (w *world) bmcConflict(i int, snap globalSnap) (ifSnap, bool) {
+	m := w.hw[i]
+	if w.roles[i] != "server" || m.BMC == nil || m.BMC.MAC == "" {
+		return ifSnap{}, false
+	}
+	var stale *ifSnap
+	rows := snap.Devices[w.servers[i]].Ifaces
+	for k, s := range rows {
+		if s.Mgmt && strings.Contains(s.AllMACs, upper(m.BMC.MAC)) {
+			return ifSnap{}, false
+		}
+		if s.Name == "ipmi" && s.AllMACs != "" {
+			stale = &rows[k]
+		}
+	}
+	if stale == nil {
+		return ifSnap{}, false
+	}
+	return *stale, true
 }
 
 func snapEqual(a, b globalSnap) bool { return snapDiff(a, b) == "" }

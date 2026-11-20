@@ -1,13 +1,14 @@
-//go:build integration && commissionfindings
+//go:build integration
 
 package netboxtest_test
 
-// Real-NetBox twins of the commission write-back regressions in
-// internal/netbox/commission_e2e_regress_test.go. They run the production
-// write path (CommissionToSync -> SyncCommissionData) against a NetBox
-// container, so the NetBox behaviour each finding depends on (module bay
-// occupancy, device asset_tag uniqueness, interface name uniqueness) is
-// NetBox's own, not a fake's.
+// Commission write-back cases whose outcome depends on a constraint NetBox
+// itself enforces: module bay occupancy, device asset_tag uniqueness,
+// interface name uniqueness. They run CommissionToSync and
+// SyncCommissionData against a NetBox container, so that behaviour is
+// NetBox's own and not a fake's; the property test in
+// internal/netbox/commission_e2e_prop_test.go models the same constraints
+// in internal/netbox/nbfake.
 
 import (
 	"context"
@@ -58,8 +59,8 @@ func listBaysModules(t *testing.T, env *netboxtest.Env, devID int) bayModule {
 	return out
 }
 
-// Two PSUs whose DMI type 39 Location is the same placeholder (the shape
-// five Dell R640 hosts and one mini PC report in production).
+// Two PSUs whose DMI type 39 Location is the same placeholder, as some
+// server firmware reports.
 const twoPSUsSameLocation = `{"system":{"serial_number":"S-PSU-DUP"},
  "psus":[{"location":"Not Specified","model":"PWR SPLY,750W","serial":"PSU-A","max_watts":750},
          {"location":"Not Specified","model":"PWR SPLY,750W","serial":"PSU-B","max_watts":750}]}`
@@ -125,8 +126,8 @@ func TestCommissionWriteback(t *testing.T) {
 	t.Run("OperatorIPMI0RowIsNotDuplicated", func(t *testing.T) { writebackOperatorIPMI0RowIsNotDuplicated(t, env) })
 }
 
-// The production operator shape for a BMC row is "ipmi0", mgmt_only, with
-// the BMC MAC. Commission must recognise it as the BMC row and not add a
+// The hardware docs have operators model the BMC row as "ipmi0", mgmt_only,
+// with the BMC MAC. Commission must recognise it as the BMC row and not add a
 // second management interface ("ipmi") carrying the same MAC.
 func writebackOperatorIPMI0RowIsNotDuplicated(t *testing.T, env *netboxtest.Env) {
 	ctx := context.Background()
