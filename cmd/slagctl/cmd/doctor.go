@@ -38,8 +38,12 @@ func newDoctorCmd() *cobra.Command {
 	return cmd
 }
 
-// slagctlTokenCheck verifies that an OIDC token is cached and not expired.
-// Missing or expired token = Fail with a "run slagctl auth login" nudge.
+// slagctlTokenCheck verifies that an OIDC session is cached and usable
+// without a new login. An expired access token passes when a refresh token
+// is cached, because every command renews it silently; whether that refresh
+// still works is what slagctlConnectivityCheck shows. A missing token, or an
+// expired one with no refresh token, is a Fail with a "run slagctl auth
+// login" nudge.
 func slagctlTokenCheck() clicheck.Check {
 	return clicheck.Check{
 		Name: "slagctl-token",
@@ -48,13 +52,17 @@ func slagctlTokenCheck() clicheck.Check {
 			if err != nil {
 				return clicheck.Fail("run `slagctl auth login`")
 			}
+			who := id.PreferredUsername
+			if who == "" {
+				who = id.Subject
+			}
 			if id.Expiry > 0 && time.Now().After(time.Unix(id.Expiry, 0)) {
-				return clicheck.Fail("token expired — run `slagctl auth login`")
+				if !id.Refreshable {
+					return clicheck.Fail("token expired — run `slagctl auth login`")
+				}
+				return clicheck.OK(who + " (access token expired; refreshes on next use)")
 			}
-			if id.PreferredUsername != "" {
-				return clicheck.OK(id.PreferredUsername)
-			}
-			return clicheck.OK(id.Subject)
+			return clicheck.OK(who)
 		},
 	}
 }

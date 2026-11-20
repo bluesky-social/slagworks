@@ -10,13 +10,18 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// Identity is the human-readable subset of a token's claims, for `auth whoami`.
+// Identity is the human-readable subset of a token's claims, for `auth whoami`
+// and `doctor`.
 type Identity struct {
 	Subject           string   `json:"sub"`
 	Email             string   `json:"email"`
 	PreferredUsername string   `json:"preferred_username"`
 	Groups            []string `json:"groups"`
 	Expiry            int64    `json:"exp"`
+	// Refreshable is not a claim: CachedIdentity sets it when the cache also
+	// holds a refresh token, so an expired access token is renewed on next
+	// use instead of needing a new login.
+	Refreshable bool `json:"-"`
 }
 
 // DecodeIdentity extracts claims from a JWT access token WITHOUT verifying its
@@ -79,7 +84,9 @@ func WriteCachedToken(ctx context.Context, cfg Config, tok *oauth2.Token) error 
 }
 
 // CachedIdentity loads the cached access token and decodes its identity for
-// `whoami`, without triggering a login. Returns an error if there's no cache.
+// `whoami` and `doctor`, without triggering a login or a refresh, and reports
+// whether the cache holds a refresh token. Returns an error if there's no
+// cache.
 func CachedIdentity(cfg Config) (*Identity, error) {
 	path, err := defaultTokenPath(cfg.AppName)
 	if err != nil {
@@ -89,5 +96,10 @@ func CachedIdentity(cfg Config) (*Identity, error) {
 	if err != nil {
 		return nil, fmt.Errorf("not logged in (no cached token): %w", err)
 	}
-	return DecodeIdentity(tok.AccessToken)
+	id, err := DecodeIdentity(tok.AccessToken)
+	if err != nil {
+		return nil, err
+	}
+	id.Refreshable = tok.RefreshToken != ""
+	return id, nil
 }

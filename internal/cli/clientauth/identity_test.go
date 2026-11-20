@@ -92,9 +92,10 @@ func TestCachedTokenLifecycle(t *testing.T) {
 
 	access := mkJWT(t, map[string]any{"sub": "abc123", "preferred_username": "operator@example.com"})
 	if err := WriteCachedToken(context.Background(), cfg, &oauth2.Token{
-		AccessToken: access,
-		Expiry:      time.Now().Add(time.Hour),
-		TokenType:   "Bearer",
+		AccessToken:  access,
+		RefreshToken: "rt",
+		Expiry:       time.Now().Add(time.Hour),
+		TokenType:    "Bearer",
 	}); err != nil {
 		t.Fatalf("WriteCachedToken: %v", err)
 	}
@@ -108,6 +109,9 @@ func TestCachedTokenLifecycle(t *testing.T) {
 	}
 	if id.PreferredUsername != "operator@example.com" {
 		t.Errorf("preferred_username = %q", id.PreferredUsername)
+	}
+	if !id.Refreshable {
+		t.Error("Refreshable = false, want true: the cache holds a refresh token")
 	}
 
 	// A valid cached token needs no discovery, so the unresolvable issuer is

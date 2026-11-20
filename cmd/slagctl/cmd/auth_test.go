@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -125,6 +126,126 @@ func TestDoctorChecksWithoutToken(t *testing.T) {
 			t.Errorf("check %q status = %q, want %q", f.Name, f.Status, want[f.Name])
 		}
 	}
+}
+
+// TestDoctorTokenCheckWithExpiredAccessToken: access tokens are short-lived
+// (ten minutes is typical) and every command renews an expired one with the
+// cached refresh token, without a login. doctor must judge the session the
+// same way: an expired access token with a refresh token is a healthy
+// session, so the token check passes and doctor exits 0; only a session with
+// no refresh token needs `slagctl auth login`.
+func TestDoctorTokenCheckWithExpiredAccessToken(t *testing.T) {
+	jwt := func(exp time.Time) string {
+		claims, err := json.Marshal(map[string]any{"sub": "abc123", "preferred_username": "operator", "exp": exp.Unix()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".sig"
+	}
+	type finding struct{ Name, Status, Detail string }
+	runDoctor := func(t *testing.T, refreshToken string) (map[string]finding, error) {
+		t.Helper()
+		configHome, _ := isolateUserDirs(t)
+		t.Setenv("SLAGWORKS_API", "")
+
+		// The identity provider grants a fresh access token for the cached
+		// refresh token; the API accepts only that fresh token.
+		fresh := jwt(time.Now().Add(10 * time.Minute))
+		var idp *httptest.Server
+		idp = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/.well-known/openid-configuration":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"issuer": idp.URL, "authorization_endpoint": idp.URL + "/authorize",
+					"token_endpoint": idp.URL + "/token", "jwks_uri": idp.URL + "/jwks",
+				})
+			case "/token":
+				if r.FormValue("grant_type") != "refresh_token" || r.FormValue("refresh_token") != refreshToken {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"access_token": fresh, "refresh_token": "rt-next", "token_type": "Bearer", "expires_in": 600,
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(idp.Close)
+		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer "+fresh {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"ready":true,"version":"test"}`))
+		}))
+		t.Cleanup(api.Close)
+
+		expired := time.Now().Add(-time.Minute)
+		dir := filepath.Join(configHome, "slagctl")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for name, v := range map[string]any{
+			"config.json": map[string]string{"api": api.URL, "oidc_issuer": idp.URL, "oidc_client_id": "slagctl"},
+			"token.json": map[string]any{
+				"access_token": jwt(expired), "refresh_token": refreshToken,
+				"token_type": "Bearer", "expiry": expired.Format(time.RFC3339),
+			},
+		} {
+			b, err := json.Marshal(v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, name), b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Not execCmd: an injected client skips resolving the saved server,
+		// which the connectivity check needs.
+		root := cmd.NewRootCmd()
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetErr(new(bytes.Buffer))
+		root.SetArgs([]string{"doctor", "--json"})
+		runErr := root.Execute()
+		var findings []finding
+		if err := json.Unmarshal(out.Bytes(), &findings); err != nil {
+			t.Fatalf("doctor --json output did not parse: %v\n%s", err, out.String())
+		}
+		byName := map[string]finding{}
+		for _, f := range findings {
+			byName[f.Name] = f
+		}
+		return byName, runErr
+	}
+
+	t.Run("refresh token cached", func(t *testing.T) {
+		got, err := runDoctor(t, "rt-cached")
+		if f := got["slagctl-token"]; f.Status != "ok" || !strings.Contains(f.Detail, "operator") {
+			t.Errorf("slagctl-token = %+v, want ok naming the operator: the refresh token keeps the session alive", f)
+		}
+		// The connectivity check refreshes for real, proving the session works.
+		if f := got["slagctl-connectivity"]; f.Status != "ok" {
+			t.Errorf("slagctl-connectivity = %+v, want ok", f)
+		}
+		if err != nil {
+			t.Errorf("doctor exited with %v, want success", err)
+		}
+	})
+
+	t.Run("no refresh token", func(t *testing.T) {
+		got, err := runDoctor(t, "")
+		if f := got["slagctl-token"]; f.Status != "fail" || !strings.Contains(f.Detail, "slagctl auth login") {
+			t.Errorf("slagctl-token = %+v, want fail naming `slagctl auth login`", f)
+		}
+		if code, _ := clierr.Code(err); code != 1 {
+			t.Errorf("doctor exit code %d (err %v), want 1", code, err)
+		}
+	})
 }
 
 // roundTripFunc adapts a function to http.RoundTripper.
