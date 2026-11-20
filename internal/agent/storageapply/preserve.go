@@ -44,17 +44,25 @@ import (
 // with WipeStaleState's later `mdadm --stop --scan` on the destructive path.
 //
 // The array is assembled to the SAME /dev/mdN the plan will use (via
-// storage.MDDevMap). Before the targeted assemble, a single global
-// `mdadm --stop --scan` releases every auto-assembled array: the deploy
+// storage.MDDevMap). Before the targeted assemble, the members are released
+// from any array the deploy environment assembled them into: the deploy
 // initrd commonly auto-assembles a preserve array under a scan-chosen name
 // (e.g. /dev/md127), which holds the members open and would make the targeted
 // assemble fail EBUSY on a perfectly valid array. Stopping is non-destructive
 // (the plan's whole premise), so releasing auto-assembly here does NOT violate
 // the verify-before-wipe ordering -- it deletes no member data, it just frees
-// the members so we can assemble them at the name the plan will mount. It is
-// idempotent with WipeStaleState's later `mdadm --stop --scan` on the
-// destructive path.
-func PreflightPreserve(ctx *agent.Context, layout storage.Layout) error {
+// the members so we can assemble them at the name the plan will mount. Which
+// arrays it stops depends on the flag:
+//
+//   - With destructive, a global `mdadm --stop --scan`: --destructive
+//     authorizes stopping every assembled array, WipeStaleState repeats it
+//     right after, and it also frees a /dev/mdN node the plan uses from an
+//     array outside the layout.
+//   - Without it, StopAutoAssembly, which stops only arrays made of preserve
+//     members: a deploy without --destructive leaves md state outside the
+//     layout as found (CheckMDNamesFree has already refused an array outside
+//     the layout at a node the plan uses).
+func PreflightPreserve(ctx *agent.Context, layout storage.Layout, destructive bool) error {
 	preserveNames := preserveDeviceNames(layout)
 	if len(preserveNames) == 0 {
 		return nil
@@ -91,10 +99,14 @@ func PreflightPreserve(ctx *agent.Context, layout storage.Layout) error {
 	}
 
 	// Release any initrd auto-assembly (arrays held open under a scan-chosen
-	// md name) so each targeted assemble below can claim its members. Global
-	// and non-destructive; see the function doc.
-	if err := ctx.Exec.Run("mdadm", "--stop", "--scan"); err != nil {
-		ctx.Log.Info("preserve preflight: mdadm --stop --scan (no auto-assembled arrays is fine)", "err", err)
+	// md name) so each targeted assemble below can claim its members.
+	// Non-destructive; see the function doc for which arrays each path stops.
+	if destructive {
+		if err := ctx.Exec.Run("mdadm", "--stop", "--scan"); err != nil {
+			ctx.Log.Info("preserve preflight: mdadm --stop --scan (no auto-assembled arrays is fine)", "err", err)
+		}
+	} else if err := StopAutoAssembly(ctx, layout); err != nil {
+		return err
 	}
 
 	for _, name := range preserveNames {
@@ -220,24 +232,129 @@ func HasPreserveDevices(layout storage.Layout) bool {
 	return len(preserveDeviceNames(layout)) > 0
 }
 
-// StopAutoAssembly tears down any md array udev may have (re-)assembled,
-// so planPreserve's targeted `mdadm --assemble /dev/mdN` can claim its
-// members instead of failing EBUSY on an array the kernel grabbed under a
-// scan-chosen name (e.g. /dev/md127). It is the same non-destructive
-// `--stop --scan` + residual-container teardown WipeStaleState runs, but
-// callable on its own for the NON-destructive preserve path, where
-// WipeStaleState never runs: PreflightPreserve verifies then stops the
-// array, and in the window before the command loop reaches planPreserve
-// the stock `mdadm --incremental` udev rules can re-assemble it from the
-// member `change` uevents the stop emitted. Running this immediately
-// before the command loop closes that window. Stopping is non-destructive
-// (no member data is touched), so it is safe to run regardless of
-// --destructive and idempotent with WipeStaleState's own stop.
-func StopAutoAssembly(ctx *agent.Context) {
-	if err := ctx.Exec.Run("mdadm", "--stop", "--scan"); err != nil {
-		ctx.Log.Info("preserve: mdadm --stop --scan before assemble (no arrays is fine)", "err", err)
+// StopAutoAssembly stops every md array the deploy environment assembled
+// from preserve members, so a targeted `mdadm --assemble /dev/mdN` can
+// claim them instead of failing EBUSY on an array the kernel grabbed under a
+// scan-chosen name (e.g. /dev/md127). It is the NON-destructive path's
+// release, where WipeStaleState never runs: PreflightPreserve calls it before
+// its own assemble, and deploy runs it again immediately before the command
+// loop, because after PreflightPreserve verifies and stops the array the
+// stock `mdadm --incremental` udev rules can re-assemble it from the member
+// `change` uevents the stop emitted, before planPreserve reaches it.
+//
+// It stops an array only when every device the array holds is a preserve
+// member, and it holds at least one. A deploy without --destructive leaves
+// md state outside the layout as found, so an array on disks outside the
+// layout stays assembled. An array that holds a preserve member together
+// with any other device is not stopped either: it is refused, before any
+// array is stopped, because the preserve array cannot be assembled while
+// that array holds its member. Member arrays are stopped before
+// external-metadata containers, which stop only once their subarrays are
+// gone. Stopping is non-destructive (no member data is touched).
+func StopAutoAssembly(ctx *agent.Context, layout storage.Layout) error {
+	devs, err := assembledArrays(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot tell which md arrays hold the preserve members: %w; refusing to continue. "+
+			"Check the deploy environment from a --recovery boot (cat /proc/mdstat), then redeploy", err)
 	}
-	StopResidualMDDevices(ctx)
+	if len(devs) == 0 {
+		return nil
+	}
+	members, err := preserveMemberKNames(ctx, layout)
+	if err != nil {
+		return fmt.Errorf("%w; check the storage script's member names against lsblk on the target", err)
+	}
+	var stop []mdDevice
+	var mixed []string
+	for _, d := range devs {
+		if madeOfPreserveMembers(d, members) {
+			stop = append(stop, d)
+			continue
+		}
+		var held, others []string
+		for _, m := range d.members() {
+			if dev, ok := members[m]; ok {
+				held = append(held, fmt.Sprintf("preserve %q member %s", dev, m))
+			} else {
+				others = append(others, m)
+			}
+		}
+		if len(held) > 0 {
+			mixed = append(mixed, fmt.Sprintf("/dev/%s (%s) holds %s together with %s",
+				d.name, d.status, strings.Join(held, ", "), strings.Join(others, ", ")))
+		}
+	}
+	if len(mixed) > 0 {
+		return fmt.Errorf("%s, which the preserve device does not list; a deploy without --destructive stops only "+
+			"arrays made entirely of preserve members, and the preserve array cannot be assembled while another "+
+			"array holds its member. List every member of that array in the preserve device (mdadm --detail <array> "+
+			"names them), or redeploy with --destructive, which stops every assembled array",
+			strings.Join(mixed, "; "))
+	}
+	stopArray := func(d mdDevice) error {
+		md := "/dev/" + d.name
+		if err := ctx.Exec.Run("mdadm", "--stop", md); err != nil {
+			return fmt.Errorf("mdadm --stop %s (%s), assembled from preserve members, failed: %w; "+
+				"the preserve array cannot be assembled at its planned node while it is active. "+
+				"Check what holds it from a --recovery boot (cat /proc/mdstat, lsblk), then redeploy", md, d.status, err)
+		}
+		ctx.Log.Info("preserve: stopped an array assembled from preserve members", "md", md, "status", d.status)
+		return nil
+	}
+	for _, d := range stop {
+		if !d.isContainer {
+			if err := stopArray(d); err != nil {
+				return err
+			}
+		}
+	}
+	for _, d := range stop {
+		if d.isContainer {
+			if err := stopArray(d); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// preserveMemberKNames maps the kernel name of every preserve member, the
+// name /proc/mdstat lists it by, to its preserve device. The kernel resolves
+// the member, so a /dev/disk/by-* spelling maps to the device it names, and
+// KNAME is the kernel's own name even for a device-mapper member, whose lsblk
+// NAME is its mapper name. A member the kernel cannot resolve is an error.
+func preserveMemberKNames(ctx *agent.Context, layout storage.Layout) (map[string]string, error) {
+	knames := map[string]string{}
+	for _, name := range preserveDeviceNames(layout) {
+		for _, member := range layout.Devices[name].Members {
+			path := resolveMemberPath(member)
+			out, err := ctx.Exec.Output("lsblk", "-ndo", "KNAME", path)
+			if err != nil {
+				return nil, fmt.Errorf("preserve %q: cannot tell the kernel name of member %q: lsblk %s: %w", name, member, path, err)
+			}
+			kname := strings.TrimSpace(out)
+			if kname == "" || strings.ContainsAny(kname, " \t\n") {
+				return nil, fmt.Errorf("preserve %q: cannot tell the kernel name of member %q: lsblk %s printed %q", name, member, path, out)
+			}
+			knames[kname] = name
+		}
+	}
+	return knames, nil
+}
+
+// madeOfPreserveMembers reports whether an assembled array holds at least
+// one device and every device it holds is a preserve member.
+func madeOfPreserveMembers(d mdDevice, members map[string]string) bool {
+	held := d.members()
+	if len(held) == 0 {
+		return false
+	}
+	for _, m := range held {
+		if _, ok := members[m]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // diskTypeNames is the set of bare kernel names of every disk-type layout
