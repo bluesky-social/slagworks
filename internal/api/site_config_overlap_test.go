@@ -78,7 +78,7 @@ func waitForLockWaiters(t *testing.T, db *gorm.DB, n int64, done <-chan struct{}
 func TestSiteConfigOverlapCheckIsAtomicWithWrite(t *testing.T) {
 	db := testpg.DB(t, store.Migrate)
 	st := store.New(db)
-	if err := st.CreateSiteConfig(&model.SiteConfig{Slug: "c1", NetBoxSite: "s2", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}, nil); err != nil {
+	if err := st.CreateSiteConfig(&model.SiteConfig{Slug: "c1", NetBoxSite: "s2", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}); err != nil {
 		t.Fatal(err)
 	}
 	s := &Server{store: st, netbox: overlapNetBox(t), log: slog.Default(), echo: echo.New()}

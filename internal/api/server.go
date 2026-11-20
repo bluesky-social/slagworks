@@ -2336,7 +2336,7 @@ func (s *Server) createSiteConfig(c *echo.Context) error {
 	if herr != nil {
 		return herr
 	}
-	if err := s.store.CreateSiteConfig(&cfg, admit); err != nil {
+	if err := s.store.CreateSiteConfigIfAdmitted(&cfg, admit); err != nil {
 		if herr, ok := errors.AsType[*echo.HTTPError](err); ok {
 			return herr
 		}
@@ -2497,7 +2497,7 @@ func (s *Server) updateSiteConfig(c *echo.Context) error {
 	if herr != nil {
 		return herr
 	}
-	if err := s.store.UpdateSiteConfig(cfg, admit); err != nil {
+	if err := s.store.UpdateSiteConfigIfAdmitted(cfg, admit); err != nil {
 		if errors.Is(err, store.ErrSiteConfigNotFound) {
 			return echo.NewHTTPError(http.StatusNotFound, "site_config not found")
 		}

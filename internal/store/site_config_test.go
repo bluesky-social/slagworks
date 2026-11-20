@@ -12,7 +12,7 @@ import (
 func TestCreateSiteConfig(t *testing.T) {
 	st := testStore(t)
 	cfg := &model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}
-	if err := st.CreateSiteConfig(cfg, nil); err != nil {
+	if err := st.CreateSiteConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -20,7 +20,7 @@ func TestCreateSiteConfig(t *testing.T) {
 func TestGetSiteConfig(t *testing.T) {
 	st := testStore(t)
 	cfg := &model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}
-	if err := st.CreateSiteConfig(cfg, nil); err != nil {
+	if err := st.CreateSiteConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
 	got, err := st.GetSiteConfig("pop3")
@@ -45,10 +45,10 @@ func TestSiteConfigLocationRoundTrip(t *testing.T) {
 		Slug: "pop1", NetBoxSite: "pop1",
 		EphemeralPoolStart: "10.1.0.100", EphemeralPoolEnd: "10.1.0.200",
 	}
-	if err := st.CreateSiteConfig(loc, nil); err != nil {
+	if err := st.CreateSiteConfig(loc); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CreateSiteConfig(whole, nil); err != nil {
+	if err := st.CreateSiteConfig(whole); err != nil {
 		t.Fatal(err)
 	}
 	gotLoc, err := st.GetSiteConfig("pop2-old-cage")
@@ -72,7 +72,7 @@ func TestSiteConfigLocationRoundTrip(t *testing.T) {
 
 func TestBumpSiteSnapshotMeta(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateSiteConfig(&model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}, nil); err != nil {
+	if err := st.CreateSiteConfig(&model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}); err != nil {
 		t.Fatal(err)
 	}
 	first, err := st.BumpSiteSnapshotMeta("pop3", "hash-a")
@@ -110,7 +110,7 @@ func TestBumpSiteSnapshotMetaSurvivesRecreate(t *testing.T) {
 	mk := func() *model.SiteConfig {
 		return &model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}
 	}
-	if err := st.CreateSiteConfig(mk(), nil); err != nil {
+	if err := st.CreateSiteConfig(mk()); err != nil {
 		t.Fatal(err)
 	}
 	var last int64
@@ -128,7 +128,7 @@ func TestBumpSiteSnapshotMetaSurvivesRecreate(t *testing.T) {
 	if err := st.DeleteSiteConfig("pop3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CreateSiteConfig(mk(), nil); err != nil {
+	if err := st.CreateSiteConfig(mk()); err != nil {
 		t.Fatal(err)
 	}
 	seq, err := st.BumpSiteSnapshotMeta("pop3", "hash-d")
@@ -155,7 +155,7 @@ func TestBumpSiteSnapshotMetaSurvivesRecreate(t *testing.T) {
 // SeqNum it already holds, so the operator's change never reaches the site.
 func TestUpdateSiteConfigKeepsSnapshotMetaBumpedAfterLoad(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateSiteConfig(&model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}, nil); err != nil {
+	if err := st.CreateSiteConfig(&model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := st.GetSiteConfig("pop3") // the PATCH handler loads the row
@@ -166,7 +166,7 @@ func TestUpdateSiteConfigKeepsSnapshotMetaBumpedAfterLoad(t *testing.T) {
 		t.Fatalf("bump: seq=%d err=%v", seq, err)
 	}
 	loaded.Promiscuous = true
-	if err := st.UpdateSiteConfig(loaded, nil); err != nil {
+	if err := st.UpdateSiteConfig(loaded); err != nil {
 		t.Fatal(err)
 	}
 
@@ -188,7 +188,7 @@ func TestUpdateSiteConfigKeepsSnapshotMetaBumpedAfterLoad(t *testing.T) {
 // inserting the stale copy.
 func TestUpdateSiteConfigDoesNotRecreateDeletedRow(t *testing.T) {
 	st := testStore(t)
-	if err := st.CreateSiteConfig(&model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}, nil); err != nil {
+	if err := st.CreateSiteConfig(&model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := st.GetSiteConfig("pop3")
@@ -199,7 +199,7 @@ func TestUpdateSiteConfigDoesNotRecreateDeletedRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded.Promiscuous = true
-	if err := st.UpdateSiteConfig(loaded, nil); !errors.Is(err, ErrSiteConfigNotFound) {
+	if err := st.UpdateSiteConfig(loaded); !errors.Is(err, ErrSiteConfigNotFound) {
 		t.Errorf("UpdateSiteConfig of a deleted row: got %v, want ErrSiteConfigNotFound", err)
 	}
 	if _, err := st.GetSiteConfig("pop3"); !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -212,7 +212,7 @@ func TestListSiteConfigs(t *testing.T) {
 	for _, slug := range []string{"pop3", "pop4", "pop5"} {
 		if err := st.CreateSiteConfig(&model.SiteConfig{
 			Slug: slug, NetBoxSite: slug, EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200",
-		}, nil); err != nil {
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -232,7 +232,7 @@ func TestSiteConfigAdmitRunsAgainstCurrentRowsAndRefusalWritesNothing(t *testing
 	mk := func(slug, site string) *model.SiteConfig {
 		return &model.SiteConfig{Slug: slug, NetBoxSite: site, EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}
 	}
-	if err := st.CreateSiteConfig(mk("c1", "s1"), nil); err != nil {
+	if err := st.CreateSiteConfig(mk("c1", "s1")); err != nil {
 		t.Fatal(err)
 	}
 	errRefused := errors.New("refused")
@@ -245,7 +245,7 @@ func TestSiteConfigAdmitRunsAgainstCurrentRowsAndRefusalWritesNothing(t *testing
 		return errRefused
 	}
 
-	if err := st.CreateSiteConfig(mk("c2", "s1"), refuse); !errors.Is(err, errRefused) {
+	if err := st.CreateSiteConfigIfAdmitted(mk("c2", "s1"), refuse); !errors.Is(err, errRefused) {
 		t.Fatalf("refused create: err=%v, want the admit error", err)
 	}
 	if len(saw) != 1 || saw[0] != "c1@s1" {
@@ -255,7 +255,7 @@ func TestSiteConfigAdmitRunsAgainstCurrentRowsAndRefusalWritesNothing(t *testing
 		t.Errorf("refused create left a row (GetSiteConfig err=%v)", err)
 	}
 
-	if err := st.UpdateSiteConfig(mk("c1", "s2"), refuse); !errors.Is(err, errRefused) {
+	if err := st.UpdateSiteConfigIfAdmitted(mk("c1", "s2"), refuse); !errors.Is(err, errRefused) {
 		t.Fatalf("refused update: err=%v, want the admit error", err)
 	}
 	got, err := st.GetSiteConfig("c1")
@@ -267,10 +267,10 @@ func TestSiteConfigAdmitRunsAgainstCurrentRowsAndRefusalWritesNothing(t *testing
 	}
 
 	admit := func([]model.SiteConfig) error { return nil }
-	if err := st.UpdateSiteConfig(mk("c1", "s2"), admit); err != nil {
+	if err := st.UpdateSiteConfigIfAdmitted(mk("c1", "s2"), admit); err != nil {
 		t.Fatalf("admitted update: %v", err)
 	}
-	if err := st.CreateSiteConfig(mk("c2", "s1"), admit); err != nil {
+	if err := st.CreateSiteConfigIfAdmitted(mk("c2", "s1"), admit); err != nil {
 		t.Fatalf("admitted create: %v", err)
 	}
 }

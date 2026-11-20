@@ -463,7 +463,7 @@ func mirrorBijection(t *testing.T, allowSerialChange bool) {
 	st := store.New(db)
 	if err := st.CreateSiteConfig(&model.SiteConfig{
 		Slug: propSite, NetBoxSite: propSite, EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200",
-	}, nil); err != nil {
+	}); err != nil {
 		t.Fatalf("create site config: %v", err)
 	}
 	rapid.Check(t, func(rt *rapid.T) {

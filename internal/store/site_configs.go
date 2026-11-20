@@ -52,11 +52,18 @@ func (s *Store) writeSiteConfig(admit SiteConfigAdmit, write func(tx *gorm.DB) e
 	})
 }
 
-// CreateSiteConfig inserts a SiteConfig after validating the payload. admit,
-// when non-nil, is asked whether the config may be created; the question and
-// the insert are atomic with respect to every other site-config create and
-// update (see writeSiteConfig).
-func (s *Store) CreateSiteConfig(cfg *model.SiteConfig, admit SiteConfigAdmit) error {
+// CreateSiteConfig inserts a SiteConfig after validating the payload, with
+// no admission check. A caller with an invariant across configs to keep (the
+// API's overlap rule) uses CreateSiteConfigIfAdmitted.
+func (s *Store) CreateSiteConfig(cfg *model.SiteConfig) error {
+	return s.CreateSiteConfigIfAdmitted(cfg, nil)
+}
+
+// CreateSiteConfigIfAdmitted inserts a SiteConfig after validating the
+// payload. admit, when non-nil, is asked whether the config may be created;
+// the question and the insert are atomic with respect to every other
+// site-config create and update (see writeSiteConfig).
+func (s *Store) CreateSiteConfigIfAdmitted(cfg *model.SiteConfig, admit SiteConfigAdmit) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -119,12 +126,17 @@ var ErrSiteConfigNotFound = errors.New("site config not found")
 // last_snapshot_hash: writing the loaded values back would undo a bump
 // committed in between, and the next rebuild would reissue a SeqNum the
 // worker has already applied and will drop. Returns ErrSiteConfigNotFound
-// when no row matches, so a config deleted mid-request stays deleted.
-//
+// when no row matches, so a config deleted mid-request stays deleted. It
+// makes no admission check; see UpdateSiteConfigIfAdmitted.
+func (s *Store) UpdateSiteConfig(cfg *model.SiteConfig) error {
+	return s.UpdateSiteConfigIfAdmitted(cfg, nil)
+}
+
+// UpdateSiteConfigIfAdmitted is UpdateSiteConfig with an admission check:
 // admit, when non-nil, is asked whether the config may be written as cfg has
 // it; the question and the write are atomic with respect to every other
 // site-config create and update (see writeSiteConfig).
-func (s *Store) UpdateSiteConfig(cfg *model.SiteConfig, admit SiteConfigAdmit) error {
+func (s *Store) UpdateSiteConfigIfAdmitted(cfg *model.SiteConfig, admit SiteConfigAdmit) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}

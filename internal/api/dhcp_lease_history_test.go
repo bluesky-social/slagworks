@@ -54,7 +54,7 @@ func TestDHCPLeaseHistorySiteConfig_EmptyHistory(t *testing.T) {
 	if err := st.CreateSiteConfig(&model.SiteConfig{
 		Slug: "pop1", NetBoxSite: "pop1",
 		EphemeralPoolStart: "10.0.0.10", EphemeralPoolEnd: "10.0.0.250",
-	}, nil); err != nil {
+	}); err != nil {
 		t.Fatalf("seed site_config: %v", err)
 	}
 	srv := httptest.NewServer(s.echo)
@@ -86,7 +86,7 @@ func TestDHCPLeaseHistorySiteConfig_FiltersAndDefaultOrder(t *testing.T) {
 	if err := st.CreateSiteConfig(&model.SiteConfig{
 		Slug: "pop1", NetBoxSite: "pop1",
 		EphemeralPoolStart: "10.0.0.10", EphemeralPoolEnd: "10.0.0.250",
-	}, nil); err != nil {
+	}); err != nil {
 		t.Fatalf("seed site_config: %v", err)
 	}
 
@@ -141,7 +141,7 @@ func TestDHCPLeaseHistorySiteConfig_InvalidLimitBadRequest(t *testing.T) {
 	if err := st.CreateSiteConfig(&model.SiteConfig{
 		Slug: "pop1", NetBoxSite: "pop1",
 		EphemeralPoolStart: "10.0.0.10", EphemeralPoolEnd: "10.0.0.250",
-	}, nil); err != nil {
+	}); err != nil {
 		t.Fatalf("seed site_config: %v", err)
 	}
 	srv := httptest.NewServer(s.echo)

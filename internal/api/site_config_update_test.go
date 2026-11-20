@@ -20,7 +20,7 @@ import (
 // PATCH reports 404 rather than re-creating the row or claiming success.
 func TestUpdateSiteConfigDeletedMidRequestReturns404(t *testing.T) {
 	st := store.New(testpg.DB(t, store.Migrate))
-	if err := st.CreateSiteConfig(&model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}, nil); err != nil {
+	if err := st.CreateSiteConfig(&model.SiteConfig{Slug: "pop3", NetBoxSite: "pop3", EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200"}); err != nil {
 		t.Fatal(err)
 	}
 

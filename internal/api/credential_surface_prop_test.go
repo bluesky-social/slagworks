@@ -366,7 +366,7 @@ func (h *surfaceHarness) reset(rt *rapid.T, m *surfaceModel) {
 		}
 	}
 	if err := h.st.CreateSiteConfig(&model.SiteConfig{Slug: "popa", NetBoxSite: "popa",
-		EphemeralPoolStart: "10.0.0.10", EphemeralPoolEnd: "10.0.0.250"}, nil); err != nil {
+		EphemeralPoolStart: "10.0.0.10", EphemeralPoolEnd: "10.0.0.250"}); err != nil {
 		rt.Fatalf("seed site_config: %v", err)
 	}
 	if err := h.st.CreateSSHKey(&model.SSHKey{PublicKey: "ssh-ed25519 AAAAC3Nz test"}); err != nil {

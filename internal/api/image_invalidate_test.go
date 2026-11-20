@@ -87,7 +87,7 @@ func TestImageUpsert_InvalidatesAllSites(t *testing.T) {
 			NetBoxSite:         slug,
 			EphemeralPoolStart: "10.0.0.10",
 			EphemeralPoolEnd:   "10.0.0.250",
-		}, nil); err != nil {
+		}); err != nil {
 			t.Fatalf("seed site_config %s: %v", slug, err)
 		}
 	}
@@ -146,7 +146,7 @@ func TestImageWrite_RejectsInvalidName(t *testing.T) {
 		NetBoxSite:         "pop-a",
 		EphemeralPoolStart: "10.0.0.10",
 		EphemeralPoolEnd:   "10.0.0.250",
-	}, nil); err != nil {
+	}); err != nil {
 		t.Fatalf("seed site_config: %v", err)
 	}
 	inv := &fakeInvalidator{}

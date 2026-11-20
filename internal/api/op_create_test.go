@@ -60,7 +60,7 @@ func opFlowServer(t *testing.T) (*Server, *store.Store, *fakeInvalidator, *fakeO
 		NetBoxSite:         "pop-a",
 		EphemeralPoolStart: "10.0.0.10",
 		EphemeralPoolEnd:   "10.0.0.250",
-	}, nil); err != nil {
+	}); err != nil {
 		t.Fatalf("seed site_config: %v", err)
 	}
 	s := &Server{store: st, invalidator: inv, opPublisher: pub, log: slog.Default(), echo: echo.New()}
@@ -325,7 +325,7 @@ func TestCreateOperation_PreflightRejection(t *testing.T) {
 		NetBoxSite:         "pop-pf",
 		EphemeralPoolStart: "10.0.0.10",
 		EphemeralPoolEnd:   "10.0.0.250",
-	}, nil); err != nil {
+	}); err != nil {
 		t.Fatalf("seed site_config: %v", err)
 	}
 	if err := st.CreateSSHKey(&model.SSHKey{PublicKey: "ssh-ed25519 AAAAC3Nz test"}); err != nil {
