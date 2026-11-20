@@ -758,7 +758,13 @@ version switches back without a download. Idempotent; on a site worker
 it runs on the cache's background syncer, one sync at a time. A
 download that receives no data for a minute (response headers included)
 is abandoned with an error, so a connection that stops delivering
-cannot hold the syncer. The image
+cannot hold the syncer. It holds an exclusive `flock` on
+`imagesDir` for its whole run, so syncs of one dir from different
+processes (the worker and `slagctl image sync --dir`) also run one at a
+time, and while holding it removes the `.image-download-*`,
+`.image-extract-*`, `.image-link-*` and `.image-old-*` temp entries left
+by a sync whose process exited partway (the kernel drops a dead holder's
+lock; its cleanup never ran). The image
 name becomes the link it replaces, so it skips, with an error, a name
 that fails `model.ValidateImageName` before downloading anything, and
 still syncs the other images; the API applies the same rule when the

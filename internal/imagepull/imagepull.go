@@ -27,6 +27,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bluesky-social/slagworks/internal/model"
@@ -91,7 +92,21 @@ func Installed(imagesDir, name string) (string, bool) {
 // the same way, since part of it becomes a directory name (no such digest
 // could match a download anyway). A skipped image does not stop the other
 // images from syncing; it is reported in the returned error.
+//
+// SyncImages holds an exclusive lock on imagesDir for its whole run (see
+// lockImagesDir), so syncs of one dir run one at a time across processes,
+// and first removes the temp files that a sync which exited mid-pull left
+// behind (see removeLeftovers). If the lock cannot be taken it logs a warning
+// and syncs without removing anything.
 func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Image) error {
+	if unlock, err := lockImagesDir(log, imagesDir); err != nil {
+		log.Warn("could not lock the images dir: syncing without removing leftovers of interrupted syncs, and without waiting for any other sync of this dir; check that the dir exists and its filesystem supports flock",
+			"dir", imagesDir, "err", err)
+	} else {
+		defer unlock()
+		removeLeftovers(log, imagesDir)
+	}
+
 	var refused []error
 	for name, img := range images {
 		if err := model.ValidateImageName(name); err != nil {
@@ -147,7 +162,7 @@ func isDir(path string) bool {
 // over, so it is moved aside first and removed once the link is in place.
 func activate(imagesDir, name, version string) error {
 	link := filepath.Join(imagesDir, name)
-	tmp := filepath.Join(imagesDir, ".image-link-"+name)
+	tmp := filepath.Join(imagesDir, linkTempPrefix+name)
 	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("clearing stale link %s: %w", tmp, err)
 	}
@@ -156,7 +171,7 @@ func activate(imagesDir, name, version string) error {
 	}
 	var aside string
 	if fi, err := os.Lstat(link); err == nil && fi.Mode()&fs.ModeSymlink == 0 {
-		if aside, err = os.MkdirTemp(imagesDir, ".image-old-*"); err != nil {
+		if aside, err = os.MkdirTemp(imagesDir, oldTempPrefix+"*"); err != nil {
 			_ = os.Remove(tmp)
 			return fmt.Errorf("creating temp dir: %w", err)
 		}
@@ -196,7 +211,7 @@ func prune(log *slog.Logger, imagesDir, name string, keep []string) {
 		if !strings.HasPrefix(old, name+"@") || slices.Contains(keep, old) {
 			continue
 		}
-		aside, err := os.MkdirTemp(imagesDir, ".image-old-*")
+		aside, err := os.MkdirTemp(imagesDir, oldTempPrefix+"*")
 		if err != nil {
 			log.Warn("could not remove old image version", "name", name, "version", old, "err", err)
 			continue
@@ -219,8 +234,9 @@ func (e *fetchError) Error() string { return e.err.Error() }
 func (e *fetchError) Unwrap() error { return e.err }
 
 // Retryable reports whether a SyncImages error includes a failure to fetch
-// an image from its URL (a transport error, a response other than 200, or a
-// body cut short), which the same URL may not repeat on a later attempt.
+// an image from its URL (a transport error, a response other than 200, a
+// body cut short, or a stalled download), which the same URL may not repeat
+// on a later attempt.
 // Every other failure repeats until the image row or the host changes:
 // bytes that do not match the row's digest or do not extract (a later
 // attempt downloads the same bytes again), a refused name, or an error
@@ -243,6 +259,93 @@ func (rr *readErrRecorder) Read(p []byte) (int, error) {
 		rr.err = err
 	}
 	return n, err
+}
+
+// Temp names a sync creates directly in imagesDir and removes itself when
+// it runs to the end: pullImage downloads into a file named
+// downloadTempPrefix+"*" and extracts into a dir named extractTempPrefix+"*",
+// activate builds the new link at linkTempPrefix+<name>, and activate and
+// prune move what they delete into a dir named oldTempPrefix+"*" first. No
+// image link or version directory can start with any of them:
+// model.ValidateImageName requires a leading letter or digit.
+const (
+	downloadTempPrefix = ".image-download-"
+	extractTempPrefix  = ".image-extract-"
+	linkTempPrefix     = ".image-link-"
+	oldTempPrefix      = ".image-old-"
+)
+
+var tempPrefixes = []string{downloadTempPrefix, extractTempPrefix, linkTempPrefix, oldTempPrefix}
+
+// msgWaitingForLock is logged when SyncImages finds another sync holding the
+// images dir lock and starts waiting for it.
+const msgWaitingForLock = "another image sync is running in this images dir; waiting for it to finish"
+
+// lockImagesDir takes an exclusive flock on imagesDir itself and returns the
+// function that releases it. A sync in another process (the site worker and
+// `slagctl image sync --dir` pointed at the same dir) or another goroutine
+// holding it makes this wait, after logging msgWaitingForLock. The kernel
+// releases the lock when its holder exits, however it exits, so a temp file
+// seen while holding the lock belongs to a sync that is no longer running.
+// The directory itself is locked rather than a lock file in it so the sync
+// adds nothing to the dir the site worker serves.
+//
+// It waits rather than returning "busy" because the site worker retries
+// only a sync that failed to fetch, so a skipped sync could leave it serving
+// a stale image until its next snapshot change. The wait is normally no
+// longer than the download the worker would otherwise run itself (both sides
+// pull the same rows), accepting that a holder that hangs or is stopped (an
+// operator's slagctl image sync) also holds up the worker's image sync, and
+// the commission and deploy ops waiting on it, until it exits.
+func lockImagesDir(log *slog.Logger, imagesDir string) (unlock func(), err error) {
+	d, err := os.Open(imagesDir)
+	if err != nil {
+		return nil, err
+	}
+	fd := int(d.Fd())
+	err = flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) {
+		log.Info(msgWaitingForLock, "dir", imagesDir)
+		err = flock(fd, syscall.LOCK_EX)
+	}
+	if err != nil {
+		_ = d.Close()
+		return nil, fmt.Errorf("flock %s: %w", imagesDir, err)
+	}
+	// Closing the only descriptor for the open file releases the lock.
+	return func() { _ = d.Close() }, nil
+}
+
+func flock(fd, how int) error {
+	for {
+		if err := syscall.Flock(fd, how); !errors.Is(err, syscall.EINTR) {
+			return err
+		}
+	}
+}
+
+// removeLeftovers removes the temp entries (tempPrefixes) a sync left in
+// imagesDir when its process exited before it removed them itself
+// (SIGKILL, OOM, or a SIGTERM that ends the process mid-pull). The caller
+// holds the images dir lock, so none of them belongs to a running sync. A
+// failure is logged and does not stop the sync.
+func removeLeftovers(log *slog.Logger, imagesDir string) {
+	entries, err := os.ReadDir(imagesDir)
+	if err != nil {
+		log.Warn("could not list the images dir to remove leftovers of interrupted syncs", "dir", imagesDir, "err", err)
+		return
+	}
+	for _, e := range entries {
+		if !slices.ContainsFunc(tempPrefixes, func(p string) bool { return strings.HasPrefix(e.Name(), p) }) {
+			continue
+		}
+		p := filepath.Join(imagesDir, e.Name())
+		if err := os.RemoveAll(p); err != nil {
+			log.Warn("could not remove a leftover of an interrupted image sync; remove it by hand", "path", p, "err", err)
+			continue
+		}
+		log.Info("removed a leftover of an interrupted image sync", "path", p)
+	}
 }
 
 // minProgressBytes is the smallest download that emits progress snapshots
@@ -311,7 +414,7 @@ func (s *stallReader) Read(p []byte) (int, error) {
 // targetDir, which must not exist yet. On any failure targetDir is not
 // created.
 func pullImage(log *slog.Logger, img *model.Image, targetDir string) error {
-	tmpFile, err := os.CreateTemp(filepath.Dir(targetDir), ".image-download-*")
+	tmpFile, err := os.CreateTemp(filepath.Dir(targetDir), downloadTempPrefix+"*")
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
 	}
@@ -367,7 +470,7 @@ func pullImage(log *slog.Logger, img *model.Image, targetDir string) error {
 		return fmt.Errorf("sha256 mismatch: got %s, want %s", got, img.SHA256)
 	}
 
-	tmpDir, err := os.MkdirTemp(filepath.Dir(targetDir), ".image-extract-*")
+	tmpDir, err := os.MkdirTemp(filepath.Dir(targetDir), extractTempPrefix+"*")
 	if err != nil {
 		return fmt.Errorf("creating temp dir: %w", err)
 	}

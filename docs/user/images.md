@@ -225,20 +225,24 @@ notes below). Each version of the image lives in its own directory,
 `<images_dir>/noble-pxe` is a symlink to the current one. The
 algorithm:
 
-1. If `<images_dir>/noble-pxe` links to the row's version directory and
+1. Take an exclusive `flock` on `<images_dir>`, waiting for any other
+   sync of that dir to finish, then remove the temp entries
+   (`.image-download-*`, `.image-extract-*`, `.image-link-*`,
+   `.image-old-*`) that a sync killed partway through left behind.
+2. If `<images_dir>/noble-pxe` links to the row's version directory and
    that directory exists, do nothing — the image is up to date.
-2. If the version directory is already on disk (a rollback to the
-   version the link was last switched away from), skip to step 5.
-3. Otherwise, HTTP-GET the row's `URL` into a temp file, stream through
+3. If the version directory is already on disk (a rollback to the
+   version the link was last switched away from), skip to step 6.
+4. Otherwise, HTTP-GET the row's `URL` into a temp file, stream through
    `sha256.New()` while writing, verify the hash matches the row (fail
    the whole sync if not).
-4. Extract the tarball into a temp dir and rename the extracted
+5. Extract the tarball into a temp dir and rename the extracted
    directory to `<images_dir>/noble-pxe@<sha16>`.
-5. Switch the link: create a new symlink and rename it over
+6. Switch the link: create a new symlink and rename it over
    `<images_dir>/noble-pxe`. The rename replaces the link in one step,
    so a request never finds the image missing. A failure before this
    step leaves the link, and the version it names, as they were.
-6. Delete version directories other than the new one and the one the
+7. Delete version directories other than the new one and the one the
    link named before the switch.
 
 Why the previous version stays: each boot script names the version
@@ -297,7 +301,10 @@ Notes:
   agent fetches `vmlinuz` + `initrd-local` for a UEFI ESP.
 - `slagctl image sync --dir <path>` runs the same code path
   interactively — useful for verifying an image works on a specific
-  host or for pre-populating a new site worker.
+  host or for pre-populating a new site worker. Pointed at a running
+  worker's images dir, it logs that another sync is running and waits
+  for the worker's sync to finish (and the worker likewise waits for
+  it), so the two never interleave.
 
 Diagnosing "the new image didn't roll": compare
 `readlink <images_dir>/noble-pxe` (`noble-pxe@<sha16>`) against the

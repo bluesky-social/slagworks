@@ -556,6 +556,140 @@ func TestSyncImages_RollbackSurvivesDownloadFailure(t *testing.T) {
 	}
 }
 
+// TestSyncImages_RemovesLeftoversOfAnInterruptedSync: pullImage downloads
+// into <imagesDir>/.image-download-* and extracts into
+// <imagesDir>/.image-extract-*, and removes both with defers. A process that
+// exits mid-sync (SIGKILL, OOM, or a SIGTERM from systemctl restart or the
+// unit's start timeout, since nothing waits for the sync to unwind) runs no
+// defers, so the partial tarball (up to the full image size) and the partial
+// tree stay in imagesDir. Before the fix nothing ever removed them: each
+// interrupted sync leaked another copy onto the worker's data filesystem.
+// The next sync must remove them.
+func TestSyncImages_RemovesLeftoversOfAnInterruptedSync(t *testing.T) {
+	tarPath, sha := buildTestTarball(t, "noble-pxe")
+	tarData, _ := os.ReadFile(tarPath)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(tarData)
+	}))
+	defer srv.Close()
+
+	imagesDir := t.TempDir()
+	leftovers := []string{
+		filepath.Join(imagesDir, ".image-download-1234567"),
+		filepath.Join(imagesDir, ".image-extract-7654321", "noble-pxe", "root.squashfs"),
+		filepath.Join(imagesDir, ".image-old-2468", "noble-pxe@0123456789abcdef", "vmlinuz"),
+		filepath.Join(imagesDir, ".image-link-jammy-pxe"),
+	}
+	for _, p := range leftovers {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := SyncImages(slog.Default(), imagesDir, map[string]*model.Image{
+		"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: srv.URL + "/noble-pxe.tar.gz"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, p := range []string{leftovers[0], filepath.Join(imagesDir, ".image-extract-7654321"),
+		filepath.Join(imagesDir, ".image-old-2468"), leftovers[3]} {
+		if _, err := os.Lstat(p); !os.IsNotExist(err) {
+			t.Errorf("%s, left by an interrupted sync, is still in the images dir after a successful sync (stat err %v)", filepath.Base(p), err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); err != nil {
+		t.Errorf("noble-pxe was not synced: %v", err)
+	}
+}
+
+// TestSyncImages_WaitsForAnotherSyncInTheSameDir: the leftover sweep must
+// only remove temp files whose sync is dead, never those of a sync still
+// running in another process (slagctl image sync --dir pointed at a running
+// worker's images dir). Removing a live sync's extract dir mid-extraction
+// would let it rename a tree missing its earlier files into place and stamp
+// it with a valid marker. SyncImages therefore holds an exclusive flock on
+// imagesDir, which the kernel releases when the holder exits however it
+// exits, and waits for it before sweeping or downloading. The test holds the
+// lock the way a live sync in another process would.
+func TestSyncImages_WaitsForAnotherSyncInTheSameDir(t *testing.T) {
+	tarPath, sha := buildTestTarball(t, "noble-pxe")
+	tarData, _ := os.ReadFile(tarPath)
+	var downloads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads.Add(1)
+		w.Write(tarData)
+	}))
+	defer srv.Close()
+
+	imagesDir := t.TempDir()
+	unlock, err := lockImagesDir(slog.Default(), imagesDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := filepath.Join(imagesDir, ".image-extract-1111111", "noble-pxe", "vmlinuz")
+	if err := os.MkdirAll(filepath.Dir(live), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(live, []byte("being extracted"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	waiting := make(chan struct{})
+	logger := slog.New(&signalHandler{captureHandler: &captureHandler{}, msg: msgWaitingForLock, ch: waiting})
+	done := make(chan error, 1)
+	go func() {
+		done <- SyncImages(logger, imagesDir, map[string]*model.Image{
+			"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: srv.URL + "/noble-pxe.tar.gz"},
+		})
+	}()
+
+	select {
+	case <-waiting:
+	case err := <-done:
+		unlock()
+		t.Fatalf("SyncImages returned %v while another sync held the images dir lock, want it to wait", err)
+	}
+	// SyncImages has found the lock held and is blocked on it: nothing it
+	// does before acquiring the lock touches the dir or the network.
+	if _, err := os.Stat(live); err != nil {
+		t.Errorf("a waiting SyncImages removed the running sync's temp file: %v", err)
+	}
+	if n := downloads.Load(); n != 0 {
+		t.Errorf("a waiting SyncImages downloaded %d times before the running sync finished", n)
+	}
+
+	unlock() // the other sync exits; its temp file is now a leftover
+	if err := <-done; err != nil {
+		t.Fatalf("SyncImages after the lock was released: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(imagesDir, ".image-extract-1111111")); !os.IsNotExist(err) {
+		t.Errorf("leftover of the finished sync not removed once the lock was free (stat err %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); err != nil {
+		t.Errorf("noble-pxe was not synced after the lock was released: %v", err)
+	}
+}
+
+// signalHandler closes ch the first time a record with message msg is
+// handled, so a test can wait for a specific log line without sleeping.
+type signalHandler struct {
+	*captureHandler
+	msg  string
+	ch   chan struct{}
+	once sync.Once
+}
+
+func (h *signalHandler) Handle(ctx context.Context, r slog.Record) error {
+	if r.Message == h.msg {
+		h.once.Do(func() { close(h.ch) })
+	}
+	return h.captureHandler.Handle(ctx, r)
+}
+
 // TestSyncImages_RefusesPathShapedName: an image's name becomes a path
 // under imagesDir, and the name arrives from the image row via the site
 // snapshot (or from slagctl image sync --images-json). A name that is not
