@@ -3,15 +3,16 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
-	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"golang.org/x/term"
 
 	"github.com/bluesky-social/slagworks/cmd/slagctl/tui"
+	"github.com/bluesky-social/slagworks/internal/cli/clientauth"
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/ws"
@@ -28,7 +29,7 @@ func errOperationFailed(opID string) error {
 // existing WS endpoints and dispatches `machine deploy/commission -w` and
 // `operation watch` into the one 3-pane model (plan D8 — the legacy watchModel
 // is deleted). The TUI package owns rendering + reduction; this file owns the
-// network and the slagctl globals (apiURL/apiToken).
+// network and the slagctl globals (apiURL/apiClient).
 
 // runDeployTUI is the entry point for an interactive -w / `operation watch`.
 // It fetches the op once (for type + claimed_by backfill), then drives the TUI
@@ -56,6 +57,11 @@ func runDeployTUI(ctx context.Context, opID string, holdFlag, noHoldFlag bool) e
 
 	machine := machineLabel(ctx, machineID)
 	resolveWorker := workerResolver(ctx)
+	// A sign-in that only a new login can restore ends the watch, with the
+	// error naming `slagctl auth login`, instead of the watch polling
+	// silently until --timeout (stopOnLoginRequired).
+	ctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
 	cfg := tui.RunConfig{
 		OpType:        op.Type,
 		Machine:       machine,
@@ -67,12 +73,15 @@ func runDeployTUI(ctx context.Context, opID string, holdFlag, noHoldFlag bool) e
 		Loc:           time.Local,
 		Console:       consoleSource(machineID),
 		Logs:          logSource(machineID, opID, op.CreatedAt),
-		Poll:          opPoller(opID),
+		Poll:          stopOnLoginRequired(opPoller(opID), stop),
 		Interactive:   interactiveStderr(),
 		Hold:          holdFlag,
 		NoHold:        noHoldFlag,
 	}
 	result, err := tui.Run(ctx, cfg)
+	if cause := context.Cause(ctx); errors.Is(cause, clientauth.ErrLoginRequired) {
+		return fmt.Errorf("stopped watching operation %s: %w", opID, cause)
+	}
 	if err != nil {
 		return err
 	}
@@ -141,10 +150,7 @@ func consoleSource(machineID string) tui.ConsoleSource {
 		if err != nil {
 			return err
 		}
-		conn, resp, err := websocket.Dial(ctx, url, streamDialOptions(apiToken))
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-		}
+		conn, err := dialStream(ctx, url)
 		if err != nil {
 			return err
 		}
@@ -223,7 +229,11 @@ func consoleSource(machineID string) tui.ConsoleSource {
 
 // logSource streams control-plane log envelopes for the op, reconnecting with
 // the cursor (plan D4). It subscribes excluding SOL (D3) — phases ride these
-// envelopes, and the D6 global lifecycle envelopes carry claim/terminal.
+// envelopes, and the D6 global lifecycle envelopes carry claim/terminal. It
+// stops reconnecting, returning the error, when no access token can be had
+// without a new login (clientauth.ErrLoginRequired): every further attempt
+// would fail the same way, and would ask the identity provider once a second
+// to refresh a token it already refused.
 func logSource(machineID, opID string, since time.Time) tui.LogSource {
 	return func(ctx context.Context, onEnvelope func(int64, slogkit.Envelope)) error {
 		var lastSeen int64
@@ -232,8 +242,8 @@ func logSource(machineID, opID string, since time.Time) tui.LogSource {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if err == nil {
-				return nil
+			if err == nil || errors.Is(err, clientauth.ErrLoginRequired) {
+				return err
 			}
 			// Transient drop: reconnect from the cursor after a short backoff.
 			select {
@@ -253,10 +263,7 @@ func streamLogEnvelopes(ctx context.Context, machineID, opID string, since time.
 	if err != nil {
 		return err
 	}
-	conn, resp, err := websocket.Dial(ctx, streamURL, streamDialOptions(apiToken))
-	if resp != nil && resp.Body != nil {
-		_ = resp.Body.Close()
-	}
+	conn, err := dialStream(ctx, streamURL)
 	if err != nil {
 		return err
 	}
@@ -314,6 +321,25 @@ func opPoller(opID string) tui.OpPoller {
 			return false, false, "", nil
 		}
 		return true, op.Status == model.OpFailed, opFailureReason(op), nil
+	}
+}
+
+// stopOnLoginRequired wraps the TUI's op-row poll so a poll that fails with
+// clientauth.ErrLoginRequired cancels the watch, with that error as the
+// cause: tui.Run's program is bound to the context and exits, and
+// runDeployTUI returns the cause. The TUI otherwise ignores poll errors,
+// which is right for a transient failure but would leave a watch whose
+// sign-in is gone polling silently until --timeout. The poll stops once
+// the op is terminal, so it cannot end a finished watch held on screen.
+// (logSource stops reconnecting on the same error; the poll sees it within
+// one interval.)
+func stopOnLoginRequired(poll tui.OpPoller, stop context.CancelCauseFunc) tui.OpPoller {
+	return func(ctx context.Context) (terminal, failed bool, reason string, err error) {
+		terminal, failed, reason, err = poll(ctx)
+		if errors.Is(err, clientauth.ErrLoginRequired) {
+			stop(err)
+		}
+		return terminal, failed, reason, err
 	}
 }
 

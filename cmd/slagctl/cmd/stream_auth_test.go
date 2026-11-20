@@ -12,6 +12,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
+	slclient "github.com/bluesky-social/slagworks/cmd/slagctl/client"
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/ws"
@@ -40,9 +41,11 @@ func stubStreamServer(t *testing.T, serve func(ctx context.Context, c *websocket
 	}))
 	t.Cleanup(srv.Close)
 
-	prevURL, prevToken := apiURL, apiToken
-	apiURL, apiToken = srv.URL, "stream-test-token"
-	t.Cleanup(func() { apiURL, apiToken = prevURL, prevToken })
+	prevURL, prevClient := apiURL, apiClient
+	apiURL = srv.URL
+	apiClient = slclient.New(slclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(),
+		Bearer: func(context.Context) (string, error) { return "stream-test-token", nil }})
+	t.Cleanup(func() { apiURL, apiClient = prevURL, prevClient })
 	return seen
 }
 

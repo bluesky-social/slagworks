@@ -102,10 +102,11 @@ func newFakeGlobal(t *testing.T, op model.Operation, envs ...slogkit.Envelope) *
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	prevURL, prevToken, prevClient := apiURL, apiToken, apiClient
-	apiURL, apiToken = srv.URL, "tok"
-	apiClient = slclient.New(slclient.Config{BaseURL: srv.URL, Token: "tok", HTTPClient: srv.Client()})
-	t.Cleanup(func() { apiURL, apiToken, apiClient = prevURL, prevToken, prevClient })
+	prevURL, prevClient := apiURL, apiClient
+	apiURL = srv.URL
+	apiClient = slclient.New(slclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(),
+		Bearer: func(context.Context) (string, error) { return "tok", nil }})
+	t.Cleanup(func() { apiURL, apiClient = prevURL, prevClient })
 	return g
 }
 

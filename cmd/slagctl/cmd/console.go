@@ -30,10 +30,7 @@ func runConsoleStream(ctx context.Context, machineID, tail string, fromStart, fo
 	if err != nil {
 		return err
 	}
-	conn, resp, err := websocket.Dial(ctx, streamURL, streamDialOptions(apiToken))
-	if resp != nil && resp.Body != nil {
-		_ = resp.Body.Close()
-	}
+	conn, err := dialStream(ctx, streamURL)
 	if err != nil {
 		return fmt.Errorf("connect to /api/v1/console/stream: %w", err)
 	}

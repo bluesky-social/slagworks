@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 
 	"golang.org/x/oauth2"
@@ -90,8 +91,10 @@ func (c Config) binding() binding {
 // or client than the Config names.
 var errOtherServer = errors.New("the cached session is for another server or identity provider")
 
+// notSignedIn also matches ErrLoginRequired: only a login to this server
+// clears it, so a command that retries token fetches stops on it.
 func notSignedIn(want binding) error {
-	return fmt.Errorf("not signed in to %s: %w", want.API, errOtherServer)
+	return fmt.Errorf("not signed in to %s: %w (%w)", want.API, errOtherServer, ErrLoginRequired)
 }
 
 func (c Config) validate() error {
@@ -150,11 +153,23 @@ func Bearer(ctx context.Context, cfg Config) (string, error) {
 	return tok.AccessToken, nil
 }
 
+// ErrLoginRequired matches (errors.Is) a CachedBearer error that only a new
+// interactive login clears: nothing is cached, the cached session is for
+// another server, the access token expired with no refresh token, or the
+// identity provider refused the refresh token.
+// Any other error, such as the provider being unreachable or answering 5xx,
+// may clear on a retry. A command that retries token fetches stops on this
+// one: each retry would ask the provider to refresh a token it already
+// refused.
+var ErrLoginRequired = errors.New("sign-in required")
+
 // CachedBearer is Bearer without the interactive fallback: it returns a
 // valid access token from the cache (silently refreshing if expired and a
 // refresh token is present) or an error. It never opens a browser or starts
 // a device flow, so it is safe for headless/agent contexts — callers surface
-// the error as "run <cli> auth login".
+// the error as "run <cli> auth login". It reads the cache on every call, so
+// a long-running command can call it before each request to get a token
+// that is still valid.
 func CachedBearer(ctx context.Context, cfg Config) (string, error) {
 	if err := cfg.validate(); err != nil {
 		return "", err
@@ -180,8 +195,11 @@ func CachedBearer(ctx context.Context, cfg Config) (string, error) {
 // may do a full login.
 func loadFromCacheOrRefresh(ctx context.Context, cfg Config, cachePath string) (*oauth2.Token, error) {
 	cached, err := readCache(cachePath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("%w: no cached token", ErrLoginRequired)
+	}
 	if err != nil {
-		return nil, err // no cache yet (or unreadable) — caller logs in
+		return nil, err // unreadable — caller logs in
 	}
 	if cached.binding != cfg.binding() {
 		return nil, notSignedIn(cfg.binding())
@@ -190,7 +208,7 @@ func loadFromCacheOrRefresh(ctx context.Context, cfg Config, cachePath string) (
 		return cached.Token, nil
 	}
 	if cached.Token.RefreshToken == "" {
-		return nil, fmt.Errorf("cached token expired and no refresh token")
+		return nil, fmt.Errorf("%w: the cached token expired and has no refresh token", ErrLoginRequired)
 	}
 	// Expired access token + refresh token present: refresh under lock. The
 	// token source checks the binding again under the lock, since a login

@@ -3,6 +3,8 @@ package client_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -118,19 +120,57 @@ func TestAPIError(t *testing.T) {
 	}
 }
 
-func TestBearerToken(t *testing.T) {
+// TestBearer_AskedOnEveryRequest: the client asks its bearer source for a
+// token before each request, so a command that outlives one access token
+// sends the refreshed one instead of the token it started with.
+func TestBearer_AskedOnEveryRequest(t *testing.T) {
+	var got []string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer mytoken" {
-			t.Errorf("unexpected auth header: %q", r.Header.Get("Authorization"))
-		}
+		got = append(got, r.Header.Get("Authorization"))
 		w.Write([]byte("{}"))
 	}))
 	defer ts.Close()
 
-	c := client.New(client.Config{BaseURL: ts.URL, Token: "mytoken", HTTPClient: ts.Client()})
-	var out map[string]any
-	if err := c.Get(context.Background(), "/", nil, &out); err != nil {
+	n := 0
+	c := client.New(client.Config{BaseURL: ts.URL, HTTPClient: ts.Client(), Bearer: func(context.Context) (string, error) {
+		n++
+		return fmt.Sprintf("token-%d", n), nil
+	}})
+	ctx := context.Background()
+	if err := c.Get(ctx, "/", nil, nil); err != nil {
 		t.Fatal(err)
+	}
+	if err := c.Post(ctx, "/", map[string]string{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(ctx, "/"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Bearer token-1", "Bearer token-2", "Bearer token-3"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("Authorization headers = %q, want %q", got, want)
+	}
+}
+
+// TestBearer_ErrorFailsTheRequest: when the bearer source cannot produce a
+// token the request is not sent unauthenticated; the source's error comes
+// back unchanged, so callers can still match it with errors.Is.
+func TestBearer_ErrorFailsTheRequest(t *testing.T) {
+	sent := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sent = true
+	}))
+	defer ts.Close()
+
+	errNoToken := errors.New("no token")
+	c := client.New(client.Config{BaseURL: ts.URL, HTTPClient: ts.Client(), Bearer: func(context.Context) (string, error) {
+		return "", errNoToken
+	}})
+	if err := c.Get(context.Background(), "/", nil, nil); !errors.Is(err, errNoToken) {
+		t.Fatalf("Get error = %v, want the bearer source's error", err)
+	}
+	if sent {
+		t.Fatal("the request was sent although the bearer source failed")
 	}
 }
 

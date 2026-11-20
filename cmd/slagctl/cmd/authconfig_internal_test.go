@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -97,6 +98,82 @@ func TestLoginSettings_OldServer(t *testing.T) {
 	_, _, err := loginSettings(context.Background(), ts.URL)
 	if err == nil || !strings.Contains(err.Error(), "SLAGWORKS_OIDC_ISSUER") {
 		t.Fatalf("want an error naming the env overrides, got %v", err)
+	}
+}
+
+// bearerSource re-reads the token cache on every call, so a long command
+// gets the token a refresh (or a login in another terminal) wrote after it
+// started; and it re-checks the saved server every time, so once another
+// terminal signs in to a different server this command gets an error that
+// only a new login clears, never that server's token.
+func TestBearerSource_FollowsTheCacheAndStaysOnItsServer(t *testing.T) {
+	isolateConfig(t)
+	ctx := context.Background()
+	login := func(api, token string) {
+		t.Helper()
+		if err := writeSavedConfig(savedConfig{API: api, OIDCIssuer: "https://idp.example/", OIDCClientID: "client-abc"}); err != nil {
+			t.Fatal(err)
+		}
+		cfg := clientauth.Config{AppName: appName, API: api, Issuer: "https://idp.example/", ClientID: "client-abc"}
+		if err := clientauth.WriteCachedToken(ctx, cfg, &oauth2.Token{AccessToken: token, Expiry: time.Now().Add(time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bearer := bearerSource("https://prod.example")
+
+	login("https://prod.example", "prod-1")
+	if got, err := bearer(ctx); err != nil || got != "prod-1" {
+		t.Fatalf("got %q err %v, want prod-1", got, err)
+	}
+	login("https://prod.example", "prod-2")
+	if got, err := bearer(ctx); err != nil || got != "prod-2" {
+		t.Fatalf("after the cache changed: got %q err %v, want prod-2", got, err)
+	}
+
+	login("https://other.example", "other-1")
+	got, err := bearer(ctx)
+	if got != "" || !errors.Is(err, clientauth.ErrLoginRequired) || !strings.Contains(err.Error(), "auth login --api https://prod.example") {
+		t.Fatalf("after signing in to another server: got %q err %v, want no token and a sign-in error naming the login command", got, err)
+	}
+}
+
+// A login to another server that finishes while bearerSource is reading the
+// token (here, while it refreshes) is caught by its second look at the
+// saved server: the request fails rather than go out with whatever the
+// cache holds by then.
+func TestBearerSource_RechecksTheServerAfterReadingTheToken(t *testing.T) {
+	isolateConfig(t)
+	ctx := context.Background()
+	var idp *httptest.Server
+	idp = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			_ = json.NewEncoder(w).Encode(map[string]string{"issuer": idp.URL, "authorization_endpoint": idp.URL + "/authorize",
+				"token_endpoint": idp.URL + "/token", "jwks_uri": idp.URL + "/jwks"})
+		case "/token":
+			// Meanwhile another terminal signs in to a different server.
+			if err := writeSavedConfig(savedConfig{API: "https://other.example", OIDCIssuer: idp.URL, OIDCClientID: "client-abc"}); err != nil {
+				t.Error(err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "prod-2", "refresh_token": "rt-2", "token_type": "Bearer", "expires_in": 600})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(idp.Close)
+	if err := writeSavedConfig(savedConfig{API: "https://prod.example", OIDCIssuer: idp.URL, OIDCClientID: "client-abc"}); err != nil {
+		t.Fatal(err)
+	}
+	expired := &oauth2.Token{AccessToken: "prod-1", RefreshToken: "rt-1", Expiry: time.Now().Add(-time.Minute)}
+	cfg := clientauth.Config{AppName: appName, API: "https://prod.example", Issuer: idp.URL, ClientID: "client-abc"}
+	if err := clientauth.WriteCachedToken(ctx, cfg, expired); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := bearerSource("https://prod.example")(ctx)
+	if got != "" || !errors.Is(err, clientauth.ErrLoginRequired) {
+		t.Fatalf("got %q err %v; want no token and a sign-in error once the saved server changed", got, err)
 	}
 }
 

@@ -17,14 +17,20 @@ import (
 // Client is a thin HTTP client for the slagworks global API.
 type Client struct {
 	baseURL    string
-	token      string
+	bearer     func(context.Context) (string, error)
 	httpClient *http.Client
 }
 
 // Config holds client configuration.
 type Config struct {
-	BaseURL    string
-	Token      string
+	BaseURL string
+	// Bearer returns the access token for one request; nil sends none. The
+	// client calls it before every request rather than taking a token once,
+	// because a command can outlive the access token it started with (an
+	// operation watch, a list under -w): the source hands back a refreshed
+	// token after the old one expires. An error from it fails the request
+	// and is returned as is.
+	Bearer     func(context.Context) (string, error)
 	HTTPClient *http.Client // nil uses a default with 30s timeout
 }
 
@@ -51,7 +57,7 @@ func New(cfg Config) *Client {
 		hc = &http.Client{Timeout: 30 * time.Second}
 	}
 	baseURL := strings.TrimRight(cfg.BaseURL, "/")
-	return &Client{baseURL: baseURL, token: cfg.Token, httpClient: hc}
+	return &Client{baseURL: baseURL, bearer: cfg.Bearer, httpClient: hc}
 }
 
 // InsecureWarning returns a non-empty string if the base URL uses http://
@@ -81,7 +87,9 @@ func (c *Client) Get(ctx context.Context, path string, query url.Values, out any
 	if err != nil {
 		return err
 	}
-	c.setHeaders(req)
+	if err := c.authorize(req); err != nil {
+		return err
+	}
 	return c.do(req, out)
 }
 
@@ -99,7 +107,9 @@ func (c *Client) Post(ctx context.Context, path string, body any, out any) error
 	if err != nil {
 		return err
 	}
-	c.setHeaders(req)
+	if err := c.authorize(req); err != nil {
+		return err
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -120,7 +130,9 @@ func (c *Client) Put(ctx context.Context, path string, body any, out any) error 
 	if err != nil {
 		return err
 	}
-	c.setHeaders(req)
+	if err := c.authorize(req); err != nil {
+		return err
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -141,7 +153,9 @@ func (c *Client) Patch(ctx context.Context, path string, body any, out any) erro
 	if err != nil {
 		return err
 	}
-	c.setHeaders(req)
+	if err := c.authorize(req); err != nil {
+		return err
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -154,14 +168,34 @@ func (c *Client) Delete(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	c.setHeaders(req)
+	if err := c.authorize(req); err != nil {
+		return err
+	}
 	return c.do(req, nil)
 }
 
-func (c *Client) setHeaders(req *http.Request) {
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+// BearerToken returns the access token the client would send on a request
+// made now: Config.Bearer's answer, or "" when the client has none. Callers
+// that open their own connections to the API (the WebSocket streams) use it
+// so they authenticate exactly as the client's requests do.
+func (c *Client) BearerToken(ctx context.Context) (string, error) {
+	if c.bearer == nil {
+		return "", nil
 	}
+	return c.bearer(ctx)
+}
+
+// authorize sets the request's Authorization header from the bearer
+// source, asked afresh for this request.
+func (c *Client) authorize(req *http.Request) error {
+	token, err := c.BearerToken(req.Context())
+	if err != nil {
+		return err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return nil
 }
 
 func (c *Client) do(req *http.Request, out any) error {

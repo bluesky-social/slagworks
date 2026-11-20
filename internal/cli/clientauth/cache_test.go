@@ -3,6 +3,7 @@ package clientauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -314,6 +315,80 @@ func TestPersistingTokenSource_RefreshErrorPreservesCache(t *testing.T) {
 	}
 	if onDisk.Token.RefreshToken != "rt-dead" || onDisk.Token.AccessToken != "at-old" {
 		t.Errorf("cache was modified on failed refresh: %+v", onDisk.Token)
+	}
+}
+
+// TestPersistingTokenSource_LoginRequiredOnlyWhenNoRetryCanHelp: a refresh
+// the provider refuses, an expired token with no refresh token, and a cache
+// that a logout removed all match ErrLoginRequired, so a long-running
+// command stops instead of retrying them; a provider that is down, failing
+// or rate-limiting does not, so the command keeps retrying.
+func TestPersistingTokenSource_LoginRequiredOnlyWhenNoRetryCanHelp(t *testing.T) {
+	answer := func(status int) string {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+		}))
+		t.Cleanup(srv.Close)
+		return srv.URL
+	}
+	down := httptest.NewServer(http.NotFoundHandler())
+	down.Close()
+	expired := func(refreshToken string) *oauth2.Token {
+		return &oauth2.Token{AccessToken: "at-old", RefreshToken: refreshToken, Expiry: time.Now().Add(-time.Minute)}
+	}
+	for _, tc := range []struct {
+		name     string
+		provider string
+		cached   *oauth2.Token // nil: no cache file
+		bound    binding       // what the cached session was issued for
+		want     bool
+	}{
+		{"refresh token refused", answer(http.StatusBadRequest), expired("rt"), testBinding, true},
+		{"client refused", answer(http.StatusUnauthorized), expired("rt"), testBinding, true},
+		{"no refresh token", answer(http.StatusOK), expired(""), testBinding, true},
+		{"logged out", answer(http.StatusOK), nil, testBinding, true},
+		{"session for another server", answer(http.StatusOK), expired("rt"), binding{API: "https://other.example", Issuer: testBinding.Issuer, ClientID: testBinding.ClientID}, true},
+		{"provider failing", answer(http.StatusServiceUnavailable), expired("rt"), testBinding, false},
+		{"provider rate-limiting", answer(http.StatusTooManyRequests), expired("rt"), testBinding, false},
+		{"provider unreachable", down.URL, expired("rt"), testBinding, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := tokenPath(t)
+			if tc.cached != nil {
+				if err := writeCache(path, session{binding: tc.bound, Token: tc.cached}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			oc := &oauth2.Config{ClientID: "test", Endpoint: oauth2.Endpoint{TokenURL: tc.provider + "/token"}}
+			_, err := newPersistingTokenSource(context.Background(), oc, testBinding, path).Token()
+			if err == nil {
+				t.Fatal("Token() succeeded; want an error")
+			}
+			if got := errors.Is(err, ErrLoginRequired); got != tc.want {
+				t.Fatalf("errors.Is(%q, ErrLoginRequired) = %v, want %v", err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCachedBearer_LoginRequiredBeforeRefreshing: the checks CachedBearer
+// makes before it would contact the provider (nothing cached, an expired
+// token with no refresh token) match ErrLoginRequired too.
+func TestCachedBearer_LoginRequiredBeforeRefreshing(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ctx := context.Background()
+	// The issuer is never contacted: both cases fail before a refresh.
+	cfg := Config{AppName: "slagctl", API: "https://api.example", Issuer: "http://127.0.0.1:1", ClientID: "test", LoopbackPort: 1}
+	if _, err := CachedBearer(ctx, cfg); !errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("with nothing cached: err = %v, want ErrLoginRequired", err)
+	}
+	if err := WriteCachedToken(ctx, cfg, &oauth2.Token{AccessToken: "at-old", Expiry: time.Now().Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CachedBearer(ctx, cfg); !errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("with an expired token and no refresh token: err = %v, want ErrLoginRequired", err)
 	}
 }
 

@@ -310,6 +310,13 @@ recent active operation.
   `machine deploy -w` and `machine commission -w` take this path when
   stderr is not a terminal (CI, pipes).
 
+Either way the watch refreshes the access token as it expires, so it can
+outlast the token's lifetime. If the token can no longer be refreshed
+(the identity provider refused the refresh token, or another terminal
+logged out or signed in to a different server), the watch stops with an
+error that says to run `slagctl auth login`; the operation itself is not
+affected.
+
 Flags: `--timeout <dur>` (default 30m), `--hold` (keep TUI open on
 completion even under CI recording), `--no-hold` (tear down
 immediately). Deploy and commission spins are the only op types that

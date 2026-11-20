@@ -88,7 +88,7 @@ func slagctlConnectivityCheck() clicheck.Check {
 			httpClient := &http.Client{Timeout: 5 * time.Second}
 			c := slclient.New(slclient.Config{
 				BaseURL:    apiURL,
-				Token:      token,
+				Bearer:     func(context.Context) (string, error) { return token, nil },
 				HTTPClient: httpClient,
 			})
 			var resp struct {

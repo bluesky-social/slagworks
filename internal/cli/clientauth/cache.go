@@ -3,7 +3,10 @@ package clientauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -190,6 +193,10 @@ func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
 	// Read INSIDE the lock so a process that was waiting picks up whatever the
 	// previous holder just wrote.
 	cur, err := readCache(p.cachePath)
+	if errors.Is(err, fs.ErrNotExist) {
+		// A logout landed while this invocation waited for the lock.
+		return nil, fmt.Errorf("%w: no cached token", ErrLoginRequired)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("reading token cache under lock: %w", err)
 	}
@@ -200,7 +207,7 @@ func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
 		return cur.Token, nil // someone else already refreshed (or it never expired)
 	}
 	if cur.Token.RefreshToken == "" {
-		return nil, fmt.Errorf("token expired and no refresh token; re-login required")
+		return nil, fmt.Errorf("%w: the cached token expired and has no refresh token", ErrLoginRequired)
 	}
 
 	// Refresh from the on-disk token (NOT a pre-captured one).
@@ -213,10 +220,27 @@ func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
 		if isNoAnswer(err) {
 			return nil, err
 		}
-		return nil, fmt.Errorf("refreshing token (re-login may be required): %w", err)
+		if refreshRefused(err) {
+			return nil, fmt.Errorf("%w: the identity provider refused the refresh token: %w", ErrLoginRequired, err)
+		}
+		return nil, fmt.Errorf("refreshing token: %w", err)
 	}
 	if err := writeCache(p.cachePath, session{binding: p.want, Token: refreshed}); err != nil {
 		return nil, fmt.Errorf("persisting refreshed token: %w", err)
 	}
 	return refreshed, nil
+}
+
+// refreshRefused reports whether a refresh failed because the identity
+// provider answered the grant with an OAuth error, which RFC 6749 section
+// 5.2 sends as 400 (invalid_grant for a revoked, expired or already-spent
+// refresh token) or 401 (invalid_client). Retrying the same refresh token
+// cannot succeed. Anything else (no answer, a 5xx, a 429) may be
+// transient.
+func refreshRefused(err error) bool {
+	var re *oauth2.RetrieveError
+	if !errors.As(err, &re) || re.Response == nil {
+		return false
+	}
+	return re.Response.StatusCode == http.StatusBadRequest || re.Response.StatusCode == http.StatusUnauthorized
 }

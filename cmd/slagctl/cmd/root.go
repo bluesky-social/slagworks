@@ -22,11 +22,11 @@ var ErrSilent = errors.New("")
 var (
 	apiURL  string
 	jsonOut bool
-	// apiToken holds the OIDC access token fetched in PersistentPreRunE.
-	// Streaming commands (machine logs, machine logs --sol, operation watch)
-	// read it directly to build their own authenticated requests outside the
-	// shared client.
-	apiToken     string
+	// apiClient is built in PersistentPreRunE with bearerSource, so it
+	// fetches the operator's OIDC access token for every request, and the
+	// stream dials (dialStream) take theirs from it too: a watch or a list
+	// under -w outlives the token the command started with, and every
+	// reconnect and poll after that must carry a refreshed one.
 	apiClient    *slclient.Client
 	apiClientSet bool // true when injected via SetAPIClient (tests)
 )
@@ -80,20 +80,21 @@ func NewRootCmd() *cobra.Command {
 			if isAuthCommand(cmd) || isDoctorCommand(cmd) {
 				return nil
 			}
-			// Operator auth is OIDC-only: obtain a valid access token
-			// (cached, silently refreshed, or via interactive login).
+			// Operator auth is OIDC-only: make sure there is a valid access
+			// token (cached, silently refreshed, or via interactive login)
+			// before the command starts. Requests then fetch it through
+			// bearerSource, which refreshes it as it expires but never
+			// starts an interactive login part-way through a command.
 			cfg, err := authConfig(apiURL)
 			if err != nil {
 				return err
 			}
-			token, err := clientauth.Bearer(cmd.Context(), cfg)
-			if err != nil {
+			if _, err := clientauth.Bearer(cmd.Context(), cfg); err != nil {
 				return fmt.Errorf("authentication failed: %w\n  run `slagctl auth login` to sign in", err)
 			}
-			apiToken = token
 			apiClient = slclient.New(slclient.Config{
 				BaseURL: apiURL,
-				Token:   token,
+				Bearer:  bearerSource(apiURL),
 			})
 			if w := apiClient.InsecureWarning(); w != "" {
 				fmt.Fprintln(os.Stderr, format.WarnStyle.Render("warning: "+w))
