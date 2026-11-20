@@ -179,6 +179,20 @@ func (f *fakeStore) GetSiteConfig(slug string) (*model.SiteConfig, error) {
 	return &cc, nil
 }
 
+// ListSiteConfigsByNetBoxSite returns the matching configs in map order,
+// which varies from call to call like Postgres's unordered rows.
+func (f *fakeStore) ListSiteConfigsByNetBoxSite(netboxSite string) ([]model.SiteConfig, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []model.SiteConfig
+	for _, c := range f.configs {
+		if c.NetBoxSite == netboxSite {
+			out = append(out, *c)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeStore) ListMachinesByDeviceIDs(ids []int) ([]model.Machine, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

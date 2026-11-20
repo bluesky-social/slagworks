@@ -53,14 +53,17 @@ import (
 //   - the snapshot's machine set, per-machine identity, interface set and
 //     primary prefix equal a recomputation from the world;
 //   - ClaimResolver and ResolveOwningConfigSlug agree with a brute-force
-//     ancestor walk, and no device is claimed twice;
+//     ancestor walk, and no device is claimed twice; where a location
+//     re-parent nests two admitted configs, a device both claim has no
+//     owner and neither config builds or reconciles;
 //   - a machine row is only ever deleted or re-pointed once its NetBox
 //     device is gone; UUID <-> serial never changes;
 //   - an in-order webhook leaves every slug's pushed snapshot fresh and the
 //     device it names enrolled, without waiting for a reconcile tick;
 //   - after reconcile ticks with no further change the system is at a fixed
-//     point (idempotent), every claimed serialled device is enrolled, and
-//     every slug's pushed snapshot is fresh.
+//     point (idempotent), every claimed serialled device is enrolled, every
+//     slug's pushed snapshot is fresh, and the reconciler flags exactly the
+//     configs that cannot build for their scope (stale or overlapping).
 //
 // propKnobs select input classes. The tests at the bottom of the file run
 // the combinations; two of them are skipped, each naming the behavior that
@@ -71,8 +74,8 @@ type propKnobs struct {
 	StaleHooks bool // webhooks may be dropped, duplicated, or delivered late
 	Faults     bool // NetBox calls fail on a schedule
 	// LocReparent lets a location be re-parented under another. That can
-	// nest two configs' scopes after both were admitted, so it lifts the
-	// one-claimer-per-device requirement.
+	// nest two configs' scopes after both were admitted, so a device can
+	// have two claimers; both configs must then be refused.
 	LocReparent bool
 	// SerialReuse lets a device's serial change after it is set, including
 	// to a serial that a machine row bound to another live device holds.
@@ -94,7 +97,7 @@ type propStats struct {
 	claimed0, claimed1, claimed2                   atomic.Int64
 	maxDevs, maxMachines, maxLocDepth, maxSlugs    atomic.Int64
 	staleCfgRebuilds, locScopedBuilds, wholeBuilds atomic.Int64
-	nbFaults                                       atomic.Int64
+	overlapCfgRebuilds, nbFaults                   atomic.Int64
 	opKinds                                        [32]atomic.Int64
 }
 
@@ -107,7 +110,7 @@ func (s *propStats) String() string {
 	}
 	return fmt.Sprintf(`cases=%d ops=%d
  hooks: now=%d dropped=%d dup=%d late=%d
- rebuilds: push=%d skip_no_change=%d model_error=%d injected_fault=%d (loc-scoped=%d whole-site=%d stale-config=%d)
+ rebuilds: push=%d skip_no_change=%d model_error=%d injected_fault=%d (loc-scoped=%d whole-site=%d stale-config=%d overlapping-config=%d)
  reconcile: ticks=%d settles=%d nb_faults=%d
  machines: enrolled=%d deleted=%d rebound=%d frozen_mid_op=%d
  devices: moves=%d moves_across_configs=%d recreates_same_serial=%d
@@ -118,7 +121,7 @@ func (s *propStats) String() string {
 		s.cases.Load(), s.ops.Load(),
 		s.hooksNow.Load(), s.hooksDropped.Load(), s.hooksDup.Load(), s.hooksLate.Load(),
 		s.rebuildPush.Load(), s.rebuildSkip.Load(), s.rebuildErr.Load(), s.rebuildFault.Load(),
-		s.locScopedBuilds.Load(), s.wholeBuilds.Load(), s.staleCfgRebuilds.Load(),
+		s.locScopedBuilds.Load(), s.wholeBuilds.Load(), s.staleCfgRebuilds.Load(), s.overlapCfgRebuilds.Load(),
 		s.ticks.Load(), s.settles.Load(), s.nbFaults.Load(),
 		s.enrolled.Load(), s.deleted.Load(), s.rebound.Load(), s.frozen.Load(),
 		s.moves.Load(), s.movesAcrossConfigs.Load(), s.recreatesSameSN.Load(),
@@ -239,6 +242,22 @@ func (p *propPipe) setup() {
 	for _, id := range propSortedIDs(p.w.locs) {
 		if rapid.IntRange(0, 9).Draw(rt, "locPrefix") > 4 {
 			p.addPrefix(0, id, rapid.SampledFrom(propCIDRs).Draw(rt, "locCIDR"))
+		}
+	}
+	if p.k.LocReparent {
+		// Start from the topology a re-parent can break: two sibling
+		// locations on one site, each with a production prefix and a
+		// location-scoped config.
+		for _, slug := range propSlugs[:2] {
+			id := p.w.id()
+			p.w.locs[id] = &pwLoc{ID: id, Slug: "cage-" + slug, Site: propSites[0]}
+			p.addPrefix(0, id, propCIDRs[1])
+			cfg := model.SiteConfig{Slug: slug, NetBoxSite: propSites[0], NetBoxLocation: "cage-" + slug, EphemeralPoolStart: "10.1.0.100", EphemeralPoolEnd: "10.1.0.200"}
+			if !p.admitConfig(cfg) {
+				rt.Fatalf("setup: sibling-location config %s refused", slug)
+			}
+			p.db.configs[slug] = &cfg
+			p.inv.Invalidate(slug)
 		}
 	}
 	for range rapid.IntRange(0, 2).Draw(rt, "nCfg") {
@@ -375,12 +394,36 @@ func (p *propPipe) modelScopeError(cfg model.SiteConfig) string {
 	return ""
 }
 
+// modelRefused says why the reconciler / dispatcher refuse to act on the
+// config's claim, "" if they don't: its scope does not resolve, or it can
+// claim a device that another config on the site whose scope resolves also
+// claims. Admission keeps configs disjoint; a location re-parent can nest
+// two of them afterwards.
+func (p *propPipe) modelRefused(cfg model.SiteConfig) string {
+	if e := p.modelScopeError(cfg); e != "" {
+		return e
+	}
+	for _, e := range p.db.sortedConfigs() {
+		if e.Slug == cfg.Slug || e.NetBoxSite != cfg.NetBoxSite || p.modelScopeError(e) != "" {
+			continue
+		}
+		if cfg.NetBoxLocation == "" || e.NetBoxLocation == "" {
+			return "overlaps " + e.Slug
+		}
+		cl, el := p.w.locBySlug(cfg.NetBoxSite, cfg.NetBoxLocation), p.w.locBySlug(e.NetBoxSite, e.NetBoxLocation)
+		if p.w.inSubtree(cl, el) || p.w.inSubtree(el, cl) {
+			return "overlaps " + e.Slug
+		}
+	}
+	return ""
+}
+
 func (p *propPipe) modelBuildError(slug string) string {
 	cfg, ok := p.db.configs[slug]
 	if !ok {
 		return "config missing"
 	}
-	if e := p.modelScopeError(*cfg); e != "" {
+	if e := p.modelRefused(*cfg); e != "" {
 		return e
 	}
 	if len(p.w.modelProdPrefixes(*cfg)) == 0 {
@@ -420,6 +463,19 @@ func (p *propPipe) modelClaimers(d *pwDev) []string {
 	for _, cfg := range p.db.sortedConfigs() {
 		if p.w.modelClaims(cfg, d) {
 			out = append(out, cfg.Slug)
+		}
+	}
+	return out
+}
+
+// modelLiveClaimers is modelClaimers without the configs the reconciler
+// refuses (modelRefused): the claimers whose devices a reconcile tick
+// mirrors.
+func (p *propPipe) modelLiveClaimers(d *pwDev) []string {
+	var out []string
+	for _, slug := range p.modelClaimers(d) {
+		if p.modelRefused(*p.db.configs[slug]) == "" {
+			out = append(out, slug)
 		}
 	}
 	return out
@@ -565,6 +621,9 @@ func (p *propPipe) rebuildAndCheck(slug string) {
 		if wantErr == "location missing" {
 			p.st.staleCfgRebuilds.Add(1)
 		}
+		if strings.HasPrefix(wantErr, "overlaps ") {
+			p.st.overlapCfgRebuilds.Add(1)
+		}
 		if p.sink.pushes[slug] != prevPushes {
 			p.rt.Fatalf("rebuild(%s) failed but still pushed", slug)
 		}
@@ -643,10 +702,10 @@ func (p *propPipe) checkAllFresh(when string) {
 	}
 }
 
-// enrollGap says why a claimed, serialled device has no machine row ("" if
-// it has one or needs none).
-func (p *propPipe) enrollGap(d *pwDev) string {
-	if d.Serial == "" || len(p.modelClaimers(d)) == 0 {
+// enrollGap says why a serialled device some config in claimers claims has
+// no machine row ("" if it has one or needs none).
+func (p *propPipe) enrollGap(d *pwDev, claimers []string) string {
+	if d.Serial == "" || len(claimers) == 0 {
 		return ""
 	}
 	why := "no row holds its serial"
@@ -671,19 +730,21 @@ func (p *propPipe) serialHeldByGoneDevice(serial string) bool {
 }
 
 // storeViolations lists what a settled reconciler must not leave behind:
-// claimed, serialled devices with no machine row, and rows for vanished
-// devices. The missing-device sweep runs when at least one config
-// reconciles; a config whose scope no longer resolves does not hold it back.
+// serialled devices a config it reconciles claims with no machine row, and
+// rows for vanished devices. The missing-device sweep runs when at least
+// one config reconciles; a config it refuses (scope no longer resolves, or
+// overlaps another) does not hold it back.
 func (p *propPipe) storeViolations() []string {
 	var out []string
 	anyProcessed := false
 	for _, cfg := range p.db.sortedConfigs() {
-		if p.modelScopeError(cfg) == "" {
+		if p.modelRefused(cfg) == "" {
 			anyProcessed = true
 		}
 	}
 	for _, id := range propSortedIDs(p.w.devs) {
-		if gap := p.enrollGap(p.w.devs[id]); gap != "" {
+		d := p.w.devs[id]
+		if gap := p.enrollGap(d, p.modelLiveClaimers(d)); gap != "" {
 			out = append(out, gap)
 		}
 	}
@@ -749,8 +810,8 @@ func (p *propPipe) checkIdentity(before map[uuid.UUID]model.Machine, devsBefore 
 			}
 			if p.liveOnly {
 				d := p.w.devs[*a.NetBoxDeviceID]
-				if d == nil || len(p.modelClaimers(d)) == 0 || d.Serial != a.NetBoxSerial {
-					p.rt.Fatalf("reconcile enrolled machine %s (serial %s) for device %d, which no site_config claims (or which does not carry that serial)",
+				if d == nil || len(p.modelLiveClaimers(d)) == 0 || d.Serial != a.NetBoxSerial {
+					p.rt.Fatalf("reconcile enrolled machine %s (serial %s) for device %d, which no site_config it reconciles claims (or which does not carry that serial)",
 						id, a.NetBoxSerial, *a.NetBoxDeviceID)
 				}
 			}
@@ -803,6 +864,10 @@ func (p *propPipe) checkClaims() {
 		case len(want) == 1:
 			if err != nil || owner != want[0] {
 				p.rt.Fatalf("ResolveOwningConfigSlug(device %d) = %q, %v; brute force says %v", d.ID, owner, err, want)
+			}
+		default:
+			if !errors.Is(err, ErrAmbiguousOwningConfig) {
+				p.rt.Fatalf("ResolveOwningConfigSlug(device %d) = %q, %v; brute force says %v all claim it, so none may be picked as the owner", d.ID, owner, err, want)
 			}
 		}
 	}
@@ -1415,6 +1480,16 @@ func (p *propPipe) settle() {
 	if v := p.storeViolations(); len(v) > 0 {
 		p.rt.Fatalf("reconcile did not converge after 4 ticks over an unchanged world:\n  %s", strings.Join(v, "\n  "))
 	}
+	for _, cfg := range p.db.sortedConfigs() {
+		if want, got := p.modelRefused(cfg), p.rec.IsStale(cfg.Slug); got != (want != "") {
+			p.rt.Fatalf("after settle the reconciler flags %s stale=%v (%v), model says %q", cfg.Slug, got, p.rec.StaleSites(), want)
+		}
+	}
+	for slug := range p.rec.StaleSites() {
+		if p.db.configs[slug] == nil {
+			p.rt.Fatalf("after settle the reconciler still flags %s stale, but no such site_config exists", slug)
+		}
+	}
 	p.checkAllFresh("after settle")
 	if len(p.inv.dirty) != 0 {
 		p.rt.Fatalf("slugs still dirty after settle: %v", p.inv.dirty)
@@ -1505,7 +1580,7 @@ func (p *propPipe) step(kind int) {
 				// as a new machine (the settle checks cover that).
 				continue
 			}
-			if gap := p.enrollGap(d); gap != "" {
+			if gap := p.enrollGap(d, p.modelClaimers(d)); gap != "" {
 				p.rt.Fatalf("after an in-order webhook delivery: %s", gap)
 			}
 		}
@@ -1531,6 +1606,9 @@ func propRunPipeline(t *testing.T, k propKnobs, maxOps int) {
 	weights := [propNumOps]int{opDevCreate: 6, opDevDelete: 4, opDevMove: 6, opDevRename: 2, opDevSerial: 3, opDevAttr: 2,
 		opIface: 2, opIP: 3, opPrefix: 2, opLoc: 3, opCfgCreate: 4, opCfgDelete: 2, opCfgUpdate: 3, opMachine: 2,
 		opStartOp: 2, opTick: 4, opLateHook: 3, opFault: 2, opSettle: 2, opTouch: 1, opStaleCfg: 2}
+	if k.LocReparent {
+		weights[opLoc] = 9 // re-parents are a third of location edits
+	}
 	rapid.Check(t, func(rt *rapid.T) {
 		st.cases.Add(1)
 		uuid.SetRand(rand.New(rand.NewSource(rapid.Int64Range(0, 1<<30).Draw(rt, "uuidSeed"))))
