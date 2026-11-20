@@ -218,7 +218,12 @@ Each generated script sets `BOOTIF=01-${net0/mac:hexhyp}` and `ip=dhcp` so
 stock Ubuntu `/init` (via `configure_networking`) knows which NIC iPXE
 chainloaded on and will DHCP on the correct port. `boot=slagworks` is the
 BOOT-hook selector; `slagworks.server=` and `slagworks.image=` tell the
-initrd hook where to fetch the squashfs from.
+initrd hook where to fetch the squashfs from. `slagworks.image=` names
+the image's version directory (`noble-pxe@<sha16>`) current when the
+script was served, the same one the script's kernel and initrd URLs
+name, and the agent fetches the UEFI ESP's kernel and initrd from it
+too, so one boot never mixes files from two image versions
+([images.md](images.md#site-workers-how-the-row-reaches-a-running-deploy)).
 
 The handler also fires an `ipxe_loaded` progress report for the active
 boot-driving op the moment the script goes out (`handler.go:181-196`), so
@@ -237,7 +242,8 @@ consults during a deploy (`handler.go:897-921`):
   `/boot/storage-script?mac=...` for the agent's convenience)
 - `/boot/ssh-keys` — operator authorized_keys the agent writes into the
   deployed OS
-- `/files/images/<image>/{vmlinuz,initrd,root.squashfs}` — the image tree
+- `/files/images/<image>@<sha16>/{vmlinuz,initrd,initrd-local,root.squashfs}`
+  — one version of the image
 - `/files/bin/slagworks-agent` — the agent binary (see the images doc for
   where this comes from; it is NOT part of the image)
 - `/files/bin/systemd-bootx64.efi` — the ESP bootloader binary. Not

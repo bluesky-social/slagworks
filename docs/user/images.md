@@ -211,6 +211,9 @@ the first image or to move to another bucket;
 For manual rollback or a curated pin (staging a specific SHA that isn't
 `latest-sha.txt`), use `slagctl image create` with `--name`, `--version`,
 `--sha256`, and `--url` pointing at the known-good per-SHA tarball URL.
+A row created under a new name boots once it is the site's only row:
+while a row named by the worker's `SLAGWORKS_DEFAULT_IMAGE` exists, boots
+keep using that one.
 "Follow latest" and "manually pin" are the only two authoritative flows
 for changing what the fleet runs; they both terminate in the same DB
 row change.
@@ -218,45 +221,132 @@ row change.
 ## Site workers: how the row reaches a running deploy
 
 Every site worker runs `imagepull.SyncImages`
-(`internal/imagepull/imagepull.go`) on each snapshot tick. The
+(`internal/imagepull/imagepull.go`) each time it applies a site
+snapshot, and again on a backoff after a failed download (see the
+notes below). Each version of the image lives in its own directory,
+`<images_dir>/noble-pxe@<first 16 hex digits of its SHA256>`, and
+`<images_dir>/noble-pxe` is a symlink to the current one. The
 algorithm:
 
-1. Read the on-disk marker at `<images_dir>/noble-pxe.sha256`.
-2. If it matches the row's `SHA256`, do nothing — the image is up to
-   date.
-3. Otherwise, HTTP-GET the row's `URL` into a temp file, stream through
-   `sha256.New()` while writing, verify the hash matches the row (fail
-   the whole sync if not).
-4. Extract the tarball into a temp dir, atomically rename the extracted
-   `noble-pxe/` directory into place at `<images_dir>/noble-pxe`.
-5. Write the marker file last. A crash between rename and marker write
-   leaves the previous marker (or none) so the next tick retries the
-   whole download.
+1. Take an exclusive `flock` on `<images_dir>`, waiting for any other
+   sync of that dir to finish, then remove the temp entries
+   (`.image-download-*`, `.image-extract-*`, `.image-link-*`,
+   `.image-old-*`) that a sync killed partway through left behind.
+2. If `<images_dir>/noble-pxe` links to the row's version directory and
+   that directory exists, do nothing — the image is up to date.
+3. If the version directory is already on disk (a rollback to the
+   version the link was last switched away from), skip to step 6.
+4. Otherwise, HTTP-GET the row's `URL` into a temp file, stream through
+   `sha256.New()` while writing, verify the hash matches the row (if
+   not, report the mismatch and leave the link on the previous version).
+5. Extract the tarball into a temp dir and check that its top-level
+   directory holds all four image files (`vmlinuz`, `initrd`,
+   `initrd-local`, `root.squashfs`) as regular files. A tarball missing
+   one fails the sync for that image and leaves the link on the previous
+   version, so pin a complete image. Then rename the extracted directory
+   to `<images_dir>/noble-pxe@<sha16>`.
+6. Switch the link: create a new symlink and rename it over
+   `<images_dir>/noble-pxe`. The rename replaces the link in one step,
+   so a request never finds the image missing. A failure before this
+   step leaves the link, and the version it names, as they were.
+7. Delete version directories other than the new one and the one the
+   link named before the switch.
+
+Why the previous version stays: each boot script names the version
+directory current when it was served (`slagworks.image=noble-pxe@<sha16>`
+and the kernel and initrd URLs), and the BOOT hook and the agent build
+their URLs from it. A boot that was in flight when the image was
+re-pinned keeps fetching from the version it booted: `root.squashfs`
+from the hook, and on a UEFI deploy the agent's `vmlinuz` and
+`initrd-local` for the ESP minutes later. Without that, the ESP could
+get the new image's kernel over the old squashfs's `/lib/modules`. A
+boot that spans two re-pins finds its version deleted, and its next
+fetch fails with a 404 rather than mixing versions; deploy it again.
 
 Notes:
 
-- The row name is the directory name. `SyncImages` skips, with an
+- The row's `SHA256` is compared in lowercase with surrounding
+  whitespace trimmed, so a digest pinned in upper case names the same
+  tarball and the same version directory.
+- The download runs in the background. While it runs the worker stays
+  connected to global, answers power, boot and lease reads, applies
+  operations and aborts, and keeps serving boots from the previous image.
+  It holds commission and deploy operations until the download ends, so
+  a deploy created after the row changed installs the new image. A
+  download that fails releases them; they then boot the image already on
+  disk.
+- A row whose tarball fails to download (a connection error, a
+  response other than 200, a body cut short, a stalled download) is
+  retried by the site worker itself: 5 seconds after the failure, then
+  doubling up to every 5 minutes, until it succeeds or a newer
+  snapshot's sync takes over. Nothing else would run it again, because
+  global pushes no new snapshot while the site's content is unchanged.
+  A digest mismatch, a tarball that does not extract, or a failed write
+  to the images directory is logged and that row is not retried, even
+  while another row is being retried, since another
+  attempt would fail the same way (and a digest mismatch costs a full
+  download each time): fix the row, which pushes a new snapshot, or fix
+  the host and restart the site worker.
+- A download that receives no data for a minute is abandoned and logged
+  as `download stalled`; a slow download that keeps receiving data is
+  never cut off.
+- The row name is the link name. `SyncImages` skips, with an
   error, any name that fails `model.ValidateImageName` (lowercase
-  letters, digits, `.`, `_`, `-`, starting with a letter or digit)
-  before downloading or removing anything, and still syncs the other
-  rows. The API refuses such names when the row is written.
+  letters, digits, `.`, `_`, `-`, starting with a letter or digit; not
+  `systemd-bootx64.efi`, the bootloader the package links into the
+  images directory) before downloading or removing anything, and still
+  syncs the other rows. The API refuses such names when the row is
+  written. It skips a
+  row whose `sha256` is not 64 hex digits the same way.
+- A plain `noble-pxe/` directory (put there by hand, or extracted in
+  place by a release before version directories) is replaced by the
+  link on the next sync, which downloads the image once more. Until
+  then the boot handler serves the plain directory by name. A boot
+  already in flight at that switch named the plain directory, not a
+  version, so its later fetches follow the new link: if the row pins a
+  different image than the directory held, that boot can mix the two.
+  When upgrading from such a release, do not re-pin the image until
+  each upgraded worker has switched to the link (or let running deploys
+  finish first). A `noble-pxe.sha256` file left by such a release is no
+  longer read and can be deleted.
+- Each row is synced on its own. A failed download, hash mismatch or
+  link switch on one row costs only that row: the other rows still
+  sync, the site worker logs the failure as "image sync failed", and
+  `slagctl image sync` exits with every row's error.
 - No cpio repack, no InjectOverlayInit. The initrd downloaded IS the
   initrd served. That's the entire point of baking the BOOT hook at
   image-build time.
-- The site worker's HTTP boot handler serves the tree under
-  `/files/images/noble-pxe/`, which is where the initrd fetches
-  `root.squashfs` and the boot handler fetches `vmlinuz` + `initrd`.
+- The site worker's HTTP boot handler serves the images dir under
+  `/files/images/`. Boot scripts point at
+  `/files/images/noble-pxe@<sha16>/`, which is where iPXE fetches
+  `vmlinuz` + `initrd`, the initrd fetches `root.squashfs`, and the
+  agent fetches `vmlinuz` + `initrd-local` for a UEFI ESP.
+  Each boot uses the row named by the worker's `SLAGWORKS_DEFAULT_IMAGE`
+  (default `noble-pxe`) if there is one, and otherwise the site's only
+  row, whatever its name. With several rows and none of them named
+  `SLAGWORKS_DEFAULT_IMAGE`, the boot stops at an iPXE shell with an error
+  naming the rows. A deleted row's link and version directories stay on
+  disk, which is why a boot follows the rows rather than a name on disk.
 - `slagctl image sync --dir <path>` runs the same code path
   interactively — useful for verifying an image works on a specific
-  host or for pre-populating a new site worker.
+  host or for pre-populating a new site worker. Pointed at a running
+  worker's images dir, it logs that another sync is running and waits
+  for the worker's sync to finish (and the worker likewise waits for
+  it), so the two never interleave.
 
-Diagnosing "the new image didn't roll": check the on-disk
-`.sha256` marker against `slagctl image list`. If they match, the
-worker HAS synced — a bug is in the built image, not in the rollout.
-If they differ, look at the site worker's `SyncImages` logs; a
-mid-flight failure leaves the previous target dir intact for rollback.
-Do NOT look for a mtime, a timer, or a `latest-sha.txt` cache — none of
-those exist on the site workers by design.
+Diagnosing "the new image didn't roll": compare
+`readlink <images_dir>/noble-pxe` (`noble-pxe@<sha16>`) against the
+SHA256 column of `slagctl image list` (the first 12 characters;
+`--json` prints the full digest). If the link's digits start with the
+column's (ignoring hex case), the worker HAS synced — a bug is in the
+built image, not in the rollout.
+If they differ, look at the site worker's image sync logs: `image sync
+failed; retrying` with a `retry_in` is a failed download the worker is
+retrying, and `image sync failed` with a `hint` is one it will not
+retry. A mid-flight failure leaves the link on the previous version.
+Do NOT look for a mtime or a `latest-sha.txt` cache: site workers never
+poll the bucket, by design, and their only image timer is the retry
+after a failed download.
 
 ## The other artifact: the slagworks-agent binary
 
@@ -301,8 +391,9 @@ For a change that spans everything:
    at `/readyz`.
 3. **Image changes**: once the tarball for the commit is published and
    `latest-sha.txt` names it, run `slagctl image follow-latest`. Confirm each site
-   worker synced: `slagctl image list`'s pinned SHA matches the
-   on-disk `noble-pxe.sha256` on the worker.
+   worker synced: `readlink <images_dir>/noble-pxe` on the worker names
+   `noble-pxe@` followed by 16 hex digits that start with the SHA256
+   column of `slagctl image list`.
 4. **Agent changes**: upgrade the `slagworks` (or `slagworks-agent`)
    apt package on every site worker that will serve the deploy.
    Restarting `slagworksd-site.service` picks up the new binary.

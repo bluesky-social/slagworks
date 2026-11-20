@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 
@@ -131,13 +132,74 @@ func TestImageUpsert_InvalidatesAllSites(t *testing.T) {
 	}
 }
 
+// TestImageDelete_InvalidatesAllSites: a site worker's boot handler picks
+// the image to boot from the site's image rows, so deleting a row must
+// reach every site. Without the push, a rollback done by pinning a new row
+// and deleting the old one keeps booting the old row's image until some
+// unrelated change rebuilds the site's snapshot.
+func TestImageDelete_InvalidatesAllSites(t *testing.T) {
+	db := testpg.DB(t, store.Migrate)
+	st := store.New(db)
+	for _, slug := range []string{"pop-a", "pop-b"} {
+		if err := st.CreateSiteConfig(&model.SiteConfig{
+			Slug:               slug,
+			NetBoxSite:         slug,
+			EphemeralPoolStart: "10.0.0.10",
+			EphemeralPoolEnd:   "10.0.0.250",
+		}); err != nil {
+			t.Fatalf("seed site_config %s: %v", slug, err)
+		}
+	}
+	if err := st.CreateImage(&model.Image{
+		Name: "noble-pxe", Version: "24.04", Arch: "amd64",
+		SHA256: "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00",
+		URL:    "https://example.com/noble-pxe/abc.tar.gz",
+	}); err != nil {
+		t.Fatalf("seed image: %v", err)
+	}
+
+	inv := &fakeInvalidator{}
+	s := &Server{store: st, invalidator: inv, echo: echo.New()}
+	s.echo.DELETE("/api/v1/images/:name", s.deleteImage)
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	del := func() int {
+		req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/api/v1/images/noble-pxe", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("DELETE image: %v", err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := del(); code != http.StatusNoContent {
+		t.Fatalf("DELETE image: status %d, want 204", code)
+	}
+	got := inv.seen()
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"pop-a", "pop-b"}) {
+		t.Fatalf("delete must invalidate every site (pop-a, pop-b), got %v", got)
+	}
+
+	// A delete that removes nothing pushes nothing.
+	if code := del(); code != http.StatusNotFound {
+		t.Fatalf("second DELETE image: status %d, want 404", code)
+	}
+	if again := inv.seen(); len(again) != len(got) {
+		t.Errorf("a delete that found no row invalidated sites: %v", again)
+	}
+}
+
 // TestImageWrite_RejectsInvalidName: an image name becomes a directory on
 // every site worker (imagepull.SyncImages removes and replaces
 // <images_dir>/<name>), so POST and PUT must refuse a name that is not a
-// plain path element with a 400, store nothing, and push no snapshot.
-// Before the fix both accepted "..", "." and "../victim", and the next
-// snapshot made every site worker delete its data dir, its images dir, or
-// a sibling of it.
+// plain path element, or that names the package's systemd-bootx64.efi in
+// the images dir, with a 400, store nothing, and push no snapshot. Before
+// the fix both accepted "..", "." and "../victim", and the next snapshot
+// made every site worker delete its data dir, its images dir, or a sibling
+// of it; they also accepted "systemd-bootx64.efi", which replaced the
+// bootloader with the image.
 func TestImageWrite_RejectsInvalidName(t *testing.T) {
 	db := testpg.DB(t, store.Migrate)
 	st := store.New(db)
@@ -174,14 +236,14 @@ func TestImageWrite_RejectsInvalidName(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	for _, name := range []string{"..", ".", "../victim", "noble-pxe/..", ".hidden", "Noble-PXE", "noble pxe"} {
+	for _, name := range []string{"..", ".", "../victim", "noble-pxe/..", ".hidden", "Noble-PXE", "noble pxe", "systemd-bootx64.efi"} {
 		if code := send(http.MethodPost, "/api/v1/images", name); code != http.StatusBadRequest {
 			t.Errorf("POST image name %q: status %d, want 400", name, code)
 		}
 	}
 	// The PUT name comes from the path; ".." and "." reach the handler
 	// as-is (Go's client and echo's router do not clean them).
-	for _, name := range []string{"..", ".", ".hidden", "Noble-PXE"} {
+	for _, name := range []string{"..", ".", ".hidden", "Noble-PXE", "systemd-bootx64.efi"} {
 		if code := send(http.MethodPut, "/api/v1/images/"+name, "noble-pxe"); code != http.StatusBadRequest {
 			t.Errorf("PUT image name %q: status %d, want 400", name, code)
 		}

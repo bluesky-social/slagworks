@@ -216,8 +216,10 @@ real serial.
   that file is missing, so package installs should set
   `SLAGWORKS_IMAGES_DIR=/var/lib/slagworks/images` (as
   `deploy/site.env.example` does).
-- **`SLAGWORKS_DEFAULT_IMAGE`** — image name used for boots that do not
-  name one. Default `noble-pxe`.
+- **`SLAGWORKS_DEFAULT_IMAGE`** — the image row boots use when the site
+  has a row of this name. Otherwise boots use the site's only image row,
+  whatever its name, and refuse when there are several; with no rows at
+  all they use the directory of this name. Default `noble-pxe`.
 - **`SLAGWORKS_DATA_DIR`** — local state directory. Default
   `/var/lib/slagworks`. The worker's SQLite database is
   `<data-dir>/worker.db`.

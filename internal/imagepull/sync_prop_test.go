@@ -6,7 +6,9 @@ package imagepull
 // directory.
 //
 // Model: imagesDir maps an image name to the content of the last tarball
-// that synced successfully for it. Everything else on disk is a bystander
+// that synced successfully for it, reached through <name>, and to the
+// version before it, which stays in its version directory <name>@<sha16>
+// for boots that started on it. Everything else on disk is a bystander
 // and must never change: other images' directories, the
 // systemd-bootx64.efi the site-worker package installs into imagesDir
 // (served at /files/bin/systemd-bootx64.efi and copied onto every UEFI
@@ -14,7 +16,9 @@ package imagepull
 //
 // Image names reach the site worker through the site snapshot. A path-shaped
 // name ("..", "a/b") is refused: it is reported in the returned error, puts
-// nothing on disk, and does not stop the other images from syncing.
+// nothing on disk, and does not stop the other images from syncing. A failed
+// pull is likewise reported and leaves that image's previous cache in place
+// without stopping the other images.
 
 import (
 	"archive/tar"
@@ -70,7 +74,8 @@ func propTarball(t interface{ Fatalf(string, ...any) }, top string, files map[st
 	return buf.Bytes(), hex.EncodeToString(sum[:])
 }
 
-// treeDigest returns path -> content for every regular file under root.
+// treeDigest returns path -> content for every regular file under root,
+// and path -> "-> target" for every symlink (not followed).
 func treeDigest(root string) map[string]string {
 	out := map[string]string{}
 	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
@@ -80,12 +85,38 @@ func treeDigest(root string) map[string]string {
 		if info.IsDir() {
 			return nil
 		}
-		b, _ := os.ReadFile(p)
 		rel, _ := filepath.Rel(root, p)
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, _ := os.Readlink(p)
+			out[rel] = "-> " + target
+			return nil
+		}
+		b, _ := os.ReadFile(p)
 		out[rel] = string(b)
 		return nil
 	})
 	return out
+}
+
+// imgPath is the tree key of an entry in imagesDir.
+func imgPath(elem ...string) string {
+	return filepath.Join(append([]string{"site", "images"}, elem...)...)
+}
+
+// served returns the content a request for <name>/<file> gets: file in the
+// version directory <name> links to.
+func served(tree map[string]string, name, file string) string {
+	target, ok := strings.CutPrefix(tree[imgPath(name)], "-> ")
+	if !ok {
+		return ""
+	}
+	return tree[imgPath(target, file)]
+}
+
+// ownedBy reports whether tree key k belongs to image name: its link or one
+// of its version directories.
+func ownedBy(k, name string) bool {
+	return k == imgPath(name) || strings.HasPrefix(k, imgPath(name)+"@")
 }
 
 func diffTrees(before, after map[string]string) string {
@@ -167,6 +198,8 @@ func runSyncHistory(t *rapid.T, allowHostile bool, stats map[string]int) {
 
 	model_ := map[string]map[string]string{} // image name -> files of last good sync
 	modelSHA := map[string]string{}
+	prevFiles := map[string]map[string]string{} // image name -> files of the version before it
+	prevSHA := map[string]string{}
 
 	steps := rapid.IntRange(1, 6).Draw(t, "steps")
 	for step := 0; step < steps; step++ {
@@ -188,6 +221,7 @@ func runSyncHistory(t *rapid.T, allowHostile bool, stats map[string]int) {
 			files := map[string]string{
 				"vmlinuz":       fmt.Sprintf("kernel-%s-v%d", name, version),
 				"initrd":        fmt.Sprintf("initrd-%s-v%d", name, version),
+				"initrd-local":  fmt.Sprintf("initrd-local-%s-v%d", name, version),
 				"root.squashfs": fmt.Sprintf("root-%s-v%d", name, version),
 			}
 			// The tarball's top-level dir is whatever the build named it;
@@ -201,10 +235,9 @@ func runSyncHistory(t *rapid.T, allowHostile bool, stats map[string]int) {
 			switch fault {
 			case 0:
 				srv.fail[path] = true // transient 500
-				// An image already cached at this digest is not fetched,
-				// so the fault is never seen.
-				marker, _ := os.ReadFile(filepath.Join(imagesDir, name+".sha256"))
-				if strings.TrimSpace(string(marker)) != sum {
+				// A version already on disk (current or previous) is not
+				// fetched, so the fault is never seen.
+				if _, err := os.Stat(filepath.Join(imagesDir, name+"@"+sum[:16])); err != nil {
 					failing[name] = true
 				}
 			case 1:
@@ -248,13 +281,12 @@ func runSyncHistory(t *rapid.T, allowHostile bool, stats map[string]int) {
 			}
 			if failing[name] {
 				stats["failed_pulls"]++
-				// Documented: a failure before the swap leaves the previous
-				// cache (marker and target) intact, and installs nothing.
+				// Documented: a failure before the switch leaves the link and
+				// every version directory intact, and installs nothing.
 				entry := func(tree map[string]string) map[string]string {
 					out := map[string]string{}
 					for k, v := range tree {
-						if strings.HasPrefix(k, filepath.Join("site", "images", name)+string(filepath.Separator)) ||
-							k == filepath.Join("site", "images", name+".sha256") {
+						if ownedBy(k, name) {
 							out[k] = v
 						}
 					}
@@ -267,35 +299,41 @@ func runSyncHistory(t *rapid.T, allowHostile bool, stats map[string]int) {
 			}
 			synced := true
 			for fn, content := range files {
-				if after[filepath.Join("site", "images", name, fn)] != content {
+				if served(after, name, fn) != content {
 					synced = false
 				}
 			}
-			marker := strings.TrimSpace(after[filepath.Join("site", "images", name+".sha256")])
-			if synced && marker == wantSHA[name] {
+			link := after[imgPath(name)]
+			if synced && link == "-> "+name+"@"+wantSHA[name][:16] {
+				if old, ok := modelSHA[name]; ok && old != wantSHA[name] {
+					prevFiles[name], prevSHA[name] = model_[name], old
+					stats["version_switches"]++
+				}
 				model_[name], modelSHA[name] = files, wantSHA[name]
 				stats["good_syncs"]++
-				continue
-			}
-			// Not synced. Only acceptable when another image's pull failed
-			// (SyncImages stops at the first failing pull, in map order); a
-			// refused name stops nothing.
-			if !anyFailing {
-				t.Fatalf("step %d: image %q not synced (marker %q, want %q) and SyncImages returned %v", step, name, marker, wantSHA[name], syncErr)
-			}
-			// It must then still hold the previous good content, if any.
-			if prev, ok := model_[name]; ok {
-				for fn, content := range prev {
-					if after[filepath.Join("site", "images", name, fn)] != content {
-						t.Fatalf("step %d: image %q lost its previous good content %s without a successful resync", step, name, fn)
+				// The version before it stays whole for boots that
+				// started on it.
+				if p, ok := prevFiles[name]; ok {
+					for fn, content := range p {
+						if got := after[imgPath(name+"@"+prevSHA[name][:16], fn)]; got != content {
+							t.Fatalf("step %d: image %q switched to %s but its previous version's %s reads %q, want %q",
+								step, name, wantSHA[name][:16], fn, got, content)
+						}
 					}
 				}
+				continue
 			}
+			// Not synced. Never acceptable: images are independent, so
+			// neither another image's failed pull nor a refused name stops
+			// this one.
+			t.Fatalf("step %d: image %q not synced (link %q, want the %s version) and SyncImages returned %v; failing pulls=%v",
+				step, name, link, wantSHA[name][:16], syncErr, failing)
 		}
 
-		// Bystanders: nothing outside the dir and marker of the valid images
-		// in this snapshot may change, whatever other names it carried. A
-		// cached image the snapshot no longer lists is a bystander too.
+		// Bystanders: nothing outside the link and version directories of
+		// the valid images in this snapshot may change, whatever other names
+		// it carried. A cached image the snapshot no longer lists is a
+		// bystander too.
 		filter := func(tree map[string]string) map[string]string {
 			out := map[string]string{}
 			for k, v := range tree {
@@ -304,8 +342,7 @@ func runSyncHistory(t *rapid.T, allowHostile bool, stats map[string]int) {
 					if !slices.Contains(benignImageNames, b) {
 						continue
 					}
-					if strings.HasPrefix(k, filepath.Join("site", "images", b)+string(filepath.Separator)) ||
-						k == filepath.Join("site", "images", b+".sha256") {
+					if ownedBy(k, b) {
 						owned = true
 					}
 				}
