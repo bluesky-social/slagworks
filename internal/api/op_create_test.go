@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -208,6 +209,29 @@ func TestAbortMachine_PublishesOpRemovedAndInvalidatesOnDurable(t *testing.T) {
 	// rebuild must fire.
 	if got := len(inv.seen()); got != beforeInv+1 {
 		t.Errorf("durable abort must invalidate once, got %d", got-beforeInv)
+	}
+}
+
+// TestAbortMachine_UnknownMachineIsNotFound: abort on a well-formed UUID that
+// names no machine (a stale UUID after the NetBox mirror deleted the row, or a
+// typo) is a 404 like every other machine route, not a 500, and touches
+// nothing.
+func TestAbortMachine_UnknownMachineIsNotFound(t *testing.T) {
+	s, _, inv, pub := opFlowServer(t)
+	srv := httptest.NewServer(s.echo)
+	defer srv.Close()
+
+	resp := postJSON(t, srv, "/api/v1/machines/"+uuid.New().String()+"/abort", `{}`)
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("abort on an unknown machine: %d %s, want 404", resp.StatusCode, bytes.TrimSpace(body))
+	}
+	if got := pub.removedCount(); got != 0 {
+		t.Errorf("abort on an unknown machine published %d op_removed, want 0", got)
+	}
+	if got := len(inv.seen()); got != 0 {
+		t.Errorf("abort on an unknown machine fired %d identity rebuilds, want 0", got)
 	}
 }
 

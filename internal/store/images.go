@@ -21,6 +21,12 @@ func (s *Store) CreateImage(img *model.Image) error {
 // CreatedAt are preserved by gorm's autoCreateTime / primary-key
 // semantics.
 //
+// The row is keyed by name, so the store always assigns the id and any
+// id the caller set is discarded: the conflict target is name alone, so
+// a caller's id that belongs to another row would fail on the primary
+// key instead of resolving. A new row gets a fresh id; an existing row
+// keeps its own.
+//
 // We use UpdateAll rather than an explicit AssignmentColumns list so
 // future Image schema additions are picked up automatically; otherwise
 // a new column would silently fail to update on follow-latest pins.
@@ -36,9 +42,7 @@ func (s *Store) CreateImage(img *model.Image) error {
 // that resolves the current latest <git-sha>.tar.gz on S3 and points
 // the named row at it without caring whether the row already exists.
 func (s *Store) UpsertImage(img *model.Image) error {
-	if img.ID == uuid.Nil {
-		img.ID = uuid.New()
-	}
+	img.ID = uuid.New()
 	return s.db.Clauses(
 		clause.OnConflict{
 			Columns:   []clause.Column{{Name: "name"}},
@@ -60,16 +64,21 @@ func (s *Store) ListImages() ([]model.Image, error) {
 // downloaded under the old name stays on disk (SyncImages only pulls
 // missing/mismatched entries — it does not prune), which is acceptable:
 // disk space on the image cache is not a slagworks-managed constraint.
+//
+// An ident that parses as a uuid is tried as an id first, so the id wins
+// when it is one image's id and another image's name: slagctl always sends
+// the uuid it resolved, and that must name the row the operator picked.
+// When no row has that id, the ident is tried as a name, since image names
+// are free-form and some parse as uuids (32 hex digits, e.g. an md5).
 func (s *Store) DeleteImage(ident string) error {
 	if id, err := uuid.Parse(ident); err == nil {
 		res := s.db.Delete(&model.Image{}, "id = ?", id)
 		if res.Error != nil {
 			return res.Error
 		}
-		if res.RowsAffected == 0 {
-			return fmt.Errorf("image %s not found", ident)
+		if res.RowsAffected > 0 {
+			return nil
 		}
-		return nil
 	}
 	res := s.db.Delete(&model.Image{}, "name = ?", ident)
 	if res.Error != nil {

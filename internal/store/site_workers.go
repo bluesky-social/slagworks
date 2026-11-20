@@ -19,10 +19,10 @@ import (
 // ErrSiteWorkerNotFound is returned when token lookup finds no row.
 var ErrSiteWorkerNotFound = errors.New("site worker not found")
 
-// AmbiguousSiteWorkerError is returned by ResolveSiteWorker when a
-// non-uuid ident (worker_id or fqdn) matches more than one row — e.g. the
-// same worker_id registered under two site slugs, or two workers sharing
-// an fqdn. Candidates lists every match so a caller can tell the operator
+// AmbiguousSiteWorkerError is returned by ResolveSiteWorker when an ident
+// that is no row's id (a worker_id or fqdn) matches more than one row —
+// e.g. the same worker_id registered under two site slugs, or two workers
+// sharing an fqdn. Candidates lists every match so a caller can tell the operator
 // which uuid to disambiguate with without re-querying.
 type AmbiguousSiteWorkerError struct {
 	Ident      string
@@ -46,7 +46,12 @@ func (e *AmbiguousSiteWorkerError) Error() string {
 // On first call for a (slug, worker_id) pair: creates the row, stores
 // TokenHash, returns plaintext.
 // On re-register (rotation): updates TokenHash with a fresh value,
-// refreshes fqdn + last_seen_at, preserves first_seen_at.
+// refreshes fqdn + last_seen_at, preserves id and first_seen_at.
+//
+// The returned row is the stored one: clause.Returning{} refreshes w
+// from the row the upsert wrote, so on the rotation path w carries the
+// existing id and first_seen_at rather than the uuid.New() and now it
+// was built with. The API returns that id, and DELETE takes it.
 func (s *Store) RegisterSiteWorker(siteSlug, workerID, fqdn string) (*model.SiteWorker, string, error) {
 	token, hash, err := newWorkerToken()
 	if err != nil {
@@ -62,14 +67,17 @@ func (s *Store) RegisterSiteWorker(siteSlug, workerID, fqdn string) (*model.Site
 		FirstSeenAt: now,
 		LastSeenAt:  now,
 	}
-	err = s.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "site_slug"}, {Name: "worker_id"}},
-		DoUpdates: clause.Assignments(map[string]any{
-			"last_seen_at": now,
-			"fqdn":         fqdn,
-			"token_hash":   hash,
-		}),
-	}).Create(&w).Error
+	err = s.db.Clauses(
+		clause.OnConflict{
+			Columns: []clause.Column{{Name: "site_slug"}, {Name: "worker_id"}},
+			DoUpdates: clause.Assignments(map[string]any{
+				"last_seen_at": now,
+				"fqdn":         fqdn,
+				"token_hash":   hash,
+			}),
+		},
+		clause.Returning{},
+	).Create(&w).Error
 	if err != nil {
 		return nil, "", err
 	}
@@ -171,17 +179,22 @@ func (s *Store) ListSiteWorkersBySerial(serial string) ([]model.SiteWorker, erro
 // Returns ErrSiteWorkerNotFound if nothing matches, *AmbiguousSiteWorkerError
 // if more than one row matches (e.g. the same worker_id registered under
 // two different site slugs, or two different workers sharing an fqdn).
+//
+// An ident that parses as a uuid is tried as an id first, so the id wins
+// when it is one row's id and another row's worker_id: the uuid is what
+// slagctl tells an operator to use to disambiguate. When no row has that
+// id, the ident is tried as a worker_id or fqdn, since slagworksd generates
+// a uuid for its worker_id unless SLAGWORKS_WORKER_ID overrides it.
 func (s *Store) ResolveSiteWorker(ident string) (*model.SiteWorker, error) {
 	if id, err := uuid.Parse(ident); err == nil {
 		var w model.SiteWorker
 		err := s.db.Where("id = ?", id).First(&w).Error
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrSiteWorkerNotFound
+		if err == nil {
+			return &w, nil
 		}
-		if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, err
 		}
-		return &w, nil
 	}
 	var matches []model.SiteWorker
 	if err := s.db.Where("worker_id = ? OR fqdn = ?", ident, ident).Find(&matches).Error; err != nil {

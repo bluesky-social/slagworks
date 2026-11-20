@@ -77,6 +77,18 @@ fresh operation can be issued. Used to unstick a machine wedged in
 `commissioning` or `deploying`. Aborting does not power the host
 off; if you need that, follow with `machine power off`.
 
+An agent that is running on the host when you abort stops by itself:
+it reports to its site worker at least every 5 seconds, is told the
+operation is over, kills what it was doing and drops to the recovery
+environment (the same recovery sshd a failed deploy leaves) without
+rebooting. The agent logs a line saying so; it is on the serial console
+(`slagctl machine logs --sol <machine>`) and, when the agent gets it
+out before exiting, in `slagctl machine logs <machine>`. A deploy
+aborted after partitioning began leaves the disks half-written, so the
+next deploy of that machine needs `--destructive`.
+An agent that cannot reach its site worker does not hear about the
+abort; power the host off if you need it stopped for certain.
+
 ### `machine lock <machine>` / `machine unlock <machine>`
 
 Locking prevents any new operations from being created against the

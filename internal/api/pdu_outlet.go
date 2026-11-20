@@ -169,19 +169,28 @@ func (s *Server) resolveOutlet(ctx context.Context, ident string, outletN int) (
 	}
 
 	// Step 2: resolve the PDU's creds (mgmt IP, serial, kind).
-	// When bmcSecrets is nil (dev/test) this still resolves the mgmt IP and
-	// serial from NetBox; credential fields will be empty.
-	creds, err := s.deviceCredsFor(ctx, pduDev)
-	if err != nil {
-		return outletResolution{}, err
-	}
-	// Kind guard: only PDU devices may be addressed here. Skip when
-	// bmcSecrets is nil because deviceCredsFor returns kind="" without a
-	// secret store — that case is dev/test only.
-	if s.bmcSecrets != nil && creds.Kind != awssecrets.KindPDU {
-		return outletResolution{}, echo.NewHTTPError(http.StatusBadRequest,
-			fmt.Sprintf("device %q (kind %q) is not a PDU; only PDU devices can be addressed via this endpoint",
-				pduDev.Name, creds.Kind))
+	var creds DeviceCreds
+	if s.bmcSecrets == nil {
+		// No secret store (dev/test): deviceCredsFor reads the store, so
+		// resolve the mgmt IP and serial from NetBox alone and leave the
+		// kind and credential fields empty.
+		mgmtIP, ipErr := s.netboxMgmtIPForDevice(ctx, pduDev.ID)
+		if ipErr != nil {
+			return outletResolution{}, echo.NewHTTPError(http.StatusInternalServerError,
+				fmt.Sprintf("lookup mgmt IP for PDU %q (id %d): %v", pduDev.Name, pduDev.ID, ipErr))
+		}
+		creds = DeviceCreds{Device: pduDev.Name, NetBoxID: pduDev.ID, Serial: pduDev.Serial, MgmtIP: mgmtIP}
+	} else {
+		creds, err = s.deviceCredsFor(ctx, pduDev)
+		if err != nil {
+			return outletResolution{}, err
+		}
+		// Kind guard: only PDU devices may be addressed here.
+		if creds.Kind != awssecrets.KindPDU {
+			return outletResolution{}, echo.NewHTTPError(http.StatusBadRequest,
+				fmt.Sprintf("device %q (kind %q) is not a PDU; only PDU devices can be addressed via this endpoint",
+					pduDev.Name, creds.Kind))
+		}
 	}
 
 	// Step 3: PDU must have a Machine row (enrolled via a site-config).

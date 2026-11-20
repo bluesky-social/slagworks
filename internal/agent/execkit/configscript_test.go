@@ -21,7 +21,7 @@ func TestRunConfigScript_RoundTrip(t *testing.T) {
 	script := []byte("#!/bin/sh\ncat \"$SLAGWORKS_TESTDATA\"\n")
 	data := []byte(`{"hello":"world"}`)
 
-	out, err := RunConfigScript(slog.Default(), "test", script, "SLAGWORKS_TESTDATA", data, nil)
+	out, err := RunConfigScript(nil, slog.Default(), "test", script, "SLAGWORKS_TESTDATA", data, nil)
 	if err != nil {
 		t.Fatalf("runConfigScript: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestRunConfigScript_RoundTrip(t *testing.T) {
 // that writes to stderr must not pollute the returned bytes.
 func TestRunConfigScript_StdoutOnly(t *testing.T) {
 	script := []byte("#!/bin/sh\necho diagnostic >&2\necho RESULT\n")
-	out, err := RunConfigScript(slog.Default(), "test", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil)
+	out, err := RunConfigScript(nil, slog.Default(), "test", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil)
 	if err != nil {
 		t.Fatalf("runConfigScript: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestRunConfigScript_StdoutOnly(t *testing.T) {
 // surfaces as an error naming the kind, not a silent empty result.
 func TestRunConfigScript_NonZeroExitFails(t *testing.T) {
 	script := []byte("#!/bin/sh\necho partial\nexit 3\n")
-	_, err := RunConfigScript(slog.Default(), "storage", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil)
+	_, err := RunConfigScript(nil, slog.Default(), "storage", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil)
 	if err == nil {
 		t.Fatal("expected error on non-zero exit, got nil")
 	}
@@ -68,7 +68,7 @@ func TestRunConfigScript_FailureCarriesStderr(t *testing.T) {
 		"exit 1\n")
 	logger, records := recordingLogger()
 
-	_, err := RunConfigScript(logger, "network", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil)
+	_, err := RunConfigScript(nil, logger, "network", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil)
 	if err == nil {
 		t.Fatal("expected error on non-zero exit, got nil")
 	}
@@ -100,7 +100,7 @@ func TestRunConfigScript_StderrLoggedOnSuccess(t *testing.T) {
 	script := []byte("#!/bin/sh\necho 'WARNING: bond0 has only ONE member' >&2\necho '{}'\n")
 	logger, records := recordingLogger()
 
-	out, err := RunConfigScript(logger, "network", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil)
+	out, err := RunConfigScript(nil, logger, "network", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil)
 	if err != nil {
 		t.Fatalf("runConfigScript: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestRunConfigScript_StderrCaptureIsBounded(t *testing.T) {
 		"exit 2\n")
 	logger, _ := recordingLogger()
 
-	_, err := RunConfigScript(logger, "storage", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil)
+	_, err := RunConfigScript(nil, logger, "storage", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil)
 	if err == nil {
 		t.Fatal("expected error on non-zero exit, got nil")
 	}
@@ -146,7 +146,7 @@ func TestRunConfigScript_StderrCaptureIsBounded(t *testing.T) {
 func TestRunConfigScript_CleansUpTempFiles(t *testing.T) {
 	before := countSlagworksTempFiles(t)
 	script := []byte("#!/bin/sh\ncat \"$SLAGWORKS_TESTDATA\"\n")
-	if _, err := RunConfigScript(slog.Default(), "test", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil); err != nil {
+	if _, err := RunConfigScript(nil, slog.Default(), "test", script, "SLAGWORKS_TESTDATA", []byte("{}"), nil); err != nil {
 		t.Fatalf("runConfigScript: %v", err)
 	}
 	after := countSlagworksTempFiles(t)
@@ -170,7 +170,7 @@ func TestRunConfigScript_SidecarCoLocated(t *testing.T) {
 	script := []byte("#!/usr/bin/env python3\nimport helper_mod\nprint(helper_mod.VALUE)\n")
 	sidecars := map[string][]byte{"helper_mod.py": []byte("VALUE = 'from-sidecar'\n")}
 
-	out, err := RunConfigScript(slog.Default(), "network", script, "SLAGWORKS_TESTDATA", []byte("{}"), sidecars)
+	out, err := RunConfigScript(nil, slog.Default(), "network", script, "SLAGWORKS_TESTDATA", []byte("{}"), sidecars)
 	if err != nil {
 		t.Fatalf("runConfigScript with sidecar: %v", err)
 	}
