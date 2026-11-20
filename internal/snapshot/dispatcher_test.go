@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -83,6 +84,39 @@ func TestDispatcherBumpsSeqOnContentChange(t *testing.T) {
 	}
 	if snap.SeqNum != 2 {
 		t.Fatalf("second push seq should be 2, got %d", snap.SeqNum)
+	}
+}
+
+// The snapshot lists the workers registered to its own config, sorted: each
+// worker takes its share of the fabric dynamic ranges by its position in
+// that list, so the list must be the same on every worker and change only
+// when a registration does. A registration changes the content, so the
+// rebuild it triggers pushes.
+func TestDispatcherListsTheConfigsRegisteredWorkers(t *testing.T) {
+	d, sink, fs, _ := dispatcherFixture(t)
+	fs.workers = []model.SiteWorker{
+		{SiteSlug: "pop3", WorkerID: "worker-b"},
+		{SiteSlug: "other", WorkerID: "worker-c"},
+		{SiteSlug: "pop3", WorkerID: "worker-a"},
+	}
+	snap, err := d.rebuild(context.Background(), "pop3", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := snap.DHCP.Workers, []string{"worker-a", "worker-b"}; !slices.Equal(got, want) {
+		t.Fatalf("DHCP.Workers = %v, want %v", got, want)
+	}
+
+	fs.workers = append(fs.workers, model.SiteWorker{SiteSlug: "pop3", WorkerID: "worker-0"})
+	snap, err = d.rebuild(context.Background(), "pop3", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := snap.DHCP.Workers, []string{"worker-0", "worker-a", "worker-b"}; !slices.Equal(got, want) {
+		t.Fatalf("after a registration DHCP.Workers = %v, want %v", got, want)
+	}
+	if sink.Count() != 2 {
+		t.Fatalf("a registration must push a new snapshot: %d pushes, want 2", sink.Count())
 	}
 }
 

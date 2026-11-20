@@ -571,7 +571,7 @@ func TestCacheRecordPhoneHome_CompletesDeployOp(t *testing.T) {
 		{ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed},
 	}...)
 
-	c.RecordPhoneHome(id)
+	c.RecordPhoneHome(id, opID)
 
 	m := c.MachineByID(id)
 	if m == nil || m.State != model.MachineStateRunning {
@@ -603,7 +603,7 @@ func TestCacheRecordPhoneHome_NoActiveOpStillEmitsObs(t *testing.T) {
 		Machines: []model.MachineSnapshot{{ID: id, State: model.MachineStateDeploying}},
 	})
 
-	c.RecordPhoneHome(id)
+	c.RecordPhoneHome(id, uuid.New())
 
 	obs, updates := c.DrainOutbox()
 	if len(obs) != 1 || obs[0].Obs.Event != "phone_home" {
@@ -753,7 +753,7 @@ func TestCachePhoneHome(t *testing.T) {
 	id := uuid.New()
 	c.ApplySnapshot(snapMachine(id, "aa:aa:aa:00:00:01", model.MachineStateRunning))
 
-	c.RecordPhoneHome(id)
+	c.RecordPhoneHome(id, uuid.New())
 
 	m := c.MachineByID(id)
 	if m == nil || m.State != model.MachineStateRunning {

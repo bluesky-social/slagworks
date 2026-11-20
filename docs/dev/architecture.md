@@ -374,7 +374,9 @@ what it left out on every build; neither fails the site. More than one
 Its inputs (`Inputs`, `builder.go:31`) are
 NetBox reads (site, config, prefixes, OOB prefixes and ranges,
 devices, device-types, interfaces, IPs), Postgres reads (machines,
-images, storage scripts, network scripts, SSH keys), and
+images, storage scripts, network scripts, SSH keys, and the config's
+registered site workers, whose sorted IDs become `DHCP.Workers` and
+assign each worker its share of the fabric dynamic ranges), and
 an optional `BMCAdminSecret` from AWS Secrets for admin-cred
 prestamping.
 
@@ -513,6 +515,20 @@ Global to site:
   ops.
 - `power_status_request` / `boot_status_request` (`131`, `150`) —
   synchronous RPCs invoked by the API for operator reads.
+- `heartbeat` (`HeartbeatMsg`) — every 30 seconds, so an idle site still
+  hears from global.
+
+Both ends heartbeat every `ws.HeartbeatInterval` (30s) and read with
+`Conn.ReadMessageIdle`, which drops the connection when nothing has
+arrived for `ws.IdleTimeout` (90s). That is how either end notices a path
+that stopped delivering without a FIN or RST; TCP alone reports it only
+when retransmission gives up, or never when something in the path keeps
+acknowledging. The timer restarts on each 32 KiB of a message as it
+arrives, so a large message on a slow link is not cut. These are messages
+rather than WebSocket pings because coder/websocket answers a ping from
+inside the receiver's read and fails that read when the pong cannot be
+written within 5 seconds, which it cannot while a large message is being
+written ahead of it.
 
 There is a generic `rpc_response` envelope (line 319) with a
 `Terminal` flag, and the slagctl-side stream types
@@ -538,9 +554,16 @@ cast pipeline, and the `SourceSOL` constant no longer exists.
   SeqNum is below the cached one closes the slug's connections instead,
   so each worker reconnects and adopts the new snapshot from its hello
   reply.
-- On hello, sends a snapshot or `no_change`. Coalesces concurrent
-  hello-triggered rebuilds through a
-  `singleflight.Group` (`helloRebuild`, 226).
+- On hello, sends a snapshot or `no_change`. With no cached snapshot for
+  the slug (global just started) the hello waits, up to `RebuildTimeout`,
+  on the slug's rebuild actor (`Rebuilder.RebuildAndWait`), where
+  concurrent hellos batch onto one rebuild. When that wait fails, the hello
+  is still answered from a snapshot cached meanwhile (by a push, or by
+  another worker's hello); it is refused with `rebuild_failed` only when
+  the cache is still empty.
+- After the hello reply, heartbeats the worker every 30 seconds
+  (`workerConn.heartbeatLoop`) and drops a connection that has sent
+  nothing for 90 seconds.
 - Dispatches inbound envelopes per type (`dispatch`, 701) to
   handlers implemented in `internal/hubhandlers`:
   `handleObservation` (789), `handleOpUpdate` (837),
@@ -586,7 +609,11 @@ polling loop.
 
 `WSConn` (line 31) manages the single upstream connection.
 
-- `Run` (274) drives the connect / read / drain loops with backoff.
+- `Run` (274) drives the connect / read / drain loops with backoff: the
+  wait between attempts starts at 1s and doubles to 30s, and returns to
+  1s only after an attempt that lasted 30s with the hello accepted, so a
+  global that accepts each hello and drops the connection is retried
+  every 30s rather than every second.
 - Snapshot receive path: `applySnapshot` (461) calls
   `cache.ApplySnapshot`, persists the sync cursor
   (`localDB.SetSyncCursor`), and then `checkVersion` (495). If the
@@ -598,6 +625,10 @@ polling loop.
 - Outbound drain loops: `drainLoop` (579) for observations and op
   updates, `logRingDrainLoop` (601), `castDrainLoop` (701),
   `heartbeatLoop` (670).
+- `heartbeatLoop` starts as soon as the hello is sent, so the time the
+  worker takes to apply the hello reply is not silence to global. The
+  read loop drops the connection and reconnects
+  when global has sent nothing for 90 seconds; global heartbeats every 30.
 - RPC surface: `handlePowerStatus` (760) and `handleBootStatus`
   (840) are called on the receive path when the hub asks for a
   synchronous power or boot read; the controller is built by the
@@ -702,7 +733,10 @@ unanswered, see below). Per-op:
 
 - Skip the op, unclaimed, if its machine has left the view since the
   pass built its pending list (a snapshot applied while earlier ops
-  held the BMC).
+  held the BMC), or if its agent has reported it failed since then (a
+  host can run the agent on the pending-op boot clause before any
+  claim lands). The worker holds an agent's failure until `op_removed`,
+  and none of the steps below writes over it.
 - `MarkOpClaimed` locally in the cache first (line 120) to prevent
   the next tick re-driving.
 - WS `claimOp` RPC (`Claimer` interface, implemented by
@@ -901,7 +935,9 @@ OIDC-protected under `/api/v1` (middleware in `internal/api/oidcauth.go`):
 - Streams (WebSocket upgrades, token in the `Authorization` header):
   `GET /logs/stream`, `GET /console/stream`. They accept an upgrade
   with no `Origin` header or a same-origin one and refuse any other
-  origin (`acceptOperatorStream` in `logs_stream.go`).
+  origin (`acceptOperatorStream` in `logs_stream.go`), and ping the
+  client every 30 seconds so a proxy's idle timeout does not close a
+  quiet stream (`keepOperatorStreamAlive`).
 - Machine writes: `PATCH /machines/:id`;
   `POST /machines/:id/deploy` / `commission` / `lock` / `unlock` /
   `activate` / `deactivate` / `power` / `boot` / `bmc-reconcile` /
@@ -1131,8 +1167,11 @@ configuration (`Config`, 57) carries:
   known, but must not get a bootfile. Unknown MACs are still
   eligible on a promiscuous pool; the httpboot layer decides what
   to serve them.
-- `OnACK(mac, opID)` — records DHCP phases (`dhcp_ack`, `ipxe_dhcp`)
-  on the machine's booting op for the TUI (`site.go:646`).
+- `OnACK(mac, client)` — records DHCP phases on the machine's booting
+  op for the TUI: `dhcp_ack` when `client` is `ClientFirmware`,
+  `ipxe_dhcp` when it is `ClientIPXE`, nothing for `ClientOther` (the
+  deploy environment's own DHCP client, an installed OS)
+  (`site.go:757`).
 
 The handler supports the multi-interface split-pool case
 (`IfaceParams`, line 135), relay pools for L3 fabrics
@@ -1270,9 +1309,9 @@ Packages:
   by the site worker for the `bmc_reconcile` op.
 - `commission` — Observation handler for `commission_report`,
   `deploy_complete`, `bmc_reconcile_report`, and `dhcp_lease` events.
-  Writes commission data back to NetBox, stores the BMC monitor
-  credential in AWS, finalizes `bmc_reconcile` ops, and records the
-  DHCP lease ledger.
+  Writes commission data back to NetBox, latches a deploy op at
+  `awaiting_phone_home` and stores the BMC monitor credential in AWS,
+  finalizes `bmc_reconcile` ops, and records the DHCP lease ledger.
 - `configscript` — Shared config-script parser and matcher used by
   both the storage and network script pipelines.
 - `dhcp` — DHCPv4 handler and server, multi-interface, split-pool,

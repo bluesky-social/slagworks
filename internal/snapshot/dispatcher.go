@@ -41,6 +41,7 @@ type StoreReader interface {
 	ListStorageScripts() ([]model.StorageScript, error)
 	ListNetworkScripts() ([]model.NetworkScript, error)
 	ListSSHPublicKeys() ([]string, error)
+	ListSiteWorkers(siteSlug string) ([]model.SiteWorker, error)
 	BumpSiteSnapshotMeta(slug, newHash string) (int64, error)
 }
 
@@ -410,6 +411,14 @@ func (d *Dispatcher) gatherAndBuild(ctx context.Context, slug string, outcome *s
 	if err != nil {
 		return model.SiteConfig{}, model.SiteSnapshot{}, err
 	}
+	siteWorkers, err := d.st.ListSiteWorkers(slug)
+	if err != nil {
+		return model.SiteConfig{}, model.SiteSnapshot{}, fmt.Errorf("list site workers for %s: %w", slug, err)
+	}
+	workerIDs := make([]string, len(siteWorkers))
+	for i, w := range siteWorkers {
+		workerIDs[i] = w.WorkerID
+	}
 
 	// Per-pop BMC admin creds: pre-stamped onto each MachineSnapshot
 	// so the site worker's Cache holds creds for every BMC in the
@@ -446,6 +455,7 @@ func (d *Dispatcher) gatherAndBuild(ctx context.Context, slug string, outcome *s
 		Scripts:          scripts,
 		NetworkScripts:   netScripts,
 		SSHKeys:          sshKeys,
+		Workers:          workerIDs,
 		ConsolePorts:     consolePorts,
 		ConsoleServers:   consoleServers,
 		BMCAdminSecret:   adminSecret,

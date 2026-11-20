@@ -1524,28 +1524,30 @@ func TestSetOperationPhase_OverlappingDuplicateChangesPhaseOnce(t *testing.T) {
 // PhaseDuration metric.
 func TestSetOperationPhase_OverlappingWritersChainPrevPhase(t *testing.T) {
 	st := testStore(t)
-	opID := claimedDeployInPhase(t, st, "SN-overlap-phase", "finalizing")
+	opID := claimedDeployInPhase(t, st, "SN-overlap-phase", "rsyncing_os")
 	// Age the starting phase so a Duration measured from it stands out.
 	if err := st.db.Model(&model.Operation{}).Where("id = ?", opID).
 		Update("phase_entered_at", time.Now().Add(-time.Hour)).Error; err != nil {
 		t.Fatal(err)
 	}
 
-	first, second := overlapSetOperationPhase(t, st, opID, "bmc_reconcile", "awaiting_phone_home")
+	// Neither phase is awaiting_phone_home: committed first, it would hold
+	// the row against the other write, and the test accepts either order.
+	first, second := overlapSetOperationPhase(t, st, opID, "finalizing", "bmc_reconcile")
 
 	if !first.Changed || !second.Changed {
 		t.Fatalf("Changed: first=%v second=%v, want both (the phases differ)", first.Changed, second.Changed)
 	}
 	earlier, later := first, second
-	if later.PrevPhase == "finalizing" {
+	if later.PrevPhase == "rsyncing_os" {
 		earlier, later = second, first
 	}
-	if earlier.PrevPhase != "finalizing" || later.PrevPhase != earlier.NewPhase {
-		t.Errorf("transitions do not chain: %q -> %q and %q -> %q, want finalizing -> one -> the other",
+	if earlier.PrevPhase != "rsyncing_os" || later.PrevPhase != earlier.NewPhase {
+		t.Errorf("transitions do not chain: %q -> %q and %q -> %q, want rsyncing_os -> one -> the other",
 			first.PrevPhase, first.NewPhase, second.PrevPhase, second.NewPhase)
 	}
 	if later.Duration > time.Minute {
-		t.Errorf("later transition's Duration = %v, want it measured from the earlier write (milliseconds), not from finalizing (1h)",
+		t.Errorf("later transition's Duration = %v, want it measured from the earlier write (milliseconds), not from rsyncing_os (1h)",
 			later.Duration)
 	}
 }
@@ -2150,6 +2152,85 @@ func TestSetOperationPhase_DoesNotRewriteTerminalOp(t *testing.T) {
 				t.Errorf("%s op's phase_entered_at moved: %s -> %s", tc.want, before.PhaseEnteredAt, after.PhaseEnteredAt)
 			}
 		})
+	}
+}
+
+// TestSetOperationPhase_AwaitingPhoneHomeHeld: once a deploy's row is at
+// awaiting_phone_home, a phase report other than "failed" leaves it there.
+//
+// The phase is the latch that keeps an installed host off the installer:
+// a site worker serves BootLocal to a host whose deploy op is at
+// awaiting_phone_home and BootDeploy to one at any earlier phase. Each
+// worker already refuses to move its own copy of the op off the latch
+// (opState.updatePhase), but the other worker of a both-active pair, or a
+// worker that restarts or resyncs, takes the phase from this row. The
+// reports that can still arrive after the latch come from a worker that
+// has not seen it: the installed host's next PXE answered by that worker
+// (dhcp_ack, ipxe_loaded), or phase reports it queued before a WebSocket
+// drop and sends after the reconnect. If one of them moves the row, every
+// worker that loads the op afterwards serves the installer again and the
+// host installs a second time, the stuck-operation sweep times the op from
+// claimed_at instead of the phone-home budget, and the phone-home itself
+// is refused. Completion and abort do not write a phase; the agent's
+// failure report does, and it must still end the wait.
+func TestSetOperationPhase_AwaitingPhoneHomeHeld(t *testing.T) {
+	st := testStore(t)
+	m := &model.Machine{ID: uuid.New(), NetBoxSerial: "SN-latch-held", State: model.MachineStateCommissioned, PXEEligible: true}
+	if err := st.CreateMachine(m); err != nil {
+		t.Fatal(err)
+	}
+	op, err := st.CreateMachineOp(m.ID, model.OpDeploy, nil, model.MachineStateCommissioned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := st.ClaimOperation(op.ID, "worker-1"); err != nil || claimed == nil {
+		t.Fatalf("claim: op=%v err=%v", claimed, err)
+	}
+	if _, err := st.SetOperationPhase(op.ID, "awaiting_phone_home"); err != nil {
+		t.Fatal(err)
+	}
+	latched, err := st.GetOperation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, late := range []string{"ipxe_loaded", "dhcp_ack", "finalizing"} {
+		tr, err := st.SetOperationPhase(op.ID, late)
+		if err != nil {
+			t.Fatalf("late %s report: %v", late, err)
+		}
+		got, err := st.GetOperation(op.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Phase != "awaiting_phone_home" || tr.Changed {
+			t.Fatalf("a late %s report moved the row off awaiting_phone_home to %q (Changed=%v); "+
+				"a worker that loads the op from this row now serves the installed host the installer",
+				late, got.Phase, tr.Changed)
+		}
+		if tr.Op != nil {
+			t.Errorf("held %s report returned a row; the hub publishes an op_delta for it", late)
+		}
+		if got.Version != latched.Version {
+			t.Errorf("held %s report moved the version %d -> %d", late, latched.Version, got.Version)
+		}
+		if !got.PhaseEnteredAt.Equal(latched.PhaseEnteredAt) {
+			t.Errorf("held %s report moved phase_entered_at (the PhoneHomeTimeout anchor): %s -> %s",
+				late, latched.PhaseEnteredAt, got.PhaseEnteredAt)
+		}
+	}
+
+	// The agent's failure report still ends the wait.
+	tr, err := st.SetOperationPhase(op.ID, "failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetOperation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tr.Changed || got.Phase != "failed" {
+		t.Fatalf("failed must leave awaiting_phone_home: phase=%q Changed=%v", got.Phase, tr.Changed)
 	}
 }
 

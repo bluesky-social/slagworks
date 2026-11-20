@@ -63,6 +63,11 @@ type Rebuilder interface {
 // rpc_response{error:"..."} and the worker leaves the outbox row for
 // the next reconnect to replay. Handlers MUST be idempotent — see
 // internal/commission for the commission-report path.
+//
+// The hub calls the handler from a goroutine per observation, so calls
+// overlap and can finish in any order, except for dhcp_lease: those it
+// handles on the connection's read loop, one at a time, in the order the
+// worker sent them (see workerConn.dispatch).
 type ObservationHandler interface {
 	HandleObservation(ctx context.Context, obs model.Observation) error
 }
@@ -323,6 +328,14 @@ type HubConfig struct {
 	// insert against pg log_envelopes; 10s is ample. Zero means 10s.
 	LogBatchTimeout time.Duration
 
+	// HeartbeatInterval is how often the hub sends each connected worker a
+	// heartbeat, and IdleTimeout how long it waits for bytes from a worker
+	// before dropping its connection as dead. Zero means the package's
+	// HeartbeatInterval and IdleTimeout, which the worker uses too; tests
+	// shorten them.
+	HeartbeatInterval time.Duration
+	IdleTimeout       time.Duration
+
 	// Version is the global daemon's own build SHA. The hub compares
 	// it against each connecting worker's Hello.Version and logs a
 	// WARN on mismatch — phase 1 of the version-pin rollout. Empty
@@ -395,6 +408,12 @@ func NewHub(cfg HubConfig) *Hub {
 	}
 	if cfg.LogBatchTimeout == 0 {
 		cfg.LogBatchTimeout = 10 * time.Second
+	}
+	if cfg.HeartbeatInterval == 0 {
+		cfg.HeartbeatInterval = HeartbeatInterval
+	}
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = IdleTimeout
 	}
 	if cfg.ObsHandler == nil {
 		cfg.ObsHandler = noopObservationHandler{}
@@ -1236,17 +1255,61 @@ func (c *workerConn) serve(ctx context.Context) error {
 		return err
 	}
 
+	// The hello reply is on the wire, so a heartbeat is a valid next
+	// message for the worker.
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+	go c.heartbeatLoop(heartbeatCtx)
+
 	// Steady-state read loop. For Plan 2 we accept hello only once
 	// per connection; subsequent messages are heartbeat / observation /
 	// op_update / log_lines / claim_op. A second hello is a protocol
 	// violation.
 	for {
-		env, err := c.conn.ReadMessage(ctx)
+		env, err := c.conn.ReadMessageIdle(ctx, c.hub.cfg.IdleTimeout)
+		if errors.Is(err, ErrPeerSilent) {
+			return fmt.Errorf("worker sent nothing for %s though it heartbeats every %s; dropping its connection, and it reconnects once its path to global delivers again: %w",
+				c.hub.cfg.IdleTimeout, HeartbeatInterval, err)
+		}
 		if err != nil {
 			return err
 		}
 		if err := c.dispatch(ctx, env); err != nil {
 			return err
+		}
+	}
+}
+
+// heartbeatLoop sends the worker a heartbeat every HeartbeatInterval until
+// ctx ends. Nothing else is guaranteed to flow from global to an idle site,
+// and without it the worker's ReadMessageIdle could not tell a quiet link
+// from a dead one. It writes directly rather than through outbound, so a
+// queued fan-out waiting on a slow database read cannot hold it up, and
+// its 10s write budget starts once it holds writeMu, so waiting behind a
+// message still being written does not count. A failed write force-closes
+// the connection, as a failed op-stream write does.
+func (c *workerConn) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(c.hub.cfg.HeartbeatInterval)
+	defer ticker.Stop()
+	write := func() error {
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return c.conn.WriteTyped(wctx, TypeHeartbeat, "", HeartbeatMsg{WorkerID: c.workerID})
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if err := write(); err != nil {
+			if ctx.Err() == nil {
+				c.log.Warn("heartbeat write failed; forcing reconnect", "err", err)
+				_ = c.conn.CloseNow()
+			}
+			return
 		}
 	}
 }
@@ -1264,11 +1327,6 @@ func (c *workerConn) handleHello(ctx context.Context, hello HelloMsg) error {
 		rctx, cancel := context.WithTimeout(ctx, c.hub.cfg.RebuildTimeout)
 		defer cancel()
 		built, err := c.hub.cfg.Rebuilder.RebuildAndWait(rctx, c.slug)
-		if err != nil {
-			c.writeError(ctx, "rebuild_failed", err.Error())
-			return fmt.Errorf("hello-triggered rebuild: %w", err)
-		}
-		snap = built
 		// Cache the rebuilt snapshot. The dispatcher only Pushes (and so
 		// only populates h.snapshots) on a content-hash CHANGE; after a
 		// global restart with unchanged content the rebuild returns
@@ -1284,13 +1342,33 @@ func (c *workerConn) handleHello(ctx context.Context, hello HelloMsg) error {
 		// from it.
 		// Comparing SeqNums instead would put a pre-reset snapshot back
 		// when the slug's counter went backwards in the meantime.
+		//
+		// The same holds when the wait failed (the rebuild errored or
+		// outlasted RebuildTimeout): a hello that arrives while a rebuild
+		// runs waits for the next one, so the running one may have pushed
+		// meanwhile, and the Push fanned out to this conn, which registered
+		// before this reply. The worker may already hold that snapshot as
+		// its hello reply. Answer from the cache; refuse only when it is
+		// still empty.
 		c.hub.mu.Lock()
-		if cur, ok := c.hub.snapshots[c.slug]; ok {
-			snap = cur
-		} else {
+		cur, cached := c.hub.snapshots[c.slug]
+		if !cached && err == nil {
 			c.hub.snapshots[c.slug] = built
 		}
 		c.hub.mu.Unlock()
+		switch {
+		case cached:
+			if err != nil {
+				c.log.Warn("hello-triggered rebuild failed; answering the hello from the snapshot cached while it waited",
+					"seq", cur.SeqNum, "err", err)
+			}
+			snap = cur
+		case err != nil:
+			c.writeError(ctx, "rebuild_failed", err.Error())
+			return fmt.Errorf("hello-triggered rebuild: %w", err)
+		default:
+			snap = built
+		}
 	}
 
 	if snap.SeqNum == hello.LastSeqNum && snap.SeqNum != 0 {
@@ -1494,18 +1572,45 @@ func (c *workerConn) dispatch(ctx context.Context, env Envelope) error {
 	switch env.Type {
 	case TypeHeartbeat:
 		// Heartbeat is fire-and-forget; refreshes last_seen_at. serial=nil
-		// leaves the stored serial (set at hello time) untouched.
+		// leaves the stored serial (set at hello time) untouched. Its
+		// arrival is what keeps an idle worker's connection up
+		// (ReadMessageIdle in serve).
 		if _, err := c.hub.cfg.Auth.TouchSiteWorker(c.slug, c.workerID, "", nil); err != nil {
 			c.log.Warn("heartbeat touch failed", "err", err)
 		}
 		return nil
 	case TypeObservation:
-		// Run handler in a goroutine so one slow observation (e.g.
+		var msg ObservationMsg
+		if err := unmarshalData(env.Data, &msg); err != nil {
+			c.log.Warn("malformed observation", "req_id", env.RequestID, "err", err)
+			c.replyObservation(env.RequestID, fmt.Errorf("decode observation: %w", err))
+			return nil
+		}
+		if msg.Event == "dhcp_lease" {
+			// Process synchronously, in arrival order. The lease ledger
+			// folds a worker's allocate, renew and delete events and the
+			// fold is order-dependent: a delete handled before the
+			// allocate it follows finds no open row and does nothing,
+			// and the allocate then opens a row nothing closes. The
+			// worker sends its outbox in order without waiting for acks
+			// (a reconnect replays the whole backlog in one burst), so a
+			// goroutine per event races them, and concurrent upserts for
+			// one MAC or IP also collide on the ledger's open-row unique
+			// indexes. The handler is one short transaction with no
+			// NetBox call, the same shape as op_update below.
+			//
+			// This orders what arrives on one connection. A row the
+			// worker re-sends, after global rejected it or after a
+			// reconnect, can still arrive behind newer rows.
+			c.handleObservation(ctx, env.RequestID, msg)
+			return nil
+		}
+		// Run other handlers in a goroutine so one slow observation (e.g.
 		// commission_report hitting a sluggish NetBox) doesn't block
 		// the read loop. Each observation carries its own request_id;
 		// responses can arrive out of order and the worker tracks the
 		// mapping on its side.
-		go c.handleObservation(ctx, env)
+		go c.handleObservation(ctx, env.RequestID, msg)
 		return nil
 	case TypeOpUpdate:
 		// Process synchronously. Spawning a goroutine would break
@@ -1583,14 +1688,13 @@ func (c *workerConn) dispatch(ctx context.Context, env Envelope) error {
 	}
 }
 
-// handleObservation decodes an observation envelope and dispatches to
-// the configured ObservationHandler, then sends an rpc_response
-// carrying the handler's outcome. The worker's ackPending map keys
-// on request_id, so we must ALWAYS reply with the same request_id
-// the worker sent — even on decode error — or the outbox row will
+// handleObservation dispatches a decoded observation to the configured
+// ObservationHandler, then sends an rpc_response carrying the handler's
+// outcome. The worker's ackPending map keys on request_id, so we must
+// ALWAYS reply with the same request_id the worker sent (dispatch does
+// so for an observation it cannot decode, too) or the outbox row will
 // never ack and the worker will replay forever.
-func (c *workerConn) handleObservation(parent context.Context, env Envelope) {
-	reqID := env.RequestID
+func (c *workerConn) handleObservation(parent context.Context, reqID string, msg ObservationMsg) {
 	if reqID == "" {
 		// No request_id means the worker doesn't want an ack. Still
 		// run the handler so the side effects happen, but don't send
@@ -1598,12 +1702,6 @@ func (c *workerConn) handleObservation(parent context.Context, env Envelope) {
 		c.log.Debug("observation without request_id, running handler without ack")
 	}
 
-	var msg ObservationMsg
-	if err := unmarshalData(env.Data, &msg); err != nil {
-		c.log.Warn("malformed observation", "req_id", reqID, "err", err)
-		c.replyObservation(reqID, fmt.Errorf("decode observation: %w", err))
-		return
-	}
 	obs := model.Observation{
 		MachineID:   msg.MachineID,
 		OperationID: msg.OperationID,

@@ -47,6 +47,11 @@ type Inputs struct {
 	NetworkScripts []model.NetworkScript
 	SSHKeys        []string
 
+	// Workers are the IDs of the site workers registered to this config,
+	// in any order. Build emits them sorted as DHCP.Workers, which assigns
+	// each worker its share of the fabric dynamic ranges.
+	Workers []string
+
 	// ConsolePorts are the console ports of the scoped devices, each with
 	// its cable-path far end. Build resolves a machine's cabled
 	// console-server endpoint (MachineSnapshot.Console) from these.
@@ -223,6 +228,9 @@ func buildWithChoices(in Inputs) (model.SiteSnapshot, []AddressChoice, error) {
 		Promiscuous:        in.Config.Promiscuous,
 		DNS:                prefixCSVField(primary, "dns_servers"),
 		LeaseSeconds:       prefixIntField(primary, "dhcp_lease_seconds"),
+	}
+	if len(in.Workers) > 0 {
+		dhcp.Workers = slices.Sorted(slices.Values(in.Workers))
 	}
 	// L3 host fabric: generate a single-address relay pool per host /31
 	// leg. The leaf's dhcp-helper relays PXE DISCOVERs with giaddr = the

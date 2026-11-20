@@ -33,7 +33,11 @@ variable shown, so a flag on the command line overrides the variable.
   `key=value` form. Default
   `host=localhost user=slagworks password=slagworks dbname=slagworks sslmode=disable`,
   which only suits local development. Migrations run at startup. Every
-  connection gets `statement_timeout=30s`.
+  connection gets `statement_timeout=30s`. Each global process holds at
+  most 16 connections; a burst of work (such as site workers replaying
+  their outboxes after a restart) waits for a free connection rather than
+  opening more, so allow 16 per running global in the database's
+  connection limit.
 - **RDS IAM login.** When the DSN's host ends in `.rds.amazonaws.com` and
   the DSN has no password, global logs in with a fresh RDS IAM token per
   connection, signed with the default AWS credential chain; the region is
@@ -286,7 +290,9 @@ executor, so that worker never claims operations.
 ### Other inputs
 
 - **`NOTIFY_SOCKET`** — set by systemd for the `Type=notify` site unit;
-  the worker reports readiness through it.
+  the worker reports readiness through it once its boot services are
+  running. That does not wait for global; `/readyz` reports the
+  connection.
 - The worker shells out to `ipmitool` (SOL console capture, BMC user
   reconcile, the chassis-serial fallback) and `dmidecode` (hardware
   serial). Both are looked up on `PATH`.
@@ -366,9 +372,16 @@ Fields:
   configs; the next reconcile (every five minutes) clears the flags and
   rebuilds the configs that remain.
 - **`ephemeral_pool_start`**, **`ephemeral_pool_end`** — the fabric DHCP
-  pool. Required, IPv4, start no greater than end.
+  pool. Required, IPv4, start no greater than end. When several workers
+  are registered to the config, each hands out addresses only from its own
+  contiguous share of this range and of each relay pool's range (a /31
+  relay pool is not split); see
+  [adding a site worker](adding-a-site-worker.md#notes--gotchas).
 - **`relay_pools`** — pools for subnets reached through a DHCP relay,
-  selected by the relay's `giaddr`. Each is
+  selected by the relay's `giaddr`. A client renewing its lease sends the
+  renew straight to the worker rather than through the relay, so the
+  packet carries no `giaddr` and the pool is chosen by the client's own
+  address (`ciaddr`). Each is
   `{"subnet","range_start","range_end","gateway"}`. The subnet must be an
   IPv4 CIDR in dotted-quad form (`10.254.27.0/24`, not IPv6 or
   IPv4-mapped notation such as `::ffff:10.254.27.0/120`); the range and
@@ -390,7 +403,17 @@ location can be given its own `slagworks-production` and `slagworks-oob`
 prefixes while the whole-site config is still serving. The DNS servers and lease time handed out on the
 fabric leg come from that prefix's `dns_servers` and `dhcp_lease_seconds`
 custom fields, defaulting to `1.1.1.1` and 5 minutes; workers read them
-when their services start, so a change takes effect on restart. When the
+when their services start, so a change takes effect on restart.
+Global copies `gateway_ip` (a bare address such as `10.0.0.1`, not
+`10.0.0.1/24`) and `dns_servers` (comma-separated addresses) into the
+snapshot without checking them; a worker that cannot parse one logs an
+error naming the field and keeps running. It skips a `dns_servers`
+entry that is not an address, falling back to `1.1.1.1` when none is
+left. When the gateway or a pool does not parse, a running worker keeps
+the pools it has, and a worker that starts on such a snapshot runs
+without the fabric DHCP pool, reporting why on `/readyz`, until a
+snapshot that parses arrives; OOB DHCP, TFTP and HTTP boot keep
+running. When the
 site or location carries more than one `slagworks-production` prefix
 (tagging a prefix is also how hosts in it get a gateway), the most specific
 one containing `ephemeral_pool_start` supplies the subnet, gateway, DNS
@@ -519,3 +542,5 @@ example files are installed mode 0640, group `slagworks`.
   minutes (`internal/api/server.go`, `NewServer`).
 - **NetBox reconcile interval** — 5 minutes.
 - **Postgres statement timeout** — 30 seconds.
+- **Postgres connections** — at most 16 per global process; idle
+  connections close after 5 minutes.

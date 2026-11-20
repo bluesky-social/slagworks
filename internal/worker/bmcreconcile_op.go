@@ -53,7 +53,7 @@ const bmcTimeTimeout = 3 * time.Minute
 // the op with non-secret facts. A re-asserted stored password is not copied
 // into the report. Neither password ever rides an op_update (persisted
 // verbatim in the operations table) or a log line. An op global ended
-// mid-run (opRemoved: an abort, a drift fail, a sweep) runs no further
+// mid-run (opEnded: an abort, a drift fail, a sweep) runs no further
 // pass and queues no report, which global would drop anyway.
 func (e *Executor) runBMCReconcile(ctx context.Context, op model.Operation) {
 	log := e.log.With("op_id", op.ID, "type", op.Type, "machine_id", op.MachineID)
@@ -108,7 +108,7 @@ func (e *Executor) runBMCReconcile(ctx context.Context, op model.Operation) {
 		return
 	}
 	_ = ctrl.Close(ctx)
-	if e.opRemoved(log, op, "bmc user reconcile") {
+	if e.opEnded(log, op, "bmc user reconcile") {
 		return
 	}
 
@@ -158,7 +158,7 @@ func (e *Executor) runBMCReconcile(ctx context.Context, op model.Operation) {
 	if err != nil {
 		rep.Error = err.Error()
 	}
-	if e.opRemoved(log, op, "bmc time pass") {
+	if e.opEnded(log, op, "bmc time pass") {
 		// Global drops a report for an op that is no longer active
 		// without storing its password, so none is queued.
 		if rep.Monitor != nil && rep.Monitor.Password != "" {

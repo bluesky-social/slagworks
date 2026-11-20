@@ -1,9 +1,11 @@
 package worker
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -169,6 +171,35 @@ func TestHandleProgressReport_UnsynchronizedIsNotFinal(t *testing.T) {
 		}
 	})
 
+	t.Run("resynced, then the connection to global dropped", func(t *testing.T) {
+		c := NewCache(nil)
+		c.ApplySnapshot(snap)
+		aborted := uuid.New()
+		seedOpsResync(c, model.Operation{ID: aborted, MachineID: machineID, Type: model.OpDeploy, Status: model.OpClaimed, Version: 2})
+		c.ApplyOpRemoved(aborted.String(), machineID.String(), 3, model.MachineStateFailed)
+		c.OpStreamDown(time.Now())
+
+		// An operation global created after the drop is unknown here and
+		// may be healthy, driven by the other worker of a pair.
+		err := c.HandleProgressReport(phaseReport(machineID, opID, "rsyncing_os"))
+		if err == nil {
+			t.Fatal("precondition: a worker that does not hold the operation refuses its reports")
+		}
+		if errors.Is(err, model.ErrOperationNotActive) {
+			t.Fatalf("a worker cut off from global told the agent an operation it never heard of is over: %v", err)
+		}
+		// An end the worker did hear about stays final through the outage.
+		if err := c.HandleProgressReport(phaseReport(machineID, aborted, "rsyncing_os")); !errors.Is(err, model.ErrOperationNotActive) {
+			t.Fatalf("report for an operation whose removal the worker applied: got %v, want model.ErrOperationNotActive", err)
+		}
+
+		// The reconnect's resync is global's active set again.
+		seedOpsResync(c)
+		if err := c.HandleProgressReport(phaseReport(machineID, opID, "rsyncing_os")); !errors.Is(err, model.ErrOperationNotActive) {
+			t.Fatalf("report for an operation absent from the reconnect's resync: got %v, want model.ErrOperationNotActive", err)
+		}
+	})
+
 	t.Run("a report bound to the wrong machine is refused but not final", func(t *testing.T) {
 		other := uuid.New()
 		c := NewCache(nil)
@@ -182,4 +213,81 @@ func TestHandleProgressReport_UnsynchronizedIsNotFinal(t *testing.T) {
 			t.Fatalf("a binding mismatch was reported as the operation being over: %v", err)
 		}
 	})
+}
+
+// TestHandleProgressReport_DisconnectedWorkerDoesNotEndUnknownOp: a worker
+// whose connection to global is down does not tell an agent its operation is
+// over merely because its op set does not hold that operation. Absence from a
+// resynced set is proof only while the op stream is up: once it drops, global
+// can create, claim and drive an operation this worker never hears of.
+//
+// An active/standby pair reaches this. The standby's connection to global is
+// down when keepalived moves the VIP to it, a deploy that started meanwhile
+// on the active worker is unknown to it, and the agent's next report (here
+// the final deploy_complete of a finished install) lands on it. A 410 there
+// halts the agent: no deploy_complete, no reboot, the host left in the
+// recovery environment until global's stuck sweep fails the op.
+//
+// The test runs a real WSConn against a real ws.Hub, so the lost connection
+// is the production event and not a test-only hook.
+func TestHandleProgressReport_DisconnectedWorkerDoesNotEndUnknownOp(t *testing.T) {
+	machineID := uuid.New()
+	snap := pop1Snap(7, machineID, "host-1")
+	snap.Machines[0].State = model.MachineStateDeploying
+
+	// A global with no active operations: the hello op_resync is empty.
+	_, url, stopGlobal := startGlobal(seqGlobal{snap: snap})
+	globalUp := true
+	defer func() {
+		if globalUp {
+			stopGlobal()
+		}
+	}()
+
+	cache := NewCache(nil)
+	wsc := NewWSConn(WSConnConfig{GlobalURL: url, Token: "tok-1", WorkerID: "worker-1"}, cache, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = wsc.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	deployComplete := func(opID uuid.UUID) error {
+		return cache.HandleProgressReport(&model.ProgressReport{
+			MachineID: machineID.String(), OperationID: opID.String(), Event: "deploy_complete",
+		})
+	}
+
+	// Control: connected and resynced, an operation the set does not hold
+	// is over. Until the hello op_resync is applied the answer is the
+	// plain "not known yet" refusal, so waiting for the final one also
+	// waits for the resync.
+	waitFor("a connected, resynced worker to refuse an absent operation as final", func() bool {
+		return errors.Is(deployComplete(uuid.New()), model.ErrOperationNotActive)
+	})
+
+	// The connection to global drops and stays down. A deploy is then
+	// created, claimed and driven by the other worker; this one never
+	// hears of it.
+	stopGlobal()
+	globalUp = false
+	waitFor("the worker to notice the lost connection", func() bool { return !wsc.Connected() })
+
+	err := deployComplete(uuid.New())
+	if err == nil {
+		t.Fatal("a report for an operation the worker does not hold was accepted")
+	}
+	if errors.Is(err, model.ErrOperationNotActive) {
+		t.Fatalf("a worker with no connection to global refused the report as final (410 Gone, the agent halts): %v; "+
+			"want a retryable refusal (409): it cannot know whether an operation created since it lost the op stream is over", err)
+	}
 }

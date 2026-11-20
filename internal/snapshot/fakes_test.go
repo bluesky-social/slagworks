@@ -156,6 +156,7 @@ type fakeStore struct {
 	scripts        []model.StorageScript
 	networkScripts []model.NetworkScript
 	sshKeys        []string
+	workers        []model.SiteWorker
 }
 
 func newFakeStore(t *testing.T, cfgs ...model.SiteConfig) *fakeStore {
@@ -213,6 +214,18 @@ func (f *fakeStore) ListImages() ([]model.Image, error)                 { return
 func (f *fakeStore) ListStorageScripts() ([]model.StorageScript, error) { return f.scripts, nil }
 func (f *fakeStore) ListNetworkScripts() ([]model.NetworkScript, error) { return f.networkScripts, nil }
 func (f *fakeStore) ListSSHPublicKeys() ([]string, error)               { return f.sshKeys, nil }
+
+func (f *fakeStore) ListSiteWorkers(siteSlug string) ([]model.SiteWorker, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []model.SiteWorker
+	for _, w := range f.workers {
+		if w.SiteSlug == siteSlug {
+			out = append(out, w)
+		}
+	}
+	return out, nil
+}
 
 func (f *fakeStore) BumpSiteSnapshotMeta(slug, hash string) (int64, error) {
 	f.mu.Lock()

@@ -490,11 +490,12 @@ func TestCache_ConditionalOverlayClear(t *testing.T) {
 			Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}},
 		}},
 	})
+	opID := uuid.New()
 	seedOpsResync(c, model.Operation{
-		ID: uuid.New(), MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Phase: "awaiting_phone_home",
+		ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Phase: "awaiting_phone_home",
 	})
 
-	c.RecordPhoneHome(id)
+	c.RecordPhoneHome(id, opID)
 	if got := c.MachineByID(id); got == nil || got.State != model.MachineStateRunning {
 		t.Fatalf("post phone-home: running overlay not applied, got %+v", got)
 	}

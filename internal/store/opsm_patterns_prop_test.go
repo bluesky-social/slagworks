@@ -219,8 +219,8 @@ func (g *opsmGen) enqueuePattern(rt *rapid.T) {
 		h.ref.hit("gen.pattern.lock_dance")
 
 	case "phone_home":
-		// The awaiting_phone_home latch: enter it, regress out of it, and
-		// age both clocks against both sweeps.
+		// The awaiting_phone_home latch: enter it, try to regress out of it
+		// (held), and age both clocks against both sweeps.
 		if op == nil || op.status == "pending" {
 			return
 		}

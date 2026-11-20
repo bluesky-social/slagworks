@@ -110,11 +110,41 @@ Before the worker will function, the site needs:
   `slagctl worker delete <ident>` removes a worker's registration row by
   uuid, worker-id, or fqdn — but refuses while the worker is currently
   connected or has an in-flight op claimed, so a live worker must be
-  stopped before it can be deleted.
+  stopped before it can be deleted. Delete the registration of a worker
+  you retire: every registered worker keeps its share of the site's
+  fabric dynamic ranges (see HA pairs below), offline or not.
 - **worker_id ↔ token binding is strict.** If `SLAGWORKS_WORKER_ID` in
   `site.env` doesn't match the id the token was registered for, the hub
   rejects the connection.
+- **Proxies and load balancers on the path.** Once connected, the worker
+  and global each send a heartbeat every 30 seconds, so the connection
+  carries traffic in both directions at least that often and an idle
+  timeout of 60 seconds or more on anything in between is fine. Either end
+  drops a connection it has heard nothing on for 90 seconds, so a path
+  that stops delivering without closing the connection (a load balancer
+  or NAT that lost its state) costs at most that long before the worker
+  reconnects; the worker's log says `global sent nothing for 1m30s` and
+  global's says `worker sent nothing for 1m30s`. Repeated drops like that
+  on an otherwise healthy site point at something in the path discarding
+  traffic.
 - **HA pairs.** A redundant gateway pair each runs its own worker with its
   own token and bind address; DHCP authority follows the externally-managed
   VIP (`SLAGWORKS_VIP` is watched, not managed — run keepalived or
-  equivalent). Register and configure each worker independently.
+  equivalent). Register and configure each worker independently. The
+  site's snapshot lists every worker registered to its site config, and
+  each worker hands out dynamic addresses only from its own share of the
+  ephemeral range and of each relay pool's range (a /31 relay pool is not
+  split), so while the set of registered workers stays the same, two
+  workers never lease one address to two hosts. While a worker is down or
+  on standby its share goes unused: the others keep leasing from their own
+  shares only. A share is the worker's position in the sorted list of
+  worker IDs, so registering or deleting a worker moves the shares as each
+  worker applies the new snapshot, and the leases already handed out do
+  not move with them: until one lease time after every serving worker has
+  applied it, a worker can offer an address that a host still holds from
+  the address's previous owner (each worker refuses its own leases outside
+  its new share at their next renewal; a worker cut off from global keeps
+  its old share until it reconnects). Register or delete a worker while
+  the other workers show online in `slagctl worker list` and no host is
+  booting from a dynamic address, or wait one lease time before booting
+  hosts.

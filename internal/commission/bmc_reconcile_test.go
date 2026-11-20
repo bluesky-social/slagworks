@@ -28,6 +28,13 @@ const reconcileMonitorPW = "Xq9!rotatedMON"
 type fakeOpPublisher struct {
 	mu      sync.Mutex
 	removed []model.Operation
+	deltas  []model.Operation
+}
+
+func (p *fakeOpPublisher) PublishOpDelta(op model.Operation, _ model.MachineState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.deltas = append(p.deltas, op)
 }
 
 func (p *fakeOpPublisher) PublishOpRemoved(op model.Operation, _ model.MachineState) {

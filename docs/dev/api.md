@@ -59,7 +59,11 @@ request's `Authorization` header, never in the URL, and a bad token gets
 401 or 403 before the upgrade. An upgrade with no `Origin` header
 (`slagctl`) is accepted; a browser upgrade is accepted only from the API's
 own origin (its `Origin` host equals the request `Host`), and any other
-origin gets 403.
+origin gets 403. The server sends a WebSocket ping on each operator stream
+every 30 seconds, so a stream with nothing new to send still carries
+traffic through a proxy's idle timeout. An unanswered ping does not end the
+stream: a client that has stopped reading is still connected. The stream
+ends when the client closes or drops the connection or a write fails.
 
 ## Conventions
 
@@ -286,15 +290,31 @@ Connection setup:
    whose only workers are still waiting for it answers those reads as if no
    worker were connected. The worker adopts the first snapshot on a
    connection even when its SeqNum is lower than the one it holds, and
-   drops a later one that is older than what it holds.
+   drops a later one that is older than what it holds. When global holds no
+   snapshot for the site yet (it has just started), it builds one before
+   replying, waiting up to 30 s; if that build fails and no snapshot for the
+   site has been cached in the meantime, it rejects the connection with
+   `rebuild_failed` and the worker reconnects and retries.
+4. Each end sends a `heartbeat` every 30 seconds (`ws.HeartbeatInterval`),
+   the worker from its `hello` on (so applying the reply is not counted as
+   silence) and global from its reply on. After the reply each end
+   drops the connection when nothing has arrived from the other for 90
+   seconds (`ws.IdleTimeout`), logging why. A path that stops delivering
+   without a FIN or RST (a load balancer or NAT that lost the flow, a
+   wedged proxy) therefore ends within 90 seconds instead of when the
+   kernel stops retransmitting, or never when something in the path keeps
+   acknowledging. The timer restarts on every chunk of a message as it
+   arrives, so a large message on a slow link is not cut, and it runs only
+   while the end is reading, so time spent handling a message is not
+   counted against the other end. Steps 1-3 have no idle timeout.
 
 Worker to global:
 
 | Type | Purpose |
 |---|---|
 | `hello` | `{"worker_id","fqdn","last_seq_num","version","proto","serial","smcipmitool"}`. |
-| `heartbeat` | `{"worker_id"}`. Refreshes `site_workers.last_seen_at`. No reply. |
-| `observation` | An outbox entry: `{"machine_id","op_id","event","timestamp","data"}`. Events: `commission_report`, `deploy_complete`, `bmc_reconcile_report`, `dhcp_lease`, `phone_home`, `inventory_import`. Acknowledged with `rpc_response`. |
+| `heartbeat` | `{"worker_id"}`, every 30 seconds. Refreshes `site_workers.last_seen_at`. No reply. |
+| `observation` | An outbox entry: `{"machine_id","op_id","event","timestamp","data"}`. Events: `commission_report`, `deploy_complete`, `bmc_reconcile_report`, `dhcp_lease`, `phone_home`, `inventory_import`. Acknowledged with `rpc_response`. Global handles a connection's `dhcp_lease` observations one at a time, in the order they arrive, because the lease ledger folds them in order; other events are handled concurrently and can be acknowledged out of order. |
 | `op_update` | `{"op_id","status","phase","result"}`. Processed in order; no reply. |
 | `log_batch` | `{"envelopes":[...]}`. The site worker sends at most 256 envelopes per batch whose encoded envelopes total at most 4 MiB (the array and message wrapper add a little), and drops a single envelope over 4 MiB, counting it in `slagworks_site_logring_dropped_total`; global enforces only the 16 MiB message limit. Persisted to `log_envelopes` and re-emitted on global's stdout. Every envelope must be `source=agent` or `site`; a batch carrying any other source (`global` is global's own op-lifecycle events) is dropped whole. |
 | `claim_op` | `{"op_id"}`. Global replies with `claim_op_response`. |
@@ -316,6 +336,7 @@ Global to worker:
 | `power_status` | RPC request `{"machine_id","bmc_runtime","amt_runtime"}`. |
 | `boot_status` | RPC request `{"machine_id","bmc_runtime"}`. |
 | `dhcp_leases` | RPC request `{}`, sent to every connected worker for the site. |
+| `heartbeat` | `{"worker_id"}` (the receiving worker's), every 30 seconds after the hello reply, so an idle site still hears from global. No reply. |
 | `rpc_response` | `{"data","error","terminal"}`. Reply to `observation` and `cast_resume`. `terminal: true` tells the worker to drop the entry rather than retry. |
 | `claim_op_response` | `rpc_response`-shaped; `data` is `{"operation"}` when the worker won the claim or `{"already_claimed": true}` when it lost, including when the operation's machine is not in the worker's site. |
 | `error` | `{"code","message","proto"}`, e.g. a rejected hello. |

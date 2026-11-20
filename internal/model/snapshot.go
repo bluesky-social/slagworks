@@ -82,6 +82,14 @@ type DHCPConfig struct {
 	// LeaseSeconds is the lease duration (option 51) from the prefix
 	// dhcp_lease_seconds custom field. 0 = handler default.
 	LeaseSeconds int `json:"lease_seconds,omitempty"`
+	// Workers are the IDs of the site workers registered to this site
+	// config, sorted. Every worker builds its pools from this one
+	// snapshot, so the worker at position i allocates only from share i
+	// of the ephemeral range and of each relay pool's range (a /31 relay
+	// pool is not split): see dhcp.PoolConfig.WorkerShare. A registered
+	// worker that is offline or on standby keeps its share, so the shares
+	// do not move when a worker disconnects or reconnects.
+	Workers []string `json:"workers,omitempty"`
 }
 
 // OOBConfig is the OOB-segment DHCP configuration the site worker binds in
@@ -365,7 +373,9 @@ func (s SiteSnapshot) ContentHash() (string, error) {
 	// re-sorted — that order is intentional and stable. DHCP.RelayPools
 	// isn't re-sorted either: configured pools keep their authored order
 	// (the worker serves from the first pool containing giaddr), and the
-	// builder emits the generated /31 pools sorted by subnet.
+	// builder emits the generated /31 pools sorted by subnet. Nor is
+	// DHCP.Workers: the builder emits it sorted, and its order assigns each
+	// worker's share of the dynamic ranges.
 	copied.OOB.DynamicSlices = append([]OOBDynamicSlice(nil), s.OOB.DynamicSlices...)
 
 	// Machine.ID is a UUID and guaranteed unique, so a simple comparator

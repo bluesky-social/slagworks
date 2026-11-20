@@ -59,14 +59,17 @@ func TestDeployOpForMAC_TerminalOp1ActiveOp2_Deterministic(t *testing.T) {
 // negative shape that made single-VM redeploy tests flaky: if op1 is left
 // ACTIVE (e.g. still claimed, awaiting_phone_home) at the same time op2 is
 // also active for the same machine, deployOpForMAC has no tiebreak beyond
-// Go's randomized map iteration order. In production this dual-active state
-// is unreachable — store/operations.go's idx_one_active_op_per_machine
-// unique index enforces at most one active lifecycle op per machine, so a
-// second op can only become active once the first is terminal. This test
-// exists only to document that boundary and must NOT assert a specific
-// winner or flip-flopping across iterations (that would pin flakiness as a
-// requirement); it asserts only what is guaranteed: the result is one of
-// the two ops.
+// Go's randomized map iteration order. Global never holds this dual-active
+// state — store/operations.go's idx_one_active_op_per_machine unique index
+// enforces at most one active lifecycle op per machine, so a second op can
+// only become active once the first is terminal — but a worker can hold it
+// briefly when op2's op_delta arrives ahead of op1's op_removed. A MAC-only
+// reader has no op to bind to, so either answer is tolerated there; a report
+// that names its op is held to that op (TestPhoneHome_CompletesTheOpItNames
+// below). This test exists only to document that boundary and must NOT
+// assert a specific winner or flip-flopping across iterations (that would
+// pin flakiness as a requirement); it asserts only what is guaranteed: the
+// result is one of the two ops.
 func TestDeployOpForMAC_BothOpsActive_UndefinedTiebreakIsOK(t *testing.T) {
 	c := NewCache(nil)
 	id := uuid.New()
@@ -86,6 +89,76 @@ func TestDeployOpForMAC_BothOpsActive_UndefinedTiebreakIsOK(t *testing.T) {
 	got := c.DeployOpForMAC(mac)
 	if got == nil || (got.ID != op1 && got.ID != op2) {
 		t.Fatalf("got %+v, want one of {op1=%s, op2=%s}", got, op1, op2)
+	}
+}
+
+// TestPhoneHome_CompletesTheOpItNames: a phone-home completes the deploy op
+// it names, and no other.
+//
+// Global ends one deploy of a machine (here the phone-home timeout failed it)
+// and the operator starts the next. Global commits both, but publishes the
+// end and the new op from different goroutines, so the new op's op_delta can
+// reach a worker before the old op's op_removed. Until the removal lands, the
+// worker holds two active deploy ops for the machine: the unique index keeps
+// global from ever holding that state, but the worker can. The first install
+// is on the disk and its phone-home unit is still retrying. If that
+// phone-home arrives in the window, the worker validates the op it names and
+// must record the completion of that op. The durable phone_home observation
+// is what global completes a deploy from, and global completes whichever
+// active deploy op the observation carries, pending included.
+func TestPhoneHome_CompletesTheOpItNames(t *testing.T) {
+	// The worker once picked the op to complete by ranging over a map, so a
+	// single run could pass by luck. Fifty independent caches cannot.
+	for i := 0; i < 50; i++ {
+		c := NewCache(nil)
+		id := uuid.New()
+		deployingMachine(c, id, "52:54:00:rd:05:01")
+
+		installed := model.Operation{
+			ID: uuid.New(), MachineID: id, Type: model.OpDeploy,
+			Status: model.OpClaimed, Phase: "awaiting_phone_home", Version: 5,
+		}
+		redeploy := model.Operation{
+			ID: uuid.New(), MachineID: id, Type: model.OpDeploy,
+			Status: model.OpPending, Version: 0,
+		}
+		seedOpsResync(c, installed)
+		// The next deploy's op_delta, ahead of the first one's op_removed.
+		c.ApplyOpDelta(redeploy, "")
+
+		if err := c.HandleProgressReport(&model.ProgressReport{
+			MachineID: id.String(), OperationID: installed.ID.String(), Event: "phone_home",
+		}); err != nil {
+			t.Fatalf("phone-home for the installed deploy refused: %v", err)
+		}
+
+		obs, updates := c.DrainOutbox()
+		var phoneHomes int
+		for _, p := range obs {
+			if p.Obs.Event != "phone_home" {
+				continue
+			}
+			phoneHomes++
+			if p.Obs.OperationID != installed.ID {
+				t.Fatalf("run %d: the phone-home named deploy %s, but the worker queued a phone_home observation for %s (the pending redeploy is %s), which global would complete without it ever having run",
+					i, installed.ID, p.Obs.OperationID, redeploy.ID)
+			}
+		}
+		if phoneHomes != 1 {
+			t.Fatalf("run %d: got %d phone_home observations, want 1: %+v", i, phoneHomes, obs)
+		}
+		var completed []string
+		for _, u := range updates {
+			if u.Status == string(model.OpCompleted) {
+				completed = append(completed, u.OperationID)
+			}
+		}
+		if len(completed) != 1 || completed[0] != installed.ID.String() {
+			t.Fatalf("run %d: completed op_updates %v, want only the named deploy %s", i, completed, installed.ID)
+		}
+		if got := c.GetOperation(redeploy.ID.String()); got == nil || got.Status != model.OpPending {
+			t.Fatalf("run %d: another op's phone-home touched the pending redeploy %s: %+v", i, redeploy.ID, got)
+		}
 	}
 }
 
@@ -119,7 +192,7 @@ func TestApplyOpResync_PhoneHomedOverlayPinning(t *testing.T) {
 		Status: model.OpClaimed, Phase: "awaiting_phone_home", Version: 1,
 	})
 
-	c.RecordPhoneHome(id)
+	c.RecordPhoneHome(id, opID)
 	if got := c.MachineByID(id); got == nil || got.State != model.MachineStateRunning {
 		t.Fatalf("post phone-home: running overlay not applied, got %+v", got)
 	}
@@ -168,7 +241,7 @@ func TestApplyOpResync_PhoneHomedOverlayPinning(t *testing.T) {
 	c.ApplyOpDelta(model.Operation{
 		ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Version: 3,
 	}, "")
-	c.RecordPhoneHome(id)
+	c.RecordPhoneHome(id, opID)
 	if !c.opState.phoneHomed[opID.String()] {
 		t.Fatal("recordPhoneHome should re-latch once the op is active again")
 	}

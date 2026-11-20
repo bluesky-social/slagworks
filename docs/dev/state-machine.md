@@ -244,16 +244,20 @@ lock (`TestFailOperation_AutoUnlocksOnFailed`,
 ### Phase write sites
 
 `Operation.Phase` is written in only one place on global
-(`Store.SetOperationPhase`, `internal/store/store.go:703`), called
+(`Store.SetOperationPhase`, `internal/store/operations.go`), called
 by `hubhandlers.OpUpdate.HandleOpUpdate`
-(`hubhandlers.go:132`). `SetOperationPhase` returns a
-`PhaseTransition` (`store.go:690`) that the hub uses to emit exactly
+(`hubhandlers.go:132`) and, with `awaiting_phone_home`, by the
+observation handler for `deploy_complete`
+(`commission.Handler.handleDeployComplete`). `SetOperationPhase` returns a
+`PhaseTransition` that the callers use to emit exactly
 one canonical log envelope per real change. It does not write a
 terminal (completed/failed) op: the worker can still report a phase
 after the op ended (a report in flight when the operator aborts, or
 executor progress after `op_removed`), and that report changes
 nothing and publishes nothing. The op keeps the phase it ended in, and
-its version stays at the tombstone workers hold for it.
+its version stays at the tombstone workers hold for it. Nor does it
+move a deploy off `awaiting_phone_home` to any phase but `failed`; see
+[the latch](#the-awaiting_phone_home-latch).
 It reads the op row `FOR
 UPDATE`, so two overlapping deliveries of the same report serialize:
 the second sees the phase the first wrote and returns `Changed=false`.
@@ -270,8 +274,13 @@ sites for that helper are:
 - `Executor.runPowerOp` and `Executor.runBMCReconcile` — emit the op
   type (`power_on`, `power_off`, `power_cycle`, `set_boot_device`,
   `bmc_reconcile`) before their first controller call.
-- `dhcpCfg.OnACK` (`cmd/slagworksd/site.go:646`) — emits
-  `dhcp_ack` (firmware DHCP) or `ipxe_dhcp` (iPXE second DHCP).
+- `dhcpCfg.OnACK` (`cmd/slagworksd/site.go:757`) — emits
+  `dhcp_ack` for an ACK to PXE or HTTP-boot firmware and `ipxe_dhcp` for
+  one to slagworks iPXE (`dhcp.ClientKind`). The host DHCPs a third time
+  once the boot script's `ip=dhcp` starts the deploy or commission
+  environment's own client (dhcpcd in the initrd, after `ipxe_loaded`),
+  and again at each renewal. That client is neither stage, so its ACKs
+  write no phase.
 - `httpboot.Handler.ServeHTTP` (`internal/httpboot/handler.go:190`)
   — emits `ipxe_loaded` when the iPXE second stage fetches the boot
   script.
@@ -551,6 +560,21 @@ resurrect a zombie op, and — the re-wipe-window fix — clears its op-driven
 machine-state overlay on an identity apply ONLY where the applied baseline
 equals the overlay value. A rehydrated-from-LocalDB op set is UNTRUSTED
 until the first `op_resync`: it may force `BootLocal` but never actuate.
+An op set frozen by a lost connection is stale for the same reason
+(global can complete, abort or sweep any op in it unheard), so once the
+worker's connection to global has been down for longer than
+`opStreamTrustWindow` (30 minutes, the default `OpTimeout`: by then global
+has ended every op the set holds as claimed) the same rule applies until
+the next `op_resync`. The clock starts when the WS client sees the first
+connection end of the outage; a hello that succeeds without delivering an
+`op_resync` (the proto refusal, the outbox-reload failure loop) does not
+stop it. Agent reports are still accepted, so an install already under way
+finishes through the outage, and the executor's claims still go to
+global, which settles them. A pending op can still be live on global past
+the window; its boot is withheld until the worker reconnects. A shorter
+outage leaves the frozen set actuating: a host whose op ended unheard less
+than 30 minutes ago can still be served its agent by the cut-off worker.
+Each withheld boot logs a `boot withheld` warning naming the op.
 The worker persists its op layer (`worker.db`, kv key `op_state`) after
 every stream apply and after the two local writes that protect an
 installed host, a deploy op reaching `awaiting_phone_home` and a
@@ -582,7 +606,10 @@ started, and a snapshot applied while earlier ops held the BMC can drop
 this machine (it moved to another site). The executor leaves such an op
 unclaimed and pending for the site that owns the machine now, rather
 than winning a claim it must then fail or having the hub's membership
-check decline it. Then:
+check decline it. It also leaves unclaimed an op whose agent has
+reported it failed since the pass began (a host can run the agent on
+the pending-op boot clause before any claim lands; see
+[Timeouts](#timeouts-and-phase-based-expiration)). Then:
 
 1. `Cache.MarkOpClaimed` locally in the cache first (line 120).
    This prevents the next 5-second tick re-driving the same op.
@@ -640,11 +667,15 @@ abort, a NetBox drift fail or a timeout sweep can therefore land an
 `op_removed` for the op while the executor is inside a BMC round trip.
 Before each write to the host or its BMC (the PXE or boot-device arm, the
 power action, `bmc_reconcile`'s account pass and its time pass) the
-executor re-reads the op layer (`Executor.opRemoved`); if the op is gone
+executor re-reads the op layer (`Executor.opEnded`); if the op is gone
 it stops there and reports nothing, since global already holds the
-terminal row. An `op_removed` that lands after a write does not undo it:
-a lifecycle op aborted just after its power cycle still reboots the host,
-which then boots from disk (`BootLocal`: no active op authorizes it).
+terminal row. It stops the same way when the agent has reported a
+lifecycle op failed (see
+[Timeouts](#timeouts-and-phase-based-expiration)): that failure is
+already queued for global. An `op_removed` that lands after a write
+does not undo it: a lifecycle op aborted just after its power cycle
+still reboots the host, which then boots from disk (`BootLocal`: no
+active op authorizes it).
 
 ### Complete
 
@@ -669,10 +700,16 @@ Path depends on the op type.
   MAC-only phone-home route: a request that names no op cannot
   complete one (`TestPhoneHome_CompletesOnlyTheBoundDeployAwaitingIt`,
   `internal/httpboot/phone_home_test.go`). An accepted report
-  calls `Cache.RecordPhoneHome` (`internal/worker/cache.go`).
-  That sets the machine's local state to `running`, emits a
-  `phone_home` observation carrying the deploy op's ID, and calls
-  `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. Both reach
+  calls `Cache.RecordPhoneHome` (`internal/worker/cache.go`) with
+  the op it named. That sets the machine's local state to `running`,
+  emits a `phone_home` observation carrying that op's ID, and calls
+  `Cache.RecordOpUpdate(deployOpID, "completed", nil)`. It never
+  looks the op up by machine: a worker can briefly hold two active
+  deploy ops for one machine, when the next deploy's `op_delta`
+  arrives ahead of the previous one's `op_removed`, and global
+  completes whichever op the observation carries, pending included
+  (`TestPhoneHome_CompletesTheOpItNames`,
+  `internal/worker/opstate_redeploy_test.go`). Both reach
   `Store.CompleteOperationWithState(opID, Running, ...)`, which
   auto-locks the machine: the op update through
   `hubhandlers.OpUpdate.HandleOpUpdate`, the observation through
@@ -685,8 +722,9 @@ Path depends on the op type.
   acks it. Without it, a worker restart, a dropped connection or a
   failed op-update handler between the 2xx and delivery would leave
   the op at `awaiting_phone_home` until `PhoneHomeTimeout` fails a
-  healthy host. A `phone_home` with no op ID (the worker held no
-  active deploy op) changes nothing.
+  healthy host. A `phone_home` with no op ID (the named op ended
+  between the worker validating the report and recording it) changes
+  nothing.
 - **Commission** completes via the commission report path, not the
   op-update path. The observation handler calls
   `Store.CommitCommissionResult(opID, machineID, data)`, which revalidates
@@ -794,6 +832,17 @@ again and reports for the op are refused as terminal. When the failure
 never reached global, the op stays active there until a timeout sweep
 fails it.
 
+The executor's own bookkeeping holds the failure too. The agent can fail
+a deploy the executor has not finished claiming: a host that PXEs while
+the deploy is pending runs the agent on the pending-op boot clause, and
+the claim RPC can wait out its 30-second deadline on a global that is
+not answering. The claim attempt, the rollback of an unanswered claim
+and the running mark after a granted claim all leave a failed op failed;
+`executeOp` does not claim an op the agent failed after the pass built
+its pending list; and the check before each host write
+(`Executor.opEnded`) stops on the failure as it does on `op_removed`.
+Tests: `executor_agent_failure_test.go`.
+
 Each sweep fails its ops one transaction at a time and keeps going past
 a per-op error, returning both the ops it failed and the joined error.
 The tick (`Server.expireOperations`) publishes `op_removed` for every op
@@ -867,10 +916,16 @@ answers it with 410 Gone (`reportRejectionStatus`,
 an op ends: a timeout sweep, a failure the agent or the boot hook
 reported, completion. The worker gives it only when it knows the op is
 over: it holds the op with a terminal status, it holds the op's
-tombstone, or the op is absent from a set that has been resynced since
-the worker started. Every other rejection stays 409 Conflict, including
-"operation state is not synchronized" from a worker that restarted
-mid-deploy, where the op may be healthy.
+tombstone, or the op is absent from the set global resynced on the
+worker's current connection. Every other rejection stays 409 Conflict,
+including "operation state is not synchronized" from a worker that
+restarted mid-deploy, where the op may be healthy, and a report for an
+op the worker does not hold while its connection to global is down
+(`Cache.OpStreamDown`): global may have created that op since, and the
+other worker of a pair may be driving it, as when keepalived moves the
+VIP to a standby that lost its connection before the deploy started.
+The reconnect's `op_resync` restores the final answer for an op that
+ended in the meantime.
 
 The agent acts on 410 on every report path (`agentReporter.send`,
 `cmd/slagworks-agent/reporter.go`): phase reports, log flushes, failure
@@ -898,8 +953,9 @@ is the expected result of that report and is ignored: global completes
 a commission as soon as it has the inventory, while the agent still has
 the console probe and its reboot ahead of it.
 
-Tests: `TestHandleProgressReport_OperationOverIsFinal` and
-`TestHandleProgressReport_UnsynchronizedIsNotFinal`
+Tests: `TestHandleProgressReport_OperationOverIsFinal`,
+`TestHandleProgressReport_UnsynchronizedIsNotFinal` and
+`TestHandleProgressReport_DisconnectedWorkerDoesNotEndUnknownOp`
 (`internal/worker/report_final_test.go`),
 `TestReportEndpoint_OperationOverIsGone` (`internal/httpboot/handler_test.go`),
 `TestRunDeploy_StopsWhenOperationIsNoLongerActive`
@@ -1009,6 +1065,43 @@ global's stale row) then finds the latched phase to keep
 (`keepTerminalWait`) and the pin to apply, and the host's next PXE still
 boots its disk. Test: `TestAwaitingPhoneHomeSurvivesRestart`
 (`opstream_test.go`).
+
+The latch also has to reach global's row and stay there, because that
+row is the only place a worker that did not accept `deploy_complete`
+learns it: the other worker of a both-active pair (either may answer the
+installed host's next PXE), and a worker that restarts or resyncs without
+a latched LocalDB row. `keepTerminalWait` protects only a worker that
+already holds the latch. Two rules on global keep the row latched:
+
+- The `deploy_complete` observation carries the latch. The phase
+  op_update is lost when it is written into a connection that then
+  drops, when the hub's handler fails, or when the worker restarts
+  before draining it; the observation stays in the worker's SQLite
+  outbox until global acks it. `commission.Handler.handleDeployComplete`
+  sets the op's phase to `awaiting_phone_home` and publishes the
+  op_delta before it handles the monitor credential, so a monitor
+  failure that drops the observation does not drop the latch, and a
+  failed phase write leaves the observation unacked for a retry.
+- `Store.SetOperationPhase` holds the row at `awaiting_phone_home`
+  against every phase but `failed`, the rule `opState.updatePhase`
+  applies to each worker's copy. The writes it drops are late: a worker
+  that has not seen the latch reporting `dhcp_ack` or `ipxe_loaded` for
+  the installed host's next PXE, or phase reports a worker queued before
+  a disconnect. The reconnect drain sends observations before op
+  updates, so even the latching worker's own `finalizing` and
+  `bmc_reconcile` can reach global after its `deploy_complete`
+  observation. Accepting one would move the row back to a mid-install
+  phase: every worker that loaded the op afterwards would serve the
+  installer, the stuck sweep would time the op from `claimed_at`, and a
+  worker holding the regressed row would refuse the phone-home.
+
+Tests: `TestHandleDeployComplete_LatchesAwaitingPhoneHome`,
+`TestHandleDeployComplete_LatchSurvivesMonitorCredFailure`
+(`internal/commission/handler_test.go`) and
+`TestSetOperationPhase_AwaitingPhoneHomeHeld`
+(`internal/store/operations_test.go`). Neither rule helps a worker that
+is cut off from global when the latch is set: until it reconnects it
+serves from the op set it last received.
 
 Timeout: `PhoneHomeTimeout` (30 minutes by default) anchored on
 `phase_entered_at`.

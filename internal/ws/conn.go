@@ -3,18 +3,51 @@ package ws
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
 	"github.com/coder/websocket"
 )
 
-const (
-	defaultReadLimit    = 1 << 20 // 1MB
-	defaultPingInterval = 30 * time.Second
-	defaultPongTimeout  = 10 * time.Second
-)
+const defaultReadLimit = 1 << 20 // 1MB
+
+// HeartbeatInterval is how often each end of the site-worker link sends
+// the other a heartbeat message. The worker's refreshes
+// site_workers.last_seen_at; global's gives an idle site something to
+// hear. Each end reads with IdleTimeout, so the heartbeats are what let it
+// tell a quiet link from a dead one: a path that stops delivering without
+// a FIN or RST (a load balancer or NAT that lost the flow, a wedged proxy)
+// otherwise looks open until the kernel gives up retransmitting, about 15
+// minutes on Linux defaults, or never when something in the path keeps
+// acknowledging.
+//
+// These are heartbeat messages rather than WebSocket pings because
+// coder/websocket answers a ping from inside the receiver's read, with 5
+// seconds to get the pong onto the connection, and fails that read
+// otherwise. A pong waits behind a message the receiver is still writing,
+// so a ping arriving while a worker uploads a 10 MiB observation over a
+// slow link would end the connection, and the replayed observation would
+// meet the next ping the same way.
+const HeartbeatInterval = 30 * time.Second
+
+// IdleTimeout is how long either end of the site-worker link waits for
+// bytes from the other before it drops the connection as dead: three
+// heartbeat intervals, so one late heartbeat or a retransmission stall on
+// a lossy path does not cost a reconnect (which loses the op_updates
+// written just before it).
+const IdleTimeout = 3 * HeartbeatInterval
+
+// ErrPeerSilent is the error ReadMessageIdle wraps when nothing arrived
+// from the other end within its idle timeout.
+var ErrPeerSilent = errors.New("nothing received from the other end within the idle timeout; treating the connection as dead")
+
+// idleReadChunk caps one read of a message's payload in ReadMessageIdle,
+// so its idle timer restarts at least every idleReadChunk bytes however
+// large the message is.
+const idleReadChunk = 32 << 10
 
 // MaxMessageBytes is the read limit both ends of the site-worker link
 // set, so it is the largest message either end may send: the hub's
@@ -78,6 +111,62 @@ func (c *Conn) ReadMessage(ctx context.Context) (Envelope, error) {
 	return ParseEnvelope(data)
 }
 
+// ReadMessageIdle is ReadMessage on a connection whose other end sends at
+// least every HeartbeatInterval: it fails with ErrPeerSilent, closing the
+// connection, when no bytes arrive for idle. The timer restarts on each
+// chunk of a message as it arrives, not once per message, so a large
+// message on a slow link is read in full; and it runs only while this
+// call reads, so time the caller spends handling the previous message is
+// not counted against the other end.
+// Must be called from a single goroutine.
+func (c *Conn) ReadMessageIdle(ctx context.Context, idle time.Duration) (Envelope, error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	timer := time.AfterFunc(idle, func() { cancel(ErrPeerSilent) })
+	defer timer.Stop()
+
+	_, r, err := c.conn.Reader(ctx)
+	if err != nil {
+		return Envelope{}, peerSilent(ctx, idle, err)
+	}
+	timer.Reset(idle)
+	data, err := io.ReadAll(&arrivalReader{r: r, arrived: func() { timer.Reset(idle) }})
+	if err != nil {
+		return Envelope{}, peerSilent(ctx, idle, err)
+	}
+	return ParseEnvelope(data)
+}
+
+// peerSilent reports a read that the idle timer ended as ErrPeerSilent,
+// and any other read error as it is.
+func peerSilent(ctx context.Context, idle time.Duration, err error) error {
+	if errors.Is(context.Cause(ctx), ErrPeerSilent) {
+		return fmt.Errorf("%w (%s)", ErrPeerSilent, idle)
+	}
+	return err
+}
+
+// arrivalReader calls arrived after each read that returned bytes, and
+// reads at most idleReadChunk bytes at a time: coder/websocket fills the
+// buffer it is handed (up to the end of the frame, and a message is one
+// frame) before returning, so one large read would sit on a slow link
+// without reporting what had already arrived.
+type arrivalReader struct {
+	r       io.Reader
+	arrived func()
+}
+
+func (a *arrivalReader) Read(p []byte) (int, error) {
+	if len(p) > idleReadChunk {
+		p = p[:idleReadChunk]
+	}
+	n, err := a.r.Read(p)
+	if n > 0 {
+		a.arrived()
+	}
+	return n, err
+}
+
 // WriteMessage marshals and writes a JSON envelope to the connection.
 // Safe for concurrent use (coder/websocket handles locking).
 func (c *Conn) WriteMessage(ctx context.Context, env Envelope) error {
@@ -129,11 +218,4 @@ func (c *Conn) Close(status websocket.StatusCode, reason string) error {
 // CloseNow closes the connection immediately without sending a close frame.
 func (c *Conn) CloseNow() error {
 	return c.conn.CloseNow()
-}
-
-// Ping sends a ping and waits for pong within the given timeout.
-func (c *Conn) Ping(ctx context.Context) error {
-	pctx, cancel := context.WithTimeout(ctx, defaultPongTimeout)
-	defer cancel()
-	return c.conn.Ping(pctx)
 }

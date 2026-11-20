@@ -44,6 +44,19 @@ type fakeStore struct {
 
 	dhcpLeaseEvents []recordedDHCPLeaseEvent
 	dhcpLeaseErr    error // injectable error for RecordDHCPLeaseEvent
+
+	// phases records SetOperationPhase calls. phaseChanged makes it
+	// report a real change carrying the post-write row, as the store does
+	// when the op was at another phase; phaseErr is an injectable error.
+	phases       []phaseWrite
+	phaseChanged bool
+	phaseErr     error
+}
+
+// phaseWrite is one SetOperationPhase call.
+type phaseWrite struct {
+	OpID  uuid.UUID
+	Phase string
 }
 
 // recordedDHCPLeaseEvent captures one RecordDHCPLeaseEvent call's
@@ -94,6 +107,23 @@ func (s *fakeStore) FailOperationOutcome(opID uuid.UUID, result []byte) (*store.
 	}
 	s.finalized = append(s.finalized, finalizedOp{OpID: opID, Status: model.OpFailed, Result: append([]byte(nil), result...)})
 	return &store.OpOutcome{Op: model.Operation{ID: opID, Status: model.OpFailed, Result: result}}, nil
+}
+
+func (s *fakeStore) SetOperationPhase(opID uuid.UUID, phase string) (store.PhaseTransition, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.phaseErr != nil {
+		return store.PhaseTransition{}, s.phaseErr
+	}
+	s.phases = append(s.phases, phaseWrite{OpID: opID, Phase: phase})
+	if !s.phaseChanged {
+		return store.PhaseTransition{NewPhase: phase}, nil
+	}
+	return store.PhaseTransition{
+		Changed:  true,
+		NewPhase: phase,
+		Op:       &model.Operation{ID: opID, Type: model.OpDeploy, Status: model.OpClaimed, Phase: phase},
+	}, nil
 }
 
 func (s *fakeStore) WithPopAdvisoryLock(ctx context.Context, popSlug string, fn func(context.Context) error) error {
@@ -701,6 +731,82 @@ func deployCompleteFixture(t *testing.T) (
 	h := New(st, nb, nil)
 	h.SetMonitorWriter(w)
 	return h, st, id, w
+}
+
+// TestHandleDeployComplete_LatchesAwaitingPhoneHome: the deploy_complete
+// observation moves global's op row to awaiting_phone_home and publishes
+// the op_delta.
+//
+// When the agent reports deploy_complete, the site worker latches the op at
+// awaiting_phone_home and tells global twice: a phase op_update, which lives
+// only in the worker's memory and is never acknowledged, and this
+// observation, which stays in the worker's SQLite outbox until global acks
+// it. The latch keeps the installed host off the installer, and the other
+// worker of a both-active pair (or a worker that restarts or resyncs) learns
+// it only from global's row. If the op_update is lost (written into a
+// connection that then drops, a failed handler call, a worker restart before
+// it drains), the observation is the only record left, so it has to carry
+// the latch. Acking it without a phase write left global's row at the last
+// phase it heard: the peer worker served the installer on the host's next
+// PXE and the host installed a second time.
+func TestHandleDeployComplete_LatchesAwaitingPhoneHome(t *testing.T) {
+	h, st, pub, _ := phoneHomeFixture()
+	st.phaseChanged = true
+	machineID, opID := uuid.New(), uuid.New()
+	obs := model.Observation{MachineID: machineID, OperationID: opID, Event: "deploy_complete"}
+
+	if err := h.HandleObservation(context.Background(), obs); err != nil {
+		t.Fatalf("deploy_complete observation: %v", err)
+	}
+	if want := (phaseWrite{OpID: opID, Phase: "awaiting_phone_home"}); len(st.phases) != 1 || st.phases[0] != want {
+		t.Fatalf("global acked the deploy_complete observation with phase writes %+v; want one write of %+v: "+
+			"with the worker's op_update lost, global's row stays at the last phase it heard and "+
+			"the site's other worker serves this host the installer", st.phases, want)
+	}
+	if len(pub.deltas) != 1 || pub.deltas[0].ID != opID || pub.deltas[0].Phase != "awaiting_phone_home" {
+		t.Fatalf("op_deltas %+v; want the latched row published so the site's workers take it", pub.deltas)
+	}
+
+	// The worker's op_update arrived after all, or the observation is
+	// replayed: the row is already latched and nothing is republished.
+	st.phaseChanged = false
+	if err := h.HandleObservation(context.Background(), obs); err != nil {
+		t.Fatalf("replayed deploy_complete observation: %v", err)
+	}
+	if len(pub.deltas) != 1 {
+		t.Errorf("an unchanged phase published another op_delta: %+v", pub.deltas)
+	}
+}
+
+// TestHandleDeployComplete_LatchSurvivesMonitorCredFailure: the latch is
+// written before the monitor credential, so a monitor failure that drops
+// the observation (the pop's monitor secret is missing: terminal) does not
+// take the latch with it. A phase write that fails is retried: the
+// observation stays in the worker's outbox.
+func TestHandleDeployComplete_LatchSurvivesMonitorCredFailure(t *testing.T) {
+	h, st, id, _ := deployCompleteFixture(t)
+	h.SetMonitorWriter(&errorMonitorWriter{
+		err: fmt.Errorf("pop/pop1/bmc-creds-monitor: %w", awssecrets.ErrMonitorSecretMissing),
+	})
+	data, _ := json.Marshal(&model.BMCCreds{
+		Monitor: &model.BMCUserCred{Username: "monitor", Password: "MON", IPMIUserSlot: 4},
+	})
+	opID := uuid.New()
+	obs := model.Observation{MachineID: id, OperationID: opID, Event: "deploy_complete", Data: data}
+
+	err := h.HandleObservation(context.Background(), obs)
+	if !errors.Is(err, ws.ErrTerminal) {
+		t.Fatalf("setup: want the missing monitor secret to drop the observation, got %v", err)
+	}
+	if want := (phaseWrite{OpID: opID, Phase: "awaiting_phone_home"}); len(st.phases) != 1 || st.phases[0] != want {
+		t.Fatalf("observation dropped with phase writes %+v; want the latch written first", st.phases)
+	}
+
+	st.phaseErr = errors.New("postgres is down")
+	err = h.HandleObservation(context.Background(), obs)
+	if err == nil || errors.Is(err, ws.ErrTerminal) {
+		t.Fatalf("a failed latch write must be retried (non-terminal error), got %v", err)
+	}
 }
 
 // TestHandleDeployComplete_NoData covers the no-rotation re-deploy
