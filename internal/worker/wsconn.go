@@ -112,6 +112,11 @@ type WSConn struct {
 	// never touches a real /usr/bin/slagworks-upgrade.
 	upgradeExec func(target globalBuild) ([]byte, error)
 
+	// reconnectRand draws the jitter for Run's reconnect wait, in [0,1).
+	// nil means randFloat. Tests pin the draw so the wait is
+	// deterministic.
+	reconnectRand func() float64
+
 	// powerFactory builds a power.Controller for hub-originated
 	// power_status RPCs (the BMC read path). Same factory the
 	// executor uses for actuation ops; nil means the worker rejects
@@ -323,8 +328,8 @@ const (
 )
 
 // Run connects to the global API and enters the message loop. It
-// reconnects with exponential backoff on disconnect. Blocks until ctx
-// is cancelled.
+// reconnects on disconnect after an exponential backoff plus up to 20% of
+// jitter. Blocks until ctx is cancelled.
 //
 // The backoff returns to its first step only after an attempt that lasted
 // at least reconnectBackoffMax with the hello accepted. A global that
@@ -335,7 +340,16 @@ const (
 // a site_workers write and a hello reply, from every worker at once. The
 // price is that a connection lost soon after a reconnect that followed a
 // long outage waits up to reconnectBackoffMax before the next attempt.
+//
+// The jitter matters because a global restart, or a restart of a proxy in
+// front of global, drops every worker's socket at once: without it the
+// whole fleet would redial at the same instant and keep retrying in
+// lockstep while global is down.
 func (w *WSConn) Run(ctx context.Context) error {
+	draw := w.reconnectRand
+	if draw == nil {
+		draw = randFloat
+	}
 	backoff := reconnectBackoffMin
 	for {
 		start := time.Now()
@@ -348,12 +362,13 @@ func (w *WSConn) Run(ctx context.Context) error {
 		if wasConnected && time.Since(start) >= reconnectBackoffMax {
 			backoff = reconnectBackoffMin
 		}
-		w.log.Warn("WebSocket disconnected, reconnecting", "err", err, "backoff", backoff)
+		wait := applyJitterWith(backoff, 0.2, draw())
+		w.log.Warn("WebSocket disconnected, reconnecting", "err", err, "backoff", wait)
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		}
 		backoff = min(backoff*2, reconnectBackoffMax)
 	}
