@@ -478,10 +478,11 @@ func (d *Dispatcher) locationSubtreePrefixes(ctx context.Context, scope Scope) (
 //
 // The order is fixed: the config's own location first, then the rest of
 // the subtree by ascending location id, each location's prefixes in
-// NetBox's order. Build serves Prefixes[0] as the fabric DHCP subnet and
-// gateway, so this makes the config's own prefix (the one site-config
-// create requires) the primary, and keeps a rebuild over unchanged NetBox
-// data from changing the content hash.
+// NetBox's order. Build takes the fabric DHCP subnet and gateway from a
+// prefix scoped to the first location listed (see dhcpPrefix), so this
+// makes the config's own location (the one site-config create requires a
+// prefix on) supply them, and keeps a rebuild over unchanged NetBox data
+// from changing the content hash.
 func (d *Dispatcher) locationSubtreePrefixesTagged(ctx context.Context, scope Scope, tag string) ([]netbox.Prefix, error) {
 	order := []int{scope.LocationID}
 	for _, id := range slices.Sorted(maps.Keys(scope.SubtreeIDs)) {

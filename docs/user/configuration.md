@@ -388,10 +388,16 @@ location can be given its own `slagworks-production` and `slagworks-oob`
 prefixes while the whole-site config is still serving. The DNS servers and lease time handed out on the
 fabric leg come from that prefix's `dns_servers` and `dhcp_lease_seconds`
 custom fields, defaulting to `1.1.1.1` and 5 minutes; workers read them
-when their services start, so a change takes effect on restart. When
-child locations of a location-scoped config also carry
+when their services start, so a change takes effect on restart. When the
+site or location carries more than one `slagworks-production` prefix
+(tagging a prefix is also how hosts in it get a gateway), the most specific
+one containing `ephemeral_pool_start` supplies the subnet, gateway, DNS
+servers and lease time, whatever order NetBox lists them in. When child locations of a location-scoped config also carry
 `slagworks-production` prefixes, the prefix scoped to the config's own
-location still supplies the subnet, gateway, DNS servers and lease time.
+location still supplies them, even if a child's prefix also contains the
+pool. If no candidate prefix contains the pool, the first one NetBox lists
+(the lowest address) is used and the snapshot build logs a warning naming
+the pool and the prefix.
 
 Manage site configs with
 `slagctl site-config {list,show,create,update,delete}`. Creating one also

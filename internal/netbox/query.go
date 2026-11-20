@@ -234,7 +234,8 @@ func (c *Client) ListPowerOutletsForDevice(ctx context.Context, deviceID int) ([
 
 // ListSitePrefixes returns the prefixes scoped to the given site itself
 // (scope_type dcim.site) and tagged with the given tag (e.g.
-// "slagworks-production" or "slagworks-oob"). Used for whole-site configs.
+// "slagworks-production" or "slagworks-oob"), in NetBox's address order.
+// Used for whole-site configs.
 //
 // NetBox 4.x prefix scope is polymorphic, and `?site=` matches every prefix
 // whose scope lies in the site: a prefix scoped to a location under the site

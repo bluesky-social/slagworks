@@ -34,7 +34,7 @@ import (
 type Inputs struct {
 	Site           netbox.Site
 	Config         model.SiteConfig
-	Prefixes       []netbox.Prefix  // tag=slagworks-production; [0] is the DHCP primary, so callers pass a stable order
+	Prefixes       []netbox.Prefix  // tag=slagworks-production; a location-scoped config's own location's first (see dhcpPrefix)
 	OOBPrefixes    []netbox.Prefix  // tag=slagworks-oob; empty pre-cutover
 	OOBRanges      []netbox.IPRange // role=slagworks-oob-dynamic; empty pre-cutover
 	Devices        []netbox.Device
@@ -155,13 +155,53 @@ func chooseInterfaceAddress(addrs []netbox.IPAddress, primaryIP4 int) netbox.IPA
 	return best
 }
 
+// dhcpPrefix picks the slagworks-production prefix the fabric DHCP subnet,
+// gateway, DNS servers and lease time come from: the most specific prefix
+// containing the config's ephemeral pool start, among
+//
+//   - every prefix, for a whole-site config (the dispatcher passes it only
+//     the prefixes scoped to the site itself);
+//   - the prefixes scoped to the same location as Prefixes[0], for a
+//     location-scoped config. The dispatcher lists the config's own location
+//     first, so its prefix supplies the subnet even when a child location's
+//     prefix also holds the pool.
+//
+// The pool decides, not list order, because a scope carries more than one
+// production prefix once an operator tags another so hosts in it resolve a
+// gateway, and NetBox lists prefixes by address: the first one listed can be
+// a prefix the pool is not in, and the worker would hand out pool addresses
+// with that prefix's mask and gateway. When no candidate contains the pool
+// start the snapshot is inconsistent whichever is chosen, so the first
+// candidate (NetBox's lowest address) is kept and a warning logged.
+func dhcpPrefix(in Inputs) netbox.Prefix {
+	first := in.Prefixes[0]
+	best, bestBits := first, -1
+	if pool, err := netip.ParseAddr(in.Config.EphemeralPoolStart); err == nil {
+		pool = pool.Unmap()
+		for _, p := range in.Prefixes {
+			if in.Config.LocationScoped() && (p.ScopeType != first.ScopeType || p.ScopeID != first.ScopeID) {
+				continue
+			}
+			if pfx, err := netip.ParsePrefix(p.Prefix); err == nil && pfx.Bits() > bestBits && pfx.Contains(pool) {
+				best, bestBits = p, pfx.Bits()
+			}
+		}
+	}
+	if bestBits < 0 {
+		slog.Warn("snapshot: the ephemeral pool start is in none of the slagworks-production prefixes the fabric DHCP subnet can come from; serving the first one, so pool addresses go out with a mask and gateway that do not fit them. Move the pool into one of those prefixes (slagctl site-config update), or tag slagworks-production the prefix it lies in, scoped to the config's site or own location",
+			"site", in.Site.Slug, "config", in.Config.Slug,
+			"ephemeral_pool_start", in.Config.EphemeralPoolStart, "prefix", first.Prefix)
+	}
+	return best
+}
+
 // buildWithChoices is Build plus the list of multi-address interfaces it
 // had to choose an address for, ordered by NetBox interface ID.
 func buildWithChoices(in Inputs) (model.SiteSnapshot, []AddressChoice, error) {
 	if len(in.Prefixes) == 0 {
 		return model.SiteSnapshot{}, nil, fmt.Errorf("site %s: no slagworks-production prefix", in.Site.Slug)
 	}
-	primary := in.Prefixes[0]
+	primary := dhcpPrefix(in)
 	gateway := prefixGatewayIP(primary)
 
 	dhcp := model.DHCPConfig{
