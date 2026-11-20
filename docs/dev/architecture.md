@@ -135,6 +135,13 @@ server changed), the error matches `clientauth.ErrLoginRequired`; the
 watches end on it with the error naming `slagctl auth login` rather than
 retrying. Token cache lives at `~/.config/slagctl/token.json`
 (`internal/cli/clientauth`).
+The API can refuse a token the client still trusts (its clock runs
+ahead of the identity provider's, or the provider rotated its signing
+keys), so the client answers a 401 with one forced refresh
+(`clientauth.RefreshRejected`, never an interactive login) and resends
+the request; once a refresh fails or its token is refused too, it stops
+refreshing for the rest of the command, and the 401 tells the operator
+to run `slagctl auth login`.
 
 Command groups (`root.go:82`): `auth`, `site`, `machine`, `operation`,
 `image`, `storage-script`, `network-script`, `ssh-key`, `worker`,

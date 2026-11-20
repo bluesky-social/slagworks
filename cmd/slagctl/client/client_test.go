@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,6 +173,133 @@ func TestBearer_ErrorFailsTheRequest(t *testing.T) {
 	}
 	if sent {
 		t.Fatal("the request was sent although the bearer source failed")
+	}
+}
+
+// TestUnauthorized_RefreshesAndResendsOnce: a 401 is answered with one call
+// to the refresher, naming the refused token, and the request is resent with
+// its body and the new token, which later requests carry from the start.
+func TestUnauthorized_RefreshesAndResendsOnce(t *testing.T) {
+	type request struct{ auth, body string }
+	var mu sync.Mutex
+	var got []request
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		got = append(got, request{r.Header.Get("Authorization"), string(b)})
+		mu.Unlock()
+		if r.Header.Get("Authorization") != "Bearer new" {
+			// Plain text, as an authenticating proxy in front of the API answers.
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte("jwt expired"))
+			return
+		}
+		w.Write([]byte("{}"))
+	}))
+	defer ts.Close()
+
+	// cached stands for the token cache: the bearer source reads it for
+	// every request and the refresher writes its replacement there.
+	cached := "old"
+	var rejected []string
+	c := client.New(client.Config{BaseURL: ts.URL, HTTPClient: ts.Client(),
+		Bearer: func(context.Context) (string, error) { return cached, nil },
+		Refresh: func(_ context.Context, tok string) (string, error) {
+			rejected = append(rejected, tok)
+			cached = "new"
+			return cached, nil
+		}})
+	ctx := context.Background()
+	if err := c.Post(ctx, "/api/v1/machines/x/power", map[string]string{"action": "cycle"}, nil); err != nil {
+		t.Fatalf("POST after a refresh: %v", err)
+	}
+	if err := c.Get(ctx, "/api/v1/machines", nil, nil); err != nil {
+		t.Fatalf("GET after a refresh: %v", err)
+	}
+
+	if len(rejected) != 1 || rejected[0] != "old" {
+		t.Errorf("refresher called with %q, want once with the refused token", rejected)
+	}
+	want := []request{
+		{"Bearer old", `{"action":"cycle"}`},
+		{"Bearer new", `{"action":"cycle"}`},
+		{"Bearer new", ""},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("server saw %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("request %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestUnauthorized_StopsRefreshingWhenItDoesNotHelp: when a refresh fails, or
+// the API refuses the refreshed token too, the client stops asking: one
+// refresh per client, not one per request (a watch loop would otherwise call
+// the identity provider on every tick). Every refusal names the command that
+// fixes it.
+func TestUnauthorized_StopsRefreshingWhenItDoesNotHelp(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"message": "invalid token"})
+	}))
+	defer ts.Close()
+
+	for _, tc := range []struct {
+		name       string
+		refreshErr error
+	}{
+		{name: "refresh fails", refreshErr: errors.New("invalid_grant")},
+		{name: "refreshed token refused too"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			refreshes := 0
+			c := client.New(client.Config{BaseURL: ts.URL, HTTPClient: ts.Client(),
+				Bearer: func(context.Context) (string, error) { return "t-0", nil },
+				Refresh: func(context.Context, string) (string, error) {
+					refreshes++
+					return fmt.Sprintf("t-%d", refreshes), tc.refreshErr
+				}})
+			for i := 0; i < 3; i++ {
+				err := c.Get(context.Background(), "/api/v1/workers", nil, nil)
+				var apiErr *client.APIError
+				if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnauthorized {
+					t.Fatalf("request %d: err = %v, want the API's 401", i, err)
+				}
+				for _, want := range []string{"invalid token (HTTP 401)", "slagctl auth login"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("request %d: error %q does not contain %q", i, err, want)
+					}
+				}
+			}
+			if refreshes != 1 {
+				t.Errorf("refreshes = %d over three refused requests, want 1", refreshes)
+			}
+		})
+	}
+}
+
+// TestForbidden_IsNotRefreshed: a 403 means the token is valid but lacks a
+// group; a refresh cannot change that, and the server's message already
+// names the fix.
+func TestForbidden_IsNotRefreshed(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{"message": "not authorized: missing group"})
+	}))
+	defer ts.Close()
+
+	c := client.New(client.Config{BaseURL: ts.URL, HTTPClient: ts.Client(),
+		Bearer: func(context.Context) (string, error) { return "t-0", nil },
+		Refresh: func(context.Context, string) (string, error) {
+			t.Error("a 403 was answered with a refresh")
+			return "t-1", nil
+		}})
+	err := c.Get(context.Background(), "/api/v1/workers", nil, nil)
+	if err == nil || err.Error() != "not authorized: missing group (HTTP 403)" {
+		t.Fatalf("err = %v, want the server's 403 message unchanged", err)
 	}
 }
 

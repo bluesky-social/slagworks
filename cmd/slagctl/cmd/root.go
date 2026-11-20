@@ -95,6 +95,13 @@ func NewRootCmd() *cobra.Command {
 			apiClient = slclient.New(slclient.Config{
 				BaseURL: apiURL,
 				Bearer:  bearerSource(apiURL),
+				// The API can refuse a token this client still trusts:
+				// its clock runs ahead of the identity provider's, or
+				// the provider rotated its signing keys. Answer that
+				// 401 with a refresh, never an interactive login.
+				Refresh: func(ctx context.Context, rejected string) (string, error) {
+					return clientauth.RefreshRejected(ctx, cfg, rejected)
+				},
 			})
 			if w := apiClient.InsecureWarning(); w != "" {
 				fmt.Fprintln(os.Stderr, format.WarnStyle.Render("warning: "+w))

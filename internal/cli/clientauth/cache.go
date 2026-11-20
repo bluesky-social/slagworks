@@ -161,9 +161,9 @@ func removeToken(ctx context.Context, path string) error {
 //
 // So Token() takes an exclusive flock, READS THE TOKEN FROM DISK INSIDE THE
 // LOCK (a pre-instantiated config.TokenSource would capture a stale token and
-// defeat the lock), refreshes only if expired, ABORTS the write on refresh
-// error (never corrupts the cache with a nil/empty token), and atomically
-// writes a successfully-rotated token back before unlocking.
+// defeat the lock), refreshes only if expired (or rejected), ABORTS the write
+// on refresh error (never corrupts the cache with a nil/empty token), and
+// atomically writes a successfully-rotated token back before unlocking.
 //
 // What it reads under the lock may be a session another invocation's login
 // just wrote for a different server. It hands out, and refreshes, only a
@@ -174,6 +174,11 @@ type persistingTokenSource struct {
 	oc        *oauth2.Config
 	want      binding
 	cachePath string
+	// rejected is an access token the API refused, possibly while its expiry
+	// still says it is valid. Token refreshes when the cache still holds it;
+	// a cache holding any other valid token means another invocation already
+	// refreshed, and spending the refresh token again would be a waste.
+	rejected string
 }
 
 func newPersistingTokenSource(ctx context.Context, oc *oauth2.Config, want binding, cachePath string) *persistingTokenSource {
@@ -203,16 +208,19 @@ func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
 	if cur.binding != p.want {
 		return nil, notSignedIn(p.want)
 	}
-	if cur.Token.Valid() {
+	if cur.Token.Valid() && cur.Token.AccessToken != p.rejected {
 		return cur.Token, nil // someone else already refreshed (or it never expired)
 	}
 	if cur.Token.RefreshToken == "" {
 		return nil, fmt.Errorf("%w: the cached token expired and has no refresh token", ErrLoginRequired)
 	}
 
-	// Refresh from the on-disk token (NOT a pre-captured one).
+	// Refresh from the on-disk refresh token (NOT a pre-captured one). The
+	// token handed to oauth2 carries only the refresh token: given a token
+	// that is still valid by its expiry, as a rejected one is, oauth2 would
+	// return it instead of refreshing.
 	refreshed, err := askProvider(p.ctx, p.want.Issuer, func(ctx context.Context) (*oauth2.Token, error) {
-		return p.oc.TokenSource(ctx, cur.Token).Token()
+		return p.oc.TokenSource(ctx, &oauth2.Token{RefreshToken: cur.Token.RefreshToken}).Token()
 	})
 	if err != nil {
 		// Do NOT touch the cache on failure — a revoked/expired/unreachable

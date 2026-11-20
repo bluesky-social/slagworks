@@ -288,6 +288,54 @@ func TestPersistingTokenSource_ValidTokenNoRefresh(t *testing.T) {
 	}
 }
 
+// TestPersistingTokenSource_RefreshesARejectedToken: an access token the API
+// refused is refreshed although its expiry says it is valid, unless the cache
+// already holds another valid one (another invocation refreshed first), which
+// is returned without spending the refresh token again.
+func TestPersistingTokenSource_RefreshesARejectedToken(t *testing.T) {
+	for _, tc := range []struct {
+		name, rejected, want string
+		wantIssued           int
+	}{
+		{name: "cache holds the rejected token", rejected: "at-valid", want: "at-refreshed", wantIssued: 1},
+		{name: "cache already replaced it", rejected: "at-older", want: "at-valid", wantIssued: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fe := newFakeTokenEndpoint()
+			defer fe.close()
+			path := tokenPath(t)
+			if err := writeCache(path, testSession(&oauth2.Token{
+				AccessToken:  "at-valid",
+				RefreshToken: "rt-1",
+				Expiry:       time.Now().Add(time.Hour),
+				TokenType:    "Bearer",
+			})); err != nil {
+				t.Fatal(err)
+			}
+
+			ts := newPersistingTokenSource(context.Background(), fe.config(), testBinding, path)
+			ts.rejected = tc.rejected
+			tok, err := ts.Token()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tok.AccessToken != tc.want {
+				t.Errorf("access token = %q, want %q", tok.AccessToken, tc.want)
+			}
+			if fe.issued != tc.wantIssued {
+				t.Errorf("token endpoint issued %d times, want %d", fe.issued, tc.wantIssued)
+			}
+			onDisk, err := readCache(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if onDisk.Token.AccessToken != tc.want {
+				t.Errorf("on-disk access token = %q, want %q", onDisk.Token.AccessToken, tc.want)
+			}
+		})
+	}
+}
+
 // TestPersistingTokenSource_RefreshErrorPreservesCache: a failing refresh must
 // NOT overwrite the cache with a bad/empty token.
 func TestPersistingTokenSource_RefreshErrorPreservesCache(t *testing.T) {

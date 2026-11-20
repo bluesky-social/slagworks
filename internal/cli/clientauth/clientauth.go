@@ -188,6 +188,35 @@ func CachedBearer(ctx context.Context, cfg Config) (string, error) {
 	return tok.AccessToken, nil
 }
 
+// RefreshRejected returns an access token to resend a request with after the
+// API refused rejected with 401. The API can refuse a token whose expiry says
+// it is still valid: its clock runs ahead of the identity provider's, or the
+// provider rotated its signing keys. Under the cache lock it returns the
+// cached token if another invocation has already replaced rejected with a
+// valid one, and otherwise spends the refresh token whatever the expiry and
+// writes the rotated token back. Like CachedBearer it never starts an
+// interactive login: it runs in the middle of a command.
+func RefreshRejected(ctx context.Context, cfg Config, rejected string) (string, error) {
+	if err := cfg.validate(); err != nil {
+		return "", err
+	}
+	cache, err := defaultTokenPath(cfg.AppName)
+	if err != nil {
+		return "", err
+	}
+	oc, err := oauthConfig(ctx, cfg)
+	if err != nil {
+		return "", err
+	}
+	ts := newPersistingTokenSource(ctx, oc, cfg.binding(), cache)
+	ts.rejected = rejected
+	tok, err := ts.Token()
+	if err != nil {
+		return "", err
+	}
+	return tok.AccessToken, nil
+}
+
 // loadFromCacheOrRefresh reads the cache and, if the access token is expired
 // but a refresh token is present, refreshes it (under lock, with write-back).
 // Returns an error if there is no usable token: errOtherServer when the cache
