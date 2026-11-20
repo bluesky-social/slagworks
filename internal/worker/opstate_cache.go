@@ -46,8 +46,9 @@ import (
 //     (keepLocalFailure) until op_removed clears it.
 //   - phaseStart: opID -> phase timing, for phase-duration logging. Local.
 //   - phoneHomed: deploy op IDs that phone-homed LOCALLY (RecordPhoneHome).
-//     A resync that brings the op back as claimed-deploying must not
-//     downgrade the running overlay this op earned — see applyOpResync.
+//     A resync or delta that brings the op back as claimed-deploying must
+//     not downgrade the running overlay this op earned — see applyOpResync
+//     and applyOpDelta.
 //     Persisted with the op set, so it survives a restart.
 //   - tombstones: opID -> terminal version; a late lower-version delta for
 //     a removed op is discarded so a concurrent-publisher race can't
@@ -165,6 +166,29 @@ func (o *opState) keepLocalFailure(incoming *model.Operation) {
 	incoming.Status = model.OpFailed
 }
 
+// keepPhoneHome holds the completion a local phone-home recorded
+// (RecordPhoneHome: Status completed, overlay running, the phoneHomed latch)
+// on an op global's incoming row still shows active, and reports whether it
+// did, in which case the caller keeps the machine's overlay at running too.
+// The completion is written without a Version bump, so a row global built
+// before it processed the phone-home (the claim's delayed op_delta, or a
+// resync) carries a higher Version, an active status and the claim's
+// transient state. Accepting it undoes the phone-home: the machine reads
+// deploying again, so the installed OS's retried phone-home is processed in
+// full and queues a second completion, and with the op active again a late
+// agent report can still fail a deploy that finished. A completed or failed
+// row from global applies; op_removed clears the latch. Caller holds mu.
+func (o *opState) keepPhoneHome(incoming *model.Operation) bool {
+	if !o.phoneHomed[incoming.ID.String()] {
+		return false
+	}
+	if incoming.Status == model.OpCompleted || incoming.Status == model.OpFailed {
+		return false
+	}
+	incoming.Status = model.OpCompleted
+	return true
+}
+
 // newOpState builds an empty op-layer whose combined reads load and whose
 // identity applies swap through the given view pointer (Cache.view). wake
 // is the executor wake channel (may be nil in tests). untrusted marks a
@@ -205,6 +229,13 @@ func (o *opState) fireWake() {
 // an op_removed must not resurrect a zombie active op). On accept, the op
 // is stored and, when machineState is non-empty, the overlay is set to it.
 // Returns true if a PENDING op was added/updated (caller fires the wake).
+//
+// Like applyOpResync, it preserves what a local phone-home earned
+// (keepPhoneHome): a delta that still shows a phoneHomed op active carries
+// a status and a state from before the phone-home. The usual one is the
+// claim's own delta (claimed, deploying), arriving after a host that
+// installed on the pending-op boot clause already phoned home. A delta that
+// ends the op (completed or failed) is global's verdict and applies whole.
 func (o *opState) applyOpDelta(op model.Operation, machineState model.MachineState) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -220,6 +251,9 @@ func (o *opState) applyOpDelta(op model.Operation, machineState model.MachineSta
 	cp := op
 	o.keepLocalFailure(&cp)
 	keepTerminalWait(o.ops[id], &cp)
+	if o.keepPhoneHome(&cp) {
+		machineState = model.MachineStateRunning
+	}
 	o.ops[id] = &cp
 	if machineState != "" {
 		o.machineState[op.MachineID] = machineState
@@ -234,8 +268,9 @@ func (o *opState) applyOpDelta(op model.Operation, machineState model.MachineSta
 // resync as claimed-deploying (global hasn't processed the completion yet),
 // forcing the overlay back to deploying would re-wipe the freshly-installed
 // disk. So for any active op in phoneHomed we pin the overlay to running,
-// overriding the resync's transient state. Entries in phoneHomed whose op
-// is no longer active (global completed it) are pruned.
+// overriding the resync's transient state, and keep the op completed
+// (keepPhoneHome). Entries in phoneHomed whose op is no longer active
+// (global completed it) are pruned.
 func (o *opState) applyOpResync(ops []model.Operation, states map[string]model.MachineState) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -256,6 +291,7 @@ func (o *opState) applyOpResync(ops []model.Operation, states map[string]model.M
 		}
 		o.keepLocalFailure(&op)
 		keepTerminalWait(o.ops[op.ID.String()], &op)
+		o.keepPhoneHome(&op)
 		next[op.ID.String()] = &op
 		if op.Status == model.OpPending {
 			anyPending = true

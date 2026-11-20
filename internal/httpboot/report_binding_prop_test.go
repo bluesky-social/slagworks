@@ -248,19 +248,17 @@ func (s *bindSim) step() {
 		op := m.op
 		// A claim delta may land after the agent already failed the op: the
 		// host can boot on the pending-op clause while the claim is delayed.
-		// It must not revive the op.
-		//
-		// A claim delta that lands after the installed OS phoned home is
-		// kept out of the history: it moves the machine's local state from
-		// running back to deploying (an op_resync in the same position
-		// keeps it running), so a retried phone-home is processed in full
-		// and queues a second completion instead of being acknowledged. The
-		// boot decision stays local either way.
-		if op == nil || op.removed || op.claimed || op.completed {
+		// It must not revive the op. Nor may one that lands after the
+		// installed OS phoned home move the machine back from running: a
+		// retried phone-home must stay an acknowledgement.
+		if op == nil || op.removed || op.claimed {
 			return
 		}
 		if op.failed {
 			s.stats["claim_after_local_failure"]++
+		}
+		if op.completed {
+			s.stats["claim_after_phone_home"]++
 		}
 		op.claimed, op.version = true, op.version+1
 		transient := model.MachineStateDeploying

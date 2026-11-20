@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -181,5 +182,102 @@ func TestApplyOpResync_PhoneHomedOverlayPinning(t *testing.T) {
 	}
 	if got := c.MachineByID(id); got == nil || got.State != model.MachineStateRunning {
 		t.Fatalf("a terminal op present in a resync still force-pins the running overlay (the stale-pin failure mode), got %+v", got)
+	}
+}
+
+// TestApplyOpDelta_LateClaimKeepsPhoneHomedRunning: a host can install on
+// the pending-op boot clause and phone home before the claim's op_delta
+// reaches this worker. That delta carries the claim's transient state
+// (deploying) for an op whose install is already over. It must not move
+// the machine back from running, exactly as an op_resync carrying the same
+// claimed op does not (applyOpResync): with the machine at deploying, the
+// installed OS's retried phone-home is processed in full and queues a
+// second completion. A delta that ends the op still applies its state.
+func TestApplyOpDelta_LateClaimKeepsPhoneHomedRunning(t *testing.T) {
+	c := NewCache(nil)
+	id, opID := uuid.New(), uuid.New()
+	mac := "52:54:00:rd:04:01"
+	c.ApplySnapshot(&model.SiteSnapshot{
+		SeqNum: 1,
+		Machines: []model.MachineSnapshot{{
+			ID: id, State: model.MachineStateCommissioned, PXEEligible: true,
+			Interfaces: []model.SnapshotInterface{{MAC: mac, Type: "physical"}},
+		}},
+	})
+	c.ApplyOpResync(nil, nil)
+	c.ApplyOpDelta(model.Operation{ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpPending, Version: 0}, "")
+
+	report := func(event string) {
+		t.Helper()
+		if err := c.HandleProgressReport(&model.ProgressReport{
+			MachineID: id.String(), OperationID: opID.String(), Event: event,
+		}); err != nil {
+			t.Fatalf("%s: %v", event, err)
+		}
+	}
+	report("deploy_complete")
+	report("phone_home")
+	if got := c.MachineByID(id); got == nil || got.State != model.MachineStateRunning {
+		t.Fatalf("after phone-home the machine must be running, got %+v", got)
+	}
+	_, before := c.DrainOutbox()
+
+	// The claim's delta arrives late.
+	c.ApplyOpDelta(model.Operation{ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Version: 1},
+		model.MachineStateDeploying)
+
+	if got := c.MachineByID(id); got == nil || got.State != model.MachineStateRunning {
+		t.Fatalf("a late claim delta moved a phone-homed machine back to %q", got.State)
+	}
+	if got := c.BootActionForMAC(mac); got != model.BootLocal {
+		t.Fatalf("BootActionForMAC = %d after the late claim delta, want BootLocal", got)
+	}
+	// The op stays completed, so a late report from the deploy agent cannot
+	// fail a deploy that finished. A resync built before global processed
+	// the phone-home is held to the same.
+	stale := []func(){
+		func() {},
+		func() {
+			c.ApplyOpResync([]model.Operation{{ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpClaimed, Version: 1}},
+				map[string]model.MachineState{id.String(): model.MachineStateDeploying})
+		},
+	}
+	for _, apply := range stale {
+		apply()
+		if op := c.GetOperation(opID.String()); op == nil || op.Status != model.OpCompleted {
+			t.Fatalf("a stale active row revived the phone-homed op: %+v", op)
+		}
+		err := c.HandleProgressReport(&model.ProgressReport{
+			MachineID: id.String(), OperationID: opID.String(), Failed: true, Phase: "partitioning", Error: "late",
+		})
+		if !errors.Is(err, model.ErrOperationNotActive) {
+			t.Fatalf("a late failure report for a phone-homed op must be refused as not active, got %v", err)
+		}
+		if got := c.MachineByID(id); got == nil || got.State != model.MachineStateRunning {
+			t.Fatalf("machine left running state: %+v", got)
+		}
+	}
+
+	// The installed OS retries a phone-home whose answer it lost: an
+	// acknowledgement, with no second completion.
+	report("phone_home")
+	obs, updates := c.DrainOutbox()
+	for _, u := range updates {
+		if u.Status == string(model.OpCompleted) {
+			t.Errorf("the retried phone-home queued a second completion (the first drain held %d updates)", len(before))
+		}
+	}
+	for _, o := range obs {
+		if o.Obs.Event == "phone_home" {
+			t.Error("the retried phone-home queued a second phone_home observation")
+		}
+	}
+
+	// Global failing the op (say, its timeout sweep won the race) still
+	// lands: a terminal delta's state is authoritative.
+	c.ApplyOpDelta(model.Operation{ID: opID, MachineID: id, Type: model.OpDeploy, Status: model.OpFailed, Version: 2},
+		model.MachineStateFailed)
+	if got := c.MachineByID(id); got == nil || got.State != model.MachineStateFailed {
+		t.Fatalf("a terminal delta must apply its machine state, got %+v", got)
 	}
 }
