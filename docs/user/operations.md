@@ -357,7 +357,13 @@ sources. By default this backfills the last window (`--since`, default
 
 Flags:
 
-- `-f, --follow` — live-tail after backfill.
+- `-f, --follow` — live-tail after backfill. When the connection drops
+  (a proxy restart, the load balancer's idle timeout, a global restart)
+  it prints a `[reconnect]` line on stderr, redials with backoff up to
+  30s, and resumes after the last line shown, so nothing repeats or goes
+  missing. It exits instead when the first connection fails, the server
+  reports an error, or a redial is refused with a status below 500 (an
+  expired login).
 - `--since <dur>` — backfill window (`5m`, `1h`, RFC3339 timestamp).
   Widen for historical operations; the default is deliberately small.
 - `--trace <uuid>` — filter to one trace ID.

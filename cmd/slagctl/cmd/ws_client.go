@@ -20,6 +20,17 @@ func streamDialOptions(token string) *websocket.DialOptions {
 	return &websocket.DialOptions{HTTPHeader: h}
 }
 
+// streamRefused is dialStream's error for an upgrade the server answered
+// with an HTTP status instead of accepting it, for callers that redial and
+// must tell a refusal (401, 403) from a backend that is down (5xx).
+type streamRefused struct {
+	status int
+	err    error
+}
+
+func (e *streamRefused) Error() string { return e.err.Error() }
+func (e *streamRefused) Unwrap() error { return e.err }
+
 // dialStream opens one of global's operator streams (/api/v1/logs/stream,
 // /api/v1/console/stream) with the token apiClient would send now, fetched
 // for this dial: global checks it only at the upgrade, so a stream opened
@@ -28,8 +39,8 @@ func streamDialOptions(token string) *websocket.DialOptions {
 // unchanged.
 //
 // When global refuses the upgrade (an expired token, a group the operator
-// lacks, a parameter it cannot parse), the error carries the reason global
-// gave, not only the status (ws.DialError).
+// lacks, a parameter it cannot parse), the error is a *streamRefused that
+// carries the reason global gave, not only the status (ws.DialError).
 //
 // Global sends one message per stored row, and the row's size is set
 // upstream, not by coder/websocket's 32 KiB default read limit: a log
@@ -48,8 +59,8 @@ func dialStream(ctx context.Context, streamURL string) (*websocket.Conn, error) 
 		}
 	}
 	conn, resp, err := websocket.Dial(ctx, streamURL, streamDialOptions(token))
-	if err != nil {
-		err = ws.DialError(err, resp)
+	if err != nil && resp != nil {
+		err = &streamRefused{status: resp.StatusCode, err: ws.DialError(err, resp)}
 	}
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()

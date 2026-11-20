@@ -3,7 +3,9 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/bluesky-social/slagworks/cmd/slagctl/format"
+	"github.com/bluesky-social/slagworks/internal/cli/clientauth"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/ws"
 )
@@ -59,7 +62,10 @@ and tails structured log envelopes scoped to this machine. Envelopes
 flow from agents (deploy/commission), site workers, and global itself;
 one trace_id correlates the full lifecycle of an op. Deploy logs are a
 subset of this stream. By default it backfills the last --since window
-(10m if unset) and exits; pass -f to follow live after backfill.
+(10m if unset) and exits; pass -f to follow live after backfill. A
+follow whose connection drops (a proxy restart, an idle timeout)
+reconnects and resumes after the last line shown, with a [reconnect]
+line on stderr.
 
 With --sol it instead streams the machine's BMC SOL (serial console)
 byte feed from /api/v1/console/stream — raw serial output rather than
@@ -232,22 +238,90 @@ func abbreviate(s string) string {
 	return s
 }
 
-// runLogsStream connects to /api/v1/logs/stream, sends the subscribe
-// frame, and pumps envelopes through render. Returns nil on EOF when
-// follow=false; otherwise blocks until ctx cancels.
+// Follow mode waits logsFollowRetryMin before redialing a dropped stream,
+// doubles the wait after each failed redial up to logsFollowRetryMax, and
+// starts over once a redial is subscribed. This is the site worker's
+// schedule for its own link to global (internal/worker/wsconn.go).
+const (
+	logsFollowRetryMin = time.Second
+	logsFollowRetryMax = 30 * time.Second
+)
+
+// logsStreamDropped marks a failure of the connection itself: no answer to
+// the dial, a 5xx from a proxy whose backend is down, or a failed write or
+// read. Follow mode recovers from it by redialing; any other error from
+// logsStreamSession ends the command.
+type logsStreamDropped struct{ err error }
+
+func (e *logsStreamDropped) Error() string { return e.err.Error() }
+func (e *logsStreamDropped) Unwrap() error { return e.err }
+
+// runLogsStream streams the envelopes sub selects from /api/v1/logs/stream
+// through render. With follow=false it returns nil once the stream has
+// been quiet for two seconds, which means the backfill is drained.
+//
+// With follow=true it blocks until ctx cancels. When a subscribed stream
+// drops (a proxy rollout, a load balancer idle timeout, a global restart, a
+// network blip) it says so on stderr and redials with last_seen_id set to
+// the highest id rendered, so the server resumes past it and no line is
+// repeated or skipped. sub's since bound is an absolute time, so a redial
+// before anything rendered covers the same window. It returns instead when
+// the first connection fails, the server sends an error frame, a redial is
+// answered with an HTTP status below 500 or needs a new login for its token
+// (which a redial would only repeat), or render fails.
 func runLogsStream(ctx context.Context, sub ws.LogStreamSubscribeMsg, render envelopeRenderer, follow bool) error {
 	streamURL, err := buildLogsStreamURL(apiURL)
 	if err != nil {
 		return err
 	}
+	everSubscribed := false
+	backoff := logsFollowRetryMin
+	for {
+		subscribed, err := logsStreamSession(ctx, streamURL, &sub, render, follow)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if subscribed {
+			everSubscribed = true
+			backoff = logsFollowRetryMin
+		}
+		var dropped *logsStreamDropped
+		if !follow || !everSubscribed || !errors.As(err, &dropped) {
+			return err
+		}
+		_, _ = fmt.Fprintf(os.Stderr, "[reconnect] %v; retrying in %s\n", err, backoff)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, logsFollowRetryMax)
+	}
+}
+
+// logsStreamSession runs one connection to streamURL: it subscribes with
+// sub, passes each envelope to render and advances sub.LastSeenID past it.
+// subscribed reports whether the server acknowledged the subscription. A
+// failure of the connection itself comes back as *logsStreamDropped.
+func logsStreamSession(ctx context.Context, streamURL string, sub *ws.LogStreamSubscribeMsg, render envelopeRenderer, follow bool) (subscribed bool, err error) {
 	conn, err := dialStream(ctx, streamURL)
 	if err != nil {
-		return fmt.Errorf("connect to global /api/v1/logs/stream: %w", err)
+		// An HTTP answer below 500 is a refusal (401, 403, or a redirect
+		// to a login page that ends in a 200), and a sign-in that only a
+		// new login restores stays gone; a redial would repeat either.
+		var refused *streamRefused
+		permanent := errors.Is(err, clientauth.ErrLoginRequired) ||
+			(errors.As(err, &refused) && refused.status < http.StatusInternalServerError)
+		err = fmt.Errorf("connect to global /api/v1/logs/stream: %w", err)
+		if permanent {
+			return false, err
+		}
+		return false, &logsStreamDropped{err}
 	}
 	defer conn.CloseNow() //nolint:errcheck
 
-	if err := writeWSMessage(ctx, conn, ws.TypeLogStreamSubscribe, sub); err != nil {
-		return err
+	if err := writeWSMessage(ctx, conn, ws.TypeLogStreamSubscribe, *sub); err != nil {
+		return false, &logsStreamDropped{fmt.Errorf("log stream dropped: %w", err)}
 	}
 
 	// In non-follow mode we need to detect "backfill exhausted" via
@@ -270,12 +344,12 @@ func runLogsStream(ctx context.Context, sub ws.LogStreamSubscribeMsg, render env
 		}
 		if err != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return subscribed, ctx.Err()
 			}
 			if !follow && readCtx.Err() == context.DeadlineExceeded {
-				return nil
+				return subscribed, nil
 			}
-			return err
+			return subscribed, &logsStreamDropped{fmt.Errorf("log stream dropped: %w", err)}
 		}
 		var env ws.Envelope
 		if err := json.Unmarshal(raw, &env); err != nil {
@@ -283,15 +357,16 @@ func runLogsStream(ctx context.Context, sub ws.LogStreamSubscribeMsg, render env
 		}
 		switch env.Type {
 		case ws.TypeSubscribed:
-			// ack — start the read loop. continue.
+			subscribed = true
 		case ws.TypeLogStreamEnvelope:
 			var msg ws.LogStreamEnvelopeMsg
 			if err := json.Unmarshal(env.Data, &msg); err != nil {
 				continue
 			}
 			if err := render(msg.Envelope, msg.ID); err != nil {
-				return err
+				return subscribed, err
 			}
+			sub.LastSeenID = max(sub.LastSeenID, msg.ID)
 		case ws.TypeLogStreamMeta:
 			var msg ws.LogStreamMetaMsg
 			if err := json.Unmarshal(env.Data, &msg); err == nil {
@@ -300,9 +375,9 @@ func runLogsStream(ctx context.Context, sub ws.LogStreamSubscribeMsg, render env
 		case ws.TypeError:
 			var msg ws.ErrorMsg
 			if err := json.Unmarshal(env.Data, &msg); err == nil {
-				return fmt.Errorf("server error: %s: %s", msg.Code, msg.Message)
+				return subscribed, fmt.Errorf("server error: %s: %s", msg.Code, msg.Message)
 			}
-			return fmt.Errorf("server error")
+			return subscribed, fmt.Errorf("server error")
 		}
 	}
 }
