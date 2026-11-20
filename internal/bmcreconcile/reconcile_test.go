@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -642,7 +643,7 @@ func TestReconcile_NoEmptySlot_TakesOverLeftover(t *testing.T) {
 		[3]string{"4", "", ""},
 	))
 
-	opt := RemoteOptions(LANTarget{Host: "192.0.2.10", Username: "ADMIN", Password: "adminpw!"}, "")
+	opt := RemoteOptions(LANTarget{Host: "192.0.2.10", Username: "ADMIN", Password: "adminpw!"}, "", nil)
 	opt.IPMITool = fake.path
 	res, err := Reconcile(context.Background(), opt)
 	if err != nil {
@@ -1520,7 +1521,7 @@ func TestReconcile_Rotate_LostWriteResponse_ReportsGeneratedPassword(t *testing.
 	queueFixInPlace(fake)
 	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
 
-	opt := RemoteOptions(LANTarget{Host: "192.0.2.10", Username: "ADMIN", Password: "adminpw!"}, "") // --rotate-monitor
+	opt := RemoteOptions(LANTarget{Host: "192.0.2.10", Username: "ADMIN", Password: "adminpw!"}, "", nil) // --rotate-monitor
 	opt.IPMITool = fake.path
 	res, err := Reconcile(context.Background(), opt)
 	if err != nil {
@@ -1540,6 +1541,262 @@ func TestReconcile_Rotate_LostWriteResponse_ReportsGeneratedPassword(t *testing.
 	}
 	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Slot != 4 || res.CreatedOrUpdated[0].Password != written[0] {
 		t.Errorf("CreatedOrUpdated = %+v, want monitor at slot 4 carrying the generated password the BMC holds", res.CreatedOrUpdated)
+	}
+}
+
+// TestReconcile_Rotate_LostWriteResponse_BMCGone_ReportsUnconfirmed: a
+// --rotate-monitor run whose first `user set password` gets no response,
+// after which the BMC answers nothing, so no `user test` can say whether
+// the write was applied. The generated password may be live on the BMC
+// with this run holding its only copy, so the failed run still reports it,
+// marked unconfirmed, for global to store.
+func TestReconcile_Rotate_LostWriteResponse_BMCGone_ReportsUnconfirmed(t *testing.T) {
+	const noSession = "Error: Unable to establish IPMI v2 / RMCP+ session\n"
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+	fake.queueFailure("user set password 4 *", setPasswordNoResponse("4"), 1)
+	for range 2 {
+		fake.queueFailure("user set password 4 *", noSession, 1)
+	}
+	for range 3 {
+		fake.queueFailure("user test 4 16 *", noSession, 1)
+		fake.queueFailure("user test 4 20 *", noSession, 1)
+	}
+
+	opt := RemoteOptions(LANTarget{Host: "192.0.2.10", Username: "ADMIN", Password: "adminpw!"}, "", nil) // --rotate-monitor
+	opt.IPMITool = fake.path
+	res, err := Reconcile(context.Background(), opt)
+	if err == nil {
+		t.Fatal("no write was confirmed, so the run must fail")
+	}
+	written := writtenPasswords(fake.calls())
+	if len(written) != 3 || written[0] != written[1] || written[1] != written[2] {
+		t.Fatalf("got %d `user set password` calls, want the 3-attempt ladder with one generated password", len(written))
+	}
+	if res == nil || len(res.CreatedOrUpdated) != 1 {
+		t.Fatalf("the BMC may hold the generated password, so the result must report it; got %+v", res)
+	}
+	u := res.CreatedOrUpdated[0]
+	if u.Slot != 4 || u.Name != MonitorUser || u.Password != written[0] || !u.PasswordUnconfirmed {
+		t.Errorf("CreatedOrUpdated[0]: slot %d name %q unconfirmed %v, password matches the written one: %v; "+
+			"want monitor at slot 4 carrying the generated password, unconfirmed",
+			u.Slot, u.Name, u.PasswordUnconfirmed, u.Password == written[0])
+	}
+	if strings.Contains(err.Error(), written[0]) {
+		t.Errorf("error leaks the generated password: %v", err)
+	}
+	if !strings.Contains(err.Error(), "may have applied") || !strings.Contains(err.Error(), "re-run") {
+		t.Errorf("error should say the password may be applied and to re-run: %v", err)
+	}
+}
+
+// TestReconcile_Rotate_WriteRefused_NotReported: a rotation whose every
+// write the BMC refuses, with `user test` confirming each time that the
+// slot holds a different password. The generated password is not on the
+// BMC, so it is not reported: storing it would replace the working one.
+func TestReconcile_Rotate_WriteRefused_NotReported(t *testing.T) {
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+	for range 3 {
+		fake.queueFailure("user set password 4 *", setPasswordNoResponse("4"), 1)
+		fake.queueFailure("user test 4 16 *", userTestIncorrect, 1)
+	}
+
+	opt := RemoteOptions(LANTarget{Host: "192.0.2.10", Username: "ADMIN", Password: "adminpw!"}, "", nil)
+	opt.IPMITool = fake.path
+	res, err := Reconcile(context.Background(), opt)
+	if err == nil {
+		t.Fatal("expected the refused write to fail the reconcile")
+	}
+	if res == nil || len(res.CreatedOrUpdated) != 0 {
+		t.Errorf("the BMC confirmed it does not hold the generated password; got %+v", res)
+	}
+}
+
+// TestReconcile_UnconfirmedPassword_NextRunConverges runs the history
+// against a MegaRAC BMC (it refuses a password that is current or in its
+// reuse history): a rotation whose password write fails with the BMC
+// unreachable from then on, then a clean compliance run with what global
+// holds after the first run: the stored password, kept, and the generated
+// one beside it as unconfirmed. Whether or not the BMC applied the write,
+// neither password is lost in between, and the second run must succeed and
+// leave the BMC and the store agreeing, with no --rotate-monitor.
+func TestReconcile_UnconfirmedPassword_NextRunConverges(t *testing.T) {
+	for name, tc := range map[string]struct {
+		fault   string
+		applied bool
+	}{
+		"write applied, response lost": {faultAfter, true},
+		"write never reached the BMC":  {faultBefore, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sim := newBMCSim(t)
+			sim.set(&simState{
+				AdminPassword: simAdminPW,
+				MegaRAC:       true,
+				Slots: []simSlot{
+					{Priv: 4},
+					{Name: "ADMIN", Priv: 4, Enabled: true, Password: simAdminPW, PwSize: 16, LAN: true},
+					{Name: MonitorUser, Priv: int(PrivUser), Enabled: true, Password: simPWA, PwSize: 16, LAN: true},
+				},
+			})
+			// Call 0 lists, call 1 is the password write, call 2 the test
+			// after it: the BMC is gone from there on.
+			rotate := propRun{rotate: true, faults: map[int]string{1: tc.fault, 2: faultDown}}
+			res, store, err := reconcileOnce(sim, rotate, simStore{pw: simPWA})
+			if err == nil {
+				t.Fatal("the rotation must fail: its write was never confirmed")
+			}
+			held := sim.snapshot().Slots[2].Password
+			if (held != simPWA) != tc.applied {
+				t.Fatalf("simulator: write applied = %v, want %v", held != simPWA, tc.applied)
+			}
+			if res == nil || len(res.CreatedOrUpdated) != 1 || !res.CreatedOrUpdated[0].PasswordUnconfirmed {
+				t.Fatalf("the rotation must report its generated password as unconfirmed; got %+v, err %v", res, err)
+			}
+			if store.pw != simPWA || len(store.unconfirmed) != 1 {
+				t.Fatalf("global must keep the stored password and hold the generated one beside it; has %d unconfirmed, stored kept: %v",
+					len(store.unconfirmed), store.pw == simPWA)
+			}
+			if !store.has(held) {
+				t.Fatal("the BMC holds a password global does not have")
+			}
+
+			res, store, err = reconcileOnce(sim, propRun{}, store)
+			if err != nil {
+				t.Fatalf("clean compliance run with the stored and unconfirmed passwords: %v", err)
+			}
+			after := sim.snapshot()
+			if why, _ := simCompliant(after); why != "" {
+				t.Fatalf("not compliant after the clean run: %s", why)
+			}
+			if after.Slots[2].Password != held {
+				t.Errorf("the clean run changed the BMC's password; it only had to find out which one the BMC holds")
+			}
+			if store.pw != held || len(store.unconfirmed) != 0 {
+				t.Errorf("after the clean run global must store the password the BMC holds and no unconfirmed ones")
+			}
+			if n := simPasswordWrites(after.Log); n != 0 {
+				t.Errorf("the clean run wrote %d passwords, want 0", n)
+			}
+			adopted := len(res.PasswordVerified) == 1 && res.PasswordVerified[0].Password != ""
+			if adopted != tc.applied {
+				t.Errorf("clean run adopted the unconfirmed password = %v, want %v", adopted, tc.applied)
+			}
+		})
+	}
+}
+
+// TestReconcile_Unconfirmed_Adopted: the BMC does not hold the stored
+// password but holds one of the unconfirmed ones the caller kept. Reconcile
+// writes nothing (MegaRAC would refuse the stored password, which is in its
+// reuse history), reports the held one for the caller to store, and still
+// re-applies privilege, channel access and the enable bit. The newest
+// unconfirmed password is tested first.
+func TestReconcile_Unconfirmed_Adopted(t *testing.T) {
+	const older, newer = "Unconf!rmed0ld", "Unconf!rmedNew"
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+	fake.queueUserTest("4", "16", storedMonitorPW, userTestIncorrect)
+	fake.queueUserTest("4", "16", newer, userTestIncorrect)
+	fake.queueUserTest("4", "16", older, userTestSuccess)
+	queueFixInPlace(fake)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+
+	opt := storedMonitorOptions(fake, storedMonitorPW)
+	opt.Desired[0].Unconfirmed = []string{older, newer}
+	res, err := Reconcile(context.Background(), opt)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	calls := fake.calls()
+	if n := countCalls(calls, "user set password"); n != 0 {
+		t.Errorf("got %d password writes, want none: the BMC holds an unconfirmed password", n)
+	}
+	if tested := testedPasswords(calls); !slices.Equal(tested, []string{storedMonitorPW, newer, older}) {
+		t.Errorf("tested %d passwords in the wrong order; want the stored one, then the unconfirmed ones newest first", len(tested))
+	}
+	if len(res.CreatedOrUpdated) != 0 || len(res.PasswordVerified) != 1 ||
+		res.PasswordVerified[0].Slot != 4 || res.PasswordVerified[0].Password != older {
+		t.Errorf("want the held unconfirmed password reported in PasswordVerified for slot 4 and nothing written")
+	}
+	if countCalls(calls, "user enable 4") != 1 {
+		t.Error("the account's privilege, access and enable bit must still be re-applied")
+	}
+}
+
+// TestReconcile_Unconfirmed_NoneHeld_WritesStored: neither the stored
+// password nor any unconfirmed one is on the BMC, so the stored password
+// is written and confirmed as usual.
+func TestReconcile_Unconfirmed_NoneHeld_WritesStored(t *testing.T) {
+	const unconfirmed = "Unconf!rmed0ld"
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+	fake.queueUserTest("4", "16", storedMonitorPW, userTestIncorrect)
+	fake.queueUserTest("4", "16", unconfirmed, userTestIncorrect)
+	fake.queueOutput("user set password 4 "+storedMonitorPW, "")
+	fake.queueUserTest("4", "16", storedMonitorPW, userTestSuccess)
+	queueFixInPlace(fake)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+
+	opt := storedMonitorOptions(fake, storedMonitorPW)
+	opt.Desired[0].Unconfirmed = []string{unconfirmed}
+	res, err := Reconcile(context.Background(), opt)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	assertPasswordWrites(t, fake.calls(), "4", storedMonitorPW)
+	if len(res.CreatedOrUpdated) != 1 || res.CreatedOrUpdated[0].Password != "" || len(res.PasswordVerified) != 0 {
+		t.Errorf("want the stored password written and nothing adopted; got written=%d verified=%d",
+			len(res.CreatedOrUpdated), len(res.PasswordVerified))
+	}
+}
+
+// TestReconcile_Unconfirmed_TestInconclusive_NoWrite: when the test of an
+// unconfirmed password cannot run, the BMC may hold it, so reconcile fails
+// before writing rather than write the stored password over it. The error
+// carries neither password.
+func TestReconcile_Unconfirmed_TestInconclusive_NoWrite(t *testing.T) {
+	const unconfirmed = "Unconf!rmed0ld"
+	fake := newFakeIPMITool(t)
+	fake.queueOutput("user list 1", monitorAtSlot4("USER"))
+	fake.queueUserTest("4", "16", storedMonitorPW, userTestIncorrect)
+	fake.queueUserTest("4", "16", unconfirmed, userTestUnknown)
+	fake.queueUserTest("4", "20", unconfirmed, userTestUnknown)
+
+	opt := storedMonitorOptions(fake, storedMonitorPW)
+	opt.Desired[0].Unconfirmed = []string{unconfirmed}
+	res, err := Reconcile(context.Background(), opt)
+	if err == nil || !strings.Contains(err.Error(), "could not test") {
+		t.Fatalf("expected an inconclusive-test error, got %v", err)
+	}
+	if strings.Contains(err.Error(), unconfirmed) || strings.Contains(err.Error(), storedMonitorPW) {
+		t.Errorf("error leaks a password: %v", err)
+	}
+	if n := countCalls(fake.calls(), "user set password"); n != 0 {
+		t.Errorf("an inconclusive test must not lead to a write; got %d", n)
+	}
+	if res == nil || len(res.CreatedOrUpdated) != 0 || len(res.PasswordVerified) != 0 {
+		t.Errorf("nothing was written or verified; got %+v", res)
+	}
+}
+
+// TestReconcile_UnconfirmedWithoutPassword_Refused: unconfirmed passwords
+// are only meaningful beside a stored password to re-assert.
+func TestReconcile_UnconfirmedWithoutPassword_Refused(t *testing.T) {
+	fake := newFakeIPMITool(t)
+	res, err := Reconcile(context.Background(), Options{
+		IPMITool: fake.path,
+		Desired:  []DesiredUser{{Name: "monitor", Privilege: PrivUser, Rotate: true, Unconfirmed: []string{"Unconf!rmed0ld"}}},
+	})
+	if err == nil || res != nil {
+		t.Fatalf("expected a refusal before any call, got res=%v err=%v", res, err)
+	}
+	if strings.Contains(err.Error(), "Unconf!rmed0ld") {
+		t.Errorf("error leaks the password: %v", err)
+	}
+	if n := len(fake.calls()); n != 0 {
+		t.Errorf("refusal must precede every ipmitool call; got %d", n)
 	}
 }
 
@@ -1677,7 +1934,7 @@ func TestReconcile_ErrorRedactsOptionSecrets(t *testing.T) {
 	fake.queueUserTest("4", "16", storedMonitorPW, userTestSuccess)
 	fake.queueFailure("user priv 4", "echo: "+storedMonitorPW+" adminpw!", 1)
 
-	opt := RemoteOptions(LANTarget{Host: "10.0.0.9", Username: "ADMIN", Password: "adminpw!"}, storedMonitorPW)
+	opt := RemoteOptions(LANTarget{Host: "10.0.0.9", Username: "ADMIN", Password: "adminpw!"}, storedMonitorPW, nil)
 	opt.IPMITool = fake.path
 	res, err := Reconcile(context.Background(), opt)
 	if err == nil {
@@ -1771,7 +2028,7 @@ func TestReconcile_DuplicateDesiredName_ExtraDisabled(t *testing.T) {
 // table and in any error text that echoes the command line. The monitor
 // account carries the stored password to re-assert, or, with none, Rotate.
 func TestRemoteOptions(t *testing.T) {
-	opt := RemoteOptions(LANTarget{Host: "10.252.240.41", Username: "ADMIN", Password: "s3cret!pw"}, "")
+	opt := RemoteOptions(LANTarget{Host: "10.252.240.41", Username: "ADMIN", Password: "s3cret!pw"}, "", nil)
 	if opt.IPMIInterface != "lanplus" {
 		t.Errorf("IPMIInterface = %q, want lanplus", opt.IPMIInterface)
 	}
@@ -1791,13 +2048,14 @@ func TestRemoteOptions(t *testing.T) {
 		t.Errorf("remote safety knobs: AdminUser=%q SkipBootOrder=%v", opt.AdminUser, opt.SkipBootOrder)
 	}
 	// No stored password (a new BMC, or an explicit rotation): rotate.
-	if !slices.Equal(opt.Desired, []DesiredUser{{Name: MonitorUser, Privilege: PrivUser, Rotate: true}}) {
+	if !reflect.DeepEqual(opt.Desired, []DesiredUser{{Name: MonitorUser, Privilege: PrivUser, Rotate: true}}) {
 		t.Errorf("Desired = %+v, want only monitor at USER, rotated", opt.Desired)
 	}
 
 	// A stored password: re-assert it, never rotate.
-	stored := RemoteOptions(LANTarget{Host: "10.252.240.41", Username: "ADMIN", Password: "s3cret!pw"}, storedMonitorPW)
-	if !slices.Equal(stored.Desired, []DesiredUser{{Name: MonitorUser, Privilege: PrivUser, Password: storedMonitorPW}}) {
+	// The entry's unconfirmed passwords ride beside it.
+	stored := RemoteOptions(LANTarget{Host: "10.252.240.41", Username: "ADMIN", Password: "s3cret!pw"}, storedMonitorPW, []string{"Unconf!rmed0ld"})
+	if !reflect.DeepEqual(stored.Desired, []DesiredUser{{Name: MonitorUser, Privilege: PrivUser, Password: storedMonitorPW, Unconfirmed: []string{"Unconf!rmed0ld"}}}) {
 		t.Errorf("Desired = %+v, want only monitor at USER with the stored password", stored.Desired)
 	}
 	for _, a := range stored.Args {
@@ -1806,7 +2064,7 @@ func TestRemoteOptions(t *testing.T) {
 		}
 	}
 
-	custom := RemoteOptions(LANTarget{Host: "h", Username: "u", Password: "p", Cipher: 3}, "")
+	custom := RemoteOptions(LANTarget{Host: "h", Username: "u", Password: "p", Cipher: 3}, "", nil)
 	if i := slices.Index(custom.Args, "-C"); i < 0 || custom.Args[i+1] != "3" {
 		t.Errorf("a configured cipher must override the default: %v", custom.Args)
 	}
@@ -1844,7 +2102,7 @@ func TestReconcile_Remote_EndToEnd(t *testing.T) {
 		[3]string{"4", "monitor", "USER"},
 	))
 
-	opt := RemoteOptions(LANTarget{Host: "10.0.0.9", Username: "ADMIN", Password: "adminpw!"}, "")
+	opt := RemoteOptions(LANTarget{Host: "10.0.0.9", Username: "ADMIN", Password: "adminpw!"}, "", nil)
 	opt.IPMITool = fake.path
 	res, err := Reconcile(context.Background(), opt)
 	if err != nil {
@@ -1891,7 +2149,7 @@ func TestSetPassword_ErrorRedactsPassword(t *testing.T) {
 		fake.queueFailure("user set password 4 *", "rejected "+storedMonitorPW, 1)
 		fake.queueUserTest("4", "16", storedMonitorPW, userTestIncorrect)
 	}
-	err := setPassword(context.Background(), Options{
+	_, err := setPassword(context.Background(), Options{
 		IPMITool: fake.path, IPMIInterface: "open",
 	}, 4, storedMonitorPW)
 	if err == nil {

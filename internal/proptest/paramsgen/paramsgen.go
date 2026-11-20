@@ -45,6 +45,7 @@ var SecretPaths = [][]string{
 	{"amt_runtime", "password"},
 	{"tailscale_runtime", "auth_key"},
 	{"monitor_runtime", "password"},
+	{"monitor_runtime", "unconfirmed", Each, "password"},
 }
 
 // Kind is a JSON value kind.
@@ -732,24 +733,29 @@ func (g *gen) outlet() *Node {
 	})
 }
 
-func (g *gen) outlets() *Node {
-	if g.o.Malformed && rapid.IntRange(0, 6).Draw(g.t, "outletsMalformed") == 0 {
-		return g.wrongShape(false, g.outlet)
+func (g *gen) outlets() *Node { return g.credentialArray("outlet", g.outlet) }
+
+// credentialArray generates an array whose elements are credential-bearing
+// objects (elem), with the null and malformed variants the options allow.
+// label names the draws and the per-element feature.
+func (g *gen) credentialArray(label string, elem func() *Node) *Node {
+	if g.o.Malformed && rapid.IntRange(0, 6).Draw(g.t, label+"sMalformed") == 0 {
+		return g.wrongShape(false, elem)
 	}
-	if !g.o.TypedValues && rapid.IntRange(0, 9).Draw(g.t, "outletsNull") == 0 {
+	if !g.o.TypedValues && rapid.IntRange(0, 9).Draw(g.t, label+"sNull") == 0 {
 		return NullN()
 	}
-	n := rapid.IntRange(0, 4).Draw(g.t, "outletCount")
+	n := rapid.IntRange(0, 4).Draw(g.t, label+"Count")
 	a := &Node{Kind: Arr}
 	for range n {
-		g.feat("outlet")
+		g.feat(label)
 		switch {
-		case rapid.IntRange(0, 9).Draw(g.t, "outletNull") == 0:
+		case rapid.IntRange(0, 9).Draw(g.t, label+"Null") == 0:
 			a.Elems = append(a.Elems, NullN())
-		case g.o.Malformed && rapid.IntRange(0, 5).Draw(g.t, "outletMalformed") == 0:
-			a.Elems = append(a.Elems, g.wrongShape(true, g.outlet))
+		case g.o.Malformed && rapid.IntRange(0, 5).Draw(g.t, label+"Malformed") == 0:
+			a.Elems = append(a.Elems, g.wrongShape(true, elem))
 		default:
-			a.Elems = append(a.Elems, g.outlet())
+			a.Elems = append(a.Elems, elem())
 		}
 	}
 	return a
@@ -783,9 +789,18 @@ func (g *gen) tailscale() *Node {
 	})
 }
 
+func (g *gen) unconfirmed() *Node {
+	return g.object([]func() (string, *Node, bool){
+		g.secretField("password"),
+		// auth_key is not an unconfirmed password's credential key.
+		g.field("auth_key", g.keepStr),
+	})
+}
+
 func (g *gen) monitor() *Node {
 	return g.object([]func() (string, *Node, bool){
 		g.secretField("password"),
+		g.field("unconfirmed", func() *Node { return g.credentialArray("unconfirmed", g.unconfirmed) }),
 		g.field("auth_key", g.keepStr),
 	})
 }

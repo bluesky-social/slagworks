@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,13 +31,15 @@ const (
 type fakeReconciler struct {
 	calls            []bmcreconcile.LANTarget
 	monitorPasswords []string
+	unconfirmed      [][]string
 	result           *bmcreconcile.Result
 	err              error
 }
 
-func (f *fakeReconciler) run(_ context.Context, t bmcreconcile.LANTarget, monitorPassword string) (*bmcreconcile.Result, error) {
+func (f *fakeReconciler) run(_ context.Context, t bmcreconcile.LANTarget, monitorPassword string, unconfirmed []string) (*bmcreconcile.Result, error) {
 	f.calls = append(f.calls, t)
 	f.monitorPasswords = append(f.monitorPasswords, monitorPassword)
+	f.unconfirmed = append(f.unconfirmed, unconfirmed)
 	return f.result, f.err
 }
 
@@ -583,4 +586,72 @@ func hasFailedUpdate(updates []model.OperationUpdate, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestExecutor_BMCReconcile_UnconfirmedPassword_Reported: a rotation whose
+// password write failed with the outcome unknown. The generated password
+// may be live on the BMC and this report is its only copy, so it reaches
+// global, flagged unconfirmed and neither rotated nor written, alongside
+// the error that fails the op.
+func TestExecutor_BMCReconcile_UnconfirmedPassword_Reported(t *testing.T) {
+	result := monitorResult()
+	result.CreatedOrUpdated[0].PasswordUnconfirmed = true
+	rec := &fakeReconciler{result: result, err: errors.New("bmcreconcile: set password slot 4: exit status 1")}
+	params := adminParams()
+	params.RotateMonitor = true
+	exec, cache, op, _ := bmcReconcileFixture(t, "10.0.0.41", "SN1", params, rec)
+
+	exec.runBMCReconcile(context.Background(), op)
+
+	obs, updates := cache.DrainOutbox()
+	if len(obs) != 1 {
+		t.Fatalf("expected the report, got %+v", obs)
+	}
+	var rep model.BMCReconcileReport
+	if err := json.Unmarshal(obs[0].Obs.Data, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Monitor == nil || rep.Monitor.Password != testMonitorPW || !rep.Monitor.PasswordUnconfirmed || rep.Monitor.IPMIUserSlot != 4 {
+		t.Errorf("the report must carry the generated password flagged unconfirmed; got unconfirmed=%v", rep.Monitor != nil && rep.Monitor.PasswordUnconfirmed)
+	}
+	if rep.MonitorRotated || rep.MonitorPasswordWritten || !strings.Contains(rep.Error, "set password slot 4") {
+		t.Errorf("want not rotated, not written, with the error; got rotated=%v written=%v error=%q",
+			rep.MonitorRotated, rep.MonitorPasswordWritten, rep.Error)
+	}
+	assertNoMonitorPWInOpUpdates(t, updates)
+}
+
+// TestExecutor_BMCReconcile_UnconfirmedCarried_Adopted: the op carries the
+// stored password and the entry's unconfirmed ones, and reconcile is handed
+// all of them. When it finds the BMC holding an unconfirmed one, the report
+// carries that password, flagged rotated and not written, for global to
+// store as the password.
+func TestExecutor_BMCReconcile_UnconfirmedCarried_Adopted(t *testing.T) {
+	result := verifiedResult()
+	result.PasswordVerified[0].Password = testMonitorPW
+	rec := &fakeReconciler{result: result}
+	params := storedMonitorParams()
+	params.MonitorRuntime.Unconfirmed = []model.UnconfirmedPassword{{Password: "Unconf!rmed0ld"}, {Password: testMonitorPW}}
+	exec, cache, op, _ := bmcReconcileFixture(t, "10.0.0.41", "SN1", params, rec)
+
+	exec.runBMCReconcile(context.Background(), op)
+
+	if len(rec.unconfirmed) != 1 || !slices.Equal(rec.unconfirmed[0], []string{"Unconf!rmed0ld", testMonitorPW}) ||
+		rec.monitorPasswords[0] != testStoredMonitorPW {
+		t.Fatalf("reconcile must be handed the stored password and the unconfirmed ones in order; got %d unconfirmed", len(rec.unconfirmed))
+	}
+	obs, updates := cache.DrainOutbox()
+	if len(obs) != 1 {
+		t.Fatalf("expected the report, got %+v", obs)
+	}
+	var rep model.BMCReconcileReport
+	if err := json.Unmarshal(obs[0].Obs.Data, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Monitor == nil || rep.Monitor.Password != testMonitorPW || rep.Monitor.PasswordUnconfirmed ||
+		!rep.MonitorRotated || rep.MonitorPasswordWritten || rep.Error != "" {
+		t.Errorf("want the adopted password reported as rotated, confirmed and not written; got rotated=%v written=%v error=%q",
+			rep.MonitorRotated, rep.MonitorPasswordWritten, rep.Error)
+	}
+	assertNoMonitorPWInOpUpdates(t, updates)
 }

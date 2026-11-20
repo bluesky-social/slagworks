@@ -448,6 +448,10 @@ site slug of the device in question.
   device serial, with `kind: "bmc"`, the same four fields, and
   `last_known_hostname` / `last_known_ip`. Written after a deploy's BMC
   reconcile (`deploy_complete`) and by `slagctl machine bmc-reconcile`.
+  An entry can also carry `unconfirmed_passwords`: generated passwords
+  whose write to the BMC failed with the outcome unknown, so the BMC holds
+  either `password` or one of them. The next `bmc-reconcile` of the device
+  settles which and removes the list; consumers keep reading `password`.
   Creating a site config creates this secret with a `_meta`-only body if
   it does not exist.
 

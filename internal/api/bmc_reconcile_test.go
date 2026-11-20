@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -354,5 +355,50 @@ func TestBMCReconcileMachine_NoNetBoxRefuses(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(string(body), "bmc-creds-admin") {
 		t.Fatalf("status = %d body=%s, want 422 naming bmc-creds-admin", resp.StatusCode, body)
+	}
+}
+
+// TestBMCReconcileMachine_UnconfirmedCarriedToOp: a stored entry's
+// unconfirmed passwords ride the op beside the stored password, in order,
+// so the worker can ask the BMC which one it holds. A rotation carries
+// neither. None of them reaches the logs or the operator's view of the op.
+func TestBMCReconcileMachine_UnconfirmedCarriedToOp(t *testing.T) {
+	const older, newer = "0lder!Unconf", "Newer!Unconf"
+	entry := storedMonitorEntry()
+	entry.UnconfirmedPasswords = []string{older, newer}
+	s, id, logs := storedMonitorServer(t, entry)
+	status, body := createBMCReconcile(t, s, id, `{}`)
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", status, body)
+	}
+	var op model.Operation
+	if err := json.Unmarshal(body, &op); err != nil {
+		t.Fatal(err)
+	}
+	p, err := op.DecodeParams()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []model.UnconfirmedPassword{{Password: older}, {Password: newer}}
+	if p.MonitorRuntime == nil || p.MonitorRuntime.Password != storedMonitorPW || !slices.Equal(p.MonitorRuntime.Unconfirmed, want) {
+		t.Errorf("params must carry the stored password and both unconfirmed ones in order")
+	}
+	redacted := string(op.Redacted().Params)
+	for _, pw := range []string{older, newer, storedMonitorPW} {
+		if strings.Contains(logs.String(), pw) {
+			t.Errorf("a monitor password reached the server logs")
+		}
+		if strings.Contains(redacted, pw) {
+			t.Errorf("a monitor password survives redaction: %s", redacted)
+		}
+	}
+
+	s, id, _ = storedMonitorServer(t, entry)
+	status, body = createBMCReconcile(t, s, id, `{"rotate_monitor":true}`)
+	if status != http.StatusCreated {
+		t.Fatalf("rotation: status = %d, want 201; body=%s", status, body)
+	}
+	if strings.Contains(string(body), older) || strings.Contains(string(body), newer) {
+		t.Errorf("a rotation must not carry the unconfirmed passwords: %s", body)
 	}
 }

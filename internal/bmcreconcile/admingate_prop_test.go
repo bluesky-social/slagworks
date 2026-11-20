@@ -35,7 +35,7 @@ func TestReconcile_Prop_AdminGate(t *testing.T) {
 		}
 		wantRefuse := len(matches) != 1 || matches[0] != 2
 		sim.set(s)
-		opt := RemoteOptions(LANTarget{Host: simLANTarget, Username: cred, Password: simAdminPW}, "")
+		opt := RemoteOptions(LANTarget{Host: simLANTarget, Username: cred, Password: simAdminPW}, "", nil)
 		if rapid.Bool().Draw(rt, "inband") {
 			opt = Options{IPMIInterface: "open", AdminUser: cred, Desired: []DesiredUser{{Name: MonitorUser, Privilege: PrivUser}}}
 		}

@@ -35,11 +35,12 @@ type PowerControllerFactory func(ctx context.Context, m *model.MachineSnapshot, 
 
 // BMCReconcileFunc runs a remote BMC user reconcile over IPMI LAN for a
 // bmc_reconcile op. monitorPassword is the stored monitor password to
-// re-assert; empty generates a fresh one. Production is
+// re-assert; empty generates a fresh one. unconfirmed is the stored entry's
+// unconfirmed passwords (bmcreconcile.DesiredUser.Unconfirmed). Production is
 // bmcreconcile.ReconcileRemote (ipmitool lanplus); tests stub it. Same
 // contract as bmcreconcile.Reconcile: a nil Result means nothing was
 // written.
-type BMCReconcileFunc func(ctx context.Context, t bmcreconcile.LANTarget, monitorPassword string) (*bmcreconcile.Result, error)
+type BMCReconcileFunc func(ctx context.Context, t bmcreconcile.LANTarget, monitorPassword string, unconfirmed []string) (*bmcreconcile.Result, error)
 
 // BMCTimeFunc runs a bmc_reconcile op's time pass (NTP, timezone, clock)
 // over Redfish and IPMI LAN. Production is bmcreconcile.ReconcileTime;

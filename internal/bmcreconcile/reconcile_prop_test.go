@@ -7,14 +7,20 @@ package bmcreconcile
 // monitor password global currently stores, and a history of reconcile runs
 // (remote compliance, remote rotation, in-band deploy), each with a fault
 // schedule (call k fails before or after it is applied, or the BMC goes
-// away). Global's storage rule is mirrored outside the production code: a
-// generated monitor password in the result is stored, nothing else changes
-// the store.
+// away). Global's storage rule is mirrored outside the production code
+// (simStore.apply): a generated monitor password in the result is stored,
+// one the result marks unconfirmed is kept beside the stored password, and
+// a remote compliance run gets both.
 //
 // Properties (the oracle reads the simulator state, never production
 // helpers):
 //   - slot 2 (the admin credential's account) is never modified
-//   - a generated password reported in the result is the one the BMC holds
+//   - a generated password reported in the result is the one the BMC holds,
+//     unless the result marks it unconfirmed
+//   - a run never leaves a slot holding a password that is neither the
+//     stored one nor reported in the result, and an enabled monitor a run
+//     created always holds a password global has (the stored one or an
+//     unconfirmed one)
 //   - no password appears in an error
 //   - a run that returns nil error leaves the BMC compliant: exactly one
 //     enabled account named monitor, USER privilege, LAN access, every
@@ -214,9 +220,50 @@ func simPasswordWrites(log []string) int {
 	return n
 }
 
+// simStore mirrors the device's entry in global's monitor secret: the
+// password, and the unconfirmed passwords kept beside it, oldest first.
+type simStore struct {
+	pw          string
+	unconfirmed []string
+}
+
+// has reports whether global holds pw for the device in either role.
+func (st simStore) has(pw string) bool {
+	return pw == st.pw || slices.Contains(st.unconfirmed, pw)
+}
+
+// apply returns the store after global handled a run's outcome. It mirrors
+// commission.upsertMonitorCred and handleBMCReconcileReport, not Reconcile.
+func (st simStore) apply(r propRun, res *Result, err error) simStore {
+	if res != nil {
+		reported := append(slices.Clone(res.CreatedOrUpdated), res.PasswordVerified...)
+		for _, u := range reported {
+			switch {
+			case u.Name != MonitorUser || u.Password == "":
+			case u.PasswordUnconfirmed && st.pw != "":
+				// Kept beside the stored password, never over it.
+				if !st.has(u.Password) {
+					st.unconfirmed = append(slices.Clone(st.unconfirmed), u.Password)
+				}
+				return st
+			default:
+				// A password the BMC holds (or the only candidate there
+				// is): it replaces the entry.
+				return simStore{pw: u.Password}
+			}
+		}
+	}
+	if err == nil && !r.inband {
+		// A remote run that succeeded without reporting a password left
+		// the BMC holding the stored one.
+		st.unconfirmed = nil
+	}
+	return st
+}
+
 // reconcileOnce runs one reconcile against the simulator and returns the
-// result, the error and the monitor password global stores afterwards.
-func reconcileOnce(sim *bmcSim, r propRun, stored string) (*Result, string, error) {
+// result, the error and what global stores afterwards.
+func reconcileOnce(sim *bmcSim, r propRun, st simStore) (*Result, simStore, error) {
 	s := sim.snapshot()
 	var opt Options
 	if r.inband {
@@ -225,11 +272,11 @@ func reconcileOnce(sim *bmcSim, r propRun, stored string) (*Result, string, erro
 			Desired:       []DesiredUser{{Name: MonitorUser, Privilege: PrivUser}},
 		}
 	} else {
-		pw := stored
+		pw, unconfirmed := st.pw, st.unconfirmed
 		if r.rotate {
-			pw = ""
+			pw, unconfirmed = "", nil
 		}
-		opt = RemoteOptions(LANTarget{Host: simLANTarget, Username: s.Slots[1].Name, Password: simAdminPW}, pw)
+		opt = RemoteOptions(LANTarget{Host: simLANTarget, Username: s.Slots[1].Name, Password: simAdminPW}, pw, unconfirmed)
 	}
 	opt.AdminUser = s.Slots[1].Name
 	opt.IPMITool = sim.bin
@@ -237,19 +284,11 @@ func reconcileOnce(sim *bmcSim, r propRun, stored string) (*Result, string, erro
 	sim.set(s)
 
 	res, err := Reconcile(context.Background(), opt)
-
-	if res != nil {
-		for _, u := range res.CreatedOrUpdated {
-			if u.Name == MonitorUser && u.Password != "" {
-				stored = u.Password
-			}
-		}
-	}
-	return res, stored, err
+	return res, st.apply(r, res, err), err
 }
 
 type reconcilePropStats struct {
-	cases, runs, inband, rotate, faultsHit, errs, generated, leftovers int
+	cases, runs, inband, rotate, faultsHit, errs, generated, unconfirmed, adopted, leftovers int
 }
 
 func checkReconcileHistory(t *rapid.T, sim *bmcSim, stats *reconcilePropStats) {
@@ -262,6 +301,7 @@ func checkReconcileHistory(t *rapid.T, sim *bmcSim, stats *reconcilePropStats) {
 			stored = initial.Slots[ms[0]-1].Password
 		}
 	}
+	store := simStore{pw: stored}
 	runs := genRuns(t)
 	sim.set(initial)
 	admin0 := initial.Slots[1]
@@ -270,9 +310,6 @@ func checkReconcileHistory(t *rapid.T, sim *bmcSim, stats *reconcilePropStats) {
 	// createdMonitor: a run named a slot monitor during this history, so
 	// that account's password is one Reconcile generated.
 	createdMonitor := false
-	// stranded: the BMC holds a generated password no result reported.
-	stranded := false
-
 	for i, r := range runs {
 		stats.runs++
 		if r.inband {
@@ -288,7 +325,9 @@ func checkReconcileHistory(t *rapid.T, sim *bmcSim, stats *reconcilePropStats) {
 			beforeMonPW = before.Slots[healthySlot-1].Password
 		}
 
-		res, newStored, err := reconcileOnce(sim, r, stored)
+		stored := store.pw
+		res, newStore, err := reconcileOnce(sim, r, store)
+		newStored := newStore.pw
 		after := sim.snapshot()
 		for k := range r.faults {
 			if k < after.Calls {
@@ -298,7 +337,7 @@ func checkReconcileHistory(t *rapid.T, sim *bmcSim, stats *reconcilePropStats) {
 		if err != nil {
 			stats.errs++
 		}
-		label := fmt.Sprintf("run %d (inband=%v rotate=%v faults=%v stored=%q)", i, r.inband, r.rotate, r.faults, stored)
+		label := fmt.Sprintf("run %d (inband=%v rotate=%v faults=%v stored=%q unconfirmed=%q)", i, r.inband, r.rotate, r.faults, stored, store.unconfirmed)
 
 		// Slot 2 untouched.
 		if fmt.Sprint(after.Slots[1]) != fmt.Sprint(admin0) {
@@ -314,8 +353,29 @@ func checkReconcileHistory(t *rapid.T, sim *bmcSim, stats *reconcilePropStats) {
 				}
 				generated = append(generated, u.Password)
 				stats.generated++
+				if u.PasswordUnconfirmed {
+					stats.unconfirmed++
+					if err == nil {
+						t.Fatalf("%s: an unconfirmed password for slot %d came without an error", label, u.Slot)
+					}
+					continue
+				}
 				if u.Slot < 1 || u.Slot > len(after.Slots) || after.Slots[u.Slot-1].Password != u.Password {
 					t.Fatalf("%s: reported generated password for slot %d is not what the BMC holds\nlog: %q", label, u.Slot, after.Log)
+				}
+			}
+			// An adopted password is an unconfirmed one global handed the
+			// run, and it is what the BMC holds.
+			for _, u := range res.PasswordVerified {
+				if u.Password == "" {
+					continue
+				}
+				stats.adopted++
+				if !slices.Contains(store.unconfirmed, u.Password) {
+					t.Fatalf("%s: adopted a password for slot %d that is not one of the unconfirmed ones", label, u.Slot)
+				}
+				if u.Slot < 1 || u.Slot > len(after.Slots) || after.Slots[u.Slot-1].Password != u.Password {
+					t.Fatalf("%s: adopted password for slot %d is not what the BMC holds\nlog: %q", label, u.Slot, after.Log)
 				}
 			}
 			stats.leftovers += len(res.LeftoversDisabled)
@@ -324,6 +384,7 @@ func checkReconcileHistory(t *rapid.T, sim *bmcSim, stats *reconcilePropStats) {
 		// No secret in the error.
 		if err != nil {
 			secrets := append(append([]string{}, knownSecrets...), generated...)
+			secrets = append(secrets, store.unconfirmed...)
 			for _, sl := range after.Slots {
 				secrets = append(secrets, sl.Password)
 				secrets = append(secrets, sl.History...)
@@ -362,6 +423,9 @@ func checkReconcileHistory(t *rapid.T, sim *bmcSim, stats *reconcilePropStats) {
 				t.Fatalf("%s: remote reconcile succeeded but the BMC monitor password %q is not the stored %q\nlog: %q",
 					label, after.Slots[m-1].Password, newStored, after.Log)
 			}
+			if !r.inband && len(newStore.unconfirmed) > 0 {
+				t.Fatalf("%s: remote reconcile succeeded but global still holds unconfirmed passwords", label)
+			}
 			if r.inband {
 				if newStored != stored && after.Slots[m-1].Password != newStored {
 					t.Fatalf("%s: in-band reported a password the BMC does not hold", label)
@@ -383,38 +447,35 @@ func checkReconcileHistory(t *rapid.T, sim *bmcSim, stats *reconcilePropStats) {
 				createdMonitor = true
 			}
 		}
-		// Excluded pattern, a defect in Reconcile: a generated password whose
-		// write the BMC applied, with that response and the `user test` that
-		// follows it both lost, is live on the BMC but missing from the
-		// result, so global never stores it. The history is then held only
-		// to recoverability (see the convergence check).
-		switch {
-		case simUnreportedPassword(after, append(generated, knownSecrets...), stored):
-			stranded = true
-		case err == nil && (!r.inband || len(generated) > 0):
-			stranded = false // the monitor holds the stored password again
+		// No password is lost: whatever a run wrote that a slot now holds
+		// is the stored password or one the result reported.
+		if simUnreportedPassword(after, append(generated, knownSecrets...), stored) {
+			t.Fatalf("%s: a slot holds a password this run wrote that is neither stored nor reported (err: %v)\nBMC after: %+v\nlog: %q",
+				label, err, after.Slots, after.Log)
 		}
 		// An in-band success must not leave an enabled monitor that an
 		// earlier run created with a password global does not hold.
-		if r.inband && err == nil && createdMonitor && !stranded {
-			if ms := simMonitorSlots(after); len(ms) == 1 && after.Slots[ms[0]-1].Enabled && after.Slots[ms[0]-1].Password != newStored {
-				t.Fatalf("%s: in-band succeeded but the monitor a run created (slot %d) holds a password global does not have (stored %q)\nBMC before: %+v\nBMC after: %+v\nlog: %q",
-					label, ms[0], newStored, before.Slots, after.Slots, after.Log)
+		if r.inband && err == nil && createdMonitor {
+			if ms := simMonitorSlots(after); len(ms) == 1 && after.Slots[ms[0]-1].Enabled && !newStore.has(after.Slots[ms[0]-1].Password) {
+				t.Fatalf("%s: in-band succeeded but the monitor a run created (slot %d) holds a password global does not have (stored %q, unconfirmed %q)\nBMC before: %+v\nBMC after: %+v\nlog: %q",
+					label, ms[0], newStored, newStore.unconfirmed, before.Slots, after.Slots, after.Log)
 			}
 		}
-		stored = newStored
+		store = newStore
 	}
+	stored = store.pw
 
 	// Convergence: one fault-free remote compliance run.
 	before := sim.snapshot()
-	_, newStored, err := reconcileOnce(sim, propRun{rotate: stored == ""}, stored)
+	res, newStore, err := reconcileOnce(sim, propRun{rotate: stored == ""}, store)
+	newStored := newStore.pw
 	after := sim.snapshot()
-	if err != nil && stranded && before.MegaRAC && strings.Contains(err.Error(), "--rotate-monitor") {
-		// The stored password sits in the reuse history behind the
-		// unreported one, so the BMC refuses it. The error names the way
-		// out, and that must work: a fault-free rotation converges.
-		_, newStored, err = reconcileOnce(sim, propRun{rotate: true}, stored)
-		after = sim.snapshot()
+	if res != nil {
+		for _, u := range res.PasswordVerified {
+			if u.Password != "" {
+				stats.adopted++
+			}
+		}
 	}
 	if err != nil {
 		t.Fatalf("convergence: fault-free remote compliance run failed: %v\nstored=%q\nBMC before: %+v\nlog: %q", err, stored, before.Slots, after.Log)
@@ -426,8 +487,12 @@ func checkReconcileHistory(t *rapid.T, sim *bmcSim, stats *reconcilePropStats) {
 	if after.Slots[m-1].Password != newStored {
 		t.Fatalf("convergence: BMC monitor password %q != stored %q", after.Slots[m-1].Password, newStored)
 	}
+	if len(newStore.unconfirmed) > 0 {
+		t.Fatalf("convergence: global still holds unconfirmed passwords after a clean remote run")
+	}
 	// Idempotence: a second clean run writes no password.
-	_, stored2, err := reconcileOnce(sim, propRun{}, newStored)
+	_, store2, err := reconcileOnce(sim, propRun{}, newStore)
+	stored2 := store2.pw
 	after2 := sim.snapshot()
 	if err != nil {
 		t.Fatalf("idempotence: second clean run failed: %v\nlog: %q", err, after2.Log)

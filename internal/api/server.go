@@ -1549,8 +1549,9 @@ func (s *Server) bmcReconcileMachine(c *echo.Context) error {
 // runtime that carries its password to the worker: nil when there is no
 // entry (a new BMC) or the op rotates. It refuses (as an HTTP error) when
 // the pop's monitor secret is missing, since a generated password could not
-// be stored, and when a stored entry cannot be re-asserted. The password is
-// never logged or put in an error.
+// be stored, and when a stored entry cannot be re-asserted. The entry's
+// unconfirmed passwords ride along for the worker to test. No password is
+// ever logged or put in an error.
 func (s *Server) resolveMonitorRuntime(ctx context.Context, dev *netbox.Device, rotate bool) (*model.MonitorRuntime, error) {
 	pop := dev.Site.Slug
 	path := "pop/" + pop + "/bmc-creds-monitor"
@@ -1570,7 +1571,11 @@ func (s *Server) resolveMonitorRuntime(ctx context.Context, dev *netbox.Device, 
 				"(its username is %q, its password is %s); fix the entry, or pass --rotate-monitor to replace it with a freshly generated password",
 			path, dev.Serial, dev.Name, bmcreconcile.MonitorUser, entry.Username, presence(entry.Password)))
 	}
-	return &model.MonitorRuntime{Password: entry.Password}, nil
+	rt := &model.MonitorRuntime{Password: entry.Password}
+	for _, pw := range entry.UnconfirmedPasswords {
+		rt.Unconfirmed = append(rt.Unconfirmed, model.UnconfirmedPassword{Password: pw})
+	}
+	return rt, nil
 }
 
 // presence describes whether a secret value is set, without revealing it.

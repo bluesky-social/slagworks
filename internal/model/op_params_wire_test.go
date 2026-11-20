@@ -32,7 +32,7 @@ func TestOpParamsWireKeys(t *testing.T) {
 		PDURuntime:       &PDURuntime{Outlets: []PDUOutlet{{PDUHost: "10.0.0.1", Outlet: 5, Serial: "PS1", Username: "apc", Password: "pw"}}, DownstreamSerial: "SN-DOWNSTREAM", Outlet: true, AllowSelf: true},
 		AMTRuntime:       &AMTRuntime{Host: "10.252.240.23", Username: "admin", Password: "pw"},
 		TailscaleRuntime: &TailscaleRuntime{AuthKey: "tskey-abc", Hostname: "h-pop1", Tags: []string{"tag:pop1"}},
-		MonitorRuntime:   &MonitorRuntime{Password: "pw"},
+		MonitorRuntime:   &MonitorRuntime{Password: "pw", Unconfirmed: []UnconfirmedPassword{{Password: "pw2"}}},
 	}
 
 	assertKeys(t, mustMarshalObj(t, p), []string{
@@ -65,7 +65,17 @@ func TestOpParamsWireKeys(t *testing.T) {
 	})
 	assertKeys(t, top["amt_runtime"], []string{"host", "username", "password"})
 	assertKeys(t, top["tailscale_runtime"], []string{"auth_key", "hostname", "tags"})
-	assertKeys(t, top["monitor_runtime"], []string{"password"})
+	assertKeys(t, top["monitor_runtime"], []string{"password", "unconfirmed"})
+	var mon struct {
+		Unconfirmed []json.RawMessage `json:"unconfirmed"`
+	}
+	if err := json.Unmarshal(top["monitor_runtime"], &mon); err != nil {
+		t.Fatal(err)
+	}
+	if len(mon.Unconfirmed) != 1 {
+		t.Fatalf("want 1 unconfirmed password, got %d", len(mon.Unconfirmed))
+	}
+	assertKeys(t, mon.Unconfirmed[0], []string{"password"})
 }
 
 // TestOpParamsEmptyOmitsAllKeys confirms a commission-shaped params-less
