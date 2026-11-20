@@ -692,9 +692,11 @@ func (r *propRun) settle(drive bool) {
 		quiet := (active == 0 && since >= r.timing.Quiet) || (active > 0 && since >= r.timing.Idle) || (over && !busy)
 		if quiet && !healed {
 			// Faults stop here. If lifting them changed anything, the
-			// system gets a fresh chance to finish on its own.
+			// system gets a fresh chance to finish on its own; if not, it
+			// was already at rest and is judged now.
 			healed = true
-			if r.heal() {
+			changed := r.heal()
+			if changed {
 				r.note("  settle: quiet; persistent faults lifted")
 			}
 			// The worker may still be waiting out its reconnect backoff
@@ -706,9 +708,11 @@ func (r *propRun) settle(drive bool) {
 			if wasDown {
 				r.note("  settle: worker back on the stream")
 			}
-			healthy = time.Now()
-			start = time.Now()
-			continue
+			if changed || wasDown {
+				healthy = time.Now()
+				start = time.Now()
+				continue
+			}
 		}
 		if quiet && r.heal() {
 			// A fault armed on a moment fired after the heal above and left
