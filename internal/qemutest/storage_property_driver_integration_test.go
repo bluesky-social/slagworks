@@ -447,7 +447,7 @@ func (r *propRun) runStep(ctx context.Context, i int, st propStep) string {
 // its partitioning work, where nothing may have been written yet.
 func propStoppedEarly(st propStep, got string) bool {
 	switch got {
-	case "fatal:safety check", "fatal:stale array member check", "fatal:preserve preflight",
+	case "fatal:safety check", "fatal:md name check", "fatal:stale array member check", "fatal:preserve preflight",
 		"fatal:planning storage layout", "fatal:resolving storage layout", "fatal:identity check", "fatal:flags":
 		return true
 	}
