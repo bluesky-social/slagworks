@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -628,10 +629,24 @@ func (h *Hub) sendOpMessage(c *workerConn, msgType string, payload any, kind, op
 // On success the call blocks until the worker disconnects or ctx is
 // cancelled, so this is intended to be wired under a long-lived
 // handler (e.g. echo.WrapHandler) rather than a request-scoped one.
+//
+// A refused worker reconnects forever, and global's log is the only place
+// its operator learns which host is refused and what to do: the request
+// log records neither the caller's address nor the query, and a worker
+// that sends its token in the URL cannot read the 401's body. So each
+// refusal logs a warning with the caller's address, the cause and the
+// remedy, and never the token.
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	token = strings.TrimSpace(token)
 	if !ok || token == "" {
+		if r.URL.Query().Has("token") {
+			// Only a worker on a build from before the token moved to
+			// the header sends it in the URL. The value is never read.
+			h.logRefusal(r, "the worker sent its token in the URL, which global never reads, so it runs a slagworks build older than global's and cannot auto-upgrade from it; upgrade its slagworks packages by hand, then rotate its token with slagctl worker register")
+		} else {
+			h.logRefusal(r, "the request carried no Authorization: Bearer token; set SLAGWORKS_TOKEN in the worker's site.env, and check that any proxy in front of global passes the Authorization header through")
+		}
 		http.Error(w, "missing worker token: send it as Authorization: Bearer <token>", http.StatusUnauthorized)
 		return
 	}
@@ -639,7 +654,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Treat any lookup error as unauthenticated; don't leak whether
 		// the token was malformed, missing, or a DB error.
-		if !errors.Is(err, store.ErrSiteWorkerNotFound) {
+		if errors.Is(err, store.ErrSiteWorkerNotFound) {
+			h.logRefusal(r, "the worker's token matches no registered site worker (rotated, or the worker deleted); put the worker's current token in SLAGWORKS_TOKEN, or mint a new one with slagctl worker register")
+		} else {
 			h.log.Error("worker auth lookup failed", "err", err)
 		}
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -683,6 +700,18 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		wc.log.Warn("worker session ended with error", "err", err)
 	}
 	_ = conn.Close(websocket.StatusNormalClosure, "server shutdown")
+}
+
+// logRefusal logs a worker connection refused before the upgrade. The
+// address is the connection's peer, the same one the API's operator-auth
+// refusals log (echo's RealIP with no IP extractor configured), so behind
+// a proxy it names the proxy.
+func (h *Hub) logRefusal(r *http.Request, cause string) {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+	h.log.Warn("refusing site worker connection: "+cause, "remote_ip", ip)
 }
 
 func (h *Hub) register(c *workerConn) {

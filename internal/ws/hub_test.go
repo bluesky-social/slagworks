@@ -254,6 +254,59 @@ func TestHub_TokenOnlyFromAuthorizationHeader(t *testing.T) {
 	_ = conn.CloseNow()
 }
 
+// TestHub_LogsWhyItRefusedAWorker: a worker global refuses reconnects
+// forever, and global's log is the only place its operator can learn which
+// host is refused and what to do. A worker on a build from before the token
+// moved to the Authorization header sends it in the URL and cannot read the
+// 401's body, and the request log records neither the caller's address nor
+// the query. Each refusal logs a warning with the caller's address, the
+// cause and the remedy, and never the token.
+func TestHub_LogsWhyItRefusedAWorker(t *testing.T) {
+	const token = "s3cret-worker-token"
+	cases := []struct {
+		name          string
+		target        string
+		authorization string
+		want          []string
+	}{
+		{name: "token in the URL", target: "/api/v1/ws/site?token=" + token,
+			want: []string{"token in the URL", "upgrade its slagworks packages by hand", "rotate its token"}},
+		{name: "no token", target: "/api/v1/ws/site",
+			want: []string{"no Authorization: Bearer token", "passes the Authorization header through"}},
+		{name: "unregistered token", target: "/api/v1/ws/site", authorization: "Bearer " + token,
+			want: []string{"matches no registered site worker", "slagctl worker register"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs strings.Builder
+			hub := NewHub(HubConfig{Auth: newFakeAuth(), Rebuilder: &fakeRebuilder{},
+				Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+			defer hub.Close()
+
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			req.RemoteAddr = "192.0.2.7:51000"
+			if tc.authorization != "" {
+				req.Header.Set("Authorization", tc.authorization)
+			}
+			rec := httptest.NewRecorder()
+			hub.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
+			}
+			got := logs.String()
+			if strings.Contains(got, token) {
+				t.Fatalf("the hub logged the worker's token: %s", got)
+			}
+			for _, want := range append([]string{"level=WARN", "remote_ip=192.0.2.7"}, tc.want...) {
+				if !strings.Contains(got, want) {
+					t.Errorf("refusal log does not contain %q; log:\n%s", want, got)
+				}
+			}
+		})
+	}
+}
+
 func TestHub_HelloColdTriggersRebuild(t *testing.T) {
 	h, auth, reb := newTestHub(t)
 	auth.register("tok-1", "pop3", "worker-1")

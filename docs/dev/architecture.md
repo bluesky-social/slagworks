@@ -121,9 +121,27 @@ instead of rebooting it. The state-machine doc has the contract
 The operator CLI. Entry `cmd/slagctl/main.go:16`; root wiring in
 `cmd/slagctl/cmd/root.go`. Every non-`auth` subcommand runs through a
 `PersistentPreRunE` (`root.go:50`) that calls
-`clientauth.Bearer` to obtain an OIDC access token, then builds a
-`slclient.Client` with that bearer. Token cache lives at
-`~/.config/slagctl/token.json` (`vendor/.../clientauth.go:139`).
+`clientauth.Bearer` to make sure there is a valid OIDC access token
+(logging in interactively if there is none), then builds a
+`slclient.Client` whose bearer source (`bearerSource` in
+`authconfig.go`) fetches the token again for every request: it re-reads
+the saved server and the token cache and refreshes an expired access
+token through `clientauth.CachedBearer`. The WebSocket stream dials take
+their token from the same client (`dialStream`), so an `operation watch`
+or a list under `-w` that outlives the access token reconnects and polls
+with a refreshed one. When only a new login can help (no cached token, no
+refresh token, a refresh the identity provider refuses, or the saved
+server changed), the error matches `clientauth.ErrLoginRequired`; the
+watches end on it with the error naming `slagctl auth login` rather than
+retrying. Token cache lives at `~/.config/slagctl/token.json`
+(`internal/cli/clientauth`).
+The API can refuse a token the client still trusts (its clock runs
+ahead of the identity provider's, or the provider rotated its signing
+keys), so the client answers a 401 with one forced refresh
+(`clientauth.RefreshRejected`, never an interactive login) and resends
+the request; once a refresh fails or its token is refused too, it stops
+refreshing for the rest of the command, and the 401 tells the operator
+to run `slagctl auth login`.
 
 Command groups (`root.go:82`): `auth`, `site`, `machine`, `operation`,
 `image`, `storage-script`, `network-script`, `ssh-key`, `worker`,

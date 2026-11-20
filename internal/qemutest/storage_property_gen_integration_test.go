@@ -35,10 +35,12 @@ import (
 	"github.com/bluesky-social/slagworks/internal/storage"
 )
 
-// propGenRootRAID456 lets the generator put the root filesystem on RAID5 or
-// RAID6. Data arrays draw those levels regardless. It is off because no run
-// of this suite has booted a parity-RAID root under either firmware, so the
-// model has no established expectation for it.
+// propGenRootRAID456 lets the plain and preserve-heavy families put the root
+// filesystem on RAID5 or RAID6. Data arrays draw those levels regardless, and
+// the wide family (propWideSeed) draws parity roots regardless. It stays off
+// so the seeds of the older families keep generating the cases they always
+// have; the pinned uefi-root-raid5/6 and bios-root-raid5/6 histories have
+// booted parity-RAID roots under both firmwares.
 const propGenRootRAID456 = false
 
 // The model's three-valued knowledge of a fact about a disk or array.
@@ -71,7 +73,14 @@ type propGen struct {
 	// preserved: seeds from propHeavySeed up. The plain mix reaches a
 	// preserve step about once in seventy.
 	heavy bool
-	next  int
+	// wide draws the combinations the plain mix avoids: seeds from
+	// propWideSeed up. See propGenCase.
+	wide bool
+	// mdsb records, per disk, whether it carries (propYes) or may carry
+	// (propMaybe) an md member superblock of any array, which an
+	// `mdadm --assemble --scan` in the deploy environment can assemble.
+	mdsb map[string]string
+	next int
 }
 
 func (g *propGen) pick(weights ...int) int {
@@ -209,14 +218,14 @@ func (g *propGen) genLayout(attach []string, keep []propArray, prev *propLayout)
 	}
 	if len(bigs) >= 3 {
 		topos = append(topos, topo{1, 3, 10})
-		if propGenRootRAID456 {
-			topos = append(topos, topo{5, 3, 15})
+		if propGenRootRAID456 || g.wide {
+			topos = append(topos, topo{5, 3, 30})
 		}
 	}
 	if len(bigs) >= 4 {
 		topos = append(topos, topo{10, 4, 15})
-		if propGenRootRAID456 {
-			topos = append(topos, topo{6, 4, 8})
+		if propGenRootRAID456 || g.wide {
+			topos = append(topos, topo{6, 4, 20})
 		}
 	}
 	ws := make([]int, len(topos))
@@ -236,6 +245,22 @@ func (g *propGen) genLayout(attach []string, keep []propArray, prev *propLayout)
 	}
 	g.rng.Shuffle(len(rest), func(i, j int) { rest[i], rest[j] = rest[j], rest[i] })
 	rootDisks = append(rootDisks, rest[:tp.n-1]...)
+	if bios && tp.level >= 0 && tp.level != 1 {
+		// GRUB reads the root array through the firmware's disk services,
+		// and SeaBIOS (like most legacy BIOSes) cannot read a 4Kn disk. A
+		// mirror boots from its 512-byte member alone; a striped or parity
+		// root needs every 4Kn member it spans, so it is kept to 512-byte
+		// disks (g2060: a BIOS RAID10 over two 512-byte and two 4Kn disks
+		// stopped at "Entering rescue mode"). A limit of the firmware, not
+		// a contract of the system under test.
+		for _, id := range rootDisks {
+			if g.c.disk(id).LBS == 4096 {
+				tp = topo{1, 2, 0}
+				rootDisks = rootDisks[:2]
+				break
+			}
+		}
+	}
 
 	sch := propRootScheme{
 		grub:      bios || g.chance(60),
@@ -292,6 +317,9 @@ func (g *propGen) genLayout(attach []string, keep []propArray, prev *propLayout)
 		role := g.pick(30, 45, 10, 7, 8)
 		if g.heavy {
 			role = g.pick(10, 75, 5, 5, 5)
+		}
+		if g.wide {
+			role = g.pick(30, 40, 10, 10, 10)
 		}
 		switch role {
 		case 0: // bystander
@@ -451,6 +479,37 @@ func (g *propGen) staleHolder(st propStep) string {
 	return worst
 }
 
+// scannedBystander returns a disk the step leaves unwritten that carries, or
+// may carry, an md member superblock while the layout uses a /dev/mdN node,
+// or "" when there is none. With PreScan such a disk's array is assembled
+// before the agent's checks, and which node it lands on depends on mdadm's
+// naming (the superblock's name and the deploy environment's hostname), so
+// the model only says the md name check may refuse. Members of the layout's
+// preserve arrays are left out: the check releases an array made of them.
+func (g *propGen) scannedBystander(st propStep) string {
+	if len(st.Layout.Arrays) == 0 {
+		return ""
+	}
+	skip := map[string]bool{}
+	for _, dl := range st.Layout.Disks {
+		skip[dl.Disk] = true
+	}
+	for _, a := range st.Layout.Arrays {
+		if a.Type != "preserve" {
+			continue
+		}
+		for _, m := range a.Members {
+			skip[m.Disk] = true
+		}
+	}
+	for _, id := range st.Attach {
+		if !skip[id] && g.mdsb[id] != "" && g.mdsb[id] != propNo {
+			return id
+		}
+	}
+	return ""
+}
+
 // predict says what the step must do, from the documented rules alone, in
 // the order the agent applies them: plan, safety check, stale array member
 // check, preserve preflight, then the deploy itself. The result joins every
@@ -486,6 +545,13 @@ func (g *propGen) predict(st propStep) (expect, why string) {
 		}
 		if unsure {
 			open("fatal:safety check", "an interrupted deploy may have left a signature on a target disk")
+		}
+	}
+
+	if st.PreScan && !st.Destructive {
+		if id := g.scannedBystander(st); id != "" {
+			open("fatal:md name check", "the deploy environment may have assembled an array from "+id+
+				", a disk this deploy leaves alone, at a /dev/mdN the layout needs, and the deploy is not --destructive")
 		}
 	}
 
@@ -607,6 +673,16 @@ func (g *propGen) apply(st propStep) {
 			}
 		}
 	}
+	for id := range touched {
+		if g.mdsb[id] == "" {
+			continue
+		}
+		if ran == propYes {
+			delete(g.mdsb, id)
+		} else {
+			g.mdsb[id] = propMaybe
+		}
+	}
 	// Arrays living on a touched disk likewise.
 	for _, s := range g.arrs {
 		for _, m := range s.a.Members {
@@ -629,6 +705,13 @@ func (g *propGen) apply(st propStep) {
 		for _, m := range a.Members {
 			if m.Part == 0 {
 				wholeMember[m.Disk] = true
+			}
+		}
+		for _, m := range a.Members {
+			if certain {
+				g.mdsb[m.Disk] = propYes
+			} else if g.mdsb[m.Disk] != propYes {
+				g.mdsb[m.Disk] = propMaybe
 			}
 		}
 		// The new array's members carry its superblock once mdadm has run,
@@ -673,11 +756,16 @@ func propGenCase(seed int64) propCase {
 	g := &propGen{
 		rng: rand.New(rand.NewSource(seed)), c: &c,
 		big: map[string]bool{}, sig: map[string]string{}, arrs: map[string]*propArrState{},
-		holders: map[string]map[string]string{},
+		holders: map[string]map[string]string{}, mdsb: map[string]string{},
 	}
-	g.heavy = seed >= propHeavySeed
+	g.heavy = seed >= propHeavySeed && seed < propWideSeed
+	g.wide = seed >= propWideSeed
 	c.Firmware = "uefi"
-	if g.chance(40) && !g.heavy {
+	if g.wide {
+		if g.chance(50) {
+			c.Firmware = "bios"
+		}
+	} else if g.chance(40) && !g.heavy {
 		c.Firmware = "bios"
 	}
 	bios := c.Firmware == "bios"
@@ -685,16 +773,26 @@ func propGenCase(seed int64) propCase {
 	if g.heavy {
 		nDisks = 3 + g.pick(40, 35, 25)
 	}
+	if g.wide {
+		nDisks = 3 + g.pick(25, 40, 35)
+	}
 	bus := []string{"virtio", "nvme", "sata", "scsi", "mixed"}[g.pick(35, 28, 12, 13, 12)]
 	fourK := g.chance(20)
 	discard := g.chance(50)
 	seeded := g.chance(30)
+	if g.wide {
+		seeded = g.chance(60)
+	}
 	nBig := 1
 	switch {
 	case nDisks == 2:
 		nBig = 1 + g.pick(30, 70)
 	case nDisks >= 3:
 		nBig = 1 + g.pick(20, 40, 20, 20)
+		if g.wide {
+			// Three or four root-capable disks reach the parity-RAID roots.
+			nBig = 1 + g.pick(10, 20, 35, 35)
+		}
 		if nBig > nDisks {
 			nBig = nDisks
 		}
@@ -729,11 +827,24 @@ func propGenCase(seed int64) propCase {
 		if fourK && b != "sata" && (!bios || !big) {
 			lbs = 4096
 		}
+		if g.wide {
+			// Sector sizes mix within a case, and on BIOS every disk but
+			// the firmware's first may be 4Kn: a root mirror then has GRUB
+			// installed on a 4Kn disk beside the 512-byte one that boots.
+			lbs = 512
+			if b != "sata" && (!bios || i != 0) && g.chance(35) {
+				lbs = 4096
+			}
+		}
 		seed := ""
 		if seeded && i > 0 && g.chance(35) {
-			// "ambiv" (conflicting signatures) is left to the handwritten
-			// safety-ambiv and destructive-over-zfs cases.
-			seed = g.choose("ext4", "luks", "dos")
+			// The plain mix leaves "ambiv" (conflicting signatures) to the
+			// handwritten safety-ambiv and destructive-over-zfs cases.
+			if g.wide {
+				seed = g.choose("ext4", "luks", "dos", "ambiv", "ambiv")
+			} else {
+				seed = g.choose("ext4", "luks", "dos")
+			}
 		}
 		return g.addDisk(b, big, lbs, discard, seed)
 	}
@@ -772,6 +883,18 @@ func propGenCase(seed int64) propCase {
 					attach = append(attach, newDisk(1, g.chance(30)))
 				}
 			}
+		}
+		// The wide family's targeted pattern: the host moves to blank disks
+		// and the old disks, arrays and all, stay attached as bystanders.
+		// Only on UEFI: on BIOS the root has to stay on the firmware's first
+		// disk.
+		var moveTo []string
+		if g.wide && !bios && i > 0 && len(g.mdsb) > 0 && len(attach) < 6 && g.chance(40) {
+			moveTo = append(moveTo, newDisk(0, true))
+			if len(attach)+len(moveTo) < 6 && g.chance(60) {
+				moveTo = append(moveTo, newDisk(0, g.chance(50)))
+			}
+			attach = append(attach, moveTo...)
 		}
 		st := propStep{Attach: append([]string(nil), attach...)}
 
@@ -837,7 +960,14 @@ func propGenCase(seed int64) propCase {
 			}
 		case 2:
 			for _, a := range keepable {
-				if !g.heavy && g.chance(15) {
+				// A kept array left out becomes a bystander array: on
+				// disks the layout does not name, intact, assembled by a
+				// scan. The wide family draws that more often.
+				skip := 15
+				if g.wide {
+					skip = 35
+				}
+				if !g.heavy && g.chance(skip) {
 					continue
 				}
 				// Re-creating needs the member disks declared with the
@@ -877,11 +1007,21 @@ func propGenCase(seed int64) propCase {
 		if mode != 0 {
 			st.Layout = g.genLayout(attach, keep, prev)
 		}
+		if moveTo != nil {
+			// Arrays mode 2 kept come along (preserved arrays then sit
+			// among bystander disks); the rest of the layout uses only the
+			// new disks.
+			st.Layout = g.genLayout(moveTo, keep, prev)
+		}
 
 		// Flags.
-		if i == 0 {
+		switch {
+		case i == 0:
 			st.Destructive = g.chance(40)
-		} else {
+		case moveTo != nil:
+			// The targets are blank: no flag is needed to write them.
+			st.Destructive = g.chance(25)
+		default:
 			st.Destructive = g.chance(80)
 		}
 		st.WipeAll = st.Destructive && g.chance(30)
@@ -892,6 +1032,9 @@ func propGenCase(seed int64) propCase {
 			} else {
 				st.KillAtCmd = 1 + g.rng.Intn(propPlanLen(st.Layout))
 			}
+		}
+		if g.wide {
+			st.PreScan = g.chance(45)
 		}
 		st.Expect, st.Why = g.predict(st)
 		// A second boot goes PXE, then the boot-local script, the path every
@@ -943,6 +1086,14 @@ func propPlanLen(l propLayout) int {
 
 // propHeavySeed is the first seed of the preserve-heavy family.
 const propHeavySeed = 1000
+
+// propWideSeed is the first seed of the wide family: three to five disks,
+// root on RAID5 and RAID6 as well as the plain topologies, sector sizes mixed
+// within a case (on BIOS too, past the firmware's first disk), conflicting
+// signatures among the seeded disks, kept arrays left as bystanders more
+// often, and storage scripts that assemble every array they can find before
+// the agent's checks (propStep.PreScan).
+const propWideSeed = 2000
 
 // propSeedsEnv names the generated cases to use instead of the defaults, as
 // a comma-separated list of seeds and inclusive ranges: "7,40-59,1000-1019".
@@ -1054,12 +1205,18 @@ func TestStoragePropGenShape(t *testing.T) {
 	for seed := int64(propHeavySeed); seed < propHeavySeed+30; seed++ {
 		def = append(def, seed)
 	}
+	for seed := int64(propWideSeed); seed < propWideSeed+60; seed++ {
+		def = append(def, seed)
+	}
 	dir := t.TempDir()
 	count := map[string]int{}
 	bump := func(k string) { count[k]++ }
 	for _, seed := range propSeeds(t, def) {
 		c := propGenCase(seed)
-		if seed >= propHeavySeed {
+		if os.Getenv("SLAGWORKS_STORAGE_PROP_LIST") == "1" {
+			t.Logf("SEED %d %s", seed, propCaseFeatures(c))
+		}
+		if seed >= propHeavySeed && seed < propWideSeed {
 			for _, st := range c.Steps {
 				for _, a := range st.Layout.Arrays {
 					if a.Type == "preserve" {
@@ -1094,6 +1251,38 @@ func TestStoragePropGenShape(t *testing.T) {
 			}
 			if st.Reboot {
 				bump("flag=reboot")
+			}
+			named := map[string]bool{}
+			preserve := false
+			for _, dl := range st.Layout.Disks {
+				named[dl.Disk] = true
+			}
+			for _, id := range st.Layout.Retain {
+				named[id] = true
+			}
+			for _, a := range st.Layout.Arrays {
+				preserve = preserve || a.Type == "preserve"
+				for _, m := range a.Members {
+					named[m.Disk] = true
+				}
+			}
+			if preserve && len(named) < len(st.Attach) {
+				bump("layout=preserve-beside-bystanders, expecting " + st.Expect)
+			}
+			if st.PreScan {
+				bump("flag=prescan")
+				if !st.Destructive {
+					bump("prescan: non-destructive expecting " + st.Expect)
+				}
+			}
+			if c.Firmware == "bios" {
+				for _, dl := range st.Layout.Disks {
+					for _, p := range dl.Parts {
+						if p.BIOSGrub && c.disk(dl.Disk).LBS == 4096 {
+							bump("bios: grub on a 4Kn disk")
+						}
+					}
+				}
 			}
 			if len(st.Layout.Retain) > 0 {
 				bump("layout=retain")
@@ -1139,7 +1328,11 @@ func TestStoragePropGenShape(t *testing.T) {
 				t.Fatal(err)
 			}
 			scriptPath := filepath.Join(dir, "script.py")
-			if err := os.WriteFile(scriptPath, []byte(propRenderScript(c, st)), 0700); err != nil {
+			// The script runs on this host, not in a VM: without PreScan,
+			// so it does not assemble the host's own arrays.
+			hostStep := st
+			hostStep.PreScan = false
+			if err := os.WriteFile(scriptPath, []byte(propRenderScript(c, hostStep)), 0700); err != nil {
 				t.Fatal(err)
 			}
 			cmd := exec.Command("python3", scriptPath)
@@ -1174,4 +1367,63 @@ func TestStoragePropGenShape(t *testing.T) {
 	for _, k := range keys {
 		t.Logf("SHAPE %-40s %d", k, count[k])
 	}
+}
+
+// propCaseFeatures is a one-line digest of the combinations a case reaches,
+// for picking seeds to play on VMs (SLAGWORKS_STORAGE_PROP_LIST=1 with
+// TestStoragePropGenShape logs it per seed).
+func propCaseFeatures(c propCase) string {
+	f := map[string]bool{"fw=" + c.Firmware: true}
+	for _, d := range c.Disks {
+		if d.Seed == "ambiv" {
+			f["ambiv"] = true
+		}
+	}
+	firstSeen := map[string]int{}
+	for i, st := range c.Steps {
+		fresh := len(st.Layout.Disks) > 0
+		for _, id := range st.Attach {
+			if _, ok := firstSeen[id]; !ok {
+				firstSeen[id] = i
+			}
+		}
+		for _, dl := range st.Layout.Disks {
+			fresh = fresh && firstSeen[dl.Disk] == i
+		}
+		if i > 0 && fresh && st.Expect == "ok" {
+			f["move"] = true
+			if st.Reboot {
+				f["move-reboot"] = true
+			}
+		}
+		for _, a := range st.Layout.Arrays {
+			if a.Name == "mdroot" && (a.Level == 5 || a.Level == 6) {
+				f[fmt.Sprintf("root-raid%d", a.Level)] = true
+			}
+			if a.Type == "preserve" {
+				f["preserve"] = true
+			}
+		}
+		if c.Firmware == "bios" {
+			for _, dl := range st.Layout.Disks {
+				for _, p := range dl.Parts {
+					if p.BIOSGrub && c.disk(dl.Disk).LBS == 4096 {
+						f["bios-grub-4kn"] = true
+					}
+				}
+			}
+		}
+		if st.PreScan && strings.Contains(st.Expect, "md name check") {
+			f["prescan-mdname"] = true
+		}
+		if st.PreScan && !st.Destructive && st.Expect == "ok" {
+			f["prescan-ok"] = true
+		}
+	}
+	keys := make([]string, 0, len(f))
+	for k := range f {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return fmt.Sprintf("steps=%d %s", len(c.Steps), strings.Join(keys, " "))
 }

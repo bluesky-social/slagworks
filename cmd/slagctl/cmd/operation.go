@@ -17,6 +17,7 @@ import (
 	slclient "github.com/bluesky-social/slagworks/cmd/slagctl/client"
 	"github.com/bluesky-social/slagworks/cmd/slagctl/format"
 	"github.com/bluesky-social/slagworks/cmd/slagctl/tui"
+	"github.com/bluesky-social/slagworks/internal/cli/clientauth"
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 )
@@ -337,8 +338,10 @@ const plainWatchPollInterval = 5 * time.Second
 // prints op's structured log envelopes to out in the `machine logs` line
 // format until the op reaches a terminal state, prints the same one-line
 // summary as the TUI to stderr, and returns nil only if the op completed. A
-// failed op, or ctx ending first (--timeout, interrupt), returns an error, so
-// the exit code is safe for automation to act on. ctx bounds the whole watch.
+// failed op, ctx ending first (--timeout, interrupt), or a sign-in that only
+// a new login can restore (clientauth.ErrLoginRequired, seen by the poll)
+// returns an error, so the exit code is safe for automation to act on. ctx
+// bounds the whole watch.
 //
 // The envelopes come from /api/v1/logs/stream through logSource, the feed the
 // TUI's log pane reads: it backfills from the op's start and resumes from its
@@ -397,6 +400,7 @@ func watchPlain(ctx context.Context, op model.Operation, out *os.File, pollEvery
 	}()
 
 	outcome, reason := tui.OutcomeIncomplete, ""
+	var signInErr error // the poll found the sign-in gone; ends the watch
 	poll := opPoller(opID)
 	polledTerminal := false
 	tick := time.NewTicker(pollEvery)
@@ -411,6 +415,10 @@ wait:
 			break wait
 		case <-tick.C:
 			done, failed, why, err := poll(ctx)
+			if errors.Is(err, clientauth.ErrLoginRequired) {
+				signInErr = err
+				break wait
+			}
 			if err != nil || !done {
 				continue
 			}
@@ -459,6 +467,9 @@ wait:
 		}
 		return errOperationFailed(opID)
 	default:
+		if signInErr != nil {
+			return fmt.Errorf("stopped watching operation %s: %w", opID, signInErr)
+		}
 		return fmt.Errorf("operation %s had not finished when the watch ended: %w", opID, ctx.Err())
 	}
 }

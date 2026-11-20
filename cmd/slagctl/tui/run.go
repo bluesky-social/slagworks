@@ -22,12 +22,17 @@ import (
 
 // ConsoleSource opens the console cast stream and invokes onBytes for each
 // decoded SOL chunk until ctx is cancelled. fromBackfill is true while
-// replaying history; the source calls onLiveEdge once when it reaches the live
-// edge (so the model can clear the catch-up placeholder). A returned error
-// other than context cancellation is surfaced as a reconnect (the source is
-// expected to retry internally for transient drops; returning signals a
-// terminal console failure, which is non-fatal to the run).
-type ConsoleSource func(ctx context.Context, onBytes func(data []byte, fromBackfill bool), onLiveEdge func()) error
+// replaying history; the source calls onLiveEdge once when it first reaches
+// the live edge (so the model can clear the catch-up placeholder).
+//
+// The source redials internally whenever a connection drops or is refused,
+// and keeps doing so until ctx is done: it calls onReconnecting(true) when it
+// loses the stream and onReconnecting(false) once a new connection is up, and
+// the pane shows a reconnect banner in between. Bytes after a redial redraw
+// the whole screen on a terminal they have reset themselves. The source
+// returns ctx.Err(), or, with the banner up, an error that no redial can
+// clear (the operator's sign-in is gone).
+type ConsoleSource func(ctx context.Context, onBytes func(data []byte, fromBackfill bool), onLiveEdge func(), onReconnecting func(reconnecting bool)) error
 
 // LogSource opens the logs stream from lastSeenID and invokes onEnvelope for
 // each envelope until ctx is cancelled. It is expected to reconnect internally
@@ -175,7 +180,7 @@ func Run(ctx context.Context, cfg RunConfig) (result RunResult, err error) {
 	// Stream goroutines. Each sends messages into the program; they exit when
 	// ctx is cancelled (the defer above cancels it when Run returns).
 	if cfg.Console != nil {
-		go runConsoleGoroutine(ctx, p, cfg.Console)
+		go runConsoleGoroutine(ctx, p.Send, cfg.Console)
 	}
 	if cfg.Logs != nil {
 		go func() {
@@ -248,8 +253,10 @@ func (m *tuiModel) lastPhaseLabel() string {
 // runConsoleGoroutine coalesces decoded console bytes into ~30Hz batches and
 // ships them as consoleBatchMsg (D2: the goroutine batches and never touches
 // the emulator). It flushes on a ticker so a steady byte trickle still renders
-// promptly, and forwards the live-edge signal as consoleBackfillDoneMsg.
-func runConsoleGoroutine(ctx context.Context, p *tea.Program, src ConsoleSource) {
+// promptly, forwards the live-edge signal as consoleBackfillDoneMsg, and
+// forwards the source's reconnect state as consoleReconnectMsg. send is the
+// program's Send.
+func runConsoleGoroutine(ctx context.Context, send func(tea.Msg), src ConsoleSource) {
 	type chunk struct {
 		data         []byte
 		fromBackfill bool
@@ -264,13 +271,9 @@ func runConsoleGoroutine(ctx context.Context, p *tea.Program, src ConsoleSource)
 		}
 	}
 	go func() {
-		// Always signal live-edge when the source returns, even on a connect
-		// error before it reached the real live edge. Without this, a console
-		// stream that fails before signaling would leave catchingUp stuck, so the
-		// box shows "catching up…" forever. The signal is idempotent (buffered
-		// cap-1 + non-blocking send), so a normal live-edge followed by this defer
-		// is harmless.
-		defer signalLiveEdge()
+		// The source returns once ctx is done (the program is exiting) or
+		// after raising the reconnect banner for a failure it cannot retry,
+		// so its error carries nothing more to show.
 		_ = src(ctx,
 			func(data []byte, fromBackfill bool) {
 				// Copy: the source may reuse its buffer after the callback.
@@ -282,6 +285,18 @@ func runConsoleGoroutine(ctx context.Context, p *tea.Program, src ConsoleSource)
 				}
 			},
 			signalLiveEdge,
+			func(reconnecting bool) {
+				if reconnecting {
+					// A source that has lost its stream, or never got one, is
+					// replaying nothing: clear the catch-up placeholder so the
+					// pane shows the banner over the last screen (or the
+					// no-signal static) instead of "catching up…" for the whole
+					// outage. Idempotent (buffered cap-1, non-blocking send), so
+					// a live edge already reached makes this a no-op.
+					signalLiveEdge()
+				}
+				send(consoleReconnectMsg{reconnecting: reconnecting})
+			},
 		)
 	}()
 
@@ -293,7 +308,7 @@ func runConsoleGoroutine(ctx context.Context, p *tea.Program, src ConsoleSource)
 		if len(pending) == 0 {
 			return
 		}
-		p.Send(consoleBatchMsg{data: pending, fromBackfill: pendingBackfill})
+		send(consoleBatchMsg{data: pending, fromBackfill: pendingBackfill})
 		pending = nil
 		pendingBackfill = false
 	}
@@ -323,7 +338,7 @@ func runConsoleGoroutine(ctx context.Context, p *tea.Program, src ConsoleSource)
 				}
 			}
 			flush() // ship all backfill bytes before signaling done
-			p.Send(consoleBackfillDoneMsg{})
+			send(consoleBackfillDoneMsg{})
 		}
 	}
 }

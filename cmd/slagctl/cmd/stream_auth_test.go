@@ -12,6 +12,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
+	slclient "github.com/bluesky-social/slagworks/cmd/slagctl/client"
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/ws"
@@ -40,9 +41,11 @@ func stubStreamServer(t *testing.T, serve func(ctx context.Context, c *websocket
 	}))
 	t.Cleanup(srv.Close)
 
-	prevURL, prevToken := apiURL, apiToken
-	apiURL, apiToken = srv.URL, "stream-test-token"
-	t.Cleanup(func() { apiURL, apiToken = prevURL, prevToken })
+	prevURL, prevClient := apiURL, apiClient
+	apiURL = srv.URL
+	apiClient = slclient.New(slclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(),
+		Bearer: func(context.Context) (string, error) { return "stream-test-token", nil }})
+	t.Cleanup(func() { apiURL, apiClient = prevURL, prevClient })
 	return seen
 }
 
@@ -100,10 +103,17 @@ func TestMachineLogsSOL_SendsBearerHeader(t *testing.T) {
 func TestWatchTUIStreams_SendBearerHeader(t *testing.T) {
 	t.Run("console", func(t *testing.T) {
 		seen := stubStreamServer(t, func(context.Context, *websocket.Conn) {})
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = consoleSource(uuid.NewString())(ctx, func([]byte, bool) {}, func() {})
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			// The source redials until ctx ends; stop it once the first
+			// upgrade has been checked.
+			_ = consoleSource(uuid.NewString())(ctx, func([]byte, bool) {}, func() {}, func(bool) {})
+		}()
 		assertBearerNotInURL(t, seen, "/api/v1/console/stream")
+		cancel()
+		<-done // the source reads apiURL; let it stop before cleanup restores it
 	})
 	t.Run("logs", func(t *testing.T) {
 		seen := stubStreamServer(t, readOne)
@@ -113,6 +123,60 @@ func TestWatchTUIStreams_SendBearerHeader(t *testing.T) {
 		_ = streamLogEnvelopes(ctx, uuid.NewString(), uuid.NewString(), time.Time{}, &lastSeen, func(int64, slogkit.Envelope) {})
 		assertBearerNotInURL(t, seen, "/api/v1/logs/stream")
 	})
+}
+
+// TestStreams_RefusalCarriesGlobalsReason: global refuses a stream upgrade
+// with a status and a body that says why (an expired token, a group the
+// operator lacks, a parameter it cannot parse). Every stream slagctl opens
+// returns that reason, not only the status code.
+func TestStreams_RefusalCarriesGlobalsReason(t *testing.T) {
+	const reason = `{"message":"not authorized: token carries none of the required groups"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, reason, http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+	prevURL, prevClient := apiURL, apiClient
+	apiURL = srv.URL
+	apiClient = slclient.New(slclient.Config{BaseURL: srv.URL, HTTPClient: srv.Client(),
+		Bearer: func(context.Context) (string, error) { return "stream-test-token", nil }})
+	t.Cleanup(func() { apiURL, apiClient = prevURL, prevClient })
+
+	streams := []struct {
+		name string
+		open func(ctx context.Context) error
+	}{
+		{"machine logs", func(ctx context.Context) error {
+			return runLogsStream(ctx, ws.LogStreamSubscribeMsg{}, func(slogkit.Envelope, int64) error { return nil }, false)
+		}},
+		{"machine logs --sol", func(ctx context.Context) error {
+			return runConsoleStream(ctx, uuid.NewString(), "", true, false, true)
+		}},
+		// One connection of the watch console: consoleSource itself redials
+		// after every refusal and shows the reconnect banner instead.
+		{"watch console", func(ctx context.Context) error {
+			relay := &consoleRelay{machineID: uuid.NewString(), onBytes: func([]byte, bool) {}, onLiveEdge: func() {}}
+			return relay.stream(ctx, func() {})
+		}},
+		{"watch logs", func(ctx context.Context) error {
+			var lastSeen int64
+			return streamLogEnvelopes(ctx, uuid.NewString(), uuid.NewString(), time.Time{}, &lastSeen, func(int64, slogkit.Envelope) {})
+		}},
+	}
+	for _, s := range streams {
+		t.Run(s.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := s.open(ctx)
+			if err == nil {
+				t.Fatal("the stream opened against a server that answers 403")
+			}
+			for _, want := range []string{"403", reason} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
 }
 
 func TestOperationWatchPlain_SendsBearerHeader(t *testing.T) {

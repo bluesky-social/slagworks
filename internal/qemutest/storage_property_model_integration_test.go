@@ -88,6 +88,13 @@ type propStep struct {
 	// deploy goes through the one-shot BootNext; this exercises the path every
 	// later boot takes (PXE, then the boot-local script).
 	Reboot bool `json:"reboot,omitempty"`
+	// PreScan makes the storage script run `mdadm --assemble --scan` before
+	// it emits the layout, so the deploy environment has assembled every
+	// array it can find by the time the agent checks the disks, as one whose
+	// initrd carries mdadm's udev rules does (the shipped deploy initrd does
+	// not: mdadm is in the deploy root, not the PXE chroot) and as a script
+	// that inspects existing arrays may.
+	PreScan bool `json:"pre_scan,omitempty"`
 	// Expect is "ok", "fatal:<stage>", "fatal_at", "killed", or several of
 	// those joined with "|" when the history leaves the outcome open.
 	Expect string `json:"expect"`
@@ -158,16 +165,25 @@ func propRenderScript(c propCase, st propStep) string {
 	for _, d := range c.Disks {
 		sizes[d.ID] = d.Bytes
 	}
-	spec, err := json.Marshal(map[string]any{"sizes": sizes, "layout": st.Layout})
+	spec, err := json.Marshal(map[string]any{"sizes": sizes, "layout": st.Layout, "pre_scan": st.PreScan})
 	if err != nil {
 		panic(err)
 	}
 	return `#!/usr/bin/env python3
-import json, os, sys
+import json, os, subprocess, sys
 
 SPEC = json.loads(r'''` + string(spec) + `''')
 with open(os.environ["SLAGWORKS_INVENTORY"]) as f:
     inv = json.load(f)
+if SPEC.get("pre_scan"):
+    # Everything goes to stderr: stdout carries the layout alone.
+    try:
+        r = subprocess.run(["mdadm", "--assemble", "--scan"], stdout=sys.stderr, stderr=sys.stderr)
+        sys.stderr.write("PROPSCAN rc=%d\n" % r.returncode)
+        out = subprocess.run(["cat", "/proc/mdstat"], capture_output=True, text=True).stdout
+        sys.stderr.write("PROPSCAN mdstat: %s\n" % " | ".join(out.split("\n")))
+    except OSError as e:
+        sys.stderr.write("PROPSCAN error: %s\n" % e)
 
 by_size = {}
 for d in inv["disks"]:

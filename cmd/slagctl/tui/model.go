@@ -278,7 +278,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case consoleReconnectMsg:
-		m.markEvent()
+		// No markEvent: a dropped or restored console connection says nothing
+		// about the machine. A quiet console behind a load balancer idle
+		// timeout drops every few minutes, and stamping here would keep
+		// resetting "last update" on a host that is doing nothing.
 		m.consoleReconnecting = msg.reconnecting
 		return m, nil
 
@@ -392,11 +395,12 @@ func (m *tuiModel) drain() tea.Cmd {
 
 // markEvent stamps lastEventAt with the current clock, recording that inbound
 // activity arrived now. Every inbound message handler that represents real
-// progress (console bytes, a log line, a phase, a claim, a reconnect toggle, a
-// terminal signal) calls it, so the summary's "last update <N>s ago" resets to
-// 0 on activity and the heartbeat ticks it up otherwise. NOT called by the
-// uiTick heartbeat or the self-scheduled drainTick — those aren't new inbound
-// activity, and stamping on them would peg the staleness clock at 0 forever.
+// progress (console bytes, a log line, a phase, a claim, a terminal signal)
+// calls it, so the summary's "last update <N>s ago" resets to 0 on activity
+// and the heartbeat ticks it up otherwise. NOT called by the uiTick heartbeat,
+// the self-scheduled drainTick or a console reconnect toggle — those aren't
+// machine activity, and stamping on them would hold the staleness clock near 0
+// on a host that has gone quiet.
 //
 // Skips the stamp once the op is terminal: on a held interactive screen the
 // stream goroutines keep running, so a trailing late envelope could arrive

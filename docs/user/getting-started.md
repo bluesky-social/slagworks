@@ -43,9 +43,10 @@ slagctl auth login --api https://slagworks.example.com
 ```
 
 This runs the interactive loopback flow (browser opens, code returns to
-localhost) and caches an access token that is refreshed silently on
-subsequent invocations. Use `--device` for the device-code flow on
-hosts without a local browser. `slagctl auth whoami` shows the cached
+localhost) and caches an access token that is refreshed silently when it
+expires, including part-way through a long `operation watch`, or when the
+server refuses it early (a 401). Use `--device` for the device-code flow
+on hosts without a local browser. `slagctl auth whoami` shows the cached
 identity; `slagctl auth logout` clears it.
 
 The login asks the server which identity provider to use and saves the

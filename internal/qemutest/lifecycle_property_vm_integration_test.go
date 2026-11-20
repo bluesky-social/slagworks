@@ -14,6 +14,9 @@ package qemutest
 //
 //	SLAGWORKS_LIFECYCLE_PROP_VM=1         every named and committed history
 //	SLAGWORKS_LIFECYCLE_PROP_VM_SEEDS=A-B generated histories
+//	SLAGWORKS_LIFECYCLE_PROP_VM_UEFI=1    with SEEDS: let them draw UEFI
+//	SLAGWORKS_LIFECYCLE_PROP_VM_SETUPS=1  TestLifecyclePropVMSetups: named
+//	                                      histories under UEFI and RAID1
 //
 //	SLAGWORKS_LIFECYCLE_PROP_VM=1 go test -tags integration ./internal/qemutest \
 //	    -run 'TestLifecyclePropVMAll' -parallel 8
@@ -213,6 +216,11 @@ func runPropVMHistory(t *testing.T, h propHistory) *propRun {
 	cfg := VMConfig{
 		Firmware: fw, MAC: "52:54:00:9a:00:0a", Network: network,
 		Memory: "4096", SMBIOSUUID: subjectUUID, DiskSize: "10G",
+		// OVMF would otherwise boot the disk entry the install registered
+		// on every later reset, and a second deploy could never start: the
+		// NIC stays first, as on a host whose BMC holds a PXE override,
+		// and the agent's one-shot BootNext still wins once.
+		NetworkBootFirst: h.Setup.UEFI,
 	}
 	subjM := propSubjectMachine(h.Setup, subjectID, cfg.MAC, subjectUUID)
 	if h.Setup.RAID1 {
@@ -313,6 +321,7 @@ func TestLifecyclePropVMAll(t *testing.T) {
 		lo, _ := strconv.ParseInt(m[1], 10, 64)
 		hi, _ := strconv.ParseInt(m[2], 10, 64)
 		cfg := propWithFamilies(t, propVMGen)
+		cfg.UEFI = os.Getenv("SLAGWORKS_LIFECYCLE_PROP_VM_UEFI") == "1"
 		for seed := lo; seed <= hi; seed++ {
 			hs = append(hs, propGenHistory(seed, cfg))
 		}
@@ -321,6 +330,61 @@ func TestLifecyclePropVMAll(t *testing.T) {
 		t.Skip("set SLAGWORKS_LIFECYCLE_PROP_VM=1 or SLAGWORKS_LIFECYCLE_PROP_VM_SEEDS=A-B")
 	}
 	for _, h := range hs {
+		t.Run(h.Name, func(t *testing.T) {
+			t.Parallel()
+			t.Logf("history: %s", h.JSON())
+			runPropVM(t, h)
+		})
+	}
+}
+
+// propVMSetupHistories are named histories under the firmware and storage
+// setups the named set never uses: UEFI (the install's BootNext and a NIC
+// pinned first), a RAID1 root over two disks, and both.
+func propVMSetupHistories(t *testing.T) []propHistory {
+	t.Helper()
+	setups := []struct {
+		tag   string
+		setup func(*propSetup)
+	}{
+		{"uefi", func(s *propSetup) { s.UEFI = true }},
+		{"raid1", func(s *propSetup) { s.RAID1 = true }},
+		{"uefi-raid1", func(s *propSetup) { s.UEFI, s.RAID1 = true, true }},
+	}
+	var hs []propHistory
+	for _, name := range []string{
+		"clean-deploy",
+		"reset-during-first-disk-boot",
+		"abort-mid-partitioning-then-redeploy",
+		"worker-restart-awaiting-phone-home",
+	} {
+		for _, s := range setups {
+			h := propScaleHistory(propNamedHistory(t, name))
+			h.Name = name + "+" + s.tag
+			s.setup(&h.Setup)
+			if h.Setup.UEFI && name == "reset-during-first-disk-boot" {
+				// A UEFI install's first boot follows the agent's BootNext
+				// straight to the disk, so the PXE-observed local boot this
+				// history arms on never happens. Reset instead as soon as
+				// deploy_complete is accepted, before the agent arms
+				// BootNext: that boot goes PXE, then boot-local.
+				h.Name = "reset-after-deploy-complete+" + s.tag
+				h.Steps[0].At = &propMoment{Host: 0, Kind: "report", Event: "deploy_complete"}
+			}
+			hs = append(hs, h)
+		}
+	}
+	return hs
+}
+
+// TestLifecyclePropVMSetups runs propVMSetupHistories with
+// SLAGWORKS_LIFECYCLE_PROP_VM_SETUPS=1 (twelve histories, two or three
+// deploys each).
+func TestLifecyclePropVMSetups(t *testing.T) {
+	if os.Getenv("SLAGWORKS_LIFECYCLE_PROP_VM_SETUPS") != "1" {
+		t.Skip("set SLAGWORKS_LIFECYCLE_PROP_VM_SETUPS=1 to run the named histories under UEFI and RAID1 setups")
+	}
+	for _, h := range propVMSetupHistories(t) {
 		t.Run(h.Name, func(t *testing.T) {
 			t.Parallel()
 			t.Logf("history: %s", h.JSON())
