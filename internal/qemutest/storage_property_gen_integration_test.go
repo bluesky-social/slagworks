@@ -1328,7 +1328,11 @@ func TestStoragePropGenShape(t *testing.T) {
 				t.Fatal(err)
 			}
 			scriptPath := filepath.Join(dir, "script.py")
-			if err := os.WriteFile(scriptPath, []byte(propRenderScript(c, st)), 0700); err != nil {
+			// The script runs on this host, not in a VM: without PreScan,
+			// so it does not assemble the host's own arrays.
+			hostStep := st
+			hostStep.PreScan = false
+			if err := os.WriteFile(scriptPath, []byte(propRenderScript(c, hostStep)), 0700); err != nil {
 				t.Fatal(err)
 			}
 			cmd := exec.Command("python3", scriptPath)
