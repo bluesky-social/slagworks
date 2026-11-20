@@ -48,10 +48,11 @@ import (
 // otherwise reject and the executor does not currently guarantee. These are
 // counted, not failed; every other class fails the case.
 var epTolerated = map[string]string{
-	"report-lost":                 "a terminal or phase op_update is in memory and unacknowledged: it is lost on a restart or a dropped write, and the op stays claimed until a sweep fails it",
-	"stale-list-claim":            "the executor claims an op whose machine left the view since the pass built its pending list, then fails it as not in cache",
-	"phone-home-acked-unrecorded": "a phone_home report for a machine the worker holds as running is answered with success and dropped, whatever op it names; a worker whose view predates the redeploy (it lost its connection to global, then took the VIP) swallows the installed OS's only phone-home",
-	"double-drive-two-executors":  "two Executor instances of one worker (VIP lost and regained while the first is still inside a claim or a BMC call) both win the same op: the local claimed mark is erased by a hello op_resync or by the other executor's rollback, and the hub re-grants the claim to the same worker ID",
+	"report-lost":                    "a terminal or phase op_update is in memory and unacknowledged: it is lost on a restart or a dropped write, and the op stays claimed until a sweep fails it",
+	"stale-list-claim":               "the executor claims an op whose machine left the view since the pass built its pending list, then fails it as not in cache",
+	"orphan-sweep-phase-undelivered": "the worker recorded its first phase before actuating, but the op_update had not reached global when the orphaned-claim grace ran out (the worker was disconnected for the whole grace, or its sender had not run): the sweep fails an op that is still being actuated",
+	"phone-home-acked-unrecorded":    "a phone_home report for a machine the worker holds as running is answered with success and dropped, whatever op it names; a worker whose view predates the redeploy (it lost its connection to global, then took the VIP) swallows the installed OS's only phone-home",
+	"double-drive-two-executors":     "two Executor instances of one worker (VIP lost and regained while the first is still inside a claim or a BMC call) both win the same op: the local claimed mark is erased by a hello op_resync or by the other executor's rollback, and the hub re-grants the claim to the same worker ID",
 }
 
 // ---------------------------------------------------------------------------
@@ -769,7 +770,24 @@ func (h *epHub) sweep() {
 		if rec.op.Status == model.OpClaimed && rec.op.Phase == "" && rec.claimedAt < now-epOrphanGrace {
 			facts := h.w.byOp[id]
 			for widx, on := range facts.running {
-				if on {
+				if !on {
+					continue
+				}
+				// The executor records a phase before its first
+				// controller call, but the phase reaches the hub as an
+				// op_update. One the worker recorded and has not
+				// delivered (disconnected, or its sender has not run
+				// since) leaves the row claimed with no phase.
+				recorded := false
+				for _, u := range h.w.wk[widx].updates(id) {
+					if u.Phase != "" {
+						recorded = true
+					}
+				}
+				if recorded {
+					h.w.violate("orphan-sweep-phase-undelivered", "orphaned-claim sweep failed %s at claimed+%ds while worker %d is still actuating it: the worker recorded its first phase, but the op_update had not reached the hub",
+						h.w.opName(id), now-rec.claimedAt, widx)
+				} else {
 					h.w.violate("orphan-sweep-midrun", "orphaned-claim sweep failed %s at claimed+%ds while worker %d is still actuating it (no phase recorded yet)",
 						h.w.opName(id), now-rec.claimedAt, widx)
 				}
