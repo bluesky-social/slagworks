@@ -1,6 +1,9 @@
 package model
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestSiteConfigValidate(t *testing.T) {
 	cases := []struct {
@@ -71,6 +74,36 @@ func TestSiteConfigValidate(t *testing.T) {
 			err := c.cfg.Validate()
 			if (err != nil) != c.wantErr {
 				t.Fatalf("got %v, wantErr=%v", err, c.wantErr)
+			}
+		})
+	}
+}
+
+// A relay pool feeds a DHCPv4 scope, so its subnet must be an IPv4 CIDR.
+// IPv4-mapped IPv6 notation is the dangerous case: net.ParseCIDR returns a
+// 16-byte mask for it, the IPv4 range and gateway still pass Contains, and
+// the DHCP handler truncates that mask to its first four bytes, telling
+// clients their netmask is 255.255.255.255. Plain IPv6 would also fail the
+// range containment check; the error must name the subnet family instead.
+func TestRelayPoolValidateRejectsNonIPv4Subnet(t *testing.T) {
+	for _, subnet := range []string{
+		"::ffff:10.254.27.0/120",
+		"::ffff:0:0/96",
+		"2001:db8::/64",
+	} {
+		t.Run(subnet, func(t *testing.T) {
+			p := RelayPool{
+				Subnet:     subnet,
+				RangeStart: "10.254.27.100",
+				RangeEnd:   "10.254.27.150",
+				Gateway:    "10.254.27.1",
+			}
+			err := p.Validate()
+			if err == nil {
+				t.Fatalf("Validate accepted non-IPv4 subnet %q", subnet)
+			}
+			if !strings.Contains(err.Error(), "must be an IPv4 CIDR") {
+				t.Fatalf("Validate rejected %q for the wrong reason: %v", subnet, err)
 			}
 		})
 	}

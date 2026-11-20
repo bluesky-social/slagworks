@@ -71,6 +71,9 @@ origin gets 403.
   refused. A body that is refused or fails to decode gets a 400 and changes
   nothing; it is never read as an empty body. Routes whose body is optional
   (deploy, commission, bmc-reconcile) accept a request with no body.
+- A `read` or `admin` request with a NUL byte (U+0000) in its path, query
+  string or JSON body gets 400 naming where the byte is, before the
+  handler runs: Postgres cannot store U+0000.
 - Machine identifiers: every `/machines/:id` route except `netbox-diff`
   accepts either the slagworks machine UUID or the NetBox device name
   (anything containing a `.`, e.g. `kworker-l34-1.pop1`). Name lookup
@@ -168,7 +171,7 @@ the real values over the WebSocket op stream. See
 |---|---|---|---|
 | GET | `/images` | read | List image rows. |
 | POST | `/images` | admin | Create a row. Body `{"name","version","sha256","url","arch"}`; all but `arch` (default `amd64`) are required. The name must match `^[a-z0-9][a-z0-9._-]*$` (`model.ValidateImageName`), since it becomes a directory on every site worker; 400 otherwise. 409 on conflict. Pushes a fresh snapshot to every site. |
-| PUT | `/images/:name` | admin | Create or replace the row named in the path (the path name wins over the body). Same name rule as POST. Used by `slagctl image follow-latest`. Pushes a fresh snapshot to every site. |
+| PUT | `/images/:name` | admin | Create or replace the row named in the path (the path name wins over the body). Same name rule as POST. An `id` in the body is ignored: a replaced row keeps its id, a new row gets a fresh one. Used by `slagctl image follow-latest`. Pushes a fresh snapshot to every site. |
 | DELETE | `/images/:name` | admin | Delete by name or row id. A row id match wins; an identifier that is no row's id is tried as a name, even when it parses as a UUID. 204. Does not push a snapshot. |
 
 ## Storage and network scripts

@@ -121,6 +121,14 @@ func (q *QMP) readMessage() (*qmpMessage, error) {
 	return &msg, nil
 }
 
+// Execute runs an arbitrary QMP command with arguments and discards its
+// return value. The storage property suite uses it for
+// blockdev-snapshot-sync, to separate what the deploy agent wrote to a disk
+// from what the installed system wrote afterwards.
+func (q *QMP) Execute(command string, args map[string]any) error {
+	return q.executeArgs(command, args, nil)
+}
+
 func (q *QMP) Reset() error { return q.execute("system_reset") }
 func (q *QMP) Quit() error  { return q.execute("quit") }
 func (q *QMP) Close() error {
