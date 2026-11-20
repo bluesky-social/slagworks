@@ -1243,8 +1243,8 @@ func TestCacheHandleProgressReport_PhoneHomeReplayAfterCompletionIsIdempotent(t 
 	}
 
 	// Global can remove the completed op before a lost HTTP response is
-	// retried. The running-state acknowledgement must remain idempotent even
-	// after the exact op has left the active set.
+	// retried. The acknowledgement of a recorded phone-home must remain
+	// idempotent even after the exact op has left the active set.
 	c.ApplyOpRemoved(opID.String(), machineID.String(), 2, model.MachineStateRunning)
 	if err := c.HandleProgressReport(report); err != nil {
 		t.Fatalf("phone-home replay after op removal: %v", err)

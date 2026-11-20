@@ -300,6 +300,17 @@ type PersistedOpState struct {
 	// still carry the op as claimed; the restored entry keeps the machine
 	// pinned to running instead of re-imaging it.
 	PhoneHomed []string `json:"phone_homed"`
+	// PhoneHomeSettled is opState.phoneHomeSettled in insertion order: the
+	// deploy ops whose phone-home retry this worker may acknowledge. It
+	// outlives the ops themselves, so a retry of a lost 2xx is still
+	// acknowledged after a restart instead of looping on the host.
+	PhoneHomeSettled []SettledPhoneHome `json:"phone_home_settled"`
+}
+
+// SettledPhoneHome is one PersistedOpState.PhoneHomeSettled entry.
+type SettledPhoneHome struct {
+	OpID      string    `json:"op_id"`
+	MachineID uuid.UUID `json:"machine_id"`
 }
 
 // SaveOpState persists the op layer to the kv table under "op_state".
