@@ -87,15 +87,23 @@ and how it reaches site workers. In short:
   without it.
 - It runs `mmdebstrap` natively on a Linux x86_64 host and inside a Docker
   container anywhere else (`just image-build`).
-- Packages come from the EC2 regional Ubuntu mirror unless
-  `SLAGWORKS_APT_MIRROR` names another. The mirror is not date-pinned, so
-  two builds of one commit can differ; a published per-commit tarball is
-  the reproducible artifact.
+- `SLAGWORKS_APT_MIRROR` (default `http://archive.ubuntu.com/ubuntu`) is
+  the Ubuntu mirror written into the image's `sources.list`.
+  `SLAGWORKS_APT_BUILD_MIRROR` is the mirror the build downloads from; it
+  defaults to `SLAGWORKS_APT_MIRROR` and leaves no trace in the image, so a
+  build host can use whichever mirror is fast from where it runs. CI sets
+  only the build mirror (the one local to GitHub-hosted runners), so CI
+  images carry the default `sources.list`. Neither mirror is date-pinned,
+  so two builds of one commit can differ; a published per-commit tarball
+  is the reproducible artifact.
 - With `SLAGWORKS_CACHE_DIR` set, the chroot outputs are reused when no
   build input changed (CI's cache).
 - A verify step at the end checks that the shipped initrd carries the boot
   hook from `assets/initramfs/scripts/slagworks`, `overlay.ko` and the
-  recovery keys the build was given.
+  recovery keys the build was given, and that `root.squashfs` has a
+  `sources.list` naming `SLAGWORKS_APT_MIRROR` only and no apt package
+  indexes. It runs on a cache hit too, so cached outputs built for a
+  different `SLAGWORKS_APT_MIRROR` fail the build instead of shipping.
 
 `scripts/image-build/smoke.sh` then boots the tarball under TCG QEMU against
 a stub HTTP server and passes when the boot hook reports

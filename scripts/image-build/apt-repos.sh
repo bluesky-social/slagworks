@@ -104,3 +104,33 @@ repo_deb_lines() {
         printf '%s\n' "deb [signed-by=$keydir/$keyring.gpg] $repo_url $suite $component"
     done
 }
+
+# The Ubuntu archive itself. build.sh uses two mirrors of it (see "Apt mirror"
+# there): the build mirror, which mmdebstrap downloads from and writes into the
+# chroot's sources.list, and the baked mirror, which is what the image ships.
+
+# ubuntu_mirror_lines <mirror> <suite>: emit the deb-lines for one Ubuntu
+# archive mirror. All three pockets (base, updates, security) are needed:
+# passing mmdebstrap only the bare mirror URL silently drops -updates and
+# -security, yielding an image with no security-update channel.
+ubuntu_mirror_lines() {
+    local mirror="$1" suite="$2" pocket
+    for pocket in "$suite" "$suite-updates" "$suite-security"; do
+        printf '%s\n' "deb $mirror $pocket main restricted universe multiverse"
+    done
+}
+
+# baked_sources_hook <sources_file>: emit the --customize-hook=... that
+# replaces the chroot's /etc/apt/sources.list with <sources_file> (the baked
+# mirror's ubuntu_mirror_lines). mmdebstrap wrote that file from the mirrors
+# it downloaded from, which are the build mirror's, and a deployed machine
+# must not be pointed at those. Replacing the whole file rather than editing
+# URLs in place means no build-mirror line can survive, whatever form
+# mmdebstrap wrote it in. The third-party lines it also drops are the ones
+# repo_customize_hooks deletes anyway, so the hooks run in either order.
+# <sources_file> must be readable where mmdebstrap runs, like <keydir>. Goes
+# BEFORE the SUITE/TARGET positionals.
+baked_sources_hook() {
+    local sources_file="$1"
+    printf '%s\n' "--customize-hook=install -m 0644 \"$sources_file\" \"\$1/etc/apt/sources.list\""
+}

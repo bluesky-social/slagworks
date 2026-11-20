@@ -39,6 +39,12 @@
 #
 # Both chroots share the same apt mirror so package versions match.
 #
+# Two settings name Ubuntu archive mirrors (see "Apt mirror" below):
+#   SLAGWORKS_APT_MIRROR        written into the image's sources.list: what a
+#                               deployed machine fetches packages from.
+#   SLAGWORKS_APT_BUILD_MIRROR  what this build downloads from. Optional;
+#                               defaults to SLAGWORKS_APT_MIRROR.
+#
 # Output: ./<suite>-pxe.tar.gz containing {vmlinuz, initrd,
 # initrd-local, root.squashfs}, plus sha256 to stdout.
 #
@@ -47,7 +53,8 @@
 #   - mksquashfs
 #   - sha256sum / shasum
 #   - assets/initramfs/{scripts,hooks}/slagworks in the repo
-#   - Network access to an Ubuntu archive mirror (SLAGWORKS_APT_MIRROR)
+#   - Network access to an Ubuntu archive mirror (SLAGWORKS_APT_BUILD_MIRROR,
+#     or SLAGWORKS_APT_MIRROR when that is unset)
 
 set -euo pipefail
 
@@ -146,17 +153,30 @@ fi
 # apt-snapshot.txt is informational only (roughly when the pipeline was last
 # verified end to end).
 #
-# The mirror is also written into the image's sources.list, so it is what a
-# deployed machine fetches packages from.
+# Two mirrors, because the right one for the build host and the right one
+# for a deployed machine are often on different networks:
 #
-# SLAGWORKS_APT_MIRROR selects the mirror. Pick one close to the build host:
-# a regional or cloud-provider mirror is often ten times faster than the
-# default, and some regional mirrors throttle clients outside their own
-# network to the point where the build exceeds a CI time limit. A build
-# host with a local apt-cacher-ng can point this at it (for example
-# http://127.0.0.1:3142/archive.ubuntu.com/ubuntu). Third-party repos
-# (apt-repos.sh) stay direct: they are small and https-pinned.
+# SLAGWORKS_APT_MIRROR is the baked mirror: it is written into the image's
+# sources.list, so it is what a deployed machine fetches packages from. Pick
+# one close to the machines the image is deployed on.
+#
+# SLAGWORKS_APT_BUILD_MIRROR is the build mirror: every package this build
+# downloads (both mmdebstrap runs) comes from it. It defaults to the baked
+# mirror. Set it when the baked mirror is slow or unreachable from the build
+# host: a regional or cloud-provider mirror is often ten times faster from
+# inside its own network, and some throttle clients outside it to the point
+# where the build exceeds a CI time limit. A build host with a local
+# apt-cacher-ng points the build mirror at it (for example
+# http://127.0.0.1:3142/archive.ubuntu.com/ubuntu). Both must serve the same
+# Ubuntu archive. Nothing of the build mirror is left in the image: the
+# sources.list is replaced with the baked mirror's (BAKED_SOURCES below) and
+# mmdebstrap removes the downloaded package indexes, so a deployed machine's
+# first `apt update` fetches them from the baked mirror.
+#
+# Third-party repos (apt-repos.sh) stay direct in both roles: they are small
+# and https-pinned.
 APT_MIRROR_BASE="${SLAGWORKS_APT_MIRROR:-http://archive.ubuntu.com/ubuntu}"
+APT_BUILD_MIRROR_BASE="${SLAGWORKS_APT_BUILD_MIRROR:-$APT_MIRROR_BASE}"
 
 # Third-party APT repos baked into the DEPLOY chroot (FRR, Tailscale, ...) live
 # in apt-repos.sh as a data table + a shared key-fetch/deb-line/customize-hook
@@ -165,7 +185,7 @@ APT_MIRROR_BASE="${SLAGWORKS_APT_MIRROR:-http://archive.ubuntu.com/ubuntu}"
 # shellcheck source=scripts/image-build/apt-repos.sh
 source "$IMAGE_BUILD_DIR/apt-repos.sh"
 
-echo "==> Building $NAME (apt mirror $APT_MIRROR_BASE)"
+echo "==> Building $NAME (downloading from $APT_BUILD_MIRROR_BASE, baking apt mirror $APT_MIRROR_BASE)"
 
 #####################################################################
 # Pick the build runner (native mmdebstrap vs. docker)              #
@@ -231,6 +251,15 @@ if [[ "$authkey_count" -eq 0 ]]; then
     exit 1
 fi
 echo "==> Staged $authkey_count recovery operator key(s) from $RECOVERY_AUTHKEYS_SRC"
+
+# The image's /etc/apt/sources.list, naming the baked mirror. mmdebstrap
+# writes the mirrors it downloads from (the build mirror) into the chroot's
+# sources.list; a customize-hook (baked_sources_hook, apt-repos.sh) replaces
+# that with this file in both chroots, and the verify step at the end compares
+# the shipped image against it.
+BAKED_SOURCES="$WORKDIR/baked-sources.list"
+ubuntu_mirror_lines "$APT_MIRROR_BASE" "$SUITE" > "$BAKED_SOURCES"
+chmod 0644 "$BAKED_SOURCES"
 # Clean up anything we might have left mounted on early exit, then
 # remove the workdir. In docker mode the chroot files are owned by
 # container-root, so a plain `rm -rf` from the invoking user fails;
@@ -281,19 +310,6 @@ chmod 0755 "$WORKDIR"
 package_list() {
     local file="$1"
     sed -e 's/#.*//' "$file" | awk '{print $1}' | grep -v '^$' | tr '\n' ' '
-}
-
-# mmdebstrap accepts multiple `deb`-line strings as positional
-# args after target; each becomes a sources.list entry. We need
-# all three (base + updates + security) — passing only the base
-# URL (the simpler form) silently drops -updates and -security,
-# yielding an image with no security-update channel.
-mirror_lines() {
-    cat <<LINES
-deb $APT_MIRROR_BASE $SUITE main restricted universe multiverse
-deb $APT_MIRROR_BASE $SUITE-updates main restricted universe multiverse
-deb $APT_MIRROR_BASE $SUITE-security main restricted universe multiverse
-LINES
 }
 
 #####################################################################
@@ -350,6 +366,10 @@ build_chroot_native() {
         done < <(repo_customize_hooks "$WORKDIR" "$SUITE")
     fi
 
+    # Leave the baked mirror, not the build mirror, in the chroot's
+    # sources.list.
+    mmd_args+=("$(baked_sources_hook "$BAKED_SOURCES")")
+
     # Pick output format from the target's extension. .squashfs goes
     # directly to mksquashfs via mmdebstrap, preserving ownership
     # without needing root (mmdebstrap defaults to --mode=unshare
@@ -369,12 +389,11 @@ build_chroot_native() {
     fi
 
     mmd_args+=("$SUITE" "$target")
-    # Append base + updates + security mirror lines so the built
-    # image has all three suites in its sources.list. mapfile
-    # avoids word-splitting issues if mirror URLs ever contain
-    # whitespace.
+    # Append the build mirror's base + updates + security lines: these are
+    # what mmdebstrap downloads from. One array element per line, so nothing
+    # is word-split.
     local mirrors=()
-    while IFS= read -r line; do mirrors+=("$line"); done < <(mirror_lines)
+    while IFS= read -r line; do mirrors+=("$line"); done < <(ubuntu_mirror_lines "$APT_BUILD_MIRROR_BASE" "$SUITE")
     mmd_args+=("${mirrors[@]}")
 
     # Third-party repo deb-lines are MIRRORS — appended after SUITE/TARGET,
@@ -407,8 +426,9 @@ TARGET="$1"
 SUITE="$2"
 PKGS="$3"
 CUSTOMIZE="$4"            # path inside container, or empty
-MIRROR_LINES_FILE="$5"    # file with one deb-line per row
+MIRROR_LINES_FILE="$5"    # file with one build-mirror deb-line per row
 WITH_REPOS="$6"           # non-empty = bake third-party repos (deploy chroot)
+BAKED_SOURCES="$7"        # the image's sources.list (baked mirror), container path
 
 apt-get update -qq
 # squashfs-tools-ng provides tar2sqfs which mmdebstrap uses for the
@@ -448,13 +468,16 @@ fi
 # mmdebstrap runs — here, inside this container — so keys go to /work (a
 # container path). Customize-hooks are OPTIONS (added before SUITE/TARGET); the
 # deb-lines are MIRRORS (added after, below) — ordering matters to mmdebstrap.
+source /repo/scripts/image-build/apt-repos.sh
 if [[ -n "$WITH_REPOS" ]]; then
-    source /repo/scripts/image-build/apt-repos.sh
     fetch_repo_keys /work "$SUITE"
     while IFS= read -r repo_arg; do
         mmd_args+=("$repo_arg")
     done < <(repo_customize_hooks /work "$SUITE")
 fi
+
+# Leave the baked mirror, not the build mirror, in the chroot's sources.list.
+mmd_args+=("$(baked_sources_hook "$BAKED_SOURCES")")
 
 if [[ -n "$CUSTOMIZE" ]]; then
     # Already +x on the host (we did chmod before bind-mounting).
@@ -462,14 +485,14 @@ if [[ -n "$CUSTOMIZE" ]]; then
     mmd_args+=(--customize-hook="$CUSTOMIZE")
 fi
 mmd_args+=("$SUITE" "$TARGET")
-# Append base + updates + security mirror lines (read from the
+# Append the build mirror's base + updates + security lines (read from the
 # file the host wrote out and bind-mounted in).
 while IFS= read -r line; do
     [[ -n "$line" ]] && mmd_args+=("$line")
 done < "$MIRROR_LINES_FILE"
 
 # Third-party repo deb-lines are MIRRORS — after SUITE/TARGET (apt-repos.sh
-# already sourced above when WITH_REPOS is set).
+# is sourced above).
 if [[ -n "$WITH_REPOS" ]]; then
     while IFS= read -r line; do mmd_args+=("$line"); done < <(repo_deb_lines /work "$SUITE")
 fi
@@ -478,9 +501,11 @@ mmdebstrap "${mmd_args[@]}"
 DRIVER
     chmod +x "$driver"
 
-    # Write mirror lines to a file the container can read.
+    # Write the build mirror's lines to a file the container can read. This
+    # is how SLAGWORKS_APT_BUILD_MIRROR reaches the mmdebstrap in the
+    # container; the baked mirror reaches it as $BAKED_SOURCES under /work.
     local mirror_file="$WORKDIR/mirror-lines.txt"
-    mirror_lines > "$mirror_file"
+    ubuntu_mirror_lines "$APT_BUILD_MIRROR_BASE" "$SUITE" > "$mirror_file"
 
     local pkgs
     pkgs=$(package_list "$pkglist")
@@ -532,6 +557,7 @@ DRIVER
             "$container_customize"
             "/mirror-lines.txt"
             "$with_repos"
+            "${BAKED_SOURCES/#$WORKDIR//work}"
     )
 
     docker run "${docker_args[@]}"
@@ -634,7 +660,11 @@ fi
 # When CI sets SLAGWORKS_CACHE_DIR, we look there for the build      #
 # outputs (vmlinuz, initrd, initrd-local, root.squashfs) keyed on   #
 # (packages-*.txt + apt-snapshot.txt + build.sh + assets/initramfs).#
-# If present, skip the chroot build entirely.                       #
+# If present, skip the chroot build entirely. The baked mirror is   #
+# an input too (it is inside root.squashfs): whoever sets            #
+# SLAGWORKS_APT_MIRROR keys the cache on it, and the verify step     #
+# below fails a cached root.squashfs that bakes another mirror. The  #
+# build mirror is not an input: it leaves nothing in the image.      #
 #                                                                   #
 # Unlike the old two-phase build, the BOOT hook + initramfs hook are #
 # baked in by update-initramfs INSIDE the chroot now, so the         #
@@ -712,6 +742,8 @@ fi
 #     root mount needs it; catches MODULES filtering dropping it).   #
 #   - /etc/slagworks/recovery_authorized_keys must be present and    #
 #     match the PR-gated source.                                     #
+# And one thing about root.squashfs: its sources.list names the      #
+# baked apt mirror only, and it ships no apt package indexes.        #
 #                                                                   #
 # In docker RUN_MODE we unpack in a container (host may lack         #
 # unmkinitramfs); in native RUN_MODE the host has initramfs-tools.   #
@@ -726,11 +758,17 @@ if [[ "$RUN_MODE" == docker ]]; then
         -v "$verify_dir:/verify" \
         ubuntu:noble bash -c "
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq && apt-get install -y -qq initramfs-tools-core >/dev/null 2>&1
+            apt-get update -qq && apt-get install -y -qq initramfs-tools-core squashfs-tools-ng >/dev/null 2>&1
             cd /verify && unmkinitramfs /out/initrd .
+            rdsquashfs -c /etc/apt/sources.list /out/root.squashfs > /verify/shipped-sources.list
+            rdsquashfs -l /var/lib/apt/lists /out/root.squashfs > /verify/shipped-apt-lists.txt
         "
 else
     ( cd "$verify_dir" && unmkinitramfs "$OUT_DIR/initrd" . )
+    # rdsquashfs ships with tar2sqfs (squashfs-tools-ng), which mmdebstrap
+    # needs for its squashfs output, so a native build host has it.
+    rdsquashfs -c /etc/apt/sources.list "$OUT_DIR/root.squashfs" > "$verify_dir/shipped-sources.list"
+    rdsquashfs -l /var/lib/apt/lists "$OUT_DIR/root.squashfs" > "$verify_dir/shipped-apt-lists.txt"
 fi
 
 # unmkinitramfs lays the main cpio out either at top level (single-segment)
@@ -772,9 +810,34 @@ if ! diff -q "$shipped_authkeys" "$RECOVERY_AUTHKEYS" >/dev/null; then
     diff "$shipped_authkeys" "$RECOVERY_AUTHKEYS" | head -30 >&2 || true
     exit 1
 fi
+
+# The deployed root filesystem's apt configuration names the baked mirror and
+# nothing else: sources.list is exactly the baked mirror's lines (the build
+# mirror and the third-party build-path lines are gone), and no downloaded
+# package index, whose file name carries the host it came from, is shipped.
+# This runs on a cache hit too, so a cached root.squashfs built for another
+# baked mirror fails here instead of shipping.
+if ! diff -q "$verify_dir/shipped-sources.list" "$BAKED_SOURCES" >/dev/null; then
+    echo "ERROR: root.squashfs /etc/apt/sources.list does not name the baked apt mirror" >&2
+    echo "       ($APT_MIRROR_BASE). Shipped (<) against expected (>):" >&2
+    diff "$verify_dir/shipped-sources.list" "$BAKED_SOURCES" | head -30 >&2 || true
+    echo "       If SLAGWORKS_CACHE_DIR holds outputs built with a different" >&2
+    echo "       SLAGWORKS_APT_MIRROR, clear it and rebuild." >&2
+    exit 1
+fi
+if grep -q '_dists_' "$verify_dir/shipped-apt-lists.txt"; then
+    echo "ERROR: root.squashfs ships apt package indexes in /var/lib/apt/lists:" >&2
+    grep '_dists_' "$verify_dir/shipped-apt-lists.txt" | head -10 >&2
+    echo "       Their names carry the mirror the build downloaded from, and" >&2
+    echo "       mmdebstrap's cleanup normally removes them. Remove whatever" >&2
+    echo "       keeps them (a --skip=cleanup/apt option, an apt-get update in" >&2
+    echo "       a customize-hook) and rebuild." >&2
+    exit 1
+fi
 echo "    /scripts/slagworks matches assets/initramfs/scripts/slagworks"
 echo "    overlay.ko present in initrd"
 echo "    recovery_authorized_keys present and matches"
+echo "    root.squashfs sources.list names $APT_MIRROR_BASE only; no apt indexes shipped"
 
 #####################################################################
 # Sanity-check artifacts                                            #
@@ -815,4 +878,5 @@ fi
 echo
 echo "Built: $TARBALL"
 echo "SHA256: $SHA"
-echo "Apt mirror: $APT_MIRROR_BASE"
+echo "Apt mirror baked into the image: $APT_MIRROR_BASE"
+echo "Apt mirror downloaded from: $APT_BUILD_MIRROR_BASE"

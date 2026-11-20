@@ -113,6 +113,10 @@ container in docker mode, natively on Linux hosts) and assert:
 - `/etc/slagworks/recovery_authorized_keys` is present and matches the
   keys file the build was given.
 
+It also reads `/etc/apt/sources.list` out of `root.squashfs` and requires
+it to name `SLAGWORKS_APT_MIRROR` and nothing else, with no apt package
+indexes shipped beside it.
+
 Any mismatch fails the build. This gate catches packaging changes
 (initramfs-tools dropping a script, `MODULES=most` filtering an
 essential module) at build time rather than after four minutes of QEMU
@@ -122,11 +126,28 @@ smoke or a real-hardware deploy attempt.
 package lists. Comments and inline `# why` annotations are stripped
 before being handed to `apt-get`.
 
-Packages come from `http://archive.ubuntu.com/ubuntu` unless
-`SLAGWORKS_APT_MIRROR` names another mirror. Set it to one close to the
-build host: the build downloads several hundred packages, and the same
-mirror is written into the image's `sources.list`, so deployed machines
-use it too. `apt-snapshot.txt` is informational only. Reproducibility is preserved
+Two settings name Ubuntu archive mirrors:
+
+- `SLAGWORKS_APT_MIRROR` is the mirror written into the image's
+  `sources.list`, so it is the one deployed machines fetch packages from.
+  Set it to a mirror close to those machines. The default is
+  `http://archive.ubuntu.com/ubuntu`.
+- `SLAGWORKS_APT_BUILD_MIRROR` is the mirror the build itself downloads
+  from. It is optional and defaults to `SLAGWORKS_APT_MIRROR`. Set it when
+  the build host is on a different network from the deployed machines: the
+  build downloads several hundred packages, and a regional or
+  cloud-provider mirror that is fast inside its own network can throttle
+  outside clients enough to make the build take hours. A local
+  apt-cacher-ng goes here too
+  (`http://127.0.0.1:3142/archive.ubuntu.com/ubuntu`).
+
+Nothing of the build mirror stays in the image: its `sources.list` names
+only `SLAGWORKS_APT_MIRROR`, and no downloaded package index is shipped, so
+a deployed machine's first `apt update` fetches the indexes from that
+mirror. The build's verify step checks both. The two mirrors must serve the
+same Ubuntu archive.
+
+`apt-snapshot.txt` is informational only. Reproducibility is preserved
 at the output layer: every build produces a content-addressed tarball
 pinned in object storage, so "rebuild the same image" means downloading
 that tarball, not re-running the build.
