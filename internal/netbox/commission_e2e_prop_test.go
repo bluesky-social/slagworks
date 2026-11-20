@@ -1049,7 +1049,9 @@ func (w *world) checkIsolation(t *rapid.T, dev int, before, after globalSnap) {
 		strip := func(in []ifSnap) string {
 			var out []string
 			for _, s := range in {
-				out = append(out, fmt.Sprintf("%d %s %s %v %s %s", s.ID, s.Name, s.Type, s.Mgmt, s.MAC, s.AllMACs))
+				// Cable ends are judged separately below.
+				s.Cabled, s.CableEnd = false, 0
+				out = append(out, fmt.Sprintf("%+v", s))
 			}
 			return strings.Join(out, "; ")
 		}
@@ -1540,15 +1542,21 @@ func (w *world) bmcConflict(i int, snap globalSnap) (ifSnap, bool) {
 	return *stale, true
 }
 
-func snapEqual(a, b globalSnap) bool { return snapDiff(a, b) == "" }
-
-func snapDiff(a, b globalSnap) string {
+func snapEqual(a, b globalSnap) bool {
 	ja, _ := json.Marshal(a)
 	jb, _ := json.Marshal(b)
-	if string(ja) == string(jb) {
-		return ""
-	}
+	return string(ja) == string(jb)
+}
+
+// snapDiff describes where two unequal snapshots differ, for the failure
+// message only; snapEqual is the comparison.
+func snapDiff(a, b globalSnap) string {
 	var out []string
+	for id := range b.Devices {
+		if _, ok := a.Devices[id]; !ok {
+			out = append(out, fmt.Sprintf("device %d appeared", id))
+		}
+	}
 	for id, da := range a.Devices {
 		db := b.Devices[id]
 		x, _ := json.Marshal(da)
@@ -1561,7 +1569,13 @@ func snapDiff(a, b globalSnap) string {
 		out = append(out, fmt.Sprintf("cables %v -> %v", a.Cables, b.Cables))
 	}
 	if fmt.Sprint(a.ModuleTypes) != fmt.Sprint(b.ModuleTypes) {
-		out = append(out, "module types changed")
+		out = append(out, fmt.Sprintf("module types %v -> %v", a.ModuleTypes, b.ModuleTypes))
+	}
+	if fmt.Sprint(a.Mfgs) != fmt.Sprint(b.Mfgs) {
+		out = append(out, fmt.Sprintf("manufacturers %v -> %v", a.Mfgs, b.Mfgs))
+	}
+	if fmt.Sprint(a.DevTypes) != fmt.Sprint(b.DevTypes) {
+		out = append(out, fmt.Sprintf("device types %v -> %v", a.DevTypes, b.DevTypes))
 	}
 	return strings.Join(out, "\n")
 }

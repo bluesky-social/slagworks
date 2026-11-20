@@ -28,9 +28,10 @@
 //     a module bay deletes its module
 //   - list endpoints paginate with limit/offset and an absolute next URL
 //
-// Fault injection: the write (POST/PATCH/DELETE) numbered FaultAt (1-based)
-// answers FaultStatus, either without applying it or, with FaultApplied,
-// after applying it (a proxy timeout after the backend committed).
+// Fault injection: setting FaultAt to N arms one fault on the Nth write
+// (POST/PATCH/DELETE) from then on. That write answers FaultStatus, either
+// without being applied or, with FaultApplied, after being applied (a proxy
+// timeout after the backend committed).
 package nbfake
 
 import (
@@ -179,12 +180,11 @@ type Server struct {
 	// shipped profile's enum, so real NetBox does not enforce it there.
 	ValidateAttributeData bool
 
-	// Fault injection, counted over writes.
+	// Fault injection. FaultAt counts down over writes and fires at zero,
+	// so it is relative to the moment it was set.
 	FaultAt      int
 	FaultStatus  int
 	FaultApplied bool
-	writeCount   int
-	pendingFault bool
 	FaultsHit    int
 
 	// Observability.
@@ -223,7 +223,7 @@ func (s *Server) Reset() {
 	s.DeviceTypeCFs = map[string]bool{"slagworks_kernel_params": true}
 	s.ModuleCFs = map[string]bool{"firmware_version": true}
 	s.FaultAt, s.FaultStatus, s.FaultApplied = 0, 0, false
-	s.writeCount, s.pendingFault, s.FaultsHit = 0, false, 0
+	s.FaultsHit = 0
 	s.Writes, s.Rejected, s.Requests = nil, nil, 0
 	for _, p := range builtinProfiles() {
 		s.next++
@@ -349,8 +349,11 @@ func (s *Server) wrap(h handler) http.HandlerFunc {
 			}
 		}
 		if r.Method != http.MethodGet {
-			s.writeCount++
-			if s.FaultAt > 0 && s.writeCount == s.FaultAt {
+			armed := s.FaultAt > 0
+			if armed {
+				s.FaultAt--
+			}
+			if armed && s.FaultAt == 0 {
 				s.FaultsHit++
 				if !s.FaultApplied {
 					writeJSON(w, s.FaultStatus, map[string]any{"detail": "injected fault"})

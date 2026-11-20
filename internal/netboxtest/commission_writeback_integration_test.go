@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/bluesky-social/slagworks/internal/netbox"
@@ -76,6 +77,9 @@ func writebackDuplicatePSULocationKeepsBothPSUs(t *testing.T, env *netboxtest.En
 	if err1 != nil {
 		t.Errorf("first commission of a host with two same-located PSUs failed: %v", err1)
 	}
+	if err2 != nil {
+		t.Errorf("replaying the commission of a host with two same-located PSUs failed: %v", err2)
+	}
 	if len(got.modules) != 2 {
 		t.Errorf("got %d PSU modules, want 2 (one per reported PSU)", len(got.modules))
 	}
@@ -112,7 +116,20 @@ func writebackMACLessIPMIRowIsRepaired(t *testing.T, env *netboxtest.Env) {
 	}
 	report := `{"system":{"serial_number":"S-IPMI"},"bmc":{"ip":"10.0.0.5","mac":"d0:50:99:aa:bb:cc","firmware_version":"1.0"}}`
 	if err := syncReport(t, env, dev, report); err != nil {
-		t.Errorf("commission with a MAC-less ipmi row failed: %v", err)
+		t.Fatalf("commission with a MAC-less ipmi row failed: %v", err)
+	}
+	ifaces, err := env.NetBox.ListDeviceInterfaces(ctx, dev.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mgmt []string
+	for _, i := range ifaces {
+		if i.MgmtOnly {
+			mgmt = append(mgmt, fmt.Sprintf("%d/%s/%s", i.ID, i.Name, strings.ToLower(i.GetMAC())))
+		}
+	}
+	if want := fmt.Sprintf("%d/ipmi/d0:50:99:aa:bb:cc", row.ID); len(mgmt) != 1 || mgmt[0] != want {
+		t.Errorf("management interfaces after commission: %v, want only the seeded row with the BMC MAC, %s", mgmt, want)
 	}
 }
 
