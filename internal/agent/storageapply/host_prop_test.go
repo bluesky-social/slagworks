@@ -294,6 +294,12 @@ func (h *fakeHost) Output(name string, args ...string) (string, error) {
 			}
 		}
 		return strings.Join(lines, "\n"), nil
+	case name == "lsblk" && len(args) == 3 && args[0] == "-ndo" && args[1] == "KNAME":
+		r, _, ok := h.resolve(args[2])
+		if !ok {
+			return "", exitErr{32}
+		}
+		return r.kname(), nil
 	case name == "lsblk" && len(args) == 3 && args[0] == "-snlo" && args[1] == "NAME,TYPE":
 		// Inverse listing: the device, then everything beneath it.
 		r, _, ok := h.resolve(args[2])

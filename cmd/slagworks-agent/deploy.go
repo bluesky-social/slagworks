@@ -105,9 +105,9 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 			fatal("safety check", err)
 		}
 		// Without --destructive nothing stops an array the deploy
-		// environment assembled from disks outside the layout, and
-		// mdadm --create cannot take a /dev/mdN such an array holds. Refuse
-		// now rather than after the layout's disks are partitioned.
+		// environment assembled from disks outside the layout, and mdadm
+		// cannot create or assemble at a /dev/mdN such an array holds.
+		// Refuse now rather than after the layout's disks are partitioned.
 		if err := storageapply.CheckMDNamesFree(ctx, layout); err != nil {
 			fatal("md name check", err)
 		}
@@ -133,7 +133,7 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 	// isn't a real member of the expected array FATALs here with the host
 	// left exactly as found. This also closes Phase-1 roast finding #3
 	// (a preserve member on an undeclared partition of a managed disk).
-	if err := storageapply.PreflightPreserve(ctx, layout); err != nil {
+	if err := storageapply.PreflightPreserve(ctx, layout, p.destructive); err != nil {
 		fatal("preserve preflight", err)
 	}
 
@@ -172,11 +172,15 @@ func runDeploy(ctx *agent.Context, p deployParams) {
 	// rules can grab it under a scan-chosen name (/dev/md127) from the stop's
 	// member uevents, which would then EBUSY planPreserve's targeted
 	// `--assemble /dev/mdN`. Release any such auto-assembly right before the
-	// command loop. Guarded on layout having preserve devices AND the
-	// destructive path NOT having already scan-stopped, so a plain deploy
-	// never perturbs md state. Non-destructive (member data untouched).
+	// command loop. It stops only arrays made of preserve members: arrays on
+	// disks outside the layout stay assembled. Guarded on layout having
+	// preserve devices AND the destructive path NOT having already
+	// scan-stopped, so a plain deploy never perturbs md state.
+	// Non-destructive (member data untouched).
 	if !p.destructive && storageapply.HasPreserveDevices(layout) {
-		storageapply.StopAutoAssembly(ctx)
+		if err := storageapply.StopAutoAssembly(ctx, layout); err != nil {
+			fatal("preserve auto-assembly", err)
+		}
 	}
 
 	// Split the plan at the mount-phase boundary so preserve arrays are

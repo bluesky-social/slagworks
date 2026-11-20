@@ -5,6 +5,7 @@ package storageapply
 import (
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -92,12 +93,30 @@ func preserveLayout() storage.Layout {
 	}
 }
 
+// emptyMdstat is /proc/mdstat with the md driver loaded and no array
+// assembled.
+const emptyMdstat = "Personalities : [raid0] [raid1]\nunused devices: <none>\n"
+
+// autoAssembledMdstat is the deploy environment's view when the initrd has
+// auto-assembled preserveLayout's array under a scan-chosen name (md127)
+// and an old array on a disk outside the layout (sdz) as md126.
+const autoAssembledMdstat = "Personalities : [raid0] [raid1]\n" +
+	"md126 : active raid1 sdz[0]\n" +
+	"      937032704 blocks super 1.2 [2/1] [U_]\n\n" +
+	"md127 : active raid0 nvme2n1[1] nvme1n1[0]\n" +
+	"      1874065408 blocks super 1.2 512k chunks\n\n" +
+	"unused devices: <none>\n"
+
 // preserveRunner is a scriptRunner that answers the kernel's view of
-// preserveLayout's members: both are whole disks.
+// preserveLayout's members, both whole disks, on a host where no array is
+// assembled yet.
 func preserveRunner() *scriptRunner {
 	r := newScriptRunner()
 	r.output["lsblk -snlo NAME,TYPE /dev/nvme1n1"] = "nvme1n1 disk"
 	r.output["lsblk -snlo NAME,TYPE /dev/nvme2n1"] = "nvme2n1 disk"
+	r.output["lsblk -ndo KNAME /dev/nvme1n1"] = "nvme1n1"
+	r.output["lsblk -ndo KNAME /dev/nvme2n1"] = "nvme2n1"
+	r.output["cat /proc/mdstat"] = emptyMdstat
 	return r
 }
 
@@ -106,7 +125,7 @@ func TestPreflightPreserve_NoPreserveDevices_NoOp(t *testing.T) {
 		"nvme0n1": {Type: "disk"},
 	}}
 	r := newScriptRunner()
-	if err := PreflightPreserve(scriptCtx(r), layout); err != nil {
+	if err := PreflightPreserve(scriptCtx(r), layout, false); err != nil {
 		t.Fatalf("no-preserve layout should be a no-op, got: %v", err)
 	}
 	if len(r.calls) != 0 {
@@ -115,14 +134,23 @@ func TestPreflightPreserve_NoPreserveDevices_NoOp(t *testing.T) {
 }
 
 func TestPreflightPreserve_Success(t *testing.T) {
+	for _, destructive := range []bool{false, true} {
+		t.Run(fmt.Sprintf("destructive=%v", destructive), func(t *testing.T) {
+			testPreflightPreserveSuccess(t, destructive)
+		})
+	}
+}
+
+func testPreflightPreserveSuccess(t *testing.T, destructive bool) {
 	layout := preserveLayout()
 	md := storage.MDDevMap(layout)["mddata"]
 	r := preserveRunner()
+	r.output["cat /proc/mdstat"] = autoAssembledMdstat
 	// mdadm --detail returns the matching UUID (mdadm's colon-grouped form).
 	r.output["mdadm --detail "+md] = "        Version : 1.2\n           UUID : e8c9aa81:11112222:33334444:55556666\n"
 	// blkid on the array returns the fs UUID (not declared here -> not checked).
 
-	if err := PreflightPreserve(scriptCtx(r), layout); err != nil {
+	if err := PreflightPreserve(scriptCtx(r), layout, destructive); err != nil {
 		t.Fatalf("preflight should succeed, got: %v", err)
 	}
 	// Must have assembled by uuid, verified via --detail, and stopped it.
@@ -143,23 +171,36 @@ func TestPreflightPreserve_Success(t *testing.T) {
 	if stops < 1 {
 		t.Errorf("expected at least one `mdadm --stop %s` (verified array stopped for re-assemble), calls: %v", md, r.calls)
 	}
-	// A global `mdadm --stop --scan` must precede the targeted assemble so an
-	// initrd auto-assembly under a scan-chosen md name (e.g. /dev/md127) is
-	// released and doesn't wedge the assemble with EBUSY (roast MEDIUM fix).
-	scanIdx, asmIdx := -1, -1
+	// The initrd's auto-assembly of the members (md127) must be released
+	// before the targeted assemble, or it wedges the assemble with EBUSY.
+	// --destructive authorizes a global `mdadm --stop --scan`; without it
+	// only md127 is stopped, and md126, an array on a disk outside the
+	// layout, is left assembled.
+	release := "mdadm --stop /dev/md127"
+	if destructive {
+		release = "mdadm --stop --scan"
+	}
+	relIdx, asmIdx := -1, -1
 	for i, c := range r.calls {
-		if c == "mdadm --stop --scan" && scanIdx < 0 {
-			scanIdx = i
+		if c == release && relIdx < 0 {
+			relIdx = i
 		}
 		if strings.HasPrefix(c, "mdadm --assemble ") && asmIdx < 0 {
 			asmIdx = i
 		}
 	}
-	if scanIdx < 0 {
-		t.Errorf("expected a global `mdadm --stop --scan` to release auto-assembly, calls: %v", r.calls)
+	if relIdx < 0 {
+		t.Errorf("expected %q to release the auto-assembly, calls: %v", release, r.calls)
 	}
-	if scanIdx >= asmIdx {
-		t.Errorf("`mdadm --stop --scan` must precede the targeted assemble, calls: %v", r.calls)
+	if relIdx >= asmIdx {
+		t.Errorf("%q must precede the targeted assemble, calls: %v", release, r.calls)
+	}
+	if !destructive {
+		for _, c := range r.calls {
+			if c == "mdadm --stop --scan" || c == "mdadm --stop /dev/md126" {
+				t.Errorf("preflight without --destructive ran %q, which stops the array on sdz outside the layout; calls: %v", c, r.calls)
+			}
+		}
 	}
 }
 
@@ -173,11 +214,11 @@ func TestPreflightPreserve_PostVerifyStopFails_FATAL(t *testing.T) {
 	md := storage.MDDevMap(layout)["mddata"]
 	r := preserveRunner()
 	r.output["mdadm --detail "+md] = "           UUID : e8c9aa81:11112222:33334444:55556666\n"
-	// The targeted post-verify stop fails. (--stop --scan and the pre-assemble
-	// path succeed by default; only the exact-argv targeted stop errors.)
+	// The targeted post-verify stop fails. (Nothing is assembled before the
+	// preflight's own assemble; only the exact-argv targeted stop errors.)
 	r.runErr["mdadm --stop "+md] = fmt.Errorf("mdadm: /dev/md0: still in use")
 
-	err := PreflightPreserve(scriptCtx(r), layout)
+	err := PreflightPreserve(scriptCtx(r), layout, false)
 	if err == nil || !strings.Contains(err.Error(), "could not be stopped") {
 		t.Fatalf("expected FATAL when the verified array can't be stopped, got: %v", err)
 	}
@@ -218,7 +259,7 @@ func TestPreflightPreserve_MemberOnDiskTarget_FATAL(t *testing.T) {
 			// stands between this layout and sgdisk --zap-all on the member.
 			r.output["mdadm --detail "+md] = "           UUID : e8c9aa81:11112222:33334444:55556666\n"
 
-			err := PreflightPreserve(scriptCtx(r), layout)
+			err := PreflightPreserve(scriptCtx(r), layout, false)
 			if err == nil {
 				t.Fatalf("expected FATAL: preserve member %q is on disk target %s", tc.member, tc.disk)
 			}
@@ -242,7 +283,7 @@ func TestPreflightPreserve_MemberNotOnHost_FATAL(t *testing.T) {
 	r.output["lsblk -snlo NAME,TYPE /dev/nvme1n1"] = "nvme1n1 disk"
 	r.outputErr["lsblk -snlo NAME,TYPE /dev/nvme2n1"] = fmt.Errorf("exit status 32")
 
-	err := PreflightPreserve(scriptCtx(r), layout)
+	err := PreflightPreserve(scriptCtx(r), layout, false)
 	if err == nil || !strings.Contains(err.Error(), "nvme2n1") {
 		t.Fatalf("expected FATAL naming the missing member nvme2n1, got: %v", err)
 	}
@@ -258,7 +299,7 @@ func TestPreflightPreserve_AssembleFails_FATAL(t *testing.T) {
 	r.runErr["mdadm --assemble "+md+" --uuid "+testArrayUUID+" /dev/nvme1n1 /dev/nvme2n1"] =
 		fmt.Errorf("mdadm: no recogniseable superblock")
 
-	err := PreflightPreserve(scriptCtx(r), layout)
+	err := PreflightPreserve(scriptCtx(r), layout, false)
 	if err == nil || !strings.Contains(err.Error(), "assemble") {
 		t.Fatalf("expected assemble-failure FATAL, got: %v", err)
 	}
@@ -271,7 +312,7 @@ func TestPreflightPreserve_UUIDMismatch_FATAL(t *testing.T) {
 	// Assembled array reports a DIFFERENT UUID than expected.
 	r.output["mdadm --detail "+md] = "           UUID : deadbeef:00000000:11111111:22222222\n"
 
-	err := PreflightPreserve(scriptCtx(r), layout)
+	err := PreflightPreserve(scriptCtx(r), layout, false)
 	if err == nil || !strings.Contains(err.Error(), "UUID") {
 		t.Fatalf("expected UUID-mismatch FATAL, got: %v", err)
 	}
@@ -298,7 +339,7 @@ func TestPreflightPreserve_FSUUIDMismatch_FATAL(t *testing.T) {
 	r.output["mdadm --detail "+md] = "           UUID : e8c9aa81:11112222:33334444:55556666\n"
 	r.output["blkid -s UUID -o value "+md] = "ffffffff-0000-1111-2222-333333333333" // != declared FSUUID
 
-	err := PreflightPreserve(scriptCtx(r), layout)
+	err := PreflightPreserve(scriptCtx(r), layout, false)
 	if err == nil || !strings.Contains(err.Error(), "filesystem") {
 		t.Fatalf("expected fs-UUID-mismatch FATAL, got: %v", err)
 	}
@@ -393,17 +434,136 @@ func TestHasPreserveDevices(t *testing.T) {
 	}
 }
 
-// TestStopAutoAssembly asserts the non-destructive-path pre-assemble stop
-// issues the global `mdadm --stop --scan` that releases udev re-assembly so
-// planPreserve's targeted --assemble can claim its members (re-review
-// finding #1).
+// TestStopAutoAssembly: the non-destructive path's release stops every array
+// the deploy environment assembled from preserve members, so planPreserve's
+// targeted --assemble can claim them, and no other array. An array that
+// holds a preserve member together with another device is refused before
+// anything is stopped.
 func TestStopAutoAssembly(t *testing.T) {
-	r := newScriptRunner()
-	// StopResidualMDDevices reads /proc/mdstat via Output; an empty read is
-	// the "no residual md" case.
-	r.output["cat /proc/mdstat"] = ""
-	StopAutoAssembly(scriptCtx(r))
-	if !r.ran("mdadm --stop --scan") {
-		t.Errorf("StopAutoAssembly must issue `mdadm --stop --scan`; calls: %v", r.calls)
+	byIDLayout := preserveLayout()
+	dev := byIDLayout.Devices["mddata"]
+	dev.Members = []string{"nvme1n1", "/dev/disk/by-id/nvme-EXAMPLE_SERIAL_S2"}
+	byIDLayout.Devices["mddata"] = dev
+
+	partLayout := preserveLayout()
+	dev = partLayout.Devices["mddata"]
+	dev.Members = []string{"nvme1n1p1", "nvme2n1p1"}
+	partLayout.Devices["mddata"] = dev
+
+	tests := []struct {
+		name     string
+		layout   storage.Layout
+		mdstat   string // "" means the read fails
+		absent   bool   // with a failed read, /proc/mdstat does not exist
+		knames   map[string]string
+		stopErr  string // an md device whose stop fails
+		want     []string
+		wantErr  []string
+		wantNone bool // no mdadm or lsblk command runs at all
+	}{
+		{name: "nothing assembled", layout: preserveLayout(), mdstat: emptyMdstat, wantNone: true},
+		{name: "md driver not loaded", layout: preserveLayout(), absent: true, wantNone: true},
+		{name: "mdstat exists but cannot be read", layout: preserveLayout(),
+			wantErr: []string{"/proc/mdstat exists but reading it failed", "--recovery"}},
+		{name: "udev re-assembly beside an array outside the layout", layout: preserveLayout(),
+			mdstat: autoAssembledMdstat, want: []string{"mdadm --stop /dev/md127"}},
+		{name: "member named by /dev/disk/by-id", layout: byIDLayout,
+			mdstat: autoAssembledMdstat,
+			knames: map[string]string{"/dev/nvme1n1": "nvme1n1", "/dev/disk/by-id/nvme-EXAMPLE_SERIAL_S2": "nvme2n1"},
+			want:   []string{"mdadm --stop /dev/md127"}},
+		{name: "inactive partial assembly of partition members", layout: partLayout,
+			mdstat: "Personalities : [raid0]\nmd127 : inactive nvme1n1p1[0](S)\n      937032704 blocks super 1.2\n\nunused devices: <none>\n",
+			knames: map[string]string{"/dev/nvme1n1p1": "nvme1n1p1", "/dev/nvme2n1p1": "nvme2n1p1"},
+			want:   []string{"mdadm --stop /dev/md127"}},
+		{name: "external-metadata subarray before its container", layout: preserveLayout(),
+			mdstat: "Personalities : [raid0]\n" +
+				"md127 : inactive nvme2n1[1](S) nvme1n1[0](S)\n      10402 blocks super external:imsm\n\n" +
+				"md126 : active raid0 nvme1n1[1] nvme2n1[0]\n      1874065408 blocks super external:/md127/0\n\n" +
+				"unused devices: <none>\n",
+			want: []string{"mdadm --stop /dev/md126", "mdadm --stop /dev/md127"}},
+		{name: "array mixing preserve members with a disk outside the layout", layout: preserveLayout(),
+			mdstat: "Personalities : [raid1]\n" +
+				"md125 : active raid1 nvme2n1[0]\n      937032704 blocks super 1.2 [2/1] [U_]\n\n" +
+				"md127 : active raid1 sdz[2](S) nvme1n1[0]\n      937032704 blocks super 1.2 [2/1] [U_]\n\n" +
+				"unused devices: <none>\n",
+			wantErr: []string{"/dev/md127", `preserve "mddata" member nvme1n1 together with sdz`, "--destructive"}},
+		{name: "stop fails", layout: preserveLayout(), mdstat: autoAssembledMdstat, stopErr: "/dev/md127",
+			want: []string{"mdadm --stop /dev/md127"}, wantErr: []string{"mdadm --stop /dev/md127", "--recovery"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newScriptRunner()
+			if tt.knames == nil {
+				// scriptRunner matches by prefix, so these would also answer
+				// for nvme1n1p1: a case with other members lists them all.
+				tt.knames = map[string]string{"/dev/nvme1n1": "nvme1n1", "/dev/nvme2n1": "nvme2n1"}
+			}
+			for path, kname := range tt.knames {
+				r.output["lsblk -ndo KNAME "+path] = kname
+			}
+			if tt.mdstat != "" {
+				r.output["cat /proc/mdstat"] = tt.mdstat
+			} else {
+				r.outputErr["cat /proc/mdstat"] = exitErr{1}
+				if tt.absent {
+					r.output["test ! -e /proc/mdstat"] = ""
+				} else {
+					r.outputErr["test ! -e /proc/mdstat"] = exitErr{1}
+				}
+			}
+			if tt.stopErr != "" {
+				r.runErr["mdadm --stop "+tt.stopErr] = fmt.Errorf("mdadm: Cannot get exclusive access to %s", tt.stopErr)
+			}
+
+			err := StopAutoAssembly(scriptCtx(r), tt.layout)
+
+			var mdadm []string
+			for _, c := range r.calls {
+				if strings.HasPrefix(c, "mdadm") {
+					mdadm = append(mdadm, c)
+				}
+				if tt.wantNone && (strings.HasPrefix(c, "mdadm") || strings.HasPrefix(c, "lsblk")) {
+					t.Errorf("ran %q with no array to release", c)
+				}
+			}
+			if !slices.Equal(mdadm, tt.want) {
+				t.Errorf("mdadm commands = %q, want %q", mdadm, tt.want)
+			}
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("StopAutoAssembly: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("StopAutoAssembly succeeded, want an error")
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error does not mention %q: %v", want, err)
+				}
+			}
+		})
+	}
+}
+
+// A preflight without --destructive refuses, before any assemble, when an
+// array the deploy environment assembled holds a preserve member together
+// with a device outside the layout: it may not stop that array, and the
+// preserve array cannot be assembled while it holds the member.
+func TestPreflightPreserve_ArrayHoldsMemberAndOutsideDisk_Refused(t *testing.T) {
+	layout := preserveLayout()
+	r := preserveRunner()
+	r.output["cat /proc/mdstat"] = "Personalities : [raid1]\nmd127 : active raid1 sdz[2](S) nvme2n1[1] nvme1n1[0]\n" +
+		"      937032704 blocks super 1.2 [2/2] [UU]\n\nunused devices: <none>\n"
+
+	err := PreflightPreserve(scriptCtx(r), layout, false)
+	if err == nil || !strings.Contains(err.Error(), "/dev/md127") || !strings.Contains(err.Error(), "sdz") {
+		t.Fatalf("expected a refusal naming md127 and sdz, got: %v", err)
+	}
+	for _, c := range r.calls {
+		if strings.HasPrefix(c, "mdadm --stop") || strings.HasPrefix(c, "mdadm --assemble") {
+			t.Errorf("preflight ran %q; the refusal must come before any array is stopped or assembled", c)
+		}
 	}
 }
