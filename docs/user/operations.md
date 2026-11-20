@@ -301,7 +301,11 @@ recent active operation.
 
 - On a TTY: launches the three-pane deploy TUI (`cmd/slagctl/tui/`) —
   phase spine on the right, structured envelope stream on the left,
-  SOL passthrough at the bottom.
+  SOL passthrough at the bottom. When the console stream drops (a
+  proxy or API restart, an idle timeout on a quiet console) or cannot
+  connect, the SOL pane keeps its last screen, its title reads
+  `⚠ reconnecting`, and it redials until the stream is back and the
+  screen is redrawn.
 - On a non-TTY: falls back to a flat line-based log stream (`--plain`
   forces this on a TTY too and writes the lines to stdout): the op's
   structured log envelopes from `/api/v1/logs/stream`, in the

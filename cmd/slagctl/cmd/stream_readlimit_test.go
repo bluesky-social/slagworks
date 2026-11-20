@@ -187,7 +187,7 @@ func TestWatchConsoleSource_ReadsFrameOverDefaultReadLimit(t *testing.T) {
 		if bytes.HasSuffix(got, []byte("after")) {
 			cancel()
 		}
-	}, func() {})
+	}, func() {}, func(bool) {})
 	if !bytes.Equal(got, []byte(largeConsoleFrame+"after")) {
 		t.Fatalf("watch console source delivered %d bytes and returned %v; want both frames (%d bytes; frame 1 is over 32 KiB)",
 			len(got), err, len(largeConsoleFrame)+len("after"))

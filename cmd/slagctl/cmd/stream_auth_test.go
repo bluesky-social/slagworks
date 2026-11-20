@@ -103,10 +103,17 @@ func TestMachineLogsSOL_SendsBearerHeader(t *testing.T) {
 func TestWatchTUIStreams_SendBearerHeader(t *testing.T) {
 	t.Run("console", func(t *testing.T) {
 		seen := stubStreamServer(t, func(context.Context, *websocket.Conn) {})
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = consoleSource(uuid.NewString())(ctx, func([]byte, bool) {}, func() {})
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			// The source redials until ctx ends; stop it once the first
+			// upgrade has been checked.
+			_ = consoleSource(uuid.NewString())(ctx, func([]byte, bool) {}, func() {}, func(bool) {})
+		}()
 		assertBearerNotInURL(t, seen, "/api/v1/console/stream")
+		cancel()
+		<-done // the source reads apiURL; let it stop before cleanup restores it
 	})
 	t.Run("logs", func(t *testing.T) {
 		seen := stubStreamServer(t, readOne)
@@ -144,8 +151,11 @@ func TestStreams_RefusalCarriesGlobalsReason(t *testing.T) {
 		{"machine logs --sol", func(ctx context.Context) error {
 			return runConsoleStream(ctx, uuid.NewString(), "", true, false, true)
 		}},
+		// One connection of the watch console: consoleSource itself redials
+		// after every refusal and shows the reconnect banner instead.
 		{"watch console", func(ctx context.Context) error {
-			return consoleSource(uuid.NewString())(ctx, func([]byte, bool) {}, func() {})
+			relay := &consoleRelay{machineID: uuid.NewString(), onBytes: func([]byte, bool) {}, onLiveEdge: func() {}}
+			return relay.stream(ctx, func() {})
 		}},
 		{"watch logs", func(ctx context.Context) error {
 			var lastSeen int64
