@@ -16,6 +16,7 @@ package worker
 //     update appended while no fault could intervene is delivered.
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -141,9 +142,22 @@ type e2eEnv struct {
 	done   chan struct{}
 
 	lastErr atomic.Pointer[string] // last connectAndRun error, for failure reports
+
+	// globalURL is where the worker dials; "" means srv.URL. heartbeat and
+	// idle shorten the link's liveness timers at both ends when non-zero.
+	globalURL       string
+	heartbeat, idle time.Duration
 }
 
 func newE2EEnv(t fataler, dir string) *e2eEnv {
+	e := newE2EGlobalSide(t, dir, 0, 0)
+	e.startWorker()
+	return e
+}
+
+// newE2EGlobalSide starts the hub and its fake collaborators without a
+// worker, so a caller can put something between the two before startWorker.
+func newE2EGlobalSide(t fataler, dir string, heartbeat, idle time.Duration) *e2eEnv {
 	g := newE2EGlobal()
 	token := "tok-" + uuid.NewString()
 	sum := sha256.Sum256([]byte(token))
@@ -154,11 +168,12 @@ func newE2EEnv(t fataler, dir string) *e2eEnv {
 		ObsHandler:      g,
 		OpUpdateHandler: g,
 		Logger:          quietLog,
+
+		HeartbeatInterval: heartbeat,
+		IdleTimeout:       idle,
 	})
 	srv := httptest.NewServer(hub)
-	e := &e2eEnv{t: t, dir: dir, srv: srv, hub: hub, auth: auth, global: g, token: token}
-	e.startWorker()
-	return e
+	return &e2eEnv{t: t, dir: dir, srv: srv, hub: hub, auth: auth, global: g, token: token, heartbeat: heartbeat, idle: idle}
 }
 
 // runLoop is WSConn.Run without the reconnect backoff sleep (a 1s floor per
@@ -187,8 +202,9 @@ func (e *e2eEnv) startWorker() {
 	c := NewCache(db)
 	c.outbox.RejectBackoffBase = 2 * time.Millisecond
 	c.outbox.RejectBackoffMax = 20 * time.Millisecond
-	w := NewWSConn(WSConnConfig{GlobalURL: e.srv.URL, Token: e.token, WorkerID: "worker-a"}, c, db, nil)
+	w := NewWSConn(WSConnConfig{GlobalURL: cmp.Or(e.globalURL, e.srv.URL), Token: e.token, WorkerID: "worker-a"}, c, db, nil)
 	w.SetLogger(quietLog)
+	w.heartbeatInterval, w.idleTimeout = e.heartbeat, e.idle
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	e.db, e.cache, e.w, e.cancel, e.done = db, c, w, cancel, done
