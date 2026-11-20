@@ -589,9 +589,37 @@ func (o lcOp) String() string {
 }
 
 func lcGenOps(t *rapid.T) []lcOp {
-	n := rapid.IntRange(2, 7).Draw(t, "nOps")
-	ops := make([]lcOp, 0, n+1)
+	faults := []lcMode{lcUnreachable, lcAuthRefused, lcRebuildFailed, lcRebuildHang, lcSerialRefused, lcHelloHang}
+	shapes := []lcShape{lcShapeValid, lcShapeValid, lcShapeGatewayCIDR, lcShapeGatewayNone, lcShapeDNSNotIP}
+	n := rapid.IntRange(1, 5).Draw(t, "nOps")
+	ops := make([]lcOp, 0, 4*n+1)
 	for range n {
+		// Targeted patterns, between whatever random steps surround them.
+		switch rapid.IntRange(0, 5).Draw(t, "pattern") {
+		case 0:
+			// Warm, change the snapshot under the running worker, then an
+			// outage and a restart into it: the worker must come back
+			// serving what it persisted.
+			ops = append(ops, lcOp{Kind: lcOpMode, Mode: lcOK}, lcOp{Kind: lcOpBoot})
+			for range rapid.IntRange(0, 2).Draw(t, "bumps") {
+				ops = append(ops, lcOp{Kind: lcOpBump, Shape: rapid.SampledFrom(shapes).Draw(t, "shape")})
+			}
+			ops = append(ops, lcOp{Kind: lcOpMode, Mode: rapid.SampledFrom(faults).Draw(t, "mode")})
+			if rapid.Bool().Draw(t, "stopFirst") {
+				ops = append(ops, lcOp{Kind: lcOpStop, Kill: rapid.Bool().Draw(t, "kill")})
+			}
+			ops = append(ops, lcOp{Kind: lcOpBoot})
+			continue
+		case 1:
+			// Start into a fault, then global recovers under the running
+			// worker.
+			ops = append(ops,
+				lcOp{Kind: lcOpMode, Mode: rapid.SampledFrom(faults).Draw(t, "mode")},
+				lcOp{Kind: lcOpBoot},
+				lcOp{Kind: lcOpMode, Mode: lcOK})
+			continue
+		default:
+		}
 		kind := rapid.SampledFrom([]lcOpKind{lcOpBoot, lcOpBoot, lcOpBoot, lcOpMode, lcOpMode, lcOpBump, lcOpBump, lcOpStop, lcOpCorrupt}).Draw(t, "kind")
 		op := lcOp{Kind: kind}
 		switch kind {

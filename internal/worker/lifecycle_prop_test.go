@@ -49,6 +49,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"slices"
 	"strconv"
@@ -557,11 +558,6 @@ func (n *vtNotify) close() { _ = syscall.Close(n.fd) }
 
 // --- worker process under its unit -------------------------------------------
 
-// vtKilled is what a scripted image sync panics with when its process is
-// killed: the goroutine unwinds without running the rest of the apply, as a
-// killed process would not.
-type vtKilled struct{}
-
 type vtProc struct {
 	n       int
 	db      *LocalDB
@@ -627,14 +623,9 @@ func (u *vtUnit) startProc() (*vtProc, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	go func() {
+		// Deferred, so it also runs when a killed image download ends this
+		// goroutine with runtime.Goexit (see imageSync).
 		defer close(p.done)
-		defer func() {
-			if r := recover(); r != nil {
-				if _, ok := r.(vtKilled); !ok {
-					panic(r)
-				}
-			}
-		}()
 		_ = p.w.Run(ctx)
 	}()
 	return p, nil
@@ -752,7 +743,11 @@ func (e *vtEnv) imageSync(p *vtProc) error {
 			return nil
 		case <-changed: // re-evaluate under the new mode
 		case <-p.killed:
-			panic(vtKilled{})
+			// The process died mid-download. End this goroutine here, so
+			// that nothing after the download runs (a killed process
+			// persists nothing more), whichever goroutine the production
+			// code runs the download on.
+			runtime.Goexit()
 		}
 	}
 }
@@ -956,7 +951,7 @@ type vtStats struct {
 type vtRun struct {
 	t      *rapid.T
 	stats  *vtStats
-	strict bool
+	strict string // SLAGWORKS_PROP_STRICT: "1" fails every known finding, a comma-separated list of ids fails those
 	e      *vtEnv
 	trail  []string
 
@@ -991,7 +986,7 @@ func (r *vtRun) failf(format string, args ...any) {
 }
 
 func (r *vtRun) known(id, format string, args ...any) {
-	if r.strict {
+	if r.strict == "1" || slices.Contains(strings.Split(r.strict, ","), id) {
 		r.failf("["+id+"] "+format, args...)
 	}
 	r.stats.known[id]++
@@ -1102,13 +1097,13 @@ func (r *vtRun) probe() {
 			synctest.Wait()
 			if p.w.Connected() {
 				switch {
-				case p.syncing.Load() > 0:
-					r.known(vtFindImageLoop, "worker reports connected but the hub has no worker to route an RPC to: the hub dropped the connection while the worker's read loop is inside an image download")
 				case hub.IsWorkerConnected(vtSlug, vtWorkerID):
 					// The connection exists but the hub has not answered its
 					// hello: it is still waiting on the site's rebuild, and
 					// the worker took a fan-out snapshot for the reply.
 					r.known(vtFindHalfHello, "worker reports connected on a connection whose hello the hub has not answered (it is waiting on a rebuild); a pushed snapshot reached the worker first and it took that for the hello reply")
+				case p.syncing.Load() > 0:
+					r.known(vtFindImageLoop, "worker reports connected but the hub has no worker to route an RPC to: the hub dropped the connection while the worker's read loop is inside an image download")
 				default:
 					r.failf("worker reports connected but the hub has no worker to route an RPC to")
 				}
@@ -1191,13 +1186,15 @@ func (r *vtRun) settle() {
 		r.known(vtFindImageReady, "global has been healthy for %v but the unit is between start-timeout restarts: every start spends its 90s inside an image download", vtSettle)
 	case !p.w.Connected() || !hub.IsWorkerConnected(vtSlug, vtWorkerID) || vtViewGen(p.cache) != r.gen:
 		held := vtViewGen(p.cache)
+		// The specific causes first: an image download in flight is only
+		// the explanation when nothing narrower is.
 		switch {
-		case p.syncing.Load() > 0 || r.image == vtImageSlow || r.image == vtImageStuck:
-			r.known(vtFindImageLoop, "global has been healthy for %v but the worker is not connected and current (connected=%v gen=%d want %d): an image download is holding its read loop", vtSettle, p.w.Connected(), held, r.gen)
 		case !p.w.Connected() && r.hungSince == p.n:
 			r.known(vtFindHelloHang, "global has been healthy for %v but the worker still waits on a connection that an earlier, wedged global accepted and never answered", vtSettle)
 		case p.w.Connected() && held != r.gen && r.seqOf[held] == r.seqOf[r.gen]:
 			r.known(vtFindSeqReuse, "connected, but the worker keeps generation %d: global's current generation %d was published under the same sequence number %d, so the hello is answered no_change and the push is dropped as a duplicate", held, r.gen, r.seqOf[r.gen])
+		case p.syncing.Load() > 0 || r.image == vtImageSlow || r.image == vtImageStuck:
+			r.known(vtFindImageLoop, "global has been healthy for %v but the worker is not connected and current (connected=%v gen=%d want %d): an image download is holding its read loop", vtSettle, p.w.Connected(), held, r.gen)
 		default:
 			r.failf("global has been healthy for %v but the worker is not connected and current: connected=%v hub-connected=%v gen=%d want %d",
 				vtSettle, p.w.Connected(), hub.IsWorkerConnected(vtSlug, vtWorkerID), vtViewGen(p.cache), r.gen)
@@ -1306,7 +1303,7 @@ func (r *vtRun) apply(ev vtEvent) {
 
 func TestPropWorkerLifecycleVirtualTime(t *testing.T) {
 	stats := &vtStats{known: map[string]int{}}
-	strict := os.Getenv("SLAGWORKS_PROP_STRICT") == "1"
+	strict := os.Getenv("SLAGWORKS_PROP_STRICT")
 	prevLog := slog.Default()
 	slog.SetDefault(quietLog)
 	t.Cleanup(func() { slog.SetDefault(prevLog) })
