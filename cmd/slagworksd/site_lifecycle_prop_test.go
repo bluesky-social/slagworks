@@ -27,6 +27,11 @@ package main
 // Checks that fail on unmodified main for a finding already written up are
 // counted instead of failing the run, so the search continues past them;
 // SLAGWORKS_PROP_STRICT=1 turns every one of them into a failure.
+//
+// The test is opt-in (SLAGWORKS_PROP_SLOW=1): a case takes about 25 seconds
+// of real time, most of it runSite's own 5-second wait for global. Run it
+// unprivileged: as root the child processes would bind DHCP and TFTP on
+// loopback. SLAGWORKS_PROP_SHARDS sets how many cases run in parallel.
 
 import (
 	"context"
@@ -996,8 +1001,8 @@ func lcShards() int {
 }
 
 func TestPropSiteLifecycle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("starts real worker processes and waits out their startup timers")
+	if os.Getenv("SLAGWORKS_PROP_SLOW") != "1" {
+		t.Skip("starts real worker processes and waits out their startup timers (about 25s a case); set SLAGWORKS_PROP_SLOW=1 to run it")
 	}
 	stats := &lcStats{known: map[string]int{}}
 	// Cases are slow (a degraded boot waits out runSite's 5s sync window), so

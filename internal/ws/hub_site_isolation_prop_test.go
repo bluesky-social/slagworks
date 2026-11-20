@@ -32,6 +32,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -150,6 +151,11 @@ func (c *isoConn) await(t *rapid.T, what string, want func(Envelope) bool) {
 }
 
 func TestPropHubBrokenSiteDoesNotAffectOthers(t *testing.T) {
+	// Opt-in: the timing bounds need real time, so a case takes over a
+	// second (each broken-site hello is waited out to its RebuildTimeout).
+	if os.Getenv("SLAGWORKS_PROP_SLOW") != "1" {
+		t.Skip("real-time property, about 1.5s a case; set SLAGWORKS_PROP_SLOW=1 to run it")
+	}
 	var stats struct {
 		cases, brokenHellos, healthyHellos, pushes, deltas, removals, reads, hangFlips int
 		peakPending                                                                    int64
