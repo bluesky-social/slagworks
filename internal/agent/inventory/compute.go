@@ -10,11 +10,21 @@ import (
 	"github.com/bluesky-social/slagworks/internal/agent"
 )
 
-func collectCPUs(r agent.Runner) []CPUInfo {
+// maxCPUSockets bounds the socket count collectCPUs accepts from lscpu. The
+// largest machines built have a few hundred sockets and the kernel's CPU
+// limit (NR_CPUS, at most 8192) caps what lscpu can honestly report, so a
+// count above 1024 is corrupted output, not hardware.
+const maxCPUSockets = 1024
+
+// collectCPUs returns one CPUInfo per socket lscpu reports, nil when lscpu
+// fails or reports no model, and an error when it reports more sockets than
+// maxCPUSockets: the count sizes the result, and a corrupted one must not
+// become an allocation of billions of entries.
+func collectCPUs(r agent.Runner) ([]CPUInfo, error) {
 	out, err := r.Output("lscpu", "--json")
 	if err != nil {
 		slog.Warn("lscpu failed", "err", err)
-		return nil
+		return nil, nil
 	}
 
 	var parsed struct {
@@ -24,7 +34,7 @@ func collectCPUs(r agent.Runner) []CPUInfo {
 		} `json:"lscpu"`
 	}
 	if json.Unmarshal([]byte(out), &parsed) != nil {
-		return nil
+		return nil, nil
 	}
 
 	var model, speed, arch, flags string
@@ -53,8 +63,13 @@ func collectCPUs(r agent.Runner) []CPUInfo {
 	if sockets < 1 {
 		sockets = 1
 	}
+	if sockets > maxCPUSockets {
+		return nil, fmt.Errorf("lscpu reports %d CPU sockets, more than the %d any machine has; "+
+			"its output is corrupt, so no CPU inventory was recorded: run `lscpu --json` on the host and check \"Socket(s)\"",
+			sockets, maxCPUSockets)
+	}
 	if model == "" {
-		return nil
+		return nil, nil
 	}
 
 	// Parse flags into a slice
@@ -75,7 +90,18 @@ func collectCPUs(r agent.Runner) []CPUInfo {
 			Flags:   flagList,
 		}
 	}
-	return cpus
+	return cpus, nil
+}
+
+// lscpuStep collects the CPUs into res and returns the lscpu step's verdict.
+func lscpuStep(r agent.Runner, res *CommissionResult) stepVerdict {
+	cpus, err := collectCPUs(r)
+	if err != nil {
+		slog.Error("CPU inventory refused", "err", err)
+		return stepVerdict{Status: StepStatusFailed, Error: err.Error()}
+	}
+	res.CPUs = cpus
+	return verdictForSlice(len(res.CPUs), "lscpu produced no CPU info")
 }
 
 func collectMemory(r agent.Runner) *MemoryInfo {
