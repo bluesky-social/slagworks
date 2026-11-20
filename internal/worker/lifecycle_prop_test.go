@@ -75,7 +75,7 @@ const (
 	vtToken    = "vt-token"
 
 	vtStartTimeout = 90 * time.Second // systemd DefaultTimeoutStartSec
-	vtRestartSec   = 5 * time.Second  // RestartSec= in the packaged unit
+	vtRestartDelay = 5 * time.Second  // RestartSec= in the packaged unit
 	// vtSettle outlasts a start-timeout kill, the restart delay and a full
 	// 30s backoff step, so whatever the worker was doing it has had the
 	// chance to reconnect to a healthy global.
@@ -693,7 +693,7 @@ func (u *vtUnit) run() {
 			}
 		}
 		select {
-		case <-time.After(vtRestartSec):
+		case <-time.After(vtRestartDelay):
 		case <-u.stop:
 			return
 		}
@@ -736,7 +736,7 @@ func (e *vtEnv) imageSync(p *vtProc) error {
 			return errors.New("download returned 503")
 		case vtImageSlow:
 			timer = time.After(vtSlowImage)
-		case vtImageStuck:
+		case vtImageStuck, vtNumImage:
 		}
 		select {
 		case <-timer:
@@ -1294,7 +1294,7 @@ func (r *vtRun) apply(ev vtEvent) {
 	case vtEvDrop:
 		hub, _, _ := r.e.g.cur()
 		hub.Close()
-	case vtEvSettle:
+	case vtEvSettle, vtNumEvents:
 		r.settle()
 		return
 	}

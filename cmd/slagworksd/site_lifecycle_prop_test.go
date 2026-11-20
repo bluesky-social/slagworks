@@ -133,7 +133,7 @@ func lcSnapshot(gen int, shape lcShape) model.SiteSnapshot {
 		dhcp.Gateway = ""
 	case lcShapeDNSNotIP:
 		dhcp.DNS = []string{"10.77.0.2; 10.77.0.3"}
-	case lcShapeValid:
+	case lcShapeValid, lcNumShapes:
 	}
 	id := uuid.NewSHA1(uuid.NameSpaceOID, fmt.Appendf(nil, "lc-machine-%d", gen))
 	return model.SiteSnapshot{
