@@ -332,10 +332,17 @@ posture the storage matcher takes.
 The site worker exposes `/api/v1/machines/<id>/network-facts` — a JSON list
 of `model.SnapshotInterface` records (`NetBoxID`, `Name`, `MAC`, `Type`,
 `IP`, `LAG`, `VLAN`, `MTU`, `Gateway`). `Type` is `physical`, `lag`, or
-`ipmi`. `IP` is the interface's one `status=active` NetBox address. An
-interface with more than one active address fails the site's snapshot build,
-naming the device, the interface and its addresses; set every address but one
-to `reserved` or `deprecated`. `Gateway` is the longest-prefix-match of the
+`ipmi`. `IP` is one `status=active` NetBox address of the interface. When an
+interface has more than one active address (service addresses next to the
+host address, a second address on a gateway NIC), the facts carry the
+device's primary IPv4 (`primary_ip4`) if it is one of them, and otherwise the
+numerically lowest active IPv4 address (ties: shorter prefix length, then
+lower NetBox ID); an interface with only IPv6 addresses gets the lowest of
+those. NetBox list order never changes the result. The global service logs
+one warning per site naming each such device, interface and chosen address,
+and repeats it only when that list changes. A script that needs a different
+address than the rule picks should make it the device's primary IPv4.
+`Gateway` is the longest-prefix-match of the
 interface CIDR against site prefixes' `gateway_ip` custom field. The script
 owns all topology interpretation from these facts; slagworks itself is
 topology-agnostic. See

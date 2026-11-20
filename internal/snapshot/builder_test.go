@@ -223,67 +223,6 @@ func TestBuildIgnoresReservedIPs(t *testing.T) {
 	}
 }
 
-// TestBuildRejectsInterfaceWithTwoActiveIPs: a machine's network facts carry
-// one address per interface (SnapshotInterface.IP). When a bound machine's
-// NetBox interface had two status=active addresses, Build kept whichever
-// NetBox listed last and dropped the other without a word, so the address
-// handed to the network-config script and the worker's DHCP reservation
-// depended on list order. Build must refuse the site instead, naming the
-// device, the interface and every address, with the same error for either
-// order. Retiring one address (status=reserved, the renumber convention)
-// builds again with the remaining one.
-func TestBuildRejectsInterfaceWithTwoActiveIPs(t *testing.T) {
-	devID := 7
-	bound := []model.Machine{{ID: uuid.MustParse("00000000-0000-0000-0000-000000000007"), NetBoxDeviceID: &devID}}
-	ipA := netbox.IPAddress{ID: 1, Address: "10.253.0.22/22", AssignedObjectType: "dcim.interface", AssignedObjectID: new(70)}
-	ipB := netbox.IPAddress{ID: 2, Address: "10.253.0.99/22", AssignedObjectType: "dcim.interface", AssignedObjectID: new(70)}
-	inputs := func(machines []model.Machine, ips ...netbox.IPAddress) Inputs {
-		return Inputs{
-			Site:     netbox.Site{Name: "site1", Slug: "site1"},
-			Config:   model.SiteConfig{Slug: "site1"},
-			Prefixes: []netbox.Prefix{{Prefix: "10.253.0.0/22", CustomFields: gatewayJSON("10.253.3.254")}},
-			Devices:  []netbox.Device{{ID: devID, Name: "host-1"}},
-			Interfaces: []netbox.Interface{{
-				ID: 70, Name: "bond0", Type: &netbox.NestedValue{Value: "lag"},
-				Device: &netbox.NestedRef{ID: devID},
-			}},
-			IPs:      ips,
-			Machines: machines,
-		}
-	}
-
-	_, errAB := Build(inputs(bound, ipA, ipB))
-	_, errBA := Build(inputs(bound, ipB, ipA))
-	if errAB == nil || errBA == nil {
-		t.Fatalf("Build accepted an interface with two active addresses and kept one of them: [A,B] err=%v, [B,A] err=%v", errAB, errBA)
-	}
-	for _, want := range []string{"host-1", "bond0", ipA.Address, ipB.Address} {
-		if !strings.Contains(errAB.Error(), want) {
-			t.Errorf("error does not name %q: %v", want, errAB)
-		}
-	}
-	if errAB.Error() != errBA.Error() {
-		t.Errorf("error depends on NetBox list order:\n  [A,B] %v\n  [B,A] %v", errAB, errBA)
-	}
-
-	// The same interface on a device no machine is bound to reaches no
-	// machine's facts, so it must not block the site.
-	if _, err := Build(inputs(nil, ipA, ipB)); err != nil {
-		t.Errorf("unbound device's multi-address interface failed the site build: %v", err)
-	}
-
-	// The remedy the error suggests: retire one address.
-	retired := ipB
-	retired.Status = &netbox.NestedValue{Value: "reserved"}
-	snap, err := Build(inputs(bound, retired, ipA))
-	if err != nil {
-		t.Fatalf("Build with one address retired: %v", err)
-	}
-	if got := snap.Machines[0].Interfaces[0]; got.IP != ipA.Address || got.Gateway != "10.253.3.254" {
-		t.Errorf("bond0 facts = %+v, want ip %s with gateway 10.253.3.254", got, ipA.Address)
-	}
-}
-
 // TestBuildBMCIPFromBMClessSwitch locks the mgmt_only-conflation fix: a BMC-less
 // device (e.g. an SN2700 switch) whose host PXE NIC is flagged mgmt_only
 // and carries an IP must NOT be mistaken for a BMC. MachineSnapshot.BMCIP

@@ -27,20 +27,21 @@ import (
 // Oracles:
 //   - an independent reference model of the facts contract written from the
 //     SnapshotInterface doc comments (net/netip, no production helpers);
-//   - refusal: Build fails exactly when a bound machine's interface carries
-//     more than one active address (the facts hold one address per
-//     interface), and the error names every such interface;
+//   - one address per interface: a bound machine's interface with more than
+//     one active address never fails the build; its facts carry the
+//     device's primary_ip4 when that is one of them, else the numerically
+//     lowest IPv4 address, else the lowest IPv6 address;
 //   - relay pools: one per /31 link seen on an active physical-class
 //     interface address, offering the higher address of the ends present;
 //   - metamorphic: permuting Devices, Interfaces, IPs, OOB prefixes and the
 //     non-primary production prefixes must not change any machine's facts,
-//     relay pools or FQDN, nor whether Build refuses (NetBox list order is
-//     not a contract).
+//     relay pools or FQDN, including which address a multi-address
+//     interface gets (NetBox list order is not a contract).
 
 // ---------- generator ----------
 
 type genOpts struct {
-	multiIP bool // allow >1 active IP per interface (Build refuses the site)
+	multiIP bool // allow >1 active IP per interface (Build chooses one)
 }
 
 var ifaceNamePool = []string{"eno1", "eno2", "enp1s0f0", "enp1s0f1", "bond0", "bond1", "lo", "ipmi0", "bond0.100", "eth0"}
@@ -137,6 +138,7 @@ func drawSite(t *rapid.T, opts genOpts) genSite {
 		in.Devices = append(in.Devices, dev)
 		nIf := rapid.IntRange(0, 6).Draw(t, fmt.Sprintf("dev%dnIf", d))
 		var names []string
+		var devIPs []int
 		for k := 0; k < nIf; k++ {
 			pre := fmt.Sprintf("d%di%d", d, k)
 			name := rapid.SampledFrom(ifaceNamePool).Draw(t, pre+"name")
@@ -203,7 +205,13 @@ func drawSite(t *rapid.T, opts genOpts) genSite {
 					ip.Status = &netbox.NestedValue{Value: status}
 				}
 				in.IPs = append(in.IPs, ip)
+				devIPs = append(devIPs, ip.ID)
 			}
+		}
+		// primary_ip4: any of the device's addresses (active or not, on
+		// any of its interfaces), or none.
+		if len(devIPs) > 0 && rapid.Bool().Draw(t, fmt.Sprintf("dev%dhasPrimary", d)) {
+			in.Devices[len(in.Devices)-1].PrimaryIP4 = &netbox.NestedRef{ID: rapid.SampledFrom(devIPs).Draw(t, fmt.Sprintf("dev%dprimary", d))}
 		}
 	}
 	// Optionally put the leaf side of each used /31 on a separate leaf
@@ -270,6 +278,7 @@ type refIface struct {
 	MAC      string
 	Type     string
 	IPs      []string // every active address assigned to the interface
+	IP       string   // the one the facts must carry, "" when there is none
 	LAG      string
 	VLAN     int
 	MTU      int
@@ -361,16 +370,52 @@ func refFacts(in Inputs, devID int) []refIface {
 		if ni.MTU != nil {
 			r.MTU = *ni.MTU
 		}
+		var active []netbox.IPAddress
 		for _, ip := range in.IPs {
 			if ip.AssignedObjectID != nil && *ip.AssignedObjectID == ni.ID && ip.AssignedObjectType == "dcim.interface" && refActive(ip) {
 				r.IPs = append(r.IPs, ip.Address)
 				r.Gateway[ip.Address] = refGateway(allPrefixes, ip.Address)
+				active = append(active, ip)
 			}
 		}
 		sort.Strings(r.IPs)
+		primary := 0
+		if dev != nil && dev.PrimaryIP4 != nil {
+			primary = dev.PrimaryIP4.ID
+		}
+		r.IP = refChoose(active, primary)
 		out = append(out, r)
 	}
 	return out
+}
+
+// refChoose is the model's one-address rule: the device's primary_ip4 when
+// it is one of the interface's active addresses; otherwise the first of
+// them ordered IPv4 before IPv6, then by address value, then by prefix
+// length, then by NetBox ID.
+func refChoose(active []netbox.IPAddress, primary int) string {
+	if len(active) == 0 {
+		return ""
+	}
+	for _, ip := range active {
+		if primary != 0 && ip.ID == primary {
+			return ip.Address
+		}
+	}
+	sorted := append([]netbox.IPAddress(nil), active...)
+	sort.Slice(sorted, func(i, j int) bool {
+		a, b := netip.MustParsePrefix(sorted[i].Address), netip.MustParsePrefix(sorted[j].Address)
+		switch {
+		case a.Addr().Is4() != b.Addr().Is4():
+			return a.Addr().Is4()
+		case a.Addr() != b.Addr():
+			return a.Addr().Less(b.Addr())
+		case a.Bits() != b.Bits():
+			return a.Bits() < b.Bits()
+		}
+		return sorted[i].ID < sorted[j].ID
+	})
+	return sorted[0].Address
 }
 
 // refPools: one pool per /31 link seen on an active physical-class
@@ -508,30 +553,16 @@ func checkFacts(t *rapid.T, gs genSite) {
 		cvOOBReject.Add(1)
 		t.Skip("conflicting OOB reservation set (rejected by design)")
 	}
-	// A machine's facts carry one address per interface, so a site with
-	// two active addresses on a bound machine's interface is refused, the
-	// error naming each such interface, whatever order NetBox listed
-	// things in.
-	if multi := refMultiIP(in); len(multi) > 0 {
-		cvMultiIP.Add(1)
-		for _, c := range []struct {
-			label string
-			in    Inputs
-		}{{"original", in}, {"permuted", permutedInputs(t, in)}} {
-			_, err := Build(c.in)
-			if err == nil {
-				t.Fatalf("Build(%s) accepted interfaces %v with more than one active address", c.label, multi)
-			}
-			for _, id := range multi {
-				if !strings.Contains(err.Error(), fmt.Sprintf("(NetBox interface %d)", id)) {
-					t.Fatalf("Build(%s) error does not name interface %d: %v", c.label, id, err)
-				}
-			}
-		}
-		return
-	}
+	// A machine's facts carry one address per interface. A site with
+	// several active addresses on a bound machine's interface still
+	// builds; the per-interface check below holds the facts to the one
+	// address the rule picks, and the permutation at the end holds that
+	// choice independent of NetBox list order.
 	if err != nil {
 		t.Fatalf("Build: %v", err)
+	}
+	if len(refMultiIP(in)) > 0 {
+		cvMultiIP.Add(1)
 	}
 	cvCases.Add(1)
 	got := factsByKey(snap)
@@ -578,27 +609,23 @@ func checkFacts(t *rapid.T, gs genSite) {
 			if r.Type == "lag" && ifaceMgmtOnly(in, r.NetBoxID) {
 				cvMgmtLag.Add(1)
 			}
-			switch len(r.IPs) {
-			case 0:
+			if len(r.IPs) == 0 {
 				if f.IP != "" || f.Gateway != "" {
 					t.Fatalf("iface %d: unexpected ip %q gw %q (no active IP modeled)", r.NetBoxID, f.IP, f.Gateway)
 				}
-			case 1:
-				if f.IP != r.IPs[0] {
-					t.Fatalf("iface %d: ip %q, want %q", r.NetBoxID, f.IP, r.IPs[0])
-				}
-				if strings.Contains(r.IPs[0], ":") {
-					cvIPv6.Add(1)
-				}
-				if want := r.Gateway[r.IPs[0]]; want != "?" && f.Gateway != want {
-					t.Fatalf("iface %d ip %s: gateway %q, want %q", r.NetBoxID, f.IP, f.Gateway, want)
-				}
-				if f.Gateway != "" {
-					cvGateway.Add(1)
-				}
-			default:
-				t.Fatalf("iface %d (%s) has %d active addresses %v but Build did not refuse the site",
-					r.NetBoxID, r.Name, len(r.IPs), r.IPs)
+				continue
+			}
+			if f.IP != r.IP {
+				t.Fatalf("iface %d: ip %q, want %q of active addresses %v (device primary_ip4 %+v)", r.NetBoxID, f.IP, r.IP, r.IPs, d.PrimaryIP4)
+			}
+			if strings.Contains(r.IP, ":") {
+				cvIPv6.Add(1)
+			}
+			if want := r.Gateway[r.IP]; want != "?" && f.Gateway != want {
+				t.Fatalf("iface %d ip %s: gateway %q, want %q", r.NetBoxID, f.IP, f.Gateway, want)
+			}
+			if f.Gateway != "" {
+				cvGateway.Add(1)
 			}
 		}
 	}
@@ -648,12 +675,12 @@ func ifaceMgmtOnly(in Inputs, id int) bool {
 }
 
 func reportCoverage(t *testing.T) {
-	t.Logf("coverage: cases=%d facts=%d lagMembers=%d mgmtOnlyLags=%d gateways=%d ipv6=%d multiIPRefused=%d pools=%d leafInScope=%d fqdnEmpty=%d oobRejected=%d",
+	t.Logf("coverage: cases=%d facts=%d lagMembers=%d mgmtOnlyLags=%d gateways=%d ipv6=%d multiIPSites=%d pools=%d leafInScope=%d fqdnEmpty=%d oobRejected=%d",
 		cvCases.Load(), cvFacts.Load(), cvLAG.Load(), cvMgmtLag.Load(), cvGateway.Load(), cvIPv6.Load(), cvMultiIP.Load(), cvPools.Load(), cvBothEnds.Load(), cvFQDNEmpty.Load(), cvOOBReject.Load())
 }
 
-// TestProp_NetFacts checks the facts contract on sites Build accepts: at
-// most one active address per interface.
+// TestProp_NetFacts checks the facts contract on sites with at most one
+// active address per interface.
 func TestProp_NetFacts(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		checkFacts(t, drawSite(t, genOpts{}))
@@ -662,8 +689,9 @@ func TestProp_NetFacts(t *testing.T) {
 }
 
 // TestProp_NetFacts_MultipleActiveIPs widens the generator to several
-// active addresses on one interface, which Build must refuse when the
-// interface belongs to a bound machine and must ignore otherwise.
+// active addresses on one interface: Build must still build the site and
+// give each bound machine's interface the one address the rule picks,
+// whatever order NetBox lists them in.
 func TestProp_NetFacts_MultipleActiveIPs(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		checkFacts(t, drawSite(t, genOpts{multiIP: true}))
