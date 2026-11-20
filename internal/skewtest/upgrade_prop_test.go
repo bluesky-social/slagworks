@@ -187,6 +187,7 @@ type stats struct {
 	fromLatchLost                                   int
 	lateClaimActuations                             int
 	gDowns, wDowns                                  int
+	lateClaimSetups                                 int
 }
 
 // ---------------------------------------------------------------- world
@@ -896,11 +897,12 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 		kDrive
 		kGlobalToggle
 		kWorkerToggle
+		kLateClaim
 	)
 	weights := []int{kAdvance, kAdvance, kAdvance, kAdvance, kAdvance, kAdvance,
 		kDrive, kDrive, kDrive, kDrive,
 		kBoot, kBoot, kStale, kStale, kFail, kAbort, kWSDrop, kWSDrop, kWorkerRestart, kWorkerRestart, kGlobalRestart, kLease, kLease, kPower,
-		kGlobalToggle, kGlobalToggle, kWorkerToggle,
+		kGlobalToggle, kGlobalToggle, kWorkerToggle, kLateClaim, kLateClaim, kLateClaim,
 		kUpgradeGlobal, kUpgradeWorker}
 	steps := rapid.IntRange(6, 30).Draw(rt, "steps")
 	firstUpgrade := ""
@@ -988,6 +990,58 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 				st.gRestarts++
 			}
 			w.note("global restart (kill=%v, %s)", kill, w.tag(ver))
+		case kLateClaim:
+			// A deploy the worker holds but cannot claim (global's claim
+			// path is failing, as it does while its database is
+			// unreachable), on a machine that reaches the installer anyway
+			// because someone rebooted it. The install runs to some point;
+			// then claims work again, and the executor claims the op and
+			// power-cycles a host that may already be installed.
+			if w.g == nil || w.w == nil || !w.linked() {
+				continue
+			}
+			// Any machine with no deploy in flight will do.
+			var target *mach
+			for _, cand := range append([]*mach{m}, w.machines...) {
+				if o := cand.cur(); o == nil || o.settled() {
+					target = cand
+					break
+				}
+			}
+			if target == nil {
+				continue
+			}
+			w.must("g.fail_claims", w.g.call("g.fail_claims", map[string]any{"on": true}, nil))
+			before := len(target.ops)
+			w.noWait = true
+			w.createOp(target, "deploy")
+			w.noWait = false
+			if len(target.ops) > before {
+				o := target.cur()
+				// Wait until the worker holds the op.
+				eventually(2*time.Second, func() bool {
+					_, ok := w.status().Ops[o.id]
+					return ok
+				})
+				st.lateClaimSetups++
+				w.boot(target)
+				w.report(target, o, rapid.SampledFrom(agentPhases).Draw(rt, "phase"), "", false)
+				if rapid.IntRange(0, 3).Draw(rt, "installed") > 0 {
+					w.report(target, o, "", "deploy_complete", false)
+					if rapid.Bool().Draw(rt, "phoned") {
+						w.boot(target)
+						w.report(target, o, "", "phone_home", false)
+					}
+				}
+			}
+			if w.g != nil {
+				w.must("g.fail_claims", w.g.call("g.fail_claims", map[string]any{"on": false}, nil))
+				// The executor retries the claim on its next tick; if it
+				// wins, it power-cycles the host, and checkActuations
+				// looks at what the host is then served.
+				time.Sleep(200 * time.Millisecond)
+				w.checkActuations()
+			}
 		case kGlobalToggle:
 			// Global goes away and stays away (or comes back). Half the
 			// time an op is created just before, so the worker is left
@@ -1214,7 +1268,7 @@ func logStats(t *testing.T, st *stats) {
 	t.Logf("coverage: ws drops=%d worker restarts=%d kills=%d outages=%d global restarts=%d kills=%d outages=%d", st.wsDrops, st.wRestarts, st.wKills, st.wDowns, st.gRestarts, st.gKills, st.gDowns)
 	t.Logf("coverage: global upgraded first=%d worker first=%d; lifecycle ops in flight at a global upgrade=%d (awaiting phone-home: %d); steps with a refused peer=%d; outbox rows carried across worker upgrades=%d",
 		st.upgradeGFirst, st.upgradeWFirst, st.midDeployUpgrades, st.awaitingAtUpgrade, st.refusedWindows, st.outboxAtWorkerUpgrade)
-	t.Logf("coverage: deploys completed=%d failed=%d (of the failed, %d had a phone-home accepted by the from-build worker); installer boots after a from-build deploy_complete=%d; power cycles of an installed host by a late claim=%d", st.finalCompleted, st.finalFailed, st.fromPhoneHomeLost, st.fromLatchLost, st.lateClaimActuations)
+	t.Logf("coverage: deploys completed=%d failed=%d (of the failed, %d had a phone-home accepted by the from-build worker); installer boots after a from-build deploy_complete=%d; late-claim setups=%d, power cycles of an installed host by a late claim=%d", st.finalCompleted, st.finalFailed, st.fromPhoneHomeLost, st.fromLatchLost, st.lateClaimSetups, st.lateClaimActuations)
 }
 
 // shards runs prop as SKEW_SHARDS parallel rapid checks (default 1), each

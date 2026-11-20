@@ -26,6 +26,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -125,6 +126,15 @@ func (t *tool) dispatch(req request) (any, error) {
 		return t.g.sweep(a)
 	case "g.rebuild":
 		return nil, t.g.rebuildAndPush()
+	case "g.fail_claims":
+		var a struct {
+			On bool `json:"on"`
+		}
+		if err := json.Unmarshal(req.Args, &a); err != nil {
+			return nil, err
+		}
+		t.g.failClaims.Store(a.On)
+		return nil, nil
 	case "g.seed_extra":
 		return nil, t.g.seedExtra()
 	case "g.dump":
@@ -191,15 +201,32 @@ type globalStartArgs struct {
 type global struct {
 	slug string
 	st   *store.Store
-	pool interface{ Close() error }
-	hub  *ws.Hub
-	srv  *http.Server
-	log  *slog.Logger
+	// failClaims makes every claim_op fail the way it does while global
+	// cannot reach its database: the op was created and published, and the
+	// worker holds it pending and keeps retrying the claim.
+	failClaims atomic.Bool
+	pool       interface{ Close() error }
+	hub        *ws.Hub
+	srv        *http.Server
+	log        *slog.Logger
 
 	mu   sync.Mutex
 	macs map[string]string
 
 	rebuildMu sync.Mutex
+}
+
+// flakyClaimer is the store with a switch on ClaimOperation.
+type flakyClaimer struct {
+	*store.Store
+	fail *atomic.Bool
+}
+
+func (f flakyClaimer) ClaimOperation(opID uuid.UUID, workerID string) (*model.Operation, error) {
+	if f.fail.Load() {
+		return nil, errors.New("skewtool: injected claim failure (database unavailable)")
+	}
+	return f.Store.ClaimOperation(opID, workerID)
 }
 
 type invalidatorFunc func(string)
@@ -258,7 +285,7 @@ func startGlobal(a globalStartArgs) (*global, int64, error) {
 		Rebuilder:       g,
 		ObsHandler:      comm,
 		OpUpdateHandler: opUpd,
-		OpClaimer:       st,
+		OpClaimer:       flakyClaimer{Store: st, fail: &g.failClaims},
 		Invalidator:     inv,
 		ActiveOps:       st,
 		Logger:          log,
