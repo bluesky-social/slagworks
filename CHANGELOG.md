@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.1](https://github.com/bluesky-social/slagworks/compare/v0.6.0...v0.6.1) (2026-11-20)
+
+
+### Bug Fixes
+
+* **image-build:** download from a build mirror separate from the baked one ([#176](https://github.com/bluesky-social/slagworks/issues/176)) ([34a53d7](https://github.com/bluesky-social/slagworks/commit/34a53d7ee1a8a2d35189ff62a9b632dab11ec58b))
+* **worker:** acknowledge a phone-home retry only for a deploy whose phone-home is settled ([#163](https://github.com/bluesky-social/slagworks/issues/163)) ([adca284](https://github.com/bluesky-social/slagworks/commit/adca2846989bac0a83e71cbaa75e3f103362fcf3))
+* **worker:** don't claim an op whose machine left the view mid-pass ([#170](https://github.com/bluesky-social/slagworks/issues/170)) ([9a05dc1](https://github.com/bluesky-social/slagworks/commit/9a05dc1e69f5a5cc3b442f5d5271ed8222145845))
+* **worker:** report an outbox table read failure instead of an empty outbox ([#173](https://github.com/bluesky-social/slagworks/issues/173)) ([00ebb5d](https://github.com/bluesky-social/slagworks/commit/00ebb5d64761f5ffda9bb725a3f90797cc7cb8ec))
+
 ## [0.6.0](https://github.com/bluesky-social/slagworks/compare/v0.5.0...v0.6.0) (2026-11-20)
 
 
