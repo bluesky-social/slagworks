@@ -311,6 +311,9 @@ func deploy(ctx *agent.Context, h *fakeHost, hc hostCase) (string, error) {
 		if err := CheckDisksClean(ctx, hc.Layout); err != nil {
 			return "safety", err
 		}
+		if err := CheckMDNamesFree(ctx, hc.Layout); err != nil {
+			return "md names", err
+		}
 	}
 	if err := CheckStaleArrayMembers(ctx, hc.Layout, hc.WipeAll); err != nil {
 		return "stale-members", err
@@ -507,7 +510,8 @@ func checkHost(hc hostCase, h *fakeHost, stage string) []hostViolation {
 // planMDNameTaken reports whether a deploy without --destructive would find
 // one of the /dev/mdN nodes its plan uses (md0 upward, one per raid or
 // preserve device) held by an auto-assembled array that nothing stops first:
-// only a layout with a preserve array stops auto-assembly on that path.
+// only a layout with a preserve array stops auto-assembly on that path. Such
+// a deploy is refused by CheckMDNamesFree before it writes anything.
 func planMDNameTaken(hc hostCase, h *fakeHost) bool {
 	if hc.Destructive {
 		return false
@@ -573,8 +577,11 @@ func quietCtx(h *fakeHost) *agent.Context {
 //     bystanders under --destructive --wipe-all-disks;
 //   - retained disks and disks holding preserve members are never written,
 //     and a preserved array's member superblocks always survive;
-//   - a host whose targets are clean (or --destructive) and whose preserved
-//     array is present deploys to completion.
+//   - without --destructive, a deploy whose plan creates an array at a
+//     /dev/mdN an auto-assembled array holds is refused before it writes
+//     anything, and stops no array;
+//   - every other host whose targets are clean (or --destructive) and whose
+//     preserved array is present deploys to completion.
 func TestDeploy_Property_StorageSafety(t *testing.T) {
 	k := allHostKnobs
 	st := &hostStats{stages: map[string]int{}, priors: map[string]int{}}
@@ -613,11 +620,24 @@ func TestDeploy_Property_StorageSafety(t *testing.T) {
 			collides = collides || ds.Prior == "preserve-p3"
 		}
 		flagsValid := hc.Destructive || !hc.WipeAll
-		// Not expected to complete: a deploy without --destructive whose
-		// layout has no preserve array never stops the arrays the initrd
-		// auto-assembled, so when one of them sits on a /dev/mdN the plan
-		// creates an array at, mdadm --create fails after the target disks
-		// were partitioned. The safety checks above still cover that case.
+		// A deploy without --destructive whose layout has no preserve array
+		// never stops the arrays the initrd auto-assembled, so when one of
+		// them sits on a /dev/mdN the plan creates an array at, the deploy
+		// cannot complete. It must say so before it writes anything.
+		if mdNameTaken && len(h.writes) > 0 {
+			fail("non-destructive deploy wrote %v although an auto-assembled array holds an md node its plan creates", keys(h.writes))
+		}
+		if mdNameTaken && len(dirty) == 0 && !hc.NoWipefs && flagsValid && stage != "md names" {
+			fail("deploy stopped at %q, want the md name check to refuse it", stage)
+		}
+		// On that path no array is ever stopped.
+		if !hc.Destructive && !HasPreserveDevices(hc.Layout) {
+			for _, c := range h.calls {
+				if strings.HasPrefix(c, "mdadm --stop") {
+					fail("non-destructive deploy with no preserve array ran %q", c)
+				}
+			}
+		}
 		expectDone := (hc.Destructive || len(dirty) == 0) && flagsValid && !hc.NoWipefs && !collides && !mdNameTaken
 		if expectDone && stage != "done" {
 			fail("deploy should have completed but stopped at %q: %v", stage, err)

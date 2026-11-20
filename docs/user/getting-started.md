@@ -203,7 +203,11 @@ The critical flags:
 
 - `--destructive` — skip the disk safety check. Required whenever the
   target has existing data or partitions. Slagworks refuses to
-  overwrite disks with content unless this is set.
+  overwrite disks with content unless this is set. It is also required
+  when the layout builds a RAID array and an old array on a disk
+  outside the layout is assembled at the same `/dev/mdN`: the deploy
+  stops assembled arrays only with this flag, and otherwise refuses
+  before changing anything. The old array's disks are not written.
 - `--wipe-all-disks` — additionally signature-wipe every disk NOT in
   the storage layout (clears stale mdadm/DDF containers and old
   filesystem signatures that would otherwise confuse later reboots).
