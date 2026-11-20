@@ -32,6 +32,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -371,15 +372,69 @@ func dropDatabase(name string) {
 
 // ---------------------------------------------------------------- small helpers
 
-func freePort(f fataler) string {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		f.Fatalf("harness: free port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
+// ports hands out loopback addresses from a range below the kernel's
+// ephemeral ports, so an address a case holds across a global restart
+// cannot be taken in between by another process's connect or listen(:0).
+// SKEW_PORT_BASE moves the range, for several test processes on one host
+// (each takes 1000 ports from its base).
+var ports = newPortAlloc()
+
+type portAlloc struct {
+	mu         sync.Mutex
+	base, next int
+	held       map[int]bool
 }
+
+const portRange = 1000
+
+func newPortAlloc() *portAlloc {
+	base := 20000 + (os.Getpid()%10)*portRange
+	if v := os.Getenv("SKEW_PORT_BASE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 1024 && n < 65000 {
+			base = n
+		}
+	}
+	return &portAlloc{base: base, held: map[int]bool{}}
+}
+
+// get returns a free address. With hold, no later get returns the same
+// port until release.
+func (a *portAlloc) get(f fataler, hold bool) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for tries := 0; tries < portRange; tries++ {
+		port := a.base + a.next
+		a.next = (a.next + 1) % portRange
+		if a.held[port] {
+			continue
+		}
+		addr := "127.0.0.1:" + strconv.Itoa(port)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			continue
+		}
+		_ = ln.Close()
+		if hold {
+			a.held[port] = true
+		}
+		return addr
+	}
+	f.Fatalf("harness: no free port in %d-%d", a.base, a.base+portRange-1)
+	return ""
+}
+
+func (a *portAlloc) release(addr string) {
+	_, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	n, _ := strconv.Atoi(p)
+	a.mu.Lock()
+	delete(a.held, n)
+	a.mu.Unlock()
+}
+
+func freePort(f fataler) string { return ports.get(f, false) }
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 

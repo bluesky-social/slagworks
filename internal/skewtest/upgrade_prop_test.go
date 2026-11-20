@@ -244,7 +244,7 @@ func (w *world) stderrTail(p *proc) string {
 	if p == nil {
 		return "(not running)"
 	}
-	return p.stderr.tail(5000)
+	return p.stderr.tail(9000)
 }
 
 func (w *world) bin(ver string) string {
@@ -542,7 +542,7 @@ func (w *world) boot(m *mach) string {
 		w.fail("boot: %s was served the %s installer but its current op %s is a %s", m.serial, class, o.id, o.typ)
 	case w.healthOnly:
 		// The boot decision is the "to" build's business.
-	case (o.completeAck || o.phoneAck) && w.tolerateFromLatch && o.completeBy == "from":
+	case (o.completeAck || o.phoneAck) && w.tolerateFromLatch && (o.completeBy == "from" || o.phoneAckBy == "from"):
 		// See scenarioConfig.tolerateFromLatch.
 		w.st.fromLatchLost++
 	case o.completeAck || o.phoneAck:
@@ -843,7 +843,8 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 			_ = s.Close()
 		}
 	}()
-	w.gAddr = freePort(rt)
+	w.gAddr = ports.get(rt, true)
+	defer ports.release(w.gAddr)
 	caseDir := filepath.Join(dir, fmt.Sprintf("case-%d", st.cases))
 	if err := os.MkdirAll(caseDir, 0o755); err != nil {
 		rt.Fatalf("harness: %v", err)
