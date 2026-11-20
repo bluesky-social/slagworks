@@ -137,6 +137,12 @@ type VMConfig struct {
 	// test can construct a FakeBMC that dials it.
 	BMCQMPPath string
 
+	// ExtraArgs are raw QEMU arguments appended after the harness-built
+	// device list. The storage property suite uses them with NoPrimaryDisk
+	// to attach disks with a bus, block size, bootindex and discard mode
+	// ExtraDisk cannot express.
+	ExtraArgs []string
+
 	// BMC, when non-nil, attaches a simulated BMC to the VM via
 	// QEMU's ipmi-bmc-extern + isa-ipmi-kcs devices. Inside the guest
 	// this surfaces as /dev/ipmi0 once the kernel's ipmi_si +
@@ -444,6 +450,7 @@ func (vm *VM) buildArgs() []string {
 	if !vm.Config.NetworkBootFirst {
 		args = append(args, "-boot", strings.Join(bootOpts, ","))
 	}
+	args = append(args, vm.Config.ExtraArgs...)
 	if vm.Config.StartPaused {
 		args = append(args, "-S")
 	}

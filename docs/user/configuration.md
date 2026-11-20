@@ -356,9 +356,11 @@ Fields:
   pool. Required, IPv4, start no greater than end.
 - **`relay_pools`** — pools for subnets reached through a DHCP relay,
   selected by the relay's `giaddr`. Each is
-  `{"subnet","range_start","range_end","gateway"}`; the range and gateway
-  must be IPv4 inside the subnet, and the gateway must lie outside the
-  range. On a subnet of /30 or wider the range must also exclude the
+  `{"subnet","range_start","range_end","gateway"}`. The subnet must be an
+  IPv4 CIDR in dotted-quad form (`10.254.27.0/24`, not IPv6 or
+  IPv4-mapped notation such as `::ffff:10.254.27.0/120`); the range and
+  gateway must be IPv4 inside the subnet, and the gateway must lie outside
+  the range. On a subnet of /30 or wider the range must also exclude the
   network and broadcast addresses. The worker leases every address in
   the range and cannot ARP-probe a relayed subnet, so an address left in
   the range by mistake is handed to a client.
