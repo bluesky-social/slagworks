@@ -241,7 +241,8 @@ distinct concepts share the word "reconcile":
   (`reconcile.go:39`) that walks every `site_config`, lists its NetBox
   devices, and calls `mirror.OnDevice*` for each. This is the safety
   net for missed webhooks. It also maintains a per-slug stale-since
-  map (`markStale`/`clearStale`) that feeds `/readyz`.
+  map (`markStale`/`clearStale`) that feeds `/readyz`; each tick drops
+  the entries of configs that no longer exist (`forgetDeletedStale`).
 
 ### Webhook fast path
 
@@ -365,7 +366,7 @@ Notable helpers inside `Build`:
 
 ### Dispatcher
 
-`internal/snapshot/dispatcher.go:59` is where "make a fresh snapshot
+`internal/snapshot/dispatcher.go:60` is where "make a fresh snapshot
 and push it" lives. Interfaces at the top (`dispatcher.go:19`):
 
 - `NetBoxReader` — every read the builder needs; the real
@@ -389,7 +390,22 @@ anything lower. The per-scope filtering lives in
 `internal/snapshot/scope.go`: a device is included in a site's
 snapshot only if `Scope.ClaimsDevice(d)` returns true (whole-site
 configs claim everything under the NetBox site; location-scoped
-configs claim only the location subtree — `scope.go:126`).
+configs claim only the location subtree — `scope.go:147`).
+
+Configs on one NetBox site must claim disjoint devices.
+`CheckOverlap` enforces that when a config is created or updated, but a
+later NetBox edit can nest two claimed locations (moving one under the
+other) without touching `site_configs`. So the builder and the
+reconciler resolve scope through `resolveClaimScope`, which also refuses
+a config whose scope now overlaps another config's: both configs fail
+their rebuilds and are flagged stale, like a config whose location is
+gone, and their workers keep the last snapshot built while the configs
+were disjoint. Both are refused, not only the outer one, because only
+the operator knows which config should own the devices.
+`ResolveOwningConfigSlug` returns `ErrAmbiguousOwningConfig` for a
+device several configs claim instead of the first one the store lists.
+`ClaimResolver.ClaimingConfigs` still returns every claimer, so webhook
+and commission invalidation reach both configs.
 
 The read-only variant `BuildSnapshot` (`dispatcher.go:157`) is what
 the API's preflight and match endpoints call — it takes the same

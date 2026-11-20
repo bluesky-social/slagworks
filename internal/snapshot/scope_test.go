@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -24,6 +25,16 @@ func testLocations() []netbox.Location {
 		{ID: 12, Slug: "rack-a1a", Site: &netbox.NestedRef{Slug: "pop2"}, Parent: &netbox.NestedRef{ID: 11}},
 		{ID: 20, Slug: "cage-b", Site: &netbox.NestedRef{Slug: "pop2"}},
 	}
+}
+
+// reparentedLocations is testLocations after a NetBox operator moves cage-a
+// under cage-b within the same site. Every location stays in the site, so a
+// config on either cage still resolves, but cage-b's subtree now holds all
+// of cage-a's.
+func reparentedLocations() []netbox.Location {
+	locs := testLocations()
+	locs[0].Parent = &netbox.NestedRef{ID: 20} // cage-a
+	return locs
 }
 
 func dev(id int, locID int) netbox.Device {
@@ -313,6 +324,43 @@ func TestResolveOwningConfigSlug(t *testing.T) {
 	})
 }
 
+// TestResolveOwningConfigSlugAmbiguousAfterLocationReparent: CheckOverlap
+// admits configs on two sibling cages, then a NetBox operator moves cage-a
+// under cage-b within the site. Nothing re-runs CheckOverlap and both
+// locations still resolve, so both configs now claim cage-a's devices.
+// Routing must refuse to pick one instead of returning whichever config the
+// store lists first: Postgres returns the rows in no fixed order, and the
+// order changes as rows are updated. A device only one config claims still
+// routes.
+func TestResolveOwningConfigSlugAmbiguousAfterLocationReparent(t *testing.T) {
+	oldCage := model.SiteConfig{Slug: "pop2-old-cage", NetBoxSite: "pop2", NetBoxLocation: "cage-a"}
+	newCage := model.SiteConfig{Slug: "pop2-new-cage", NetBoxSite: "pop2", NetBoxLocation: "cage-b"}
+	if err := CheckOverlap(newCage, []model.SiteConfig{oldCage}, testLocations()); err != nil {
+		t.Fatalf("setup: configs on sibling cages must be admitted: %v", err)
+	}
+	nb := &fakeLocNetBox{locations: reparentedLocations()}
+
+	for _, order := range [][]model.SiteConfig{{oldCage, newCage}, {newCage, oldCage}} {
+		st := fakeConfigStore{configs: order}
+		listed := order[0].Slug + ", " + order[1].Slug
+
+		slug, err := ResolveOwningConfigSlug(context.Background(), nb, st, dev(1, 10))
+		if !errors.Is(err, ErrAmbiguousOwningConfig) {
+			t.Fatalf("store lists [%s]: the cage-a device is claimed by both configs, want ErrAmbiguousOwningConfig, got (%q, %v)",
+				listed, slug, err)
+		}
+		if !strings.Contains(err.Error(), "pop2-new-cage, pop2-old-cage") {
+			t.Fatalf("store lists [%s]: the error must name both claiming configs: %v", listed, err)
+		}
+
+		slug, err = ResolveOwningConfigSlug(context.Background(), nb, st, dev(3, 20))
+		if err != nil || slug != "pop2-new-cage" {
+			t.Fatalf("store lists [%s]: the cage-b device is claimed by pop2-new-cage alone, want (pop2-new-cage, nil), got (%q, %v)",
+				listed, slug, err)
+		}
+	}
+}
+
 // TestInvariantDispatcherScopesAndResolvesSiteIdentity covers invariant 3:
 // a location-scoped config's snapshot sees only its subtree's devices,
 // but SiteInfo resolves from the NetBox site (pop2), not the config slug.
@@ -481,4 +529,80 @@ func TestInvariantDispatcherDriftErrors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "stale site_config") {
 		t.Fatalf("expected stale-config drift error, got %v", err)
 	}
+}
+
+// TestDispatcherRefusesConfigsThatOverlapAfterLocationReparent: CheckOverlap
+// admitted configs on two sibling cages, then NetBox moved cage-a under
+// cage-b within the site. Neither config is stale, but both now claim
+// cage-a's device, and building both snapshots would hand that machine to
+// two workers. Each rebuild must fail and push nothing, so both workers keep
+// their last snapshot until the operator repairs the tree or narrows a
+// config. A sibling that is merely stale claims nothing, so it must not stop
+// a healthy config from building.
+func TestDispatcherRefusesConfigsThatOverlapAfterLocationReparent(t *testing.T) {
+	oldCage := model.SiteConfig{
+		Slug: "pop2-old-cage", NetBoxSite: "pop2", NetBoxLocation: "cage-a",
+		EphemeralPoolStart: "10.0.0.100", EphemeralPoolEnd: "10.0.0.200",
+	}
+	newCage := model.SiteConfig{
+		Slug: "pop2-new-cage", NetBoxSite: "pop2", NetBoxLocation: "cage-b",
+		EphemeralPoolStart: "10.0.1.100", EphemeralPoolEnd: "10.0.1.200",
+	}
+	setup := func(locations []netbox.Location) (*Dispatcher, *countingSink) {
+		fs := newFakeStore(t, oldCage, newCage)
+		id := 1
+		fs.machines = []model.Machine{
+			{ID: uuid.New(), NetBoxDeviceID: &id, NetBoxSerial: "SN-A", State: model.MachineStateNew},
+		}
+		nb := &fakeNetBox{
+			sites:     map[string]netbox.Site{"pop2": {Slug: "pop2", Name: "pop2"}},
+			locations: locations,
+			devices: []netbox.Device{
+				{ID: 1, Name: "in-cage-a", Serial: "SN-A", Site: &netbox.NestedRef{Slug: "pop2"}, Location: &netbox.NestedRef{ID: 10}},
+			},
+			locationPrefixes: map[int][]netbox.Prefix{
+				10: {{Prefix: "10.0.0.0/24", ScopeType: "dcim.location", ScopeID: 10, CustomFields: gatewayJSON("10.0.0.1")}},
+				20: {{Prefix: "10.0.1.0/24", ScopeType: "dcim.location", ScopeID: 20, CustomFields: gatewayJSON("10.0.1.1")}},
+			},
+		}
+		sink := &countingSink{}
+		return NewDispatcher(nb, fs, sink), sink
+	}
+
+	t.Run("sibling cages build", func(t *testing.T) {
+		d, _ := setup(testLocations())
+		for _, slug := range []string{oldCage.Slug, newCage.Slug} {
+			if _, err := d.rebuild(context.Background(), slug, 1); err != nil {
+				t.Fatalf("setup: %s must build while the cages are siblings: %v", slug, err)
+			}
+		}
+	})
+
+	t.Run("nested cages are refused", func(t *testing.T) {
+		d, sink := setup(reparentedLocations())
+		for _, slug := range []string{oldCage.Slug, newCage.Slug} {
+			snap, err := d.rebuild(context.Background(), slug, 1)
+			if err == nil {
+				t.Fatalf("%s built a snapshot with %d machine(s) although cage-a now sits inside cage-b and both configs claim its device",
+					slug, len(snap.Machines))
+			}
+			if !strings.Contains(err.Error(), "pop2-old-cage") || !strings.Contains(err.Error(), "pop2-new-cage") ||
+				!strings.Contains(err.Error(), "overlap") {
+				t.Fatalf("%s: the error must name both configs and the overlap: %v", slug, err)
+			}
+		}
+		if got := sink.Count(); got != 0 {
+			t.Fatalf("refused rebuilds pushed %d snapshot(s), want 0", got)
+		}
+	})
+
+	t.Run("stale sibling does not block", func(t *testing.T) {
+		d, _ := setup([]netbox.Location{{ID: 20, Slug: "cage-b"}}) // cage-a deleted
+		if _, err := d.rebuild(context.Background(), newCage.Slug, 1); err != nil {
+			t.Fatalf("%s must build while its only sibling is stale: %v", newCage.Slug, err)
+		}
+		if _, err := d.rebuild(context.Background(), oldCage.Slug, 1); err == nil || !strings.Contains(err.Error(), "stale site_config") {
+			t.Fatalf("%s: want the stale-config error, got %v", oldCage.Slug, err)
+		}
+	})
 }

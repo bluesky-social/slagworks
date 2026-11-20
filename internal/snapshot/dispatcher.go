@@ -33,6 +33,7 @@ type NetBoxReader interface {
 // StoreReader is the subset of the Store the dispatcher reads.
 type StoreReader interface {
 	GetSiteConfig(slug string) (*model.SiteConfig, error)
+	ListSiteConfigsByNetBoxSite(netboxSite string) ([]model.SiteConfig, error)
 	ListMachinesByDeviceIDs(deviceIDs []int) ([]model.Machine, error)
 	ListImages() ([]model.Image, error)
 	ListStorageScripts() ([]model.StorageScript, error)
@@ -202,14 +203,22 @@ func (d *Dispatcher) gatherAndBuild(ctx context.Context, slug string, outcome *s
 	}
 
 	// Resolve the config's scope (whole-site, or a location subtree).
-	// resolveScope enforces the belongs-to invariant: a location-scoped
-	// config whose location is absent from the site (gone, or re-parented
-	// to another site) fails loudly here rather than scoping to nothing.
+	// resolveClaimScope enforces the belongs-to invariant: a
+	// location-scoped config whose location is absent from the site (gone,
+	// or re-parented to another site) fails loudly here rather than scoping
+	// to nothing. It also fails a config whose scope now overlaps another
+	// config's on the same site (a location moved under another), so no
+	// device lands in two workers' snapshots.
 	locations, err := d.nb.ListLocationsForSite(ctx, nbSite)
 	if err != nil {
 		return model.SiteConfig{}, model.SiteSnapshot{}, err
 	}
-	scope, err := resolveScope(*cfg, nbSite, locations)
+	siblings, err := d.st.ListSiteConfigsByNetBoxSite(nbSite)
+	if err != nil {
+		setOutcome("error_postgres")
+		return model.SiteConfig{}, model.SiteSnapshot{}, fmt.Errorf("list site_configs for netbox_site %s: %w", nbSite, err)
+	}
+	scope, err := resolveClaimScope(*cfg, siblings, locations)
 	if err != nil {
 		return model.SiteConfig{}, model.SiteSnapshot{}, err
 	}

@@ -241,11 +241,16 @@ func (l *LocalDB) AppendOutbox(obs model.Observation) (uint64, error) {
 // AckOutboxRow after the global acks the observation via
 // rpc_response{ok:true}. Corrupt rows are dropped with a warning
 // (and deleted from SQLite so they don't re-appear on every restart).
-func (l *LocalDB) ListPendingOutbox() []PendingOutbox {
+//
+// An error means the table could not be read, which says nothing about
+// what it holds: the caller must not take it for an empty outbox.
+func (l *LocalDB) ListPendingOutbox() ([]PendingOutbox, error) {
 	var rows []outboxRow
-	l.db.Order("id asc").Find(&rows)
+	if err := l.db.Order("id asc").Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("read outbox table of %s: %w", l.path, err)
+	}
 	if len(rows) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	var out []PendingOutbox
@@ -260,9 +265,11 @@ func (l *LocalDB) ListPendingOutbox() []PendingOutbox {
 		out = append(out, PendingOutbox{RowID: uint64(r.ID), Obs: o})
 	}
 	if len(corrupt) > 0 {
-		l.db.Delete(&outboxRow{}, corrupt)
+		if err := l.db.Delete(&outboxRow{}, corrupt).Error; err != nil {
+			l.log.Warn("deleting corrupt outbox entries", "ids", corrupt, "err", err)
+		}
 	}
-	return out
+	return out, nil
 }
 
 // AckOutboxRow deletes a single outbox row. Called after the global

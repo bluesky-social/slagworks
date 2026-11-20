@@ -83,7 +83,16 @@ func newOutbox(localDB *LocalDB) *outbox {
 		localDB: localDB,
 	}
 	if localDB != nil {
-		if pending := localDB.ListPendingOutbox(); len(pending) > 0 {
+		pending, err := localDB.ListPendingOutbox()
+		if err != nil {
+			// Not fatal here: the worker still serves boots from its
+			// cache. Every connection to global starts with
+			// reloadFromDisk, which reads the table again and fails the
+			// connection if it still cannot.
+			slog.Error("outbox rows persisted before this start could not be read; they are read again when the worker connects to global",
+				"err", err)
+		}
+		if len(pending) > 0 {
 			o.pending = pending
 			o.wake()
 		}
@@ -297,15 +306,23 @@ func (o *outbox) ackObservation(rowID uint64) {
 // finish its persist between our ListPending and the membership check —
 // which would otherwise make us enqueue a duplicate when append later adds
 // the same row to the in-memory slice.
-func (o *outbox) reloadFromDisk() {
+//
+// An error means the table could not be read and nothing was re-enqueued.
+// The rows it holds are then neither in memory nor on their way to global,
+// so the caller must not start draining as if the outbox were complete.
+func (o *outbox) reloadFromDisk() error {
 	if o.localDB == nil {
-		return
+		return nil
 	}
 	o.mu.Lock()
-	pending := o.localDB.ListPendingOutbox()
+	pending, err := o.localDB.ListPendingOutbox()
+	if err != nil {
+		o.mu.Unlock()
+		return err
+	}
 	if len(pending) == 0 {
 		o.mu.Unlock()
-		return
+		return nil
 	}
 	seen := make(map[uint64]struct{}, len(o.pending))
 	for _, p := range o.pending {
@@ -328,4 +345,5 @@ func (o *outbox) reloadFromDisk() {
 	if added > 0 {
 		o.wake()
 	}
+	return nil
 }

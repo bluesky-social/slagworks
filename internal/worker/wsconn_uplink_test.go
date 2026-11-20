@@ -167,7 +167,7 @@ func TestWSConn_LargeInventoryReportDoesNotWedgeUplink(t *testing.T) {
 	body := jsonBlob(2 << 20)
 	cache.RecordInventoryReport(uuid.Nil, body)
 	delivered := g.await(func(_, obs, _ int) bool { return obs == 1 })
-	acked := eventually(func() bool { return len(localDB.ListPendingOutbox()) == 0 })
+	acked := eventually(func() bool { return len(mustListOutbox(t, localDB)) == 0 })
 
 	// An op the worker is driving reports completion.
 	cache.RecordOpUpdate(uuid.NewString(), "completed", nil)
@@ -209,9 +209,9 @@ func TestWSConn_UndeliverableObservationIsDropped(t *testing.T) {
 				_, obs, upd := g.counts()
 				t.Fatalf("what was queued behind the undeliverable observation never arrived: observations %d (want 1), op_updates %d (want 1)", obs, upd)
 			}
-			if !eventually(func() bool { return len(localDB.ListPendingOutbox()) == 0 && cache.OutboxDepth() == 0 }) {
+			if !eventually(func() bool { return len(mustListOutbox(t, localDB)) == 0 && cache.OutboxDepth() == 0 }) {
 				t.Errorf("the undeliverable observation is still queued: %d rows on disk, %d in memory",
-					len(localDB.ListPendingOutbox()), cache.OutboxDepth())
+					len(mustListOutbox(t, localDB)), cache.OutboxDepth())
 			}
 			if hellos, _, _ := g.counts(); hellos != 1 {
 				t.Errorf("the worker connected %d times, want 1", hellos)

@@ -781,9 +781,10 @@ func (c *Cache) AckObservation(rowID uint64) {
 }
 
 // ReloadOutboxFromDisk repopulates the in-memory outbox with unacked
-// SQLite rows on WS reconnect. See outbox.reloadFromDisk.
-func (c *Cache) ReloadOutboxFromDisk() {
-	c.outbox.reloadFromDisk()
+// SQLite rows on WS reconnect. See outbox.reloadFromDisk; an error means
+// the rows could not be read and the outbox is incomplete.
+func (c *Cache) ReloadOutboxFromDisk() error {
+	return c.outbox.reloadFromDisk()
 }
 
 // --- Operation queries ---

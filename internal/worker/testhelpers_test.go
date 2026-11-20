@@ -40,3 +40,17 @@ func openTestDB(t *testing.T) *LocalDB {
 	}
 	return db
 }
+
+// mustListOutbox returns the persisted outbox rows, failing the test if the
+// table cannot be read.
+func mustListOutbox(t interface {
+	Helper()
+	Fatalf(string, ...any)
+}, db *LocalDB) []PendingOutbox {
+	t.Helper()
+	pending, err := db.ListPendingOutbox()
+	if err != nil {
+		t.Fatalf("list pending outbox: %v", err)
+	}
+	return pending
+}
