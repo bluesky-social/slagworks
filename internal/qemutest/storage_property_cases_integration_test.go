@@ -297,10 +297,15 @@ func propPinnedCases() map[string]propCase {
 			// /dev/md0, and without --destructive nothing stops an array
 			// the deploy environment has assembled. With the boot image
 			// these tests use, the old array is not assembled there and the
-			// deploy completes; an image whose initrd assembles it must get
-			// the md name check's refusal with nothing written. What may
-			// never happen is the third outcome: the blank disks
-			// partitioned and mdadm --create failing on a node in use.
+			// deploy completes: mdadm, and with it the udev rules that
+			// assemble arrays, is in the deploy root but not in the PXE
+			// chroot the initrd is built from, and the agent's chroot does
+			// not change which rules the running udevd has. An image whose
+			// initrd assembles it must get the md name check's refusal with
+			// nothing written; uefi-prescan-bystander-md0 plays that by
+			// assembling from the storage script. What may never happen is
+			// the third outcome: the blank disks partitioned and mdadm
+			// --create failing on a node in use.
 			Name: "uefi-second-array-beside-bystander-array", Firmware: "uefi",
 			Disks: []propDisk{
 				propD("d0", "virtio", 8, 0, 512, ""), propD("d1", "virtio", 8, 1, 512, ""),
@@ -348,6 +353,7 @@ func propPinnedCases() map[string]propCase {
 	for _, seed := range []string{"ext4", "luks", "dos", "ambiv"} {
 		cases = append(cases, propSafetyCase(seed))
 	}
+	cases = append(cases, propWideCases()...)
 	byName := make(map[string]propCase, len(cases))
 	for _, c := range cases {
 		if _, dup := byName[c.Name]; dup {
