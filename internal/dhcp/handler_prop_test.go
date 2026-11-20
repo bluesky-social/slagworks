@@ -502,6 +502,18 @@ var propClasses = []propClass{
 
 func (c propClass) isIPXE() bool { return strings.Contains(c.userClass, "slagworks-ipxe") }
 
+// kind is the documented OnACK classification: slagworks iPXE, then PXE or
+// HTTP-boot firmware by option 60, then anything else.
+func (c propClass) kind() ClientKind {
+	switch {
+	case c.isIPXE():
+		return ClientIPXE
+	case strings.HasPrefix(c.opt60, "PXEClient"), strings.HasPrefix(c.opt60, "HTTPClient"):
+		return ClientFirmware
+	}
+	return ClientOther
+}
+
 // bootPointer is the documented bootFileFor result: nothing for a MAC the
 // negative gate excludes or a client that is not a netboot client; the boot
 // script URL for slagworks iPXE; the iPXE binary over HTTP for HTTPClient
@@ -557,8 +569,8 @@ func (s *propStore) LoadLeases() []PersistedLease {
 }
 
 type propACK struct {
-	mac    string
-	isIPXE bool
+	mac  string
+	kind ClientKind
 }
 
 type propSUT struct {
@@ -650,7 +662,7 @@ func (s *propSUT) boot() {
 			}
 			return nil
 		},
-		OnACK:        func(mac string, isIPXE bool) { s.acks <- propACK{mac, isIPXE} },
+		OnACK:        func(mac string, kind ClientKind) { s.acks <- propACK{mac, kind} },
 		OnLeaseEvent: func(ev LeaseEvent) { s.events = append(s.events, ev) },
 	}
 	if s.w.gateKnown {
@@ -1330,8 +1342,8 @@ func propExchange(t *rapid.T, s *propSUT, m *propModel, pk propPacket, lastOffer
 	if gotKind == "ack" {
 		select {
 		case a := <-s.acks:
-			if a.mac != propMAC(pk.mac).String() || a.isIPXE != pk.class.isIPXE() {
-				fail("OnACK(%s, %v), want (%s, %v)", a.mac, a.isIPXE, propMAC(pk.mac), pk.class.isIPXE())
+			if a.mac != propMAC(pk.mac).String() || a.kind != pk.class.kind() {
+				fail("OnACK(%s, %v), want (%s, %v)", a.mac, a.kind, propMAC(pk.mac), pk.class.kind())
 			}
 		case <-time.After(5 * time.Second):
 			fail("OnACK never fired")

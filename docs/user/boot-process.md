@@ -103,10 +103,12 @@ a machine ever gets booted:
   it to force a re-DISCOVER onto whichever slice-owner picks it up
   (`splitPoolNAK`, `handler.go:680`). Reservations are unsliced and are
   ACKed by either worker.
-- **On-ACK phase advance.** `OnACK(mac, isIPXE)` fires after a DHCPACK; the
-  site worker uses it to promote a booting op's phase to `dhcp_ack` for a
-  firmware DHCP and `ipxe_dhcp` for a post-chainload iPXE DHCP
-  (`cmd/slagworksd/site.go:640-660`).
+- **On-ACK phase advance.** `OnACK(mac, client)` fires after a DHCPACK with
+  the kind of client it went to; the site worker uses it to promote a
+  booting op's phase to `dhcp_ack` for PXE or HTTP-boot firmware and
+  `ipxe_dhcp` for slagworks iPXE after the chainload
+  (`cmd/slagworksd/site.go`). An ACK to any other client, such as the
+  deploy environment's own dhcpcd (stage 5), leaves the phase alone.
 - **Lease persistence.** When a `LeaseStore` is wired, leases are saved on
   every ACK and reloaded on startup with expired entries pruned
   (`handler.go:238-258`, `handler.go:1033-1041`).
@@ -346,7 +348,8 @@ Phase set to authority:
 - `pxe_booting` is set by the site worker executor when it claims a deploy
   op (`internal/worker/executor.go:377`).
 - `dhcp_ack` and `ipxe_dhcp` come from the DHCP `OnACK` callback
-  (`cmd/slagworksd/site.go:640-660`).
+  (`cmd/slagworksd/site.go`), for the firmware's and iPXE's DHCP only;
+  the initrd's own `ip=dhcp` exchange sets no phase.
 - `ipxe_loaded` fires the moment the HTTP boot handler serves a script
   (`internal/httpboot/handler.go:181-196`).
 - `agent_starting`, `partitioning`, `rsyncing_os`, `installing_bootloader`,

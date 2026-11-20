@@ -462,6 +462,75 @@ func TestBuildDHCPConfig_ReserveIPFromSnapshot(t *testing.T) {
 	}
 }
 
+// TestBuildDHCPConfig_OnACKIgnoresTheBootedEnvironmentsDHCP: a booting host
+// DHCPs three times, not two. The firmware's exchange is the dhcp_ack phase
+// and slagworks iPXE's is ipxe_dhcp (docs/dev/state-machine.md, "Phase write
+// sites"). Then, after ipxe_loaded, the boot script's ip=dhcp makes the
+// deploy or commission environment's own client (dhcpcd in the initrd) ask
+// again, and again at every renewal. That client is neither boot stage, so
+// its ACKs must leave the op's phase alone: writing dhcp_ack there runs the
+// phase backwards on every deploy, and an op that then dies before the
+// agent's first report times out labelled dhcp_ack, which points the
+// operator at PXE for a host that had already booted Linux.
+func TestBuildDHCPConfig_OnACKIgnoresTheBootedEnvironmentsDHCP(t *testing.T) {
+	t.Parallel()
+	const mac = "52:54:00:aa:bb:07"
+	machineID := uuid.New()
+	cache := worker.NewCache(nil)
+	applyDHCP(cache, model.DHCPConfig{
+		Subnet:             "10.99.1.0/24",
+		Gateway:            "10.99.1.1",
+		EphemeralPoolStart: "10.99.1.100",
+		EphemeralPoolEnd:   "10.99.1.200",
+	}, model.MachineSnapshot{
+		ID: machineID, State: model.MachineStateCommissioned, PXEEligible: true,
+		Interfaces: []model.SnapshotInterface{{Name: "eth0", MAC: mac, Type: "physical"}},
+	})
+	cache.ApplyOpResync(nil, nil)
+	op := model.Operation{ID: uuid.New(), MachineID: machineID, Type: model.OpDeploy, Status: model.OpClaimed, Version: 1}
+	cache.ApplyOpDelta(op, model.MachineStateDeploying)
+
+	sc := &siteServiceConfig{
+		cfg:   siteConfig{httpPort: 8080, iface: loopbackIface()},
+		cache: cache,
+		log:   slog.Default(),
+	}
+	cfg, err := buildDHCPConfig(sc, net.ParseIP("10.99.1.1"))
+	if err != nil {
+		t.Fatalf("buildDHCPConfig: %v", err)
+	}
+	opID := op.ID.String()
+	phaseOf := func() string { return cache.GetOperation(opID).Phase }
+
+	// The firmware's and iPXE's exchanges advance the boot prefix.
+	cache.UpdateOpPhase(opID, "pxe_booting")
+	cfg.OnACK(mac, dhcp.ClientFirmware)
+	if got := phaseOf(); got != "dhcp_ack" {
+		t.Fatalf("firmware ACK at pxe_booting: phase %q, want dhcp_ack", got)
+	}
+	cfg.OnACK(mac, dhcp.ClientIPXE)
+	if got := phaseOf(); got != "ipxe_dhcp" {
+		t.Fatalf("iPXE ACK at dhcp_ack: phase %q, want ipxe_dhcp", got)
+	}
+
+	// The environment's own exchange, and each renewal, arrives later.
+	for _, phase := range []string{"ipxe_loaded", "agent_starting", "rsyncing_os", "finalizing"} {
+		cache.UpdateOpPhase(opID, phase)
+		cfg.OnACK(mac, dhcp.ClientOther)
+		if got := phaseOf(); got != phase {
+			t.Errorf("environment DHCP ACK at %s moved the phase to %q", phase, got)
+		}
+	}
+
+	// A host the firmware re-PXEs mid-install (a reset or power loss) really
+	// is back at the firmware's DHCP, and the phase says so.
+	cache.UpdateOpPhase(opID, "rsyncing_os")
+	cfg.OnACK(mac, dhcp.ClientFirmware)
+	if got := phaseOf(); got != "dhcp_ack" {
+		t.Errorf("firmware ACK at rsyncing_os: phase %q, want dhcp_ack", got)
+	}
+}
+
 // fakeSMCLauncher writes a stand-in SMCIPMITool launcher and returns its
 // path. The factory only resolves it; nothing here executes it.
 func fakeSMCLauncher(t *testing.T) string {

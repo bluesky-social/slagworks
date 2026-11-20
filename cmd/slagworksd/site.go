@@ -835,10 +835,23 @@ func buildDHCPConfig(sc *siteServiceConfig, serverIP net.IP) (dhcp.Config, error
 
 	// DHCP phase reporting for booting machines (deploy or commission, which
 	// share the boot-prefix spine). Firmware DHCP → "dhcp_ack", iPXE DHCP
-	// (after chainload) → "ipxe_dhcp". Gating on the active booting op rather
-	// than machine state covers both deploying and commissioning hosts so the
+	// (after chainload) → "ipxe_dhcp". The host DHCPs a third time once the
+	// boot script has started the deploy or commission environment (ip=dhcp,
+	// after ipxe_loaded), and again whenever that client renews. That client
+	// is neither stage, so its ACK leaves the phase alone instead of moving
+	// the op back to dhcp_ack. Gating on the active booting op rather than
+	// machine state covers both deploying and commissioning hosts so the
 	// commission watch TUI animates these phases like deploy does.
-	dhcpCfg.OnACK = func(mac string, isIPXE bool) {
+	dhcpCfg.OnACK = func(mac string, client dhcp.ClientKind) {
+		var phase string
+		switch client {
+		case dhcp.ClientFirmware:
+			phase = "dhcp_ack"
+		case dhcp.ClientIPXE:
+			phase = "ipxe_dhcp"
+		case dhcp.ClientOther:
+			return
+		}
 		m := sc.cache.MachineByMAC(mac)
 		if m == nil {
 			return
@@ -846,10 +859,6 @@ func buildDHCPConfig(sc *siteServiceConfig, serverIP net.IP) (dhcp.Config, error
 		op := sc.cache.ActiveBootingOpForMachine(m.ID)
 		if op == nil {
 			return
-		}
-		phase := "dhcp_ack"
-		if isIPXE {
-			phase = "ipxe_dhcp"
 		}
 		sc.cache.UpdateOpPhase(op.ID.String(), phase)
 	}

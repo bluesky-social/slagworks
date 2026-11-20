@@ -89,10 +89,12 @@ type Config struct {
 	// to register unknown devices with the global server.
 	OnUnknownMAC func(mac string)
 
-	// OnACK, when non-nil, is called asynchronously after sending a DHCP ACK.
-	// Used to advance deploy phases when a deploying machine gets a lease.
-	// isIPXE is true when the request came from slagworks iPXE (after chainload).
-	OnACK func(mac string, isIPXE bool)
+	// OnACK, when non-nil, is called asynchronously after sending a DHCP ACK,
+	// with the kind of client the ACK went to. The site worker turns ACKs to
+	// netboot firmware and to slagworks iPXE into a booting machine's
+	// dhcp_ack and ipxe_dhcp phases; an ACK to any other client is not a
+	// boot phase.
+	OnACK func(mac string, client ClientKind)
 
 	// MachineIDForMAC, when non-nil, resolves a MAC to a machine UUID
 	// string ("" when unknown). Used to stamp `machine_id` onto every
@@ -790,7 +792,7 @@ func (h *Handler) handleRequest(req *dhcpv4.DHCPv4, mac net.HardwareAddr, view i
 
 	h.cfg.Metrics.ack(p.label)
 	if h.cfg.OnACK != nil {
-		go h.cfg.OnACK(mac.String(), isIPXEClient(req))
+		go h.cfg.OnACK(mac.String(), clientKind(req))
 	}
 
 	return reply
@@ -1273,6 +1275,36 @@ func (h *Handler) MACForIP(ip string) string {
 		}
 	}
 	return ""
+}
+
+// ClientKind is which boot stage, if any, a DHCP client identifies as. It is
+// read from the request the way bootFileFor reads it.
+type ClientKind int
+
+const (
+	// ClientOther is not a netboot client: the deploy or commission
+	// environment's own DHCP client (dhcpcd in the initrd, started by the
+	// boot script's ip=dhcp), an installed OS, a BMC or a PDU.
+	ClientOther ClientKind = iota
+	// ClientFirmware is PXE firmware (option 60 "PXEClient...") or UEFI
+	// HTTP-boot firmware ("HTTPClient..."). A generic iPXE ROM that has yet
+	// to chainload slagworks iPXE also sends PXEClient and counts here.
+	ClientFirmware
+	// ClientIPXE is slagworks iPXE after the chainload (user class
+	// slagworks-ipxe).
+	ClientIPXE
+)
+
+// clientKind classifies a request for OnACK. Slagworks iPXE is checked
+// first because it also sends option 60 PXEClient.
+func clientKind(req *dhcpv4.DHCPv4) ClientKind {
+	switch {
+	case isIPXEClient(req):
+		return ClientIPXE
+	case isPXEClient(req), isHTTPBootClient(req):
+		return ClientFirmware
+	}
+	return ClientOther
 }
 
 // isIPXEClient returns true if the DHCP request is from our slagworks iPXE

@@ -270,8 +270,13 @@ sites for that helper are:
 - `Executor.runPowerOp` and `Executor.runBMCReconcile` — emit the op
   type (`power_on`, `power_off`, `power_cycle`, `set_boot_device`,
   `bmc_reconcile`) before their first controller call.
-- `dhcpCfg.OnACK` (`cmd/slagworksd/site.go:646`) — emits
-  `dhcp_ack` (firmware DHCP) or `ipxe_dhcp` (iPXE second DHCP).
+- `dhcpCfg.OnACK` (`cmd/slagworksd/site.go:757`) — emits
+  `dhcp_ack` for an ACK to PXE or HTTP-boot firmware and `ipxe_dhcp` for
+  one to slagworks iPXE (`dhcp.ClientKind`). The host DHCPs a third time
+  once the boot script's `ip=dhcp` starts the deploy or commission
+  environment's own client (dhcpcd in the initrd, after `ipxe_loaded`),
+  and again at each renewal. That client is neither stage, so its ACKs
+  write no phase.
 - `httpboot.Handler.ServeHTTP` (`internal/httpboot/handler.go:190`)
   — emits `ipxe_loaded` when the iPXE second stage fetches the boot
   script.

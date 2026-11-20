@@ -1051,8 +1051,11 @@ configuration (`Config`, 57) carries:
   known, but must not get a bootfile. Unknown MACs are still
   eligible on a promiscuous pool; the httpboot layer decides what
   to serve them.
-- `OnACK(mac, opID)` — records DHCP phases (`dhcp_ack`, `ipxe_dhcp`)
-  on the machine's booting op for the TUI (`site.go:646`).
+- `OnACK(mac, client)` — records DHCP phases on the machine's booting
+  op for the TUI: `dhcp_ack` when `client` is `ClientFirmware`,
+  `ipxe_dhcp` when it is `ClientIPXE`, nothing for `ClientOther` (the
+  deploy environment's own DHCP client, an installed OS)
+  (`site.go:757`).
 
 The handler supports the multi-interface split-pool case
 (`IfaceParams`, line 135), relay pools for L3 fabrics

@@ -1249,3 +1249,87 @@ func TestBootFile_RequiresNetbootClassIdentifier(t *testing.T) {
 		})
 	}
 }
+
+// TestOnACK_ReportsClientKind pins the client kind OnACK reports, which the
+// site worker maps to a booting op's phase: firmware -> dhcp_ack, slagworks
+// iPXE -> ipxe_dhcp, anything else -> no phase. The case that matters is the
+// deploy or commission environment's own DHCP client (dhcpcd in the initrd,
+// started by ip=dhcp after the boot script is served): it is not PXE
+// firmware, and reporting it as firmware rewound every booting op from
+// ipxe_loaded to dhcp_ack.
+func TestOnACK_ReportsClientKind(t *testing.T) {
+	cases := []struct {
+		name string
+		mods []dhcpv4.Modifier
+		want ClientKind
+	}{
+		{
+			name: "PXE firmware BIOS",
+			mods: []dhcpv4.Modifier{withVendorClass("PXEClient:Arch:00000:UNDI:002001"), withArch(iana.INTEL_X86PC)},
+			want: ClientFirmware,
+		},
+		{
+			name: "PXE firmware UEFI",
+			mods: []dhcpv4.Modifier{withVendorClass("PXEClient:Arch:00007:UNDI:003016"), withArch(iana.EFI_BC)},
+			want: ClientFirmware,
+		},
+		{
+			name: "UEFI HTTP-boot firmware",
+			mods: []dhcpv4.Modifier{withVendorClass("HTTPClient:Arch:00016:UNDI:003000"), withArch(iana.EFI_X86_64)},
+			want: ClientFirmware,
+		},
+		{
+			// A NIC's own iPXE ROM: still the firmware stage, it chainloads
+			// slagworks iPXE next.
+			name: "generic iPXE ROM",
+			mods: []dhcpv4.Modifier{withPXEClient(), withUserClass("iPXE"), withArch(iana.INTEL_X86PC)},
+			want: ClientFirmware,
+		},
+		{
+			name: "slagworks iPXE",
+			mods: []dhcpv4.Modifier{withPXEClient(), withUserClass("slagworks-ipxe"), withArch(iana.EFI_X86_64)},
+			want: ClientIPXE,
+		},
+		{
+			name: "slagworks iPXE, no option 60",
+			mods: []dhcpv4.Modifier{withUserClass("slagworks-ipxe")},
+			want: ClientIPXE,
+		},
+		{
+			// dhcpcd's default option 60.
+			name: "deploy environment dhcpcd",
+			mods: []dhcpv4.Modifier{withVendorClass("dhcpcd-10.0.6:Linux-6.8.0-48-generic:x86_64:GenuineIntel")},
+			want: ClientOther,
+		},
+		{
+			name: "no option 60",
+			want: ClientOther,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			acks := make(chan ClientKind, 1)
+			cfg := testConfig()
+			cfg.OnACK = func(_ string, client ClientKind) { acks <- client }
+			h := NewHandler(cfg)
+			mac, _ := net.ParseMAC("52:54:00:aa:bb:01")
+
+			offer := h.HandlePacket(mustDiscover(t, mac, tc.mods...))
+			if offer == nil {
+				t.Fatal("expected an offer, got nil")
+			}
+			ack := h.HandlePacket(mustRequestFromOffer(t, offer, tc.mods...))
+			if ack == nil || ack.MessageType() != dhcpv4.MessageTypeAck {
+				t.Fatalf("expected an ack, got %v", ack)
+			}
+			select {
+			case got := <-acks:
+				if got != tc.want {
+					t.Fatalf("OnACK client kind %d, want %d", got, tc.want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("OnACK never fired")
+			}
+		})
+	}
+}
