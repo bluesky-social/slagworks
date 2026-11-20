@@ -39,24 +39,24 @@ func stalledBucket(t *testing.T) (srv *httptest.Server, release func()) {
 	return srv, func() { once.Do(func() { close(ch) }) }
 }
 
-// imageSyncGlobal is the hub's view of one site with one worker: it
+// stalledImageGlobal is the hub's view of one site with one worker: it
 // authenticates token "tok-1" and answers every hello with snap.
-type imageSyncGlobal struct {
+type stalledImageGlobal struct {
 	mu   sync.Mutex
 	snap model.SiteSnapshot
 }
 
-func (g *imageSyncGlobal) GetSiteWorkerByTokenHash(hash string) (*model.SiteWorker, error) {
+func (g *stalledImageGlobal) GetSiteWorkerByTokenHash(hash string) (*model.SiteWorker, error) {
 	if hash != store.HashWorkerToken("tok-1") {
 		return nil, store.ErrSiteWorkerNotFound
 	}
 	return &model.SiteWorker{SiteSlug: "site-a", WorkerID: "worker-1"}, nil
 }
-func (g *imageSyncGlobal) TouchSiteWorker(slug, workerID, _ string, _ *string) (*model.SiteWorker, error) {
+func (g *stalledImageGlobal) TouchSiteWorker(slug, workerID, _ string, _ *string) (*model.SiteWorker, error) {
 	return &model.SiteWorker{SiteSlug: slug, WorkerID: workerID}, nil
 }
-func (g *imageSyncGlobal) ListSiteWorkers(string) ([]model.SiteWorker, error) { return nil, nil }
-func (g *imageSyncGlobal) RebuildAndWait(context.Context, string) (model.SiteSnapshot, error) {
+func (g *stalledImageGlobal) ListSiteWorkers(string) ([]model.SiteWorker, error) { return nil, nil }
+func (g *stalledImageGlobal) RebuildAndWait(context.Context, string) (model.SiteSnapshot, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.snap, nil
@@ -68,19 +68,13 @@ func (g *imageSyncGlobal) RebuildAndWait(context.Context, string) (model.SiteSna
 func releaseAndDrain(t *testing.T, cache *Cache, release func()) {
 	t.Cleanup(func() {
 		release()
-		if !within(10*time.Second, func() bool {
-			cache.imageSyncMu.Lock()
-			defer cache.imageSyncMu.Unlock()
-			return !cache.imageSyncRunning
-		}) {
-			t.Error("image syncer still running 10s after the download was released")
-		}
+		waitImageSyncIdle(t, cache)
 	})
 }
 
-// startImageSyncWorker runs a real hub and a real WSConn against it, with the
+// startStalledImageWorker runs a real hub and a real WSConn against it, with the
 // production image sync writing into a temp images dir.
-func startImageSyncWorker(t *testing.T, g *imageSyncGlobal) (*ws.Hub, *WSConn, *Cache) {
+func startStalledImageWorker(t *testing.T, g *stalledImageGlobal) (*ws.Hub, *WSConn, *Cache) {
 	t.Helper()
 	hub := ws.NewHub(ws.HubConfig{Auth: g, Rebuilder: g})
 	srv := httptest.NewServer(hub)
@@ -104,10 +98,10 @@ func startImageSyncWorker(t *testing.T, g *imageSyncGlobal) (*ws.Hub, *WSConn, *
 // systemd's start timeout (90s by default).
 func TestWSConn_FirstSyncDoesNotWaitForImageDownload(t *testing.T) {
 	bucket, release := stalledBucket(t)
-	g := &imageSyncGlobal{snap: model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "site-a"}, Images: []model.Image{{
+	g := &stalledImageGlobal{snap: model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "site-a"}, Images: []model.Image{{
 		Name: "noble-pxe", Version: "24.04", SHA256: strings.Repeat("aa", 32), URL: bucket.URL + "/noble-pxe/new.tar.gz",
 	}}}}
-	_, wsc, cache := startImageSyncWorker(t, g)
+	_, wsc, cache := startStalledImageWorker(t, g)
 	releaseAndDrain(t, cache, release)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -123,8 +117,8 @@ func TestWSConn_FirstSyncDoesNotWaitForImageDownload(t *testing.T) {
 func TestWSConn_ImageDownloadDoesNotStallOpStream(t *testing.T) {
 	machineID := uuid.New()
 	bucket, release := stalledBucket(t)
-	g := &imageSyncGlobal{snap: model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "site-a"}, Machines: []model.MachineSnapshot{{ID: machineID}}}}
-	hub, wsc, cache := startImageSyncWorker(t, g)
+	g := &stalledImageGlobal{snap: model.SiteSnapshot{SeqNum: 1, Site: model.SiteInfo{Slug: "site-a"}, Machines: []model.MachineSnapshot{{ID: machineID}}}}
+	hub, wsc, cache := startStalledImageWorker(t, g)
 	releaseAndDrain(t, cache, release)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

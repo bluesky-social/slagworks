@@ -210,6 +210,41 @@ func prune(log *slog.Logger, imagesDir, name string, keep []string) {
 	}
 }
 
+// fetchError is a failure to fetch an image from its URL: a transport error,
+// a response other than 200, a body cut short, or a download abandoned
+// because it stalled.
+type fetchError struct{ err error }
+
+func (e *fetchError) Error() string { return e.err.Error() }
+func (e *fetchError) Unwrap() error { return e.err }
+
+// Retryable reports whether a SyncImages error includes a failure to fetch
+// an image from its URL (a transport error, a response other than 200, or a
+// body cut short), which the same URL may not repeat on a later attempt.
+// Every other failure repeats until the image row or the host changes:
+// bytes that do not match the row's digest or do not extract (a later
+// attempt downloads the same bytes again), a refused name, or an error
+// writing to the images directory.
+func Retryable(err error) bool {
+	var fe *fetchError
+	return errors.As(err, &fe)
+}
+
+// readErrRecorder remembers the last non-EOF error its reader returned, so
+// a failed copy can tell a body cut short from a failed write to disk.
+type readErrRecorder struct {
+	r   io.Reader
+	err error
+}
+
+func (rr *readErrRecorder) Read(p []byte) (int, error) {
+	n, err := rr.r.Read(p)
+	if err != nil && err != io.EOF {
+		rr.err = err
+	}
+	return n, err
+}
+
 // minProgressBytes is the smallest download that emits progress snapshots
 // (1 MiB). Smaller artifacts and unknown-length downloads, where the total
 // byte count is unavailable, produce no progress logs. Completion is always
@@ -306,21 +341,24 @@ func pullImage(log *slog.Logger, img *model.Image, targetDir string) error {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		tmpFile.Close()
-		return fmt.Errorf("downloading: %w", downloadErr(err))
+		return &fetchError{fmt.Errorf("downloading: %w", downloadErr(err))}
 	}
 	defer resp.Body.Close()
 	stall.Reset(stallTimeout) // the response headers are data
 	if resp.StatusCode != http.StatusOK {
 		tmpFile.Close()
-		return fmt.Errorf("download returned %d", resp.StatusCode)
+		return &fetchError{fmt.Errorf("download returned %d", resp.StatusCode)}
 	}
 
 	hasher := sha256.New()
 	pw := &progressWriter{name: img.Name, total: resp.ContentLength, log: log}
-	body := &stallReader{r: resp.Body, timer: stall}
+	body := &readErrRecorder{r: &stallReader{r: resp.Body, timer: stall}}
 	if _, err := io.Copy(tmpFile, io.TeeReader(body, io.MultiWriter(hasher, pw))); err != nil {
 		tmpFile.Close()
-		return fmt.Errorf("writing download: %w", downloadErr(err))
+		if body.err != nil {
+			return &fetchError{fmt.Errorf("reading download: %w", downloadErr(err))}
+		}
+		return fmt.Errorf("writing download: %w", err)
 	}
 	tmpFile.Close()
 

@@ -218,8 +218,9 @@ row change.
 ## Site workers: how the row reaches a running deploy
 
 Every site worker runs `imagepull.SyncImages`
-(`internal/imagepull/imagepull.go`) on each snapshot tick. Each version
-of the image lives in its own directory,
+(`internal/imagepull/imagepull.go`) each time it applies a site
+snapshot, and again on a backoff after a failed download (see the
+notes below). Each version of the image lives in its own directory,
 `<images_dir>/noble-pxe@<first 16 hex digits of its SHA256>`, and
 `<images_dir>/noble-pxe` is a symlink to the current one. The
 algorithm:
@@ -259,7 +260,18 @@ Notes:
   It holds commission and deploy operations until the download ends, so
   a deploy created after the row changed installs the new image. A
   download that fails releases them; they then boot the image already on
-  disk, and the worker retries the download on its next snapshot.
+  disk.
+- A sync that fails to fetch the tarball (a connection error, a
+  response other than 200, a body cut short, a stalled download) is
+  retried by the site worker itself: 5 seconds after the failure, then
+  doubling up to every 5 minutes, until it succeeds or a newer
+  snapshot's sync takes over. Nothing else would run it again, because
+  global pushes no new snapshot while the site's content is unchanged.
+  A digest mismatch, a tarball that does not extract, or a failed write
+  to the images directory is logged and not retried, since another
+  attempt would fail the same way (and a digest mismatch costs a full
+  download each time): fix the row, which pushes a new snapshot, or fix
+  the host and restart the site worker.
 - A download that receives no data for a minute is abandoned and logged
   as `download stalled`; a slow download that keeps receiving data is
   never cut off.
@@ -291,10 +303,13 @@ Diagnosing "the new image didn't roll": compare
 `readlink <images_dir>/noble-pxe` (`noble-pxe@<sha16>`) against the
 start of the SHA in `slagctl image list`. If they match, the
 worker HAS synced — a bug is in the built image, not in the rollout.
-If they differ, look at the site worker's `SyncImages` logs; a
-mid-flight failure leaves the link on the previous version.
-Do NOT look for a mtime, a timer, or a `latest-sha.txt` cache — none of
-those exist on the site workers by design.
+If they differ, look at the site worker's image sync logs: `image sync
+failed; retrying` with a `retry_in` is a failed download the worker is
+retrying, and `image sync failed` with a `hint` is one it will not
+retry. A mid-flight failure leaves the link on the previous version.
+Do NOT look for a mtime or a `latest-sha.txt` cache: site workers never
+poll the bucket, by design, and their only image timer is the retry
+after a failed download.
 
 ## The other artifact: the slagworks-agent binary
 

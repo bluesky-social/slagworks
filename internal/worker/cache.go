@@ -66,7 +66,8 @@ import (
 // sync gates (PendingLifecycleOps, ReclaimableOps, BootActionForMAC), which
 // hold imageSyncMu across their opState.mu read (the order ApplySnapshot
 // takes them in; nothing takes imageSyncMu under opState.mu); subscriber
-// callbacks and the image download run with none of these held. persistMu
+// callbacks and the image download run with none of these held. The image
+// sync retry timer (retryImageSync) takes imageSyncMu alone. persistMu
 // (persistOpState) is never taken while holding opState.mu; it wraps only
 // opState.mu.RLock and the LocalDB write. Pure readers take no lock.
 type Cache struct {
@@ -143,6 +144,16 @@ type Cache struct {
 	// PendingLifecycleOps withholds commission and deploy ops.
 	imageSyncRequested, imageSyncFinished uint64
 
+	// Image sync retry (see noteImageSyncResultLocked). Guarded by
+	// imageSyncMu. imageRetryTimer is the pending retry, nil when none.
+	// imageSyncFailures counts consecutive retryable failures and sets the
+	// backoff, from imageRetryBase doubling to imageRetryMax (tests shorten
+	// both).
+	imageRetryTimer   *time.Timer
+	imageSyncFailures int
+	imageRetryBase    time.Duration
+	imageRetryMax     time.Duration
+
 	// snapshotSubs holds callbacks invoked at the end of every successful
 	// ApplySnapshot call (CastManager pump reconcile, DHCP pool refresh).
 	// Callbacks run outside all locks to avoid forcing downstream code to be
@@ -178,10 +189,12 @@ func NewCache(localDB *LocalDB) *Cache {
 func NewCacheWithSerial(localDB *LocalDB, selfSerial string) *Cache {
 	ob := newOutbox(localDB)
 	c := &Cache{
-		outbox:  ob,
-		Wake:    ob.wakeCh,
-		OpWake:  make(chan struct{}, 1),
-		localDB: localDB,
+		outbox:         ob,
+		Wake:           ob.wakeCh,
+		OpWake:         make(chan struct{}, 1),
+		localDB:        localDB,
+		imageRetryBase: defaultImageRetryBase,
+		imageRetryMax:  defaultImageRetryMax,
 	}
 	// opState is fed by the op-event STREAM (not the snapshot). A set
 	// rehydrated from LocalDB starts UNTRUSTED (may be stale — global
@@ -740,19 +753,31 @@ func (c *Cache) applySnapshot(snap *model.SiteSnapshot, adopt bool) bool {
 // requestImageSync hands images to the background syncer and returns at
 // once, starting the syncer goroutine if none is running. The syncer
 // downloads one set at a time, always moving on to the newest set
-// requested. A failed sync is logged and not retried on its own: the row's
-// SHA still mismatches the on-disk link, so the next applied snapshot
-// retries it, as before.
+// requested.
 func (c *Cache) requestImageSync(images map[string]*model.Image) {
 	c.imageSyncMu.Lock()
-	c.imageSyncRequested++
-	c.imageSyncNext = images
-	start := !c.imageSyncRunning
-	c.imageSyncRunning = true
+	start := c.requestImageSyncLocked(images)
 	c.imageSyncMu.Unlock()
 	if start {
 		go c.runImageSyncs()
 	}
+}
+
+// requestImageSyncLocked makes images the set the syncer syncs next and
+// reports whether the caller must start the syncer goroutine. It supersedes
+// a pending retry: the timer is stopped, and one that already fired finds
+// imageSyncRequested moved on and does nothing. The caller holds
+// imageSyncMu.
+func (c *Cache) requestImageSyncLocked(images map[string]*model.Image) (start bool) {
+	if c.imageRetryTimer != nil {
+		c.imageRetryTimer.Stop()
+		c.imageRetryTimer = nil
+	}
+	c.imageSyncRequested++
+	c.imageSyncNext = images
+	start = !c.imageSyncRunning
+	c.imageSyncRunning = true
+	return start
 }
 
 // runImageSyncs is the syncer goroutine: it syncs the newest waiting image
@@ -772,17 +797,83 @@ func (c *Cache) runImageSyncs() {
 		c.imageSyncNext = nil
 		c.imageSyncMu.Unlock()
 
-		if err := c.imageSyncFn(c.ImagesDir, images); err != nil {
-			slog.Error("image sync failed; the next snapshot apply retries it", "err", err)
-		}
+		err := c.imageSyncFn(c.ImagesDir, images)
 
 		c.imageSyncMu.Lock()
 		c.imageSyncFinished = gen
 		caughtUp := gen == c.imageSyncRequested
+		c.noteImageSyncResultLocked(err, images, caughtUp)
 		c.imageSyncMu.Unlock()
 		if caughtUp {
 			c.opState.fireWake()
 		}
+	}
+}
+
+// Image sync retry backoff: 5s doubling to 5 minutes, with up to 20%
+// jitter so the site workers that all failed on the same object-storage
+// error do not retry in lockstep. The cap bounds how long a worker stays on
+// the previous image after object storage recovers.
+const (
+	defaultImageRetryBase = 5 * time.Second
+	defaultImageRetryMax  = 5 * time.Minute
+)
+
+// noteImageSyncResultLocked logs the result of syncing images and, after a
+// failure to fetch, arms the retry. The caller holds imageSyncMu; caughtUp
+// says that no newer set was requested while this one synced.
+//
+// A sync is requested when a snapshot is applied, and nothing else requests
+// one while the site's snapshot stays the same: an equal-seq snapshot is
+// dropped, a reconnect gets no_change, and re-pinning an unchanged image
+// row does not change the snapshot. So when the sync fails to fetch an
+// image (imagepull.Retryable: a transport error, a non-200 response, a body
+// cut short, a stalled download), this arms a timer to request the same set
+// again on a backoff until it succeeds. Any other failure (bytes that do
+// not match the row's digest, a refused name, an error writing the images
+// directory) would repeat on every attempt, and for a digest mismatch each
+// attempt downloads the whole tarball again, so it is logged and not
+// retried. Lifecycle ops are held during each attempt and released between
+// attempts, as after any failed sync.
+func (c *Cache) noteImageSyncResultLocked(err error, images map[string]*model.Image, caughtUp bool) {
+	switch {
+	case err == nil:
+		if c.imageSyncFailures > 0 {
+			slog.Info("image sync succeeded after failed attempts", "failed_attempts", c.imageSyncFailures)
+		}
+		c.imageSyncFailures = 0
+	case !imagepull.Retryable(err):
+		c.imageSyncFailures = 0
+		slog.Error("image sync failed", "err", err,
+			"hint", "not retried, since another attempt would fail the same way: fix the image row "+
+				"(global pushes the change to the site), or fix the worker's images directory "+
+				"and restart slagworksd to sync again")
+	case !caughtUp:
+		slog.Error("image sync failed; syncing the newer image set that is waiting", "err", err)
+	default:
+		delay := applyJitter(nextBackoff(c.imageRetryBase, c.imageRetryMax, c.imageSyncFailures), 0.2)
+		c.imageSyncFailures++
+		gen := c.imageSyncRequested
+		c.imageRetryTimer = time.AfterFunc(delay, func() { c.retryImageSync(gen, images) })
+		slog.Error("image sync failed; retrying", "err", err,
+			"failed_attempts", c.imageSyncFailures, "retry_in", delay.Round(time.Millisecond))
+	}
+}
+
+// retryImageSync is the retry timer armed by noteImageSyncResultLocked: it
+// requests images, the set whose fetch failed, again. gen is
+// imageSyncRequested as of that failure; if a set has been requested since,
+// that request supersedes the retry.
+func (c *Cache) retryImageSync(gen uint64, images map[string]*model.Image) {
+	c.imageSyncMu.Lock()
+	if gen != c.imageSyncRequested {
+		c.imageSyncMu.Unlock()
+		return
+	}
+	start := c.requestImageSyncLocked(images)
+	c.imageSyncMu.Unlock()
+	if start {
+		go c.runImageSyncs()
 	}
 }
 

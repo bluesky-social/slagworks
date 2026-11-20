@@ -697,11 +697,86 @@ func TestSyncImages_AbandonsStalledDownload(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), "download stalled") {
 					t.Fatalf("SyncImages = %v, want a download stalled error", err)
 				}
+				if !Retryable(err) {
+					t.Errorf("a stalled download is not Retryable: %v", err)
+				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("SyncImages still waiting on a server that stopped sending 5s ago (stall timeout 200ms)")
 			}
 			if v, ok := Installed(imagesDir, "noble-pxe"); ok {
 				t.Errorf("image installed (%s) from an abandoned download", v)
+			}
+		})
+	}
+}
+
+// TestSyncImages_RetryableClassifiesFailures: a site worker retries a failed
+// image sync on a backoff only when Retryable says so. A failure to fetch
+// from the URL may not repeat on the next attempt and must be retryable; a
+// digest mismatch downloads the whole tarball before failing and repeats on
+// every attempt, so it, and the other failures a later attempt would
+// repeat, must not be.
+func TestSyncImages_RetryableClassifiesFailures(t *testing.T) {
+	tarPath, sha := buildTestTarball(t, "noble-pxe")
+	tarData, _ := os.ReadFile(tarPath)
+	serve := func(h http.HandlerFunc) string {
+		srv := httptest.NewServer(h)
+		t.Cleanup(srv.Close)
+		return srv.URL + "/noble-pxe.tar.gz"
+	}
+	status := func(code int) string {
+		return serve(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "no", code) })
+	}
+	good := serve(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(tarData) })
+	cutShort := serve(func(w http.ResponseWriter, _ *http.Request) {
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n")
+		_, _ = buf.Write(tarData[:len(tarData)/2])
+		_ = buf.Flush()
+	})
+	closed := httptest.NewServer(http.NotFoundHandler())
+	refusedURL := closed.URL + "/noble-pxe.tar.gz"
+	closed.Close()
+
+	for _, tc := range []struct {
+		name      string
+		imagesDir string // "" means a fresh directory
+		images    map[string]*model.Image
+		retryable bool
+	}{
+		{name: "503", retryable: true, images: map[string]*model.Image{
+			"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: status(http.StatusServiceUnavailable)}}},
+		{name: "404", retryable: true, images: map[string]*model.Image{
+			"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: status(http.StatusNotFound)}}},
+		{name: "connection refused", retryable: true, images: map[string]*model.Image{
+			"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: refusedURL}}},
+		{name: "body cut short", retryable: true, images: map[string]*model.Image{
+			"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: cutShort}}},
+		{name: "503 beside a refused name", retryable: true, images: map[string]*model.Image{
+			"..":        {Name: "..", SHA256: sha, URL: good},
+			"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: status(http.StatusServiceUnavailable)}}},
+		{name: "digest mismatch", retryable: false, images: map[string]*model.Image{
+			"noble-pxe": {Name: "noble-pxe", SHA256: strings.Repeat("0", 64), URL: good}}},
+		{name: "refused name", retryable: false, images: map[string]*model.Image{
+			"..": {Name: "..", SHA256: sha, URL: good}}},
+		{name: "images directory missing", retryable: false, imagesDir: filepath.Join(t.TempDir(), "absent"),
+			images: map[string]*model.Image{"noble-pxe": {Name: "noble-pxe", SHA256: sha, URL: good}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tc.imagesDir
+			if dir == "" {
+				dir = t.TempDir()
+			}
+			err := SyncImages(slog.Default(), dir, tc.images)
+			if err == nil {
+				t.Fatal("SyncImages succeeded, want an error")
+			}
+			if got := Retryable(err); got != tc.retryable {
+				t.Errorf("Retryable(%v) = %v, want %v", err, got, tc.retryable)
 			}
 		})
 	}
