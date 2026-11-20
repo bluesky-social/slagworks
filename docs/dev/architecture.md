@@ -748,7 +748,9 @@ GORM over SQLite at `/var/lib/slagworks/worker.db` (unless
 map. Each version of an image lives in its own directory,
 `<imagesDir>/<name>@<sha16>` (the first 16 hex digits of the tarball's
 SHA256), and `<imagesDir>/<name>` is a symlink to the current one. An
-image is up to date when its link names the row's version directory.
+image is up to date when its link names the row's version directory;
+the row's `sha256` is lowercased and trimmed first (the API stores the
+value as written).
 Otherwise SyncImages downloads and verifies the tarball, extracts it
 (`extractTarGz`) and renames the result into its version directory,
 then switches the link by renaming a new symlink over it, so a reader

@@ -38,16 +38,18 @@ import (
 // keeps slagworks.image= small on the kernel command line.
 const versionLen = 16
 
-// digestRE is the shape of an image row's sha256. Part of it becomes a
+// digestRE is the shape of an image row's sha256 once SyncImages has
+// lowercased and trimmed it. Part of it becomes a
 // directory name, so anything else is refused before it reaches a path.
-var digestRE = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+var digestRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // versionDir is the directory name one version of image name is extracted
-// into: <name>@<first 16 hex digits of its tarball's SHA256>. '@' cannot
+// into: <name>@<first 16 hex digits of its tarball's SHA256>, sha being the
+// lowercase digest. '@' cannot
 // appear in an image name (model.ValidateImageName), so a version directory
 // never collides with an image's name.
 func versionDir(name, sha string) string {
-	return name + "@" + strings.ToLower(sha[:versionLen])
+	return name + "@" + sha[:versionLen]
 }
 
 // Installed returns the version directory that <imagesDir>/<name> links to,
@@ -93,6 +95,12 @@ func Installed(imagesDir, name string) (string, bool) {
 // could match a download anyway). A skipped image does not stop the other
 // images from syncing; it is reported in the returned error.
 //
+// The row's SHA256 is whatever string was written to the API, which
+// checks only that it is non-empty. A hex digest names the same tarball in
+// either case, so SyncImages uses its lowercase form, trimmed, for the
+// version directory and the download check: the spelling
+// hex.EncodeToString produces for the downloaded bytes.
+//
 // SyncImages holds an exclusive lock on imagesDir for its whole run (see
 // lockImagesDir), so syncs of one dir run one at a time across processes,
 // and first removes the temp files that a sync which exited mid-pull left
@@ -116,11 +124,12 @@ func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Ima
 		if img.URL == "" {
 			continue
 		}
-		if !digestRE.MatchString(img.SHA256) {
+		want := strings.ToLower(strings.TrimSpace(img.SHA256))
+		if !digestRE.MatchString(want) {
 			refused = append(refused, fmt.Errorf("image %s not synced: sha256 %q is not 64 hex digits; correct the image row's sha256", name, img.SHA256))
 			continue
 		}
-		version := versionDir(name, img.SHA256)
+		version := versionDir(name, want)
 		versionPath := filepath.Join(imagesDir, version)
 		current, linked := Installed(imagesDir, name)
 		if linked && current == version && isDir(versionPath) {
@@ -132,7 +141,7 @@ func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Ima
 			log.Info("image version already on disk, switching to it", "name", name, "version", version)
 		} else {
 			log.Info("downloading image", "name", name, "url", img.URL)
-			if err := pullImage(log, img, versionPath); err != nil {
+			if err := pullImage(log, img, want, versionPath); err != nil {
 				return errors.Join(append(refused, fmt.Errorf("image %s: %w", name, err))...)
 			}
 		}
@@ -144,7 +153,7 @@ func SyncImages(log *slog.Logger, imagesDir string, images map[string]*model.Ima
 			keep = append(keep, current)
 		}
 		prune(log, imagesDir, name, keep)
-		log.Info("image ready", "name", name, "sha256", img.SHA256, "version", version)
+		log.Info("image ready", "name", name, "sha256", want, "version", version)
 	}
 	return errors.Join(refused...)
 }
@@ -410,10 +419,10 @@ func (s *stallReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// pullImage downloads img, verifies its SHA256, and extracts it into
-// targetDir, which must not exist yet. On any failure targetDir is not
-// created.
-func pullImage(log *slog.Logger, img *model.Image, targetDir string) error {
+// pullImage downloads img.URL, checks it against wantSHA256 (lowercase hex,
+// as SyncImages normalizes it), and extracts it into targetDir, which must
+// not exist yet. On any failure targetDir is not created.
+func pullImage(log *slog.Logger, img *model.Image, wantSHA256, targetDir string) error {
 	tmpFile, err := os.CreateTemp(filepath.Dir(targetDir), downloadTempPrefix+"*")
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
@@ -466,8 +475,8 @@ func pullImage(log *slog.Logger, img *model.Image, targetDir string) error {
 	tmpFile.Close()
 
 	got := hex.EncodeToString(hasher.Sum(nil))
-	if got != img.SHA256 {
-		return fmt.Errorf("sha256 mismatch: got %s, want %s", got, img.SHA256)
+	if got != wantSHA256 {
+		return fmt.Errorf("sha256 mismatch: got %s, want %s", got, wantSHA256)
 	}
 
 	tmpDir, err := os.MkdirTemp(filepath.Dir(targetDir), extractTempPrefix+"*")

@@ -258,6 +258,9 @@ fetch fails with a 404 rather than mixing versions; deploy it again.
 
 Notes:
 
+- The row's `SHA256` is compared in lowercase with surrounding
+  whitespace trimmed, so a digest pinned in upper case names the same
+  tarball and the same version directory.
 - The download runs in the background. While it runs the worker stays
   connected to global, answers power, boot and lease reads, applies
   operations and aborts, and keeps serving boots from the previous image.
@@ -308,8 +311,8 @@ Notes:
 
 Diagnosing "the new image didn't roll": compare
 `readlink <images_dir>/noble-pxe` (`noble-pxe@<sha16>`) against the
-start of the SHA in `slagctl image list`. If they match, the
-worker HAS synced — a bug is in the built image, not in the rollout.
+start of the SHA in `slagctl image list`. If they match (ignoring hex
+case), the worker HAS synced — a bug is in the built image, not in the rollout.
 If they differ, look at the site worker's image sync logs: `image sync
 failed; retrying` with a `retry_in` is a failed download the worker is
 retrying, and `image sync failed` with a `hint` is one it will not

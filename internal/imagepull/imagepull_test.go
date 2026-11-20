@@ -434,7 +434,7 @@ func TestSyncImages_ReplacesPlainDirectory(t *testing.T) {
 // refused now.
 func TestSyncImages_RefusesMalformedDigest(t *testing.T) {
 	v1, sum1 := versionTarball(t, "kernel-v1")
-	for _, bad := range []string{"", "abc", "../../../../victim/" + strings.Repeat("0", 64), strings.Repeat("g", 64), sum1 + "\n"} {
+	for _, bad := range []string{"", "abc", "../../../../victim/" + strings.Repeat("0", 64), strings.Repeat("g", 64), sum1 + "0"} {
 		t.Run(bad, func(t *testing.T) {
 			srv, hits := pinServer(t, map[string][]byte{"/v1.tar.gz": v1})
 			base := t.TempDir()
@@ -748,6 +748,58 @@ func TestSyncImages_RefusesPathShapedName(t *testing.T) {
 			}
 			if _, serr := os.Stat(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); serr != nil {
 				t.Errorf("valid image noble-pxe was not synced alongside refused name %q: %v", name, serr)
+			}
+		})
+	}
+}
+
+// TestSyncImages_DigestSpellingDoesNotMatter: the row's sha256 is whatever
+// string was written to the API (slagctl image create --sha256 passes the
+// flag through, and the API checks only that it is non-empty), and a hex
+// digest names the same tarball in either case. Before the fix SyncImages
+// compared the row's value with the lowercase hex it computed as an exact
+// string, so a row holding the tarball's digest in upper case, or with a
+// stray space or newline around it, failed with "sha256 mismatch" on every
+// snapshot apply, after downloading the whole tarball each time. The
+// image must sync, the marker must record the lowercase digest, and the
+// next sync of the same row must hit the marker instead of downloading.
+func TestSyncImages_DigestSpellingDoesNotMatter(t *testing.T) {
+	tarPath, sha := buildTestTarball(t, "noble-pxe")
+	tarData, _ := os.ReadFile(tarPath)
+	var downloads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads.Add(1)
+		w.Write(tarData)
+	}))
+	defer srv.Close()
+
+	for _, tc := range []struct{ name, digest string }{
+		{"upper case", strings.ToUpper(sha)},
+		{"mixed case", strings.ToUpper(sha[:32]) + sha[32:]},
+		{"surrounding whitespace", " " + sha + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			downloads.Store(0)
+			imagesDir := t.TempDir()
+			images := map[string]*model.Image{
+				"noble-pxe": {Name: "noble-pxe", SHA256: tc.digest, URL: srv.URL + "/noble-pxe.tar.gz"},
+			}
+
+			if err := SyncImages(slog.Default(), imagesDir, images); err != nil {
+				t.Fatalf("SyncImages with digest %q for a tarball whose digest is %s: %v", tc.digest, sha, err)
+			}
+			if got, err := os.ReadFile(filepath.Join(imagesDir, "noble-pxe", "vmlinuz")); err != nil || string(got) != "fake-kernel-content" {
+				t.Fatalf("vmlinuz = %q, %v; want the tarball's content", got, err)
+			}
+			if got, _ := Installed(imagesDir, "noble-pxe"); got != "noble-pxe@"+sha[:16] {
+				t.Errorf("installed version = %q, want the lowercase digest's %q", got, "noble-pxe@"+sha[:16])
+			}
+
+			if err := SyncImages(slog.Default(), imagesDir, images); err != nil {
+				t.Fatalf("second SyncImages: %v", err)
+			}
+			if n := downloads.Load(); n != 1 {
+				t.Errorf("downloads = %d after two syncs of the same row, want 1 (the second must find the version installed)", n)
 			}
 		})
 	}
