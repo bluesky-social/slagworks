@@ -77,7 +77,7 @@ func propUnpinnedDataLayout(boot string, members ...string) propLayout {
 }
 
 // propDeepEnv, when set to 1, makes TestStoragePropDeep play every pinned
-// history the default tests leave out: about thirty more VM boots.
+// history the default tests leave out: several dozen more VM boots.
 const propDeepEnv = "SLAGWORKS_STORAGE_PROP_DEEP"
 
 func propAll(ids ...string) []string { return ids }
@@ -474,6 +474,7 @@ var propDefaultRuns = map[string][]string{
 	"TestStoragePropThirdDisk":   {"uefi-esp-third-disk"},
 	"TestStoragePropArrays":      {"uefi-raid5-data", "uefi-stale-uuid-member"},
 	"TestStoragePropMDNode":      {"uefi-second-array-beside-bystander-array"},
+	"TestStoragePropMDNodeHeld":  {"uefi-prescan-bystander-md0"},
 }
 
 func runPropPinned(t *testing.T) {
@@ -527,12 +528,19 @@ func TestStoragePropArrays(t *testing.T) { runPropPinned(t) }
 // partitions the blank disks and then fails.
 func TestStoragePropMDNode(t *testing.T) { runPropPinned(t) }
 
+// TestStoragePropMDNodeHeld: the same pair of arrays, but the deploy
+// environment has assembled the older one at /dev/md0 before the agent
+// looks. The deploy is refused by the md name check with no disk written.
+// TestStoragePropMDNode cannot tell a working check from a missing one,
+// because the boot image never assembles the older array on its own.
+func TestStoragePropMDNodeHeld(t *testing.T) { runPropPinned(t) }
+
 // TestStoragePropDeep plays every pinned history the default tests leave
 // out. Set SLAGWORKS_STORAGE_PROP_DEEP=1 and give it a long -timeout and a
 // -parallel the host's memory allows (each VM takes 4 GB).
 func TestStoragePropDeep(t *testing.T) {
 	if os.Getenv(propDeepEnv) != "1" {
-		t.Skipf("set %s=1 to play the remaining pinned histories (about thirty VM boots)", propDeepEnv)
+		t.Skipf("set %s=1 to play the remaining pinned histories (several dozen VM boots)", propDeepEnv)
 	}
 	inDefault := map[string]bool{}
 	for _, names := range propDefaultRuns {

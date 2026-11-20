@@ -832,7 +832,7 @@ func propGenCase(seed int64) propCase {
 			// the firmware's first may be 4Kn: a root mirror then has GRUB
 			// installed on a 4Kn disk beside the 512-byte one that boots.
 			lbs = 512
-			if b != "sata" && !(bios && i == 0) && g.chance(35) {
+			if b != "sata" && (!bios || i != 0) && g.chance(35) {
 				lbs = 4096
 			}
 		}

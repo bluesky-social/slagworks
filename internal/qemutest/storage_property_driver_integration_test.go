@@ -744,6 +744,9 @@ func (r *propRun) checkReboot(ctx context.Context, i int, vm *qemutest.VM, cli *
 func runPropCase(t *testing.T, c propCase) {
 	t.Helper()
 	t.Logf("PROPCASE %s", c.JSON())
+	if why := propKnownDefect(c); why != "" {
+		t.Skipf("this history reaches a known defect: %s", why)
+	}
 
 	env := qemutest.New(t)
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)

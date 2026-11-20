@@ -14,6 +14,9 @@ package qemutest
 //
 //	SLAGWORKS_LIFECYCLE_PROP_VM=1         every named and committed history
 //	SLAGWORKS_LIFECYCLE_PROP_VM_SEEDS=A-B generated histories
+//	SLAGWORKS_LIFECYCLE_PROP_VM_UEFI=1    with SEEDS: let them draw UEFI
+//	SLAGWORKS_LIFECYCLE_PROP_VM_SETUPS=1  TestLifecyclePropVMSetups: named
+//	                                      histories under UEFI and RAID1
 //
 //	SLAGWORKS_LIFECYCLE_PROP_VM=1 go test -tags integration ./internal/qemutest \
 //	    -run 'TestLifecyclePropVMAll' -parallel 8
