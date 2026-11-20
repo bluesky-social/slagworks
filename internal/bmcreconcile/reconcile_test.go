@@ -118,8 +118,9 @@ func ipmitoolUserRow(slot int, name, callin, linkAuth, ipmiMsg, priv string) str
 // TestReconcile_RawIpmitoolOutput_InBandRedeployIsNoOp runs an in-band
 // redeploy against the bytes real ipmitool writes (ipmitoolUserListHeader).
 // The monitor account is already provisioned, so provision-once means no
-// write of any kind but the boot order, and the slot-2 gate must accept the
-// bmc-creds-admin account at slot 2 whatever its length.
+// write but the account's enable bit (which the list cannot show) and the
+// boot order, and the slot-2 gate must accept the bmc-creds-admin account
+// at slot 2 whatever its length.
 func TestReconcile_RawIpmitoolOutput_InBandRedeployIsNoOp(t *testing.T) {
 	for _, admin := range []string{"ADMIN", "Administrator"} {
 		t.Run(admin, func(t *testing.T) {
@@ -132,6 +133,7 @@ func TestReconcile_RawIpmitoolOutput_InBandRedeployIsNoOp(t *testing.T) {
 			fake.queueOutput("chassis bootparam set bootflag force_pxe options=PEF,timestamp,reset_persistence", "")
 			fake.queueOutput("user list 1", table)
 
+			fake.queueOutput("user enable 3", "")
 			res, err := Reconcile(context.Background(), Options{
 				IPMITool:  fake.path,
 				Desired:   []DesiredUser{{Name: MonitorUser, Privilege: PrivUser}},
@@ -144,7 +146,8 @@ func TestReconcile_RawIpmitoolOutput_InBandRedeployIsNoOp(t *testing.T) {
 				t.Errorf("redeploy rewrote a provisioned account's password: %+v", res.CreatedOrUpdated)
 			}
 			for _, c := range fake.calls() {
-				if !strings.Contains(c.Args, "user list 1") && !strings.Contains(c.Args, "bootparam") {
+				if !strings.Contains(c.Args, "user list 1") && !strings.Contains(c.Args, "bootparam") &&
+					!strings.Contains(c.Args, "user enable 3") {
 					t.Errorf("redeploy of a compliant BMC issued %q", c.Args)
 				}
 			}
@@ -231,8 +234,8 @@ func TestReconcile_FullProvisioning_FreshBMC(t *testing.T) {
 
 // TestReconcile_AlreadyProvisioned_NoOp covers the subsequent-deploy
 // happy path: BMC already has slagworks + monitor with the right
-// privileges. Reconcile should make no setter calls except the
-// boot-order write (always fired; idempotent).
+// privileges. Reconcile should make no setter calls except each account's
+// `user enable` and the boot-order write (always fired; idempotent).
 func TestReconcile_AlreadyProvisioned_NoOp(t *testing.T) {
 	fake := newFakeIPMITool(t)
 	provisioned := `ID  Name             Callin  Link Auth  IPMI Msg   Channel Priv Limit
@@ -245,6 +248,8 @@ func TestReconcile_AlreadyProvisioned_NoOp(t *testing.T) {
 	fake.queueOutput("chassis bootparam set bootflag force_pxe options=PEF,timestamp,reset_persistence", "")
 	fake.queueOutput("user list 1", provisioned)
 
+	fake.queueOutput("user enable 3", "")
+	fake.queueOutput("user enable 4", "")
 	res, err := Reconcile(context.Background(), Options{
 		IPMITool: fake.path,
 		Desired: []DesiredUser{
@@ -258,11 +263,52 @@ func TestReconcile_AlreadyProvisioned_NoOp(t *testing.T) {
 	if len(res.CreatedOrUpdated) != 0 {
 		t.Errorf("expected no writes, got %+v", res.CreatedOrUpdated)
 	}
+	for _, c := range fake.calls() {
+		if !strings.Contains(c.Args, "user list 1") && !strings.Contains(c.Args, "bootparam") &&
+			!strings.Contains(c.Args, "user enable 3") && !strings.Contains(c.Args, "user enable 4") {
+			t.Errorf("a compliant BMC got %q", c.Args)
+		}
+	}
 	if len(res.LeftoversDisabled) != 0 {
 		t.Errorf("expected no leftover disables, got %v", res.LeftoversDisabled)
 	}
 	if !res.BootOrderPersisted {
 		t.Error("BootOrderPersisted should be true even when users were already correct")
+	}
+}
+
+// TestReconcile_InBand_HiddenDisabledMonitor_Enabled: the monitor account
+// lists as USER with LAN access, but its enable bit is off (a create that
+// stopped before its last step, or an account disabled by hand). `user
+// list` shows the channel privilege limit whatever the enable bit, so the
+// in-band path cannot see that the account cannot log in. It must send
+// `user enable` all the same, without touching the password, rather than
+// report success over a disabled account.
+func TestReconcile_InBand_HiddenDisabledMonitor_Enabled(t *testing.T) {
+	bmc := newStatefulBMC(t, map[int]bmcSlot{
+		1: {Priv: PrivAdmin},
+		2: {Name: "ADMIN", Priv: PrivAdmin, Password: "adminpw!", Enabled: true},
+		3: {Name: "monitor", Priv: PrivUser, Password: storedMonitorPW, Enabled: false},
+	})
+	res, err := Reconcile(context.Background(), Options{
+		IPMITool: bmc.path,
+		Desired:  []DesiredUser{{Name: "monitor", Privilege: PrivUser}},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	got := bmc.slot(3)
+	if !got.Enabled {
+		t.Error("Reconcile returned nil but the monitor account is still disabled")
+	}
+	if got.Password != storedMonitorPW || got.Priv != PrivUser {
+		t.Errorf("enabling must leave the password and privilege alone; password kept: %v, priv %v", got.Password == storedMonitorPW, got.Priv)
+	}
+	if len(res.CreatedOrUpdated) != 0 {
+		t.Errorf("no password was written, so nothing is reported; got %d", len(res.CreatedOrUpdated))
+	}
+	if admin := bmc.slot(2); !admin.Enabled || admin.Password != "adminpw!" {
+		t.Errorf("slot 2 must be untouched: %+v", admin.Enabled)
 	}
 }
 
@@ -301,6 +347,7 @@ func TestReconcile_WrongPriv_FixedInPlace_NoPasswordRewrite(t *testing.T) {
 4   monitor          true    true       true       USER
 `)
 
+	fake.queueOutput("user enable 4", "")
 	res, err := Reconcile(context.Background(), Options{
 		IPMITool: fake.path,
 		Desired: []DesiredUser{
@@ -427,6 +474,7 @@ func TestReconcile_PartialCreate_DisabledUser_GetsFreshPassword(t *testing.T) {
 4   monitor          true    true       true       USER
 `)
 
+	fake.queueOutput("user enable 4", "")
 	res, err := Reconcile(context.Background(), Options{
 		IPMITool: fake.path,
 		Desired: []DesiredUser{
@@ -542,6 +590,8 @@ func TestReconcile_Leftovers_Disabled(t *testing.T) {
 5                    true    false      false      NO ACCESS
 `)
 
+	fake.queueOutput("user enable 3", "")
+	fake.queueOutput("user enable 4", "")
 	res, err := Reconcile(context.Background(), Options{
 		IPMITool: fake.path,
 		Desired: []DesiredUser{
@@ -585,6 +635,7 @@ func TestReconcile_LeftoverNameClearRefused_StillDisablesAll(t *testing.T) {
 5   monitor          true    true       true       USER
 `)
 
+	fake.queueOutput("user enable 5", "")
 	res, err := Reconcile(context.Background(), Options{
 		IPMITool:      fake.path,
 		Desired:       []DesiredUser{{Name: "monitor", Privilege: PrivUser}},
@@ -703,6 +754,7 @@ func TestReconcile_TakeoverSparesDesiredAccounts(t *testing.T) {
 		[3]string{"3", "slagworks", "OPERATOR"},
 		[3]string{"4", "monitor", "USER"},
 	))
+	fake.queueOutput("user enable 3", "")
 	res, err := Reconcile(context.Background(), Options{IPMITool: fake.path, Desired: desired, SkipBootOrder: true})
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -714,9 +766,9 @@ func TestReconcile_TakeoverSparesDesiredAccounts(t *testing.T) {
 		t.Errorf("LeftoversDisabled = %v, want [maas]", res.LeftoversDisabled)
 	}
 	for _, c := range fake.calls() {
-		for _, slot3 := range []string{"user disable 3", "user set name 3", "user set password 3", "user priv 3", "setaccess 1 3", "user enable 3"} {
+		for _, slot3 := range []string{"user disable 3", "user set name 3", "user set password 3", "user priv 3", "setaccess 1 3"} {
 			if strings.Contains(c.Args, slot3) {
-				t.Errorf("the compliant slagworks account at slot 3 must not be touched: %q", c.Args)
+				t.Errorf("the compliant slagworks account at slot 3 must get nothing but `user enable`: %q", c.Args)
 			}
 		}
 	}
@@ -755,6 +807,8 @@ func TestReconcile_PreservesVendorAdmin(t *testing.T) {
 	fake.queueOutput("chassis bootparam set bootflag force_pxe options=PEF,timestamp,reset_persistence", "")
 	fake.queueOutput("user list 1", provisioned)
 
+	fake.queueOutput("user enable 3", "")
+	fake.queueOutput("user enable 4", "")
 	res, err := Reconcile(context.Background(), Options{
 		IPMITool: fake.path,
 		Desired: []DesiredUser{
@@ -836,6 +890,7 @@ func TestReconcile_RestoresMissingUser(t *testing.T) {
 4   monitor          true    true       true       USER
 `)
 
+	fake.queueOutput("user enable 3", "")
 	res, err := Reconcile(context.Background(), Options{
 		IPMITool: fake.path,
 		Desired: []DesiredUser{
@@ -887,6 +942,7 @@ func TestReconcile_SkipBootOrder(t *testing.T) {
 	fake.queueOutput("user list 1", table)
 	fake.queueOutput("user list 1", table)
 
+	fake.queueOutput("user enable 3", "")
 	res, err := Reconcile(context.Background(), Options{
 		IPMITool:      fake.path,
 		Desired:       []DesiredUser{{Name: "monitor", Privilege: PrivUser}},
@@ -990,6 +1046,7 @@ func TestReconcile_AdminUserSlot2_CaseInsensitive(t *testing.T) {
 	)
 	fake.queueOutput("user list 1", table)
 	fake.queueOutput("user list 1", table)
+	fake.queueOutput("user enable 3", "")
 	if _, err := Reconcile(context.Background(), Options{
 		IPMITool:      fake.path,
 		Desired:       []DesiredUser{{Name: "monitor", Privilege: PrivUser}},
@@ -1746,6 +1803,7 @@ func TestReconcile_DuplicateDesiredName_ExtraDisabled(t *testing.T) {
 		[3]string{"6", "", ""},
 	))
 
+	fake.queueOutput("user enable 3", "")
 	res, err := Reconcile(context.Background(), Options{
 		IPMITool:      fake.path,
 		Desired:       []DesiredUser{{Name: "monitor", Privilege: PrivUser}},

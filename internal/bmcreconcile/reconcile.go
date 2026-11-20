@@ -12,7 +12,8 @@
 //     model, so the agent needs no network credential; it learns only the
 //     admin account's NAME (AdminUserKernelArg) for the slot-2 gate. This
 //     path provisions once and never rotates a working password, and it
-//     re-asserts the persistent PXE boot order.
+//     re-asserts the account's enable bit and the persistent PXE boot
+//     order.
 //
 //   - Over the LAN, from the site worker that owns the BMC's OOB network
 //     (the bmc_reconcile op; RemoteOptions / ReconcileRemote). The session
@@ -425,8 +426,18 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			// the channel access. A run that stopped between `user priv` and
 			// `channel setaccess` leaves the right privilege without LAN
 			// access, which is not compliant.
+			//
+			// The enable bit is not among them: `user list` prints the channel
+			// privilege limit whatever the bit (User.Enabled only means the
+			// limit is not NO ACCESS), so an account whose create stopped
+			// before its last step, or that was disabled by hand, lists as
+			// compliant while it cannot log in. `user enable` is therefore sent
+			// to every account that lists compliant; on an enabled one it
+			// changes nothing. The password stays: its write was reported
+			// before the create's enable step.
 			if existing.Privilege == d.Privilege && existing.Enabled && existing.LANAccess {
-				continue // nothing to do
+				plans = append(plans, plan{desired: d, slot: existing.Slot, exists: true, enableOnly: true})
+				continue
 			}
 			// An existing-but-DISABLED user is treated as not-yet-fully-
 			// provisioned and gets a fresh password (needsPassword). This
@@ -565,6 +576,12 @@ func Reconcile(ctx context.Context, opt Options) (*Result, error) {
 			}
 			if err := applyPrivAndEnable(ctx, opt, p.slot, p.desired.Privilege); err != nil {
 				return res, err
+			}
+			continue
+		}
+		if p.enableOnly {
+			if err := runIPMIToolVoid(ctx, opt, "user", "enable", strconv.Itoa(p.slot)); err != nil {
+				return res, fmt.Errorf("bmcreconcile: enable slot %d: %w", p.slot, err)
 			}
 			continue
 		}
@@ -941,6 +958,11 @@ type plan struct {
 	// privilege or missing LAN channel access — provision-once leaves its
 	// working password untouched.
 	needsPassword bool
+	// enableOnly is true for an existing account that lists compliant
+	// (right privilege, LAN access) and carries no Password or Rotate: the
+	// only write is `user enable`, because the list cannot show the enable
+	// bit.
+	enableOnly bool
 }
 
 // setPassword writes password to the slot. Some BMC firmware (notably

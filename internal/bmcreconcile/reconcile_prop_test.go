@@ -169,20 +169,6 @@ func simHealthyMonitor(s *simState) (int, bool) {
 	return ms[0], sl.Enabled && sl.Priv == int(PrivUser) && sl.LAN
 }
 
-// simHiddenDisabledMonitor reports whether a monitor account has its enable
-// bit off while `user list` shows it as a USER with LAN access.
-func simHiddenDisabledMonitor(s *simState) bool {
-	if s.DisableShowsNoAccess {
-		return false
-	}
-	for _, n := range simMonitorSlots(s) {
-		if sl := s.Slots[n-1]; !sl.Enabled && sl.Priv == int(PrivUser) && sl.LAN {
-			return true
-		}
-	}
-	return false
-}
-
 // simUnreportedPassword reports whether the run whose command log s carries
 // wrote a slot a password that the slot now holds and that is neither in
 // accounted (fixed test passwords and the ones the result reported) nor the
@@ -344,15 +330,7 @@ func checkReconcileHistory(t *rapid.T, sim *bmcSim, stats *reconcilePropStats) {
 		}
 
 		// Success means compliance.
-		// Excluded pattern, a defect in Reconcile: the in-band path takes a
-		// monitor that lists USER with LAN access as provisioned and never
-		// sends `user enable`, so one whose enable bit is off (a create that
-		// stopped before its last step) stays unable to log in while the run
-		// succeeds. `user list` shows the bit only on firmware that lists a
-		// disabled user as NO ACCESS. The remote path always enables, so the
-		// convergence check below still covers these tables.
-		excluded := r.inband && simHiddenDisabledMonitor(after)
-		if err == nil && !excluded {
+		if err == nil {
 			why, m := simCompliant(after)
 			if why != "" {
 				t.Fatalf("%s: Reconcile returned nil error but the BMC is not compliant: %s\nBMC before: %+v\nBMC after: %+v\nlog: %q",
