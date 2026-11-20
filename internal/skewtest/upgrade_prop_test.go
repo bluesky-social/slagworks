@@ -227,7 +227,8 @@ type world struct {
 	// connections.
 	refuses bool
 	// noWait makes createOp return without waiting for the claim.
-	noWait bool
+	noWait     bool
+	healthOnly bool
 }
 
 func (w *world) note(format string, args ...any) {
@@ -478,7 +479,7 @@ func (w *world) report(m *mach, o *opRec, phase, event string, failed bool) int 
 			// The tree under test documents when a phone-home may be
 			// accepted: only for a deploy the agent reported complete, or as
 			// a retry of one already accepted.
-			if w.wVer == "to" && !o.completeAck && !o.phoneAck {
+			if w.wVer == "to" && !w.healthOnly && !o.completeAck && !o.phoneAck {
 				w.fail("honest: worker (%s build) answered %d to a phone_home for op %s whose agent never got a 2xx for deploy_complete", w.tag(w.wVer), code, o.id)
 			}
 			if !o.phoneAck {
@@ -539,6 +540,8 @@ func (w *world) boot(m *mach) string {
 		w.fail("boot: %s was served the %s installer but no lifecycle op was ever created for it", m.serial, class)
 	case o.typ != class:
 		w.fail("boot: %s was served the %s installer but its current op %s is a %s", m.serial, class, o.id, o.typ)
+	case w.healthOnly:
+		// The boot decision is the "to" build's business.
 	case (o.completeAck || o.phoneAck) && w.tolerateFromLatch && o.completeBy == "from":
 		// See scenarioConfig.tolerateFromLatch.
 		w.st.fromLatchLost++
@@ -576,6 +579,7 @@ func (w *world) checkActuations() {
 		switch {
 		case o == nil:
 			w.fail("actuate: the executor power-cycled %s with no op created for it", m.serial)
+		case w.healthOnly:
 		case (o.completeAck || o.phoneAck) && o.selfBooted:
 			w.st.lateClaimActuations++
 		case o.completeAck || o.phoneAck:
@@ -667,7 +671,7 @@ func (w *world) upgradeGlobal() {
 		w.g = p
 		w.fail("migrate: the %s build cannot read the migrated database: %v", w.verTo, err)
 	}
-	if d.InstanceID == "" {
+	if d.InstanceID == "" && !w.healthOnly {
 		w.g = p
 		w.fail("migrate: no instance ID after the %s build's Migrate: %s", w.verTo, d.InstanceIDErr)
 	}
@@ -811,6 +815,13 @@ type scenarioConfig struct {
 	// back, so a worker stopped before that echo restarts without it
 	// (TestProp_RollingRestart checks that this tree's worker does not).
 	tolerateFromLatch bool
+	// healthOnly keeps the checks that do not depend on how the "to" build
+	// handles a deploy: every process starts on the state the other build
+	// left, Migrate loses no row, nothing crashes or hangs, and the two
+	// sides connect once both run the "to" build. A rollback to an older
+	// release runs with it: the older release's own lifecycle bugs are not
+	// this tree's to fix.
+	healthOnly bool
 }
 
 func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir string) {
@@ -818,7 +829,7 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 	w := &world{
 		t: t, f: rt, st: st, slug: "site-a", worker: "worker-1",
 		binFrom: cfg.binFrom, binTo: cfg.binTo, verFrom: cfg.verFrom, verTo: cfg.verTo,
-		strict: cfg.binFrom == cfg.binTo, tolerateFromLatch: cfg.tolerateFromLatch, refuses: cfg.refuses,
+		strict: cfg.binFrom == cfg.binTo, tolerateFromLatch: cfg.tolerateFromLatch, refuses: cfg.refuses, healthOnly: cfg.healthOnly,
 	}
 	w.dbName, w.dsn = freshDatabase(t, rt, "")
 	defer dropDatabase(w.dbName)
@@ -1122,6 +1133,15 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 	if !eventually(60*time.Second, func() bool { return w.status().Connected }) {
 		w.fail("settle: with both sides on the %s build, the worker did not connect within 60s", w.verTo)
 	}
+	if cfg.healthOnly {
+		// One more exchange in each direction, to show the pair works.
+		d := w.dump()
+		_ = w.status()
+		if len(d.Machines) != len(w.machines) {
+			w.fail("health: global lists %d machines after the scenario, the fleet has %d", len(d.Machines), len(w.machines))
+		}
+		return
+	}
 	if !eventually(45*time.Second, func() bool { return outboxRows(w.f, w.dbPath) == 0 }) {
 		w.fail("settle: the worker's outbox still holds %d unacknowledged observations 45s after it connected: global is neither accepting nor terminally rejecting them", outboxRows(w.f, w.dbPath))
 	}
@@ -1321,4 +1341,14 @@ func TestProp_UpgradeFromOldRelease(t *testing.T) {
 	strict := os.Getenv("SKEW_STRICT") != ""
 	shards(t, scenarioConfig{binFrom: toolOld, binTo: toolNew, verFrom: oldRef, verTo: "main", refuses: true,
 		tolerateFromPhoneHome: !strict, tolerateFromLatch: !strict})
+}
+
+// TestProp_RollbackToOldRelease is the scenario backwards: the fleet starts
+// on this tree and both sides go back to the old release, global onto a
+// database this tree migrated and the worker onto a worker.db this tree
+// wrote. docs/user/installation.md says rolling global back rolls the
+// workers back; this checks the old release can start on what it finds.
+func TestProp_RollbackToOldRelease(t *testing.T) {
+	needOld(t)
+	shards(t, scenarioConfig{binFrom: toolNew, binTo: toolOld, verFrom: "main", verTo: oldRef, refuses: true, healthOnly: true})
 }
