@@ -1229,9 +1229,9 @@ Packages:
   by the site worker for the `bmc_reconcile` op.
 - `commission` — Observation handler for `commission_report`,
   `deploy_complete`, `bmc_reconcile_report`, and `dhcp_lease` events.
-  Writes commission data back to NetBox, stores the BMC monitor
-  credential in AWS, finalizes `bmc_reconcile` ops, and records the
-  DHCP lease ledger.
+  Writes commission data back to NetBox, latches a deploy op at
+  `awaiting_phone_home` and stores the BMC monitor credential in AWS,
+  finalizes `bmc_reconcile` ops, and records the DHCP lease ledger.
 - `configscript` — Shared config-script parser and matcher used by
   both the storage and network script pipelines.
 - `dhcp` — DHCPv4 handler and server, multi-interface, split-pool,

@@ -429,6 +429,11 @@ func (r *refModel) setPhase(opID uuid.UUID, phase string) opsmObs {
 		r.hit("phase.same")
 		return opsmObs{Changed: false}
 	}
+	if o.phase == "awaiting_phone_home" && phase != "failed" {
+		// The phone-home latch: only the agent's failure leaves it.
+		r.hit("phase.held_awaiting_phone_home")
+		return opsmObs{Changed: false}
+	}
 	if refTerminal(o.status) {
 		// A terminal row is never written again.
 		r.hit("phase.terminal")
@@ -444,7 +449,7 @@ func (r *refModel) setPhase(opID uuid.UUID, phase string) opsmObs {
 		r.hit("phase.to_awaiting_phone_home")
 	}
 	if prev == "awaiting_phone_home" {
-		r.hit("phase.from_awaiting_phone_home")
+		r.hit("phase.failed_from_awaiting_phone_home")
 	}
 	return opsmObs{Changed: true, Prev: prev, Ops: []opsmOpView{o.view()}}
 }

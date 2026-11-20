@@ -602,10 +602,16 @@ func (w *pcWorld) gClaim(o *pcOp, us bool) pcClaimResult {
 	return pcClaimWon
 }
 
-// gPhase is SetOperationPhase as called from the op_update handler. A
-// terminal op is left as it is: no version bump, nothing published.
+// gPhase is SetOperationPhase as called from the op_update handler and the
+// deploy_complete observation. A terminal op is left as it is, and so is a
+// deploy held at awaiting_phone_home (only "failed" leaves it): no version
+// bump, nothing published.
 func (w *pcWorld) gPhase(o *pcOp, phase string) {
 	if o.phase == phase {
+		return
+	}
+	if o.phase == "awaiting_phone_home" && phase != "failed" {
+		pcStat.add("truth/phase_held_awaiting_phone_home")
 		return
 	}
 	if !o.active() {
@@ -705,6 +711,13 @@ func (w *pcWorld) gHandleObs(p PendingOutbox) {
 		o := w.opByID(p.Obs.OperationID)
 		if o != nil && o.active() && o.typ == model.OpBMCReconcile {
 			w.gComplete(o, "")
+		}
+	case "deploy_complete":
+		// The durable carrier of the awaiting_phone_home latch, beside the
+		// worker's memory-only phase op_update.
+		o := w.opByID(p.Obs.OperationID)
+		if o != nil && o.typ == model.OpDeploy && pcMachineID(o.mi) == p.Obs.MachineID {
+			w.gPhase(o, "awaiting_phone_home")
 		}
 	case "phone_home":
 		// The durable carrier of a deploy's completion: it names the deploy

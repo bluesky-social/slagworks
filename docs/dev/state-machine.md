@@ -244,16 +244,20 @@ lock (`TestFailOperation_AutoUnlocksOnFailed`,
 ### Phase write sites
 
 `Operation.Phase` is written in only one place on global
-(`Store.SetOperationPhase`, `internal/store/store.go:703`), called
+(`Store.SetOperationPhase`, `internal/store/operations.go`), called
 by `hubhandlers.OpUpdate.HandleOpUpdate`
-(`hubhandlers.go:132`). `SetOperationPhase` returns a
-`PhaseTransition` (`store.go:690`) that the hub uses to emit exactly
+(`hubhandlers.go:132`) and, with `awaiting_phone_home`, by the
+observation handler for `deploy_complete`
+(`commission.Handler.handleDeployComplete`). `SetOperationPhase` returns a
+`PhaseTransition` that the callers use to emit exactly
 one canonical log envelope per real change. It does not write a
 terminal (completed/failed) op: the worker can still report a phase
 after the op ended (a report in flight when the operator aborts, or
 executor progress after `op_removed`), and that report changes
 nothing and publishes nothing. The op keeps the phase it ended in, and
-its version stays at the tombstone workers hold for it.
+its version stays at the tombstone workers hold for it. Nor does it
+move a deploy off `awaiting_phone_home` to any phase but `failed`; see
+[the latch](#the-awaiting_phone_home-latch).
 It reads the op row `FOR
 UPDATE`, so two overlapping deliveries of the same report serialize:
 the second sees the phase the first wrote and returns `Changed=false`.
@@ -1045,6 +1049,43 @@ global's stale row) then finds the latched phase to keep
 (`keepTerminalWait`) and the pin to apply, and the host's next PXE still
 boots its disk. Test: `TestAwaitingPhoneHomeSurvivesRestart`
 (`opstream_test.go`).
+
+The latch also has to reach global's row and stay there, because that
+row is the only place a worker that did not accept `deploy_complete`
+learns it: the other worker of a both-active pair (either may answer the
+installed host's next PXE), and a worker that restarts or resyncs without
+a latched LocalDB row. `keepTerminalWait` protects only a worker that
+already holds the latch. Two rules on global keep the row latched:
+
+- The `deploy_complete` observation carries the latch. The phase
+  op_update is lost when it is written into a connection that then
+  drops, when the hub's handler fails, or when the worker restarts
+  before draining it; the observation stays in the worker's SQLite
+  outbox until global acks it. `commission.Handler.handleDeployComplete`
+  sets the op's phase to `awaiting_phone_home` and publishes the
+  op_delta before it handles the monitor credential, so a monitor
+  failure that drops the observation does not drop the latch, and a
+  failed phase write leaves the observation unacked for a retry.
+- `Store.SetOperationPhase` holds the row at `awaiting_phone_home`
+  against every phase but `failed`, the rule `opState.updatePhase`
+  applies to each worker's copy. The writes it drops are late: a worker
+  that has not seen the latch reporting `dhcp_ack` or `ipxe_loaded` for
+  the installed host's next PXE, or phase reports a worker queued before
+  a disconnect. The reconnect drain sends observations before op
+  updates, so even the latching worker's own `finalizing` and
+  `bmc_reconcile` can reach global after its `deploy_complete`
+  observation. Accepting one would move the row back to a mid-install
+  phase: every worker that loaded the op afterwards would serve the
+  installer, the stuck sweep would time the op from `claimed_at`, and a
+  worker holding the regressed row would refuse the phone-home.
+
+Tests: `TestHandleDeployComplete_LatchesAwaitingPhoneHome`,
+`TestHandleDeployComplete_LatchSurvivesMonitorCredFailure`
+(`internal/commission/handler_test.go`) and
+`TestSetOperationPhase_AwaitingPhoneHomeHeld`
+(`internal/store/operations_test.go`). Neither rule helps a worker that
+is cut off from global when the latch is set: until it reconnects it
+serves from the op set it last received.
 
 Timeout: `PhoneHomeTimeout` (30 minutes by default) anchored on
 `phase_entered_at`.

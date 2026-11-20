@@ -1067,6 +1067,12 @@ func (r *pmRun) envPhase() {
 		r.failf("env phase: %v", err)
 	}
 	r.logf("env phase %s -> %s", o.id, phase)
+	if o.phase == "awaiting_phone_home" {
+		// The store holds the phone-home latch; none of the drawn phases
+		// is the "failed" that leaves it.
+		r.stats.add("env phase: held at awaiting_phone_home")
+		return
+	}
 	if o.phase != phase {
 		o.oldPhase = false // phase_entered_at is bumped on a real change
 	}
