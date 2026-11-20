@@ -230,7 +230,16 @@ func raceRound(t *testing.T, seed int64) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	cancel()
-	wg.Wait()
+	stopped := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("seed %d: the executor or the outbox drain did not stop within 30s of cancellation", seed)
+	}
 
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
