@@ -270,7 +270,8 @@ directory names (`noble-pxe -> noble-pxe@<first 16 hex digits>`,
 
 Diagnosis order when a new image "isn't on the workers":
 
-- `slagctl image list` — does the row's SHA match the SHA you
+- `slagctl image list` — does the row's SHA256 column (the first 12
+  characters; `--json` prints the full digest) match the SHA you
   expect? If not, `follow-latest` hasn't been run yet.
 - Site-worker-side: does `readlink <images_dir>/noble-pxe` name the
   version `slagctl image list` pins? If not, the worker hasn't

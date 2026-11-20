@@ -148,11 +148,12 @@ func imageListCmd() *cobra.Command {
 					img.Name,
 					img.Version,
 					img.Arch,
+					shortSHA256(img.SHA256),
 					format.HumanDuration(img.CreatedAt),
 				}
 			}
 			format.PrintTable(cmd.OutOrStdout(),
-				[]string{"ID", "NAME", "VERSION", "ARCH", "CREATED"},
+				[]string{"ID", "NAME", "VERSION", "ARCH", "SHA256", "CREATED"},
 				rows)
 			return nil
 		},
@@ -281,6 +282,18 @@ this command (or run it on a cron).`,
 // sha256Pattern matches a 64-char lowercase hex sha256 digest.
 var sha256Pattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
+// shortSHA256 returns the first 12 characters of an image row's sha256, the
+// prefix operators compare against a worker's on-disk <name>.sha256 marker.
+// Rows are normally written with a 64-char hex digest, but the API checks
+// only that sha256 is non-empty, so a hand-registered value can be shorter;
+// that is returned whole rather than panicking on the slice.
+func shortSHA256(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
 // fetchHexLine GETs the URL and returns the trimmed body. Used for
 // both latest-sha.txt and <sha>.tar.gz.sha256 — both files are
 // hex-only-with-trailing-newline by convention. Caps the read at 256
@@ -338,15 +351,7 @@ build time (boot=slagworks sources it); there is no download-time repack.`,
 			imgMap := make(map[string]*model.Image, len(images))
 			for i := range images {
 				imgMap[images[i].Name] = &images[i]
-				// Defensive truncation: image rows are normally written
-				// with a 64-char hex sha256, but the API doesn't enforce
-				// length and a malformed row shouldn't panic the sync
-				// command across the fleet.
-				sha := images[i].SHA256
-				if len(sha) > 12 {
-					sha = sha[:12]
-				}
-				fmt.Fprintf(cmd.OutOrStdout(), "  %s sha256=%s\n", images[i].Name, sha)
+				fmt.Fprintf(cmd.OutOrStdout(), "  %s sha256=%s\n", images[i].Name, shortSHA256(images[i].SHA256))
 			}
 
 			log := slog.Default()

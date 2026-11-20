@@ -330,8 +330,10 @@ Notes:
 
 Diagnosing "the new image didn't roll": compare
 `readlink <images_dir>/noble-pxe` (`noble-pxe@<sha16>`) against the
-start of the SHA in `slagctl image list`. If they match (ignoring hex
-case), the worker HAS synced — a bug is in the built image, not in the rollout.
+SHA256 column of `slagctl image list` (the first 12 characters;
+`--json` prints the full digest). If the link's digits start with the
+column's (ignoring hex case), the worker HAS synced — a bug is in the
+built image, not in the rollout.
 If they differ, look at the site worker's image sync logs: `image sync
 failed; retrying` with a `retry_in` is a failed download the worker is
 retrying, and `image sync failed` with a `hint` is one it will not
@@ -384,8 +386,8 @@ For a change that spans everything:
 3. **Image changes**: once the tarball for the commit is published and
    `latest-sha.txt` names it, run `slagctl image follow-latest`. Confirm each site
    worker synced: `readlink <images_dir>/noble-pxe` on the worker names
-   `noble-pxe@` and the first 16 hex digits of `slagctl image list`'s
-   pinned SHA.
+   `noble-pxe@` followed by 16 hex digits that start with the SHA256
+   column of `slagctl image list`.
 4. **Agent changes**: upgrade the `slagworks` (or `slagworks-agent`)
    apt package on every site worker that will serve the deploy.
    Restarting `slagworksd-site.service` picks up the new binary.
