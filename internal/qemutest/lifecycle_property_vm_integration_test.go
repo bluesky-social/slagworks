@@ -16,7 +16,7 @@ package qemutest
 //	SLAGWORKS_LIFECYCLE_PROP_VM_SEEDS=A-B generated histories
 //
 //	SLAGWORKS_LIFECYCLE_PROP_VM=1 go test -tags integration ./internal/qemutest \
-//	    -run 'TestLifecyclePropVMDeep' -parallel 8
+//	    -run 'TestLifecyclePropVMAll' -parallel 8
 
 import (
 	"context"
@@ -291,10 +291,10 @@ func TestLifecyclePropVMLostCompletion(t *testing.T) {
 	runPropVM(t, propFileHistory(t, "global-crash-at-phone-home"))
 }
 
-// TestLifecyclePropVMDeep is the opt-in VM run: every named and committed
+// TestLifecyclePropVMAll is the opt-in VM run: every named and committed
 // history with SLAGWORKS_LIFECYCLE_PROP_VM=1, generated histories with
 // SLAGWORKS_LIFECYCLE_PROP_VM_SEEDS=A-B.
-func TestLifecyclePropVMDeep(t *testing.T) {
+func TestLifecyclePropVMAll(t *testing.T) {
 	var hs []propHistory
 	if v := os.Getenv("SLAGWORKS_LIFECYCLE_PROP_VM"); v != "" {
 		if on, err := strconv.ParseBool(v); err != nil || !on {

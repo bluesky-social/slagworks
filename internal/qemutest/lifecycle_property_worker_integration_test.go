@@ -846,7 +846,8 @@ func (w *propWorker) postMACPhoneHome(mac string) (int, error) {
 // propSimHost models a machine's firmware, the deploy/commission agent and the
 // installed OS's phone-home unit closely enough to drive every request the
 // real ones send, in the same order, with the same retry rules
-// (cmd/slagworks-agent, internal/agent/target.GeneratePhoneHomeUnit).
+// (cmd/slagworks-agent, internal/agent/target.GeneratePhoneHomeUnit),
+// including the agent halting on the 410 that says its operation is over.
 type propSimHost struct {
 	name    string
 	mac     string
@@ -1024,6 +1025,23 @@ func (h *propSimHost) bootDisk(gen int) {
 	}
 }
 
+// agentReport is the agent's agentReporter.send: a 410 before the run's
+// final report was accepted means the operation is over, and the agent
+// halts there (no further reports, no reboot; the host waits in recovery).
+// status is 0 when the request got no answer; ok is false once the agent
+// has halted.
+func (h *propSimHost) agentReport(gen int, rep model.ProgressReport) (status int, ok bool) {
+	status, err := h.report(rep)
+	if err != nil {
+		return 0, true
+	}
+	if status == http.StatusGone {
+		h.setStage(gen, "agent halted: operation over")
+		return status, false
+	}
+	return status, true
+}
+
 func (h *propSimHost) fatal(gen int, machine, op, stage string) {
 	_, _ = h.report(model.ProgressReport{MachineID: machine, OperationID: op, Phase: stage, Failed: true, Error: stage + ": simulated"})
 	h.setStage(gen, "agent FATAL during "+stage)
@@ -1047,7 +1065,9 @@ func (h *propSimHost) deployAgent(gen int, script, machine, op string) {
 	}
 	phase := func(p string) bool {
 		h.setStage(gen, "agent "+p)
-		_, _ = h.report(model.ProgressReport{MachineID: machine, OperationID: op, Phase: p})
+		if _, ok := h.agentReport(gen, model.ProgressReport{MachineID: machine, OperationID: op, Phase: p}); !ok {
+			return false
+		}
 		if fatalAt == p {
 			h.fatal(gen, machine, op, p)
 			return false
@@ -1097,11 +1117,11 @@ func (h *propSimHost) deployAgent(gen int, script, machine, op string) {
 	backoff := h.step
 	for attempt := 0; attempt < 4; attempt++ {
 		h.setStage(gen, "agent deploy_complete")
-		st, err := h.report(model.ProgressReport{MachineID: machine, OperationID: op, Event: "deploy_complete"})
-		if !h.live(gen) {
+		st, alive := h.agentReport(gen, model.ProgressReport{MachineID: machine, OperationID: op, Event: "deploy_complete"})
+		if !alive || !h.live(gen) {
 			return
 		}
-		if err == nil && st >= 200 && st < 300 {
+		if st >= 200 && st < 300 {
 			ok = true
 			break
 		}
@@ -1127,7 +1147,9 @@ func (h *propSimHost) commissionAgent(gen int, machine, op string) {
 	}
 	for _, p := range []string{"agent_starting", "collecting_inventory", "reporting"} {
 		h.setStage(gen, "agent "+p)
-		_, _ = h.report(model.ProgressReport{MachineID: machine, OperationID: op, Phase: p})
+		if _, ok := h.agentReport(gen, model.ProgressReport{MachineID: machine, OperationID: op, Phase: p}); !ok {
+			return
+		}
 		if !h.pause(gen, h.step) {
 			return
 		}
@@ -1139,11 +1161,11 @@ func (h *propSimHost) commissionAgent(gen int, machine, op string) {
 	})
 	ok := false
 	for attempt := 0; attempt < 3; attempt++ {
-		st, err := h.report(model.ProgressReport{MachineID: machine, OperationID: op, Event: "commission_report", CommissionData: inv})
-		if !h.live(gen) {
+		st, alive := h.agentReport(gen, model.ProgressReport{MachineID: machine, OperationID: op, Event: "commission_report", CommissionData: inv})
+		if !alive || !h.live(gen) {
 			return
 		}
-		if err == nil && st == http.StatusOK {
+		if st == http.StatusOK {
 			ok = true
 			break
 		}
