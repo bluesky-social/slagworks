@@ -106,16 +106,20 @@ func (w *pduWorld) classification(p, n int) (serial, class string) {
 	return downSerials[d], "sole"
 }
 
-// pduDrawFan draws the second device an outlet feeds. Fan-out is not
-// generated: an outlet cabled to two devices is resolved from its first
-// endpoint only, so the warning, the preflight token and the self-power
-// interlock describe one device while the operation cuts both (an `off`
-// can take down a serving site worker that is the outlet's second device).
-// The world and its classification model already carry a second device per
-// outlet; widen the pool here to {-1, 0, 1, 2} and add the expected refusal
-// to the property once the resolver handles every endpoint.
+// fanned reports whether outlet n+1 of PDU p feeds a second device. sync
+// adds the second endpoint only when it is a different device.
+func (w *pduWorld) fanned(p, n int) bool {
+	d, f := w.cable[p][n], w.fan[p][n]
+	return d >= 0 && f >= 0 && f != d
+}
+
+// pduDrawFan draws the second device an outlet feeds, or -1. The warning,
+// the preflight token and the self-power interlock each describe one
+// downstream device, so an outlet that feeds two must be refused, never
+// resolved from one of them. -1 is weighted so most outlets still feed one
+// device and the accepting paths stay covered.
 func pduDrawFan(t *rapid.T, label string) int {
-	return rapid.SampledFrom([]int{-1}).Draw(t, label)
+	return rapid.SampledFrom([]int{-1, -1, 0, 1, 2}).Draw(t, label)
 }
 
 type pduToken struct {
@@ -190,6 +194,16 @@ func TestProp_PDUOutletPreflightToken(t *testing.T) {
 					if resp.code != http.StatusNotFound {
 						rt.Fatalf("resolve of a nonexistent outlet: %s, want 404", resp)
 					}
+					continue
+				}
+				if w.fanned(p, n) {
+					first, second := downNames[w.cable[p][n]], downNames[w.fan[p][n]]
+					if resp.code != http.StatusUnprocessableEntity ||
+						!strings.Contains(string(resp.body), first) || !strings.Contains(string(resp.body), second) {
+						rt.Fatalf("resolve pdu %s outlet %d, which feeds %s and %s: %s, want 422 naming both",
+							pduNames[p], n+1, first, second, resp)
+					}
+					stats.add("resolve fanned")
 					continue
 				}
 				var got OutletResolution
@@ -363,6 +377,12 @@ func TestProp_PDUOutletPreflightToken(t *testing.T) {
 						rt.Fatalf("an outlet power operation was created without a live token for this exact request\n  request: operator %s verb %s pdu %s outlet %d (downstream %q, %s)\n  token kind %s: %+v\n  response: %s",
 							subject[opTok], verb, pduNames[p], n+1, serial, class, kind, tok, resp)
 					}
+					// A token bound to the first device does not cover a second
+					// one cabled since: the operation would cut it unchecked.
+					if w.fanned(p, n) {
+						rt.Fatalf("created a %s for pdu %s outlet %d, which feeds %s and %s; the token and interlock cover only %q",
+							verb, pduNames[p], n+1, downNames[w.cable[p][n]], downNames[w.fan[p][n]], serial)
+					}
 					if len(after) != before+1 {
 						rt.Fatalf("201 but %d new operation rows", len(after)-before)
 					}
@@ -415,6 +435,8 @@ func TestProp_PDUOutletPreflightToken(t *testing.T) {
 						return http.StatusConflict
 					case n == 3:
 						return http.StatusNotFound
+					case w.fanned(p, n):
+						return http.StatusUnprocessableEntity
 					case tok.p != p, tok.n != n, tok.serial != serial, tok.class != class:
 						return http.StatusConflict
 					case serial == gw && verb == "off":
