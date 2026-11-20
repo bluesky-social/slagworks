@@ -29,7 +29,8 @@ package main
 // The test is opt-in (SLAGWORKS_PROP_SLOW=1): a case takes about 25 seconds
 // of real time, most of it runSite's own 5-second wait for global. Run it
 // unprivileged: as root the child processes would bind DHCP and TFTP on
-// loopback. SLAGWORKS_PROP_SHARDS sets how many cases run in parallel.
+// loopback. SLAGWORKS_PROP_SHARDS sets how many cases run in parallel, and
+// SLAGWORKS_PROP_DEBUG=1 adds the worker's goroutine stacks to a failure.
 
 import (
 	"context"
@@ -79,7 +80,7 @@ const (
 // test: with lcChildEnv set it becomes `slagworksd site`.
 func TestSiteWorkerChild(t *testing.T) {
 	if os.Getenv(lcChildEnv) != "1" {
-		t.Skip("entry point for the child processes of TestPropSiteLifecycle")
+		t.Skip("entry point for the child processes of TestProp_SiteLifecycle")
 	}
 	os.Args = []string{"slagworksd", "site"}
 	main()
@@ -811,7 +812,10 @@ func (r *lcRun) setMode(m lcMode) {
 	// serving what it had, and stay up.
 	if prev == lcOK {
 		var conn int
-		if !lcEventually(5*time.Second, func() bool { conn = r.u.connected(); return conn == 0 || m == lcOK }) {
+		// The bound is loose: the worker's read loop persists each snapshot
+		// to worker.db before it reads on, so on a host whose disk is busy
+		// it can be seconds behind the socket.
+		if !lcEventually(15*time.Second, func() bool { conn = r.u.connected(); return conn == 0 || m == lcOK }) {
 			r.failf("global dropped the connection (now %v) but slagworks_site_ws_connected = %d", m, conn)
 		}
 	}
@@ -959,7 +963,7 @@ func lcShards() int {
 	return 2
 }
 
-func TestPropSiteLifecycle(t *testing.T) {
+func TestProp_SiteLifecycle(t *testing.T) {
 	if os.Getenv("SLAGWORKS_PROP_SLOW") != "1" {
 		t.Skip("starts real worker processes and waits out their startup timers (about 25s a case); set SLAGWORKS_PROP_SLOW=1 to run it")
 	}

@@ -1205,7 +1205,7 @@ func (r *vtRun) apply(ev vtEvent) {
 	r.check()
 }
 
-func TestPropWorkerLifecycleVirtualTime(t *testing.T) {
+func TestProp_WorkerLifecycleVirtualTime(t *testing.T) {
 	stats := &vtStats{tolerated: map[string]int{}}
 	prevLog := slog.Default()
 	slog.SetDefault(quietLog)

@@ -150,7 +150,24 @@ func (c *isoConn) await(t *rapid.T, what string, want func(Envelope) bool) {
 	}
 }
 
-func TestPropHubBrokenSiteDoesNotAffectOthers(t *testing.T) {
+// isoPublish runs one hub publication for the healthy site and fails when
+// the call itself takes longer than isoBound: a publication that waited out
+// a broken-site rebuild and then delivered would otherwise pass, since the
+// deliveries are only timed from its return.
+func isoPublish(t *rapid.T, what string, publish func()) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		publish()
+	}()
+	select {
+	case <-done:
+	case <-time.After(isoBound):
+		t.Fatalf("publishing %s for the healthy site blocked for more than %v", what, isoBound)
+	}
+}
+
+func TestProp_HubBrokenSiteDoesNotAffectOthers(t *testing.T) {
 	// Opt-in: the timing bounds need real time, so a case takes over a
 	// second (each broken-site hello is waited out to its RebuildTimeout).
 	if os.Getenv("SLAGWORKS_PROP_SLOW") != "1" {
@@ -212,13 +229,18 @@ func TestPropHubBrokenSiteDoesNotAffectOthers(t *testing.T) {
 					c := isoDial(rt, srv, fmt.Sprintf("tok-h-%d", i), fmt.Sprintf("healthy-%d", i), isoHealthy)
 					healthy = append(healthy, c)
 					stats.healthyHellos++
+					want := seq
+					c.await(rt, fmt.Sprintf("its hello's snapshot (seq %d)", want), func(e Envelope) bool {
+						var m SnapshotMsg
+						return e.Type == TypeSnapshot && json.Unmarshal(e.Data, &m) == nil && m.Snapshot.SeqNum == want
+					})
 					c.await(rt, "its hello's op_resync", func(e Envelope) bool { return e.Type == TypeOpResync })
 				}
 			case "push":
 				seq++
 				snap := healthySnap()
 				reb.healthy.Store(&snap)
-				hub.Push(isoHealthy, snap)
+				isoPublish(rt, "a snapshot", func() { hub.Push(isoHealthy, snap) })
 				stats.pushes++
 				for _, c := range healthy {
 					want := seq
@@ -229,7 +251,7 @@ func TestPropHubBrokenSiteDoesNotAffectOthers(t *testing.T) {
 				}
 			case "delta":
 				op := model.Operation{ID: uuid.New(), MachineID: healthyMachine, Type: model.OpPowerOn, Status: model.OpPending}
-				hub.PublishOpDelta(op, "")
+				isoPublish(rt, "an op_delta", func() { hub.PublishOpDelta(op, "") })
 				stats.deltas++
 				for _, c := range healthy {
 					c.await(rt, "an op_delta of its site", func(e Envelope) bool {
@@ -241,7 +263,7 @@ func TestPropHubBrokenSiteDoesNotAffectOthers(t *testing.T) {
 				// Fleet-wide, unfiltered: it is offered to the broken site's
 				// half-open connections too and must not wait on them.
 				gone := model.Operation{ID: uuid.New(), MachineID: healthyMachine, Version: 3}
-				hub.PublishOpRemoved(gone, "")
+				isoPublish(rt, "an op_removed", func() { hub.PublishOpRemoved(gone, "") })
 				stats.removals++
 				for _, c := range healthy {
 					c.await(rt, "an op_removed", func(e Envelope) bool {
