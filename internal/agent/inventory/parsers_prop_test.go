@@ -904,7 +904,10 @@ func TestInventory_Property_LscpuSockets(t *testing.T) {
 		js, _ := json.Marshal(map[string]any{"lscpu": order})
 		r := newMapRunner()
 		r.set(string(js), "lscpu", "--json")
-		got := collectCPUs(r)
+		got, cpuErr := collectCPUs(r)
+		if cpuErr != nil {
+			t.Fatalf("collectCPUs: %v", cpuErr)
+		}
 		wantSockets, err := strconv.Atoi(sockets)
 		if err != nil || wantSockets < 1 {
 			wantSockets = 1
@@ -995,11 +998,10 @@ func TestInventory_Property_CollectorsNeverPanic(t *testing.T) {
 		for k := range nr.available {
 			r.available[k] = true
 		}
-		// collectCPUs allocates one entry per reported socket with no upper
-		// bound, so a corrupted "Socket(s)" value in the billions exhausts
-		// memory. Renders the mutator turned into such a count are excluded.
-		if out := r.out["lscpu --json"]; !strings.Contains(out, "9999") && !strings.Contains(out, "1844") {
-			_ = collectCPUs(r)
+		// A corrupted "Socket(s)" count is an error, never an allocation of
+		// that many entries.
+		if cpus, err := collectCPUs(r); len(cpus) > maxCPUSockets || (err != nil && len(cpus) != 0) {
+			t.Fatalf("collectCPUs returned %d entries (err %v)", len(cpus), err)
 		}
 		_ = collectMemory(r)
 		_ = collectPSUs(r)

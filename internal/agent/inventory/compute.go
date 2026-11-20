@@ -2,19 +2,32 @@ package inventory
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/bluesky-social/slagworks/internal/agent"
 )
 
-func collectCPUs(r agent.Runner) []CPUInfo {
+// maxCPUSockets bounds the socket count collectCPUs accepts from lscpu. The
+// largest machines built have a few hundred sockets and the kernel's CPU
+// limit (NR_CPUS, at most 8192) caps what lscpu can honestly report, so a
+// count above 1024 is corrupted output, not hardware.
+const maxCPUSockets = 1024
+
+// collectCPUs returns one CPUInfo per socket lscpu reports, and nil when
+// it names no model. It returns an error when lscpu cannot be run or does
+// not print JSON, and when it reports more sockets than maxCPUSockets: the
+// count sizes the result, and a corrupted one must not become an allocation
+// of billions of entries. A count that is not a number ("-", or absent)
+// reads as one socket.
+func collectCPUs(r agent.Runner) ([]CPUInfo, error) {
 	out, err := r.Output("lscpu", "--json")
 	if err != nil {
-		slog.Warn("lscpu failed", "err", err)
-		return nil
+		return nil, fmt.Errorf("lscpu failed: %w", err)
 	}
 
 	var parsed struct {
@@ -23,11 +36,11 @@ func collectCPUs(r agent.Runner) []CPUInfo {
 			Data  string `json:"data"`
 		} `json:"lscpu"`
 	}
-	if json.Unmarshal([]byte(out), &parsed) != nil {
-		return nil
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		return nil, fmt.Errorf("lscpu --json printed something other than its JSON: %w", err)
 	}
 
-	var model, speed, arch, flags string
+	var model, speed, arch, flags, socketsField string
 	var sockets, coresPerSocket, tpc int
 	for _, f := range parsed.Lscpu {
 		field := strings.TrimRight(f.Field, ":")
@@ -35,7 +48,8 @@ func collectCPUs(r agent.Runner) []CPUInfo {
 		case "Model name":
 			model = f.Data
 		case "Socket(s)":
-			fmt.Sscanf(f.Data, "%d", &sockets)
+			socketsField = strings.TrimSpace(f.Data)
+			fmt.Sscanf(socketsField, "%d", &sockets)
 		case "Core(s) per socket":
 			fmt.Sscanf(f.Data, "%d", &coresPerSocket)
 		case "Thread(s) per core":
@@ -53,8 +67,16 @@ func collectCPUs(r agent.Runner) []CPUInfo {
 	if sockets < 1 {
 		sockets = 1
 	}
+	// A count too large for an int fails the scan above and would read as
+	// one socket; it is over the bound all the same.
+	_, atoiErr := strconv.Atoi(socketsField)
+	if sockets > maxCPUSockets || errors.Is(atoiErr, strconv.ErrRange) {
+		return nil, fmt.Errorf("lscpu reports %q CPU sockets, more than the %d any machine has; "+
+			"its output is corrupt, so no CPU inventory was recorded: run `lscpu --json` on the host and check \"Socket(s)\"",
+			socketsField, maxCPUSockets)
+	}
 	if model == "" {
-		return nil
+		return nil, nil
 	}
 
 	// Parse flags into a slice
@@ -75,7 +97,18 @@ func collectCPUs(r agent.Runner) []CPUInfo {
 			Flags:   flagList,
 		}
 	}
-	return cpus
+	return cpus, nil
+}
+
+// lscpuStep collects the CPUs into res and returns the lscpu step's verdict.
+func lscpuStep(r agent.Runner, res *CommissionResult) stepVerdict {
+	cpus, err := collectCPUs(r)
+	if err != nil {
+		slog.Warn("no CPU inventory", "err", err)
+		return stepVerdict{Status: StepStatusFailed, Error: err.Error()}
+	}
+	res.CPUs = cpus
+	return verdictForSlice(len(res.CPUs), "lscpu produced no CPU info")
 }
 
 func collectMemory(r agent.Runner) *MemoryInfo {
