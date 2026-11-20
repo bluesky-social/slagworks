@@ -39,6 +39,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/glebarez/sqlite"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -408,6 +409,31 @@ func get(url string) (int, string) {
 	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	return resp.StatusCode, string(b)
+}
+
+// outboxRows counts the rows of a worker.db's outbox table: the
+// observations the worker has queued and global has not acknowledged. It
+// reads the file directly, so the count is the durable one whatever build
+// of the worker wrote it and whether or not a worker is running. -1 means
+// the file has no outbox table yet.
+func outboxRows(f fataler, path string) int {
+	db, err := gorm.Open(sqlite.Open(path+"?_pragma=busy_timeout(5000)"), &gorm.Config{Logger: logger.Discard})
+	if err != nil {
+		f.Fatalf("harness: open %s: %v", path, err)
+	}
+	defer func() {
+		if s, err := db.DB(); err == nil {
+			_ = s.Close()
+		}
+	}()
+	var n int
+	if err := db.Raw(`SELECT count(*) FROM outbox`).Scan(&n).Error; err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			return -1
+		}
+		f.Fatalf("harness: count outbox rows of %s: %v", path, err)
+	}
+	return n
 }
 
 // eventually polls cond until it holds or d passes.

@@ -681,10 +681,10 @@ func (w *world) upgradeGlobal() {
 }
 
 func (w *world) upgradeWorker() {
-	if w.w != nil {
-		w.st.outboxAtWorkerUpgrade += w.status().Outbox
-	}
 	w.stopWorker(false)
+	if n := outboxRows(w.f, w.dbPath); n > 0 {
+		w.st.outboxAtWorkerUpgrade += n
+	}
 	w.note("worker upgraded %s -> %s", w.verFrom, w.verTo)
 	w.startWorker("to")
 }
@@ -1068,8 +1068,8 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 	if !eventually(60*time.Second, func() bool { return w.status().Connected }) {
 		w.fail("settle: with both sides on the %s build, the worker did not connect within 60s", w.verTo)
 	}
-	if !eventually(45*time.Second, func() bool { return w.status().Outbox == 0 }) {
-		w.fail("settle: the worker's outbox still holds %d observations 45s after it connected: global is neither accepting nor terminally rejecting them", w.status().Outbox)
+	if !eventually(45*time.Second, func() bool { return outboxRows(w.f, w.dbPath) == 0 }) {
+		w.fail("settle: the worker's outbox still holds %d unacknowledged observations 45s after it connected: global is neither accepting nor terminally rejecting them", outboxRows(w.f, w.dbPath))
 	}
 	w.checkActuations()
 
@@ -1138,8 +1138,8 @@ func runScenario(t *testing.T, rt *rapid.T, cfg scenarioConfig, st *stats, dir s
 				return fmt.Sprintf("machine %s: the worker holds state %q, global has %q", m.serial, s.States[m.id], gm.State)
 			}
 		}
-		if s.Outbox != 0 {
-			return fmt.Sprintf("the worker's outbox holds %d observations", s.Outbox)
+		if n := outboxRows(w.f, w.dbPath); n != 0 {
+			return fmt.Sprintf("the worker's outbox holds %d unacknowledged observations", n)
 		}
 		return ""
 	}
