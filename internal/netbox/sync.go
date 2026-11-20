@@ -282,9 +282,14 @@ func CommissionToSync(deviceID int, data json.RawMessage) (*CommissionSync, erro
 		sync.NICs = append(sync.NICs, nd)
 	}
 
-	// DIMMs
+	// DIMMs. The Locator is a firmware string; a placeholder or empty one
+	// cannot name a bay, so it takes an indexed name like the PSU fallback.
 	if cr.Memory != nil {
-		for _, dimm := range cr.Memory.DIMMs {
+		for i, dimm := range cr.Memory.DIMMs {
+			bayName := dimm.Locator
+			if isJunkDMIValue(bayName) {
+				bayName = fmt.Sprintf("DIMM_%d", i)
+			}
 			sizeGB := dimm.SizeMB / 1024
 			model := dimm.Part
 			if model == "" {
@@ -302,7 +307,7 @@ func CommissionToSync(deviceID int, data json.RawMessage) (*CommissionSync, erro
 				mfg = "Unknown"
 			}
 			sync.Modules = append(sync.Modules, ModuleData{
-				BayName:       dimm.Locator,
+				BayName:       bayName,
 				ProfileName:   "Memory",
 				Manufacturer:  mfg,
 				Model:         model,
@@ -424,10 +429,12 @@ func CommissionToSync(deviceID int, data json.RawMessage) (*CommissionSync, erro
 		})
 	}
 
-	// PSUs
+	// PSUs. Many boards leave the dmidecode Location at a placeholder, often
+	// the same one on every PSU ("Not Specified", "Default string"); like an
+	// empty one, it falls back to an indexed name.
 	for i, psu := range cr.PSUs {
 		bayName := psu.Location
-		if bayName == "" {
+		if isJunkDMIValue(bayName) {
 			bayName = fmt.Sprintf("PSU_%d", i)
 		}
 		model := psu.Model
@@ -450,7 +457,40 @@ func CommissionToSync(deviceID int, data json.RawMessage) (*CommissionSync, erro
 		})
 	}
 
+	uniqueBayNames(sync.Modules)
 	return sync, nil
+}
+
+// uniqueBayNames renames each module whose BayName repeats an earlier
+// module's. ReconcileModules keys bays and modules by name, so two modules
+// with one name cannot both be stored, and firmware names do repeat (a
+// board that prints the channel only in Bank Locator reports "DIMM 0" once
+// per channel). The first module keeps the name; each later one gets the
+// lowest "<name>_<n>" (n >= 2) that no module in the report uses. The agent
+// reports components in firmware table order, so the same hardware gets
+// the same names on every commission.
+func uniqueBayNames(modules []ModuleData) {
+	used := make(map[string]bool, len(modules))
+	for _, m := range modules {
+		used[m.BayName] = true
+	}
+	assigned := make(map[string]bool, len(modules))
+	for i := range modules {
+		name := modules[i].BayName
+		if !assigned[name] {
+			assigned[name] = true
+			continue
+		}
+		for n := 2; ; n++ {
+			candidate := fmt.Sprintf("%s_%d", name, n)
+			if !used[candidate] {
+				used[candidate] = true
+				assigned[candidate] = true
+				modules[i].BayName = candidate
+				break
+			}
+		}
+	}
 }
 
 // Internal mirrors of the agent's CommissionResult.

@@ -23,6 +23,11 @@ type ModuleData struct {
 // 1. Find-or-create ModuleTypes
 // 2. Reconcile ModuleBays by name
 // 3. Reconcile Modules (create new, update existing, delete stale)
+//
+// Each module's BayName must be unique within modules (CommissionToSync
+// guarantees it): a bay holds one module, so two modules with one name
+// cannot both be stored. Every existing bay that does not hold a wanted
+// module is deleted, including extra bays that share a wanted name.
 func (c *Client) ReconcileModules(ctx context.Context, deviceID int, modules []ModuleData) error {
 	// Step 1: Resolve all ModuleTypes
 	typeIDs := make(map[string]int) // key: profileName + "/" + model
@@ -48,12 +53,10 @@ func (c *Client) ReconcileModules(ctx context.Context, deviceID int, modules []M
 		bayByName[b.Name] = b
 	}
 
-	wantBays := make(map[string]bool)
 	bayIDs := make(map[string]int) // bayName -> bayID
 
 	// Create new bays first
 	for _, m := range modules {
-		wantBays[m.BayName] = true
 		if existing, ok := bayByName[m.BayName]; ok {
 			bayIDs[m.BayName] = existing.ID
 			continue
@@ -134,15 +137,17 @@ func (c *Client) ReconcileModules(ctx context.Context, deviceID int, modules []M
 			c.log.Warn("failed to delete stale module", "id", mod.ID, "err", err)
 		}
 	}
-	for name, bay := range bayByName {
-		if wantBays[name] {
+	// Walk the listed bays, not bayByName: NetBox allows several
+	// device-level bays with one name, and bayByName holds only one of them.
+	for _, bay := range existingBays {
+		if id, ok := bayIDs[bay.Name]; ok && id == bay.ID {
 			continue
 		}
 		path := fmt.Sprintf("/api/dcim/module-bays/%d/", bay.ID)
 		if err := c.Delete(ctx, path); err != nil {
-			c.log.Warn("failed to delete stale module bay", "name", name, "err", err)
+			c.log.Warn("failed to delete stale module bay", "name", bay.Name, "id", bay.ID, "err", err)
 		} else {
-			c.log.Info("deleted stale module bay", "name", name)
+			c.log.Info("deleted stale module bay", "name", bay.Name, "id", bay.ID)
 		}
 	}
 
