@@ -68,6 +68,14 @@ func propDataLayout(boot string, typ string, level int, members ...string) propL
 	return l
 }
 
+// propUnpinnedDataLayout is propDataLayout with a RAID1 data array that
+// pins no array UUID: an ordinary array, as most storage scripts build.
+func propUnpinnedDataLayout(boot string, members ...string) propLayout {
+	l := propDataLayout(boot, "raid", 1, members...)
+	l.Arrays[0].UUID = ""
+	return l
+}
+
 // propDeepEnv, when set to 1, makes TestStoragePropDeep play every pinned
 // history the default tests leave out: about thirty more VM boots.
 const propDeepEnv = "SLAGWORKS_STORAGE_PROP_DEEP"
@@ -283,6 +291,28 @@ func propPinnedCases() map[string]propCase {
 			},
 		},
 		{
+			// A data array lives on disks a second deploy leaves out of its
+			// layout, and that deploy builds a data array of its own on
+			// blank disks, without --destructive. The deploy environment
+			// assembles the old array at /dev/md0, the node the new array is
+			// created at, and without --destructive nothing stops it. The
+			// agent must refuse before it partitions the blank disks, not
+			// fail at mdadm --create afterwards.
+			Name: "uefi-bystander-array-holds-md-node", Firmware: "uefi",
+			Disks: []propDisk{
+				propD("d0", "virtio", 8, 0, 512, ""), propD("d1", "virtio", 8, 1, 512, ""),
+				propD("d2", "virtio", 4, 2, 512, ""), propD("d3", "virtio", 4, 3, 512, ""),
+				propD("d4", "virtio", 4, 4, 512, ""), propD("d5", "virtio", 4, 5, 512, ""),
+			},
+			Steps: []propStep{
+				{Attach: propAll("d0", "d2", "d3"), Expect: "ok", Why: "blank disks",
+					Layout: propUnpinnedDataLayout("d0", "d2", "d3")},
+				{Attach: propAll("d0", "d1", "d2", "d3", "d4", "d5"), Expect: "fatal:md name check",
+					Why:    "d1, d4 and d5 are blank, but the array on d2 and d3 holds /dev/md0 and the deploy is not --destructive",
+					Layout: propUnpinnedDataLayout("d1", "d4", "d5")},
+			},
+		},
+		{
 			// A root partition with a fixed size and free space after it:
 			// nothing at first boot may grow it.
 			Name: "uefi-root-fixed-size", Firmware: "uefi",
@@ -434,6 +464,7 @@ var propDefaultRuns = map[string][]string{
 	"TestStoragePropESPMoves":    {"uefi-esp-swaps-disk"},
 	"TestStoragePropThirdDisk":   {"uefi-esp-third-disk"},
 	"TestStoragePropArrays":      {"uefi-raid5-data", "uefi-stale-uuid-member"},
+	"TestStoragePropMDNode":      {"uefi-bystander-array-holds-md-node"},
 }
 
 func runPropPinned(t *testing.T) {
@@ -480,6 +511,11 @@ func TestStoragePropThirdDisk(t *testing.T) { runPropPinned(t) }
 // and a redeploy that would leave a stale member of a pinned array UUID on a
 // bystander disk is refused before any disk is written.
 func TestStoragePropArrays(t *testing.T) { runPropPinned(t) }
+
+// TestStoragePropMDNode: a deploy without --destructive whose new array
+// needs the /dev/mdN an array on disks outside the layout was assembled at
+// is refused before any disk is written.
+func TestStoragePropMDNode(t *testing.T) { runPropPinned(t) }
 
 // TestStoragePropDeep plays every pinned history the default tests leave
 // out. Set SLAGWORKS_STORAGE_PROP_DEEP=1 and give it a long -timeout and a
