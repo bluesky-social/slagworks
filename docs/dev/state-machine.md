@@ -290,8 +290,8 @@ There are two things called "claim" in the code base.
 
 ### Site-config claim over NetBox devices
 
-`internal/snapshot/claim.go:45` (`NewClaimResolver`) and
-`ClaimingConfigs` (line 58) decide which site configs own which
+`internal/snapshot/claim.go:48` (`NewClaimResolver`) and
+`ClaimingConfigs` (line 61) decide which site configs own which
 NetBox device. This is location-subtree membership, not an
 operation claim. It is used by the NetBox webhook and by the
 reconciler to decide which site's snapshot needs invalidation on a

@@ -28,12 +28,15 @@ import (
 //     admitted config (soundness and completeness of the create/update rule);
 //   - after admission, ClaimingConfigs and ResolveOwningConfigSlug agree with
 //     the oracle for a device in every location (the claim is computed
-//     identically everywhere);
+//     identically everywhere), and resolveClaimScope accepts every admitted
+//     config;
 //   - after a NetBox location re-parent, the one mutation that changes claim
 //     sets without touching site_configs, the claim computation still agrees
-//     with the oracle. The documented invariant "a device is claimed by at
-//     most one config" (claim.go, scope.go) does not survive it; see
-//     TestPropClaimsAgreeAfterReparent.
+//     with the oracle, a device several configs claim has no owner whatever
+//     order the store lists the configs in, and resolveClaimScope (the
+//     snapshot builder's and reconciler's gate) refuses exactly the configs
+//     that are stale or overlap another, so no device is claimed by more
+//     than one config that still builds.
 
 type claimWorld struct {
 	locs    []netbox.Location
@@ -150,6 +153,16 @@ func treeString(locs []netbox.Location) string {
 	return s
 }
 
+// deviceLocs is every place a device can sit: each location, and 0 for no
+// location.
+func deviceLocs(w claimWorld) []int {
+	out := []int{0}
+	for _, l := range w.locs {
+		out = append(out, l.ID)
+	}
+	return out
+}
+
 func deviceAt(loc int) netbox.Device {
 	d := netbox.Device{ID: 1000 + loc, Site: &netbox.NestedRef{Slug: claimSite}}
 	if loc != 0 {
@@ -159,21 +172,15 @@ func deviceAt(loc int) netbox.Device {
 }
 
 // checkAgreement compares production with the oracle for a device in every
-// location and returns the largest number of configs claiming one device.
-// With strictOwner, a device claimed by several configs must resolve to the
-// same owner (or fail) whatever order the store lists the configs in.
-func checkAgreement(t *rapid.T, w claimWorld, strictOwner bool) (maxClaimers int) {
+// location and returns the largest number of configs claiming one device. A
+// device claimed by several configs must have no owner, in the store's order
+// and in reverse.
+func checkAgreement(t *rapid.T, w claimWorld) (maxClaimers int) {
 	st := &fakeClaimConfigLister{configs: w.configs}
 	nb := &fakeNetBox{locations: w.locs}
 	r := NewClaimResolver(nb, st)
 	ctx := context.Background()
-	for _, loc := range append([]int{0}, func() []int {
-		var ids []int
-		for _, l := range w.locs {
-			ids = append(ids, l.ID)
-		}
-		return ids
-	}()...) {
+	for _, loc := range deviceLocs(w) {
 		d := deviceAt(loc)
 		var want []string
 		for _, c := range w.configs {
@@ -203,23 +210,60 @@ func checkAgreement(t *rapid.T, w claimWorld, strictOwner bool) (maxClaimers int
 			if err != nil || owner != want[0] {
 				t.Fatalf("ResolveOwningConfigSlug(loc %d) = %q, %v; oracle %v", loc, owner, err, want)
 			}
-		case !strictOwner:
 		default:
-			// More than one claimer: the owner must not depend on the order
-			// the store happens to return rows in.
+			// More than one claimer: picking one would make the owner
+			// depend on the order the store happens to return rows in, so
+			// both orders must refuse.
 			rev := append([]model.SiteConfig(nil), w.configs...)
 			for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
 				rev[i], rev[j] = rev[j], rev[i]
 			}
 			owner2, err2 := ResolveOwningConfigSlug(ctx, nb, &fakeClaimConfigLister{configs: rev}, d)
-			// Failing closed in both orders is consistent; picking a
-			// different owner per order, or an owner in one order only, is not.
-			if (err == nil) != (err2 == nil) || owner != owner2 {
-				t.Fatalf("device at loc %d claimed by %v: owner is %q in store order, %q in reversed order", loc, want, owner, owner2)
+			if !errors.Is(err, ErrAmbiguousOwningConfig) || !errors.Is(err2, ErrAmbiguousOwningConfig) {
+				t.Fatalf("device at loc %d claimed by %v: want ErrAmbiguousOwningConfig in both store orders, got (%q, %v) in store order and (%q, %v) reversed",
+					loc, want, owner, err, owner2, err2)
 			}
 		}
 	}
 	return maxClaimers
+}
+
+// checkBuildGate compares resolveClaimScope, which the snapshot builder and
+// the reconciler gate every config on, with the oracle: a config is refused
+// iff it is stale or its claim set meets that of another config that is not
+// stale. It then requires that no device is claimed by two configs the gate
+// accepts, and returns how many configs it refused.
+func checkBuildGate(t *rapid.T, w claimWorld) (refused int) {
+	accepted := map[string]bool{}
+	for _, c := range w.configs {
+		wantRefused := oracleClaims(w.locs, c) == nil
+		for _, e := range w.configs {
+			if e.Slug != c.Slug && oracleClaims(w.locs, e) != nil && oracleOverlap(w.locs, c, e) {
+				wantRefused = true
+			}
+		}
+		_, err := resolveClaimScope(c, w.configs, w.locs)
+		if (err != nil) != wantRefused {
+			t.Fatalf("resolveClaimScope(%+v) = %v, oracle refused=%v (tree %v configs %+v)", c, err, wantRefused, treeString(w.locs), w.configs)
+		}
+		if err != nil {
+			refused++
+		} else {
+			accepted[c.Slug] = true
+		}
+	}
+	for _, loc := range deviceLocs(w) {
+		var builders []string
+		for _, c := range w.configs {
+			if accepted[c.Slug] && oracleClaims(w.locs, c)[loc] {
+				builders = append(builders, c.Slug)
+			}
+		}
+		if len(builders) > 1 {
+			t.Fatalf("a device at loc %d would be in the snapshots of %v (tree %v configs %+v)", loc, builders, treeString(w.locs), w.configs)
+		}
+	}
+	return refused
 }
 
 func TestPropCheckOverlapMatchesOracleAndClaimsAgree(t *testing.T) {
@@ -227,9 +271,12 @@ func TestPropCheckOverlapMatchesOracleAndClaimsAgree(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		w := admit(t, drawLocTree(t))
 		admitted += len(w.configs)
-		if checkAgreement(t, w, true) > 1 {
+		if checkAgreement(t, w) > 1 {
 			multi++
 			t.Fatalf("admitted configs overlap: %+v tree %v", w.configs, treeString(w.locs))
+		}
+		if n := checkBuildGate(t, w); n > 0 {
+			t.Fatalf("resolveClaimScope refused %d admitted config(s): %+v tree %v", n, w.configs, treeString(w.locs))
 		}
 	})
 	t.Logf("configs admitted=%d multi-claim worlds=%d", admitted, multi)
@@ -237,17 +284,12 @@ func TestPropCheckOverlapMatchesOracleAndClaimsAgree(t *testing.T) {
 
 // TestPropClaimsAgreeAfterReparent: re-parent one location in NetBox
 // (keeping the tree acyclic), leave site_configs untouched, and require
-// ClaimingConfigs and single-claimer ownership to match the oracle on the
-// new tree.
-//
-// Not checked: that a device still has at most one claimer. Nesting one
-// configured location under another makes two admitted configs claim the
-// same devices, nothing re-runs CheckOverlap, and ResolveOwningConfigSlug
-// then returns whichever config the store lists first. Once that is
-// refused or resolved deterministically, pass strictOwner=true here and
-// require the returned count to be at most 1.
+// ClaimingConfigs and ownership to match the oracle on the new tree.
+// Nesting one configured location under another makes two admitted configs
+// claim the same devices without anything re-running CheckOverlap: such a
+// device must have no owner, and the build gate must refuse both configs.
 func TestPropClaimsAgreeAfterReparent(t *testing.T) {
-	var multi int
+	var multi, refused int
 	rapid.Check(t, func(t *rapid.T) {
 		w := admit(t, drawLocTree(t))
 		if len(w.locs) < 2 {
@@ -281,9 +323,10 @@ func TestPropClaimsAgreeAfterReparent(t *testing.T) {
 			}
 		}
 		w.locs = locs
-		if checkAgreement(t, w, false) > 1 {
+		if checkAgreement(t, w) > 1 {
 			multi++
 		}
+		refused += checkBuildGate(t, w)
 	})
-	t.Logf("worlds with a device claimed by several configs after the re-parent: %d", multi)
+	t.Logf("worlds with a device claimed by several configs after the re-parent: %d; configs refused by the build gate: %d", multi, refused)
 }

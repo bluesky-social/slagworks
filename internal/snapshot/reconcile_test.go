@@ -420,3 +420,89 @@ func TestReconcileDualCageDoesNotDoubleMirrorOrCrossDelete(t *testing.T) {
 		t.Fatalf("dual-cage sweep must not decommission live devices; got %d deletes", mir.deleteCount())
 	}
 }
+
+// TestReconcileFlagsConfigsThatOverlapAfterLocationReparent: NetBox moves
+// cage-a under cage-b within the site, so both dual-cage configs claim
+// cage-a's device while both locations still resolve. The reconciler must
+// flag both configs stale, which surfaces the overlap on /healthz and the
+// site_stale gauge, instead of mirroring the device under both. Restoring
+// the tree clears the flags.
+func TestReconcileFlagsConfigsThatOverlapAfterLocationReparent(t *testing.T) {
+	devA := 100
+	st := &reconcileFakeStore{
+		configs: []model.SiteConfig{
+			{Slug: "pop2-cage-a", NetBoxSite: "pop2", NetBoxLocation: "cage-a"},
+			{Slug: "pop2-cage-b", NetBoxSite: "pop2", NetBoxLocation: "cage-b"},
+		},
+		machines: []model.Machine{{NetBoxDeviceID: &devA, NetBoxSerial: "SN-A", State: model.MachineStateRunning}},
+	}
+	nb := &fakeNetBox{
+		sites:     map[string]netbox.Site{"pop2": {Slug: "pop2"}},
+		locations: reparentedLocations(),
+		devices: []netbox.Device{
+			{ID: devA, Name: "a", Serial: "SN-A", Site: &netbox.NestedRef{Slug: "pop2"}, Location: &netbox.NestedRef{ID: 10}},
+		},
+	}
+	mir := &recordingMirror{}
+	r := NewReconciler(nb, st, &countingInvalidator{}, mir)
+	r.ManualTick(context.Background())
+
+	for _, slug := range []string{"pop2-cage-a", "pop2-cage-b"} {
+		if !r.IsStale(slug) {
+			t.Fatalf("%s overlaps its sibling once cage-a sits inside cage-b and must be flagged stale; stale=%v",
+				slug, r.StaleSites())
+		}
+	}
+	mirroredBy := map[int][]string{}
+	for _, ds := range [][]mirror.Device{mir.creates, mir.updates} {
+		for _, d := range ds {
+			mirroredBy[d.ID] = append(mirroredBy[d.ID], d.ConfigSlug)
+		}
+	}
+	if len(mirroredBy[devA]) > 1 {
+		t.Fatalf("device %d mirrored under several configs: %v", devA, mirroredBy[devA])
+	}
+
+	nb.locations = testLocations()
+	r.ManualTick(context.Background())
+	if stale := r.StaleSites(); len(stale) != 0 {
+		t.Fatalf("restoring the location tree must clear the overlap; stale=%v", stale)
+	}
+}
+
+// TestReconcileForgetsStaleFlagOfDeletedConfig: deleting one of two configs
+// that overlap after a location re-parent is a documented way to repair the
+// overlap. The next tick must clear the survivor's flag and forget the
+// deleted config's, and drop its gauge series, or /healthz and
+// slagworks_site_stale keep reporting an overlap that no longer exists.
+func TestReconcileForgetsStaleFlagOfDeletedConfig(t *testing.T) {
+	st := &reconcileFakeStore{configs: []model.SiteConfig{
+		{Slug: "pop2-cage-a", NetBoxSite: "pop2", NetBoxLocation: "cage-a"},
+		{Slug: "pop2-cage-b", NetBoxSite: "pop2", NetBoxLocation: "cage-b"},
+	}}
+	nb := &fakeNetBox{
+		sites:     map[string]netbox.Site{"pop2": {Slug: "pop2"}},
+		locations: reparentedLocations(),
+	}
+	r := NewReconciler(nb, st, &countingInvalidator{}, &recordingMirror{})
+	r.SetMetrics(NewMetrics(prometheus.NewRegistry()))
+	r.ManualTick(context.Background())
+	if stale := r.StaleSites(); len(stale) != 2 {
+		t.Fatalf("setup: both overlapping configs must be stale; stale=%v", stale)
+	}
+
+	st.mu.Lock()
+	st.configs = st.configs[1:] // the operator deletes pop2-cage-a
+	st.mu.Unlock()
+	r.ManualTick(context.Background())
+
+	if stale := r.StaleSites(); len(stale) != 0 {
+		t.Fatalf("after deleting pop2-cage-a no config overlaps; stale=%v", stale)
+	}
+	if n := testutil.CollectAndCount(r.metrics.SiteStale); n != 1 {
+		t.Fatalf("site_stale series: got %d, want 1 (pop2-cage-b only)", n)
+	}
+	if got := testutil.ToFloat64(r.metrics.SiteStale.WithLabelValues("pop2-cage-b")); got != 0 {
+		t.Fatalf("pop2-cage-b stale gauge: got %v, want 0", got)
+	}
+}
