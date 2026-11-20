@@ -385,8 +385,10 @@ func (d *Dispatcher) gatherAndBuild(ctx context.Context, slug string, outcome *s
 	if err != nil {
 		return model.SiteConfig{}, model.SiteSnapshot{}, err
 	}
-	// From here on, remaining errors are Postgres-side. Flip the
-	// default so the deferred emission reports correctly.
+	// The NetBox reads are done: the store reads below, and Rebuild's
+	// BumpSiteSnapshotMeta after a successful build, fail Postgres-side.
+	// Flip the default so the deferred emission reports correctly; the
+	// Build error path sets it back.
 	setOutcome("error_postgres")
 	machines, err := d.st.ListMachinesByDeviceIDs(deviceIDs)
 	if err != nil {
@@ -450,6 +452,9 @@ func (d *Dispatcher) gatherAndBuild(ctx context.Context, slug string, outcome *s
 		HostnameTemplate: d.hostnames,
 	})
 	if err != nil {
+		// Build fails only on NetBox data (no slagworks-production prefix,
+		// conflicting OOB reservations, a bad OOB prefix or range set).
+		setOutcome("error_netbox")
 		return model.SiteConfig{}, model.SiteSnapshot{}, err
 	}
 	// One warning per site, and only when the list changes: these

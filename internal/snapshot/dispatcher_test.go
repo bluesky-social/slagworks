@@ -2,7 +2,9 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -196,6 +198,76 @@ func TestDispatcherEmitsMetrics(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(d.metrics.DirtyGen.WithLabelValues("pop3")); got != 6 {
 		t.Fatalf("dirty_gen after skip: got %v, want 6", got)
+	}
+}
+
+// imagesFailStore is a store whose image read fails: a Postgres error raised
+// after every NetBox read has succeeded.
+type imagesFailStore struct{ *fakeStore }
+
+func (imagesFailStore) ListImages() ([]model.Image, error) {
+	return nil, errors.New("connection refused")
+}
+
+// A failed rebuild is counted under the outcome naming the system it failed
+// on. Build runs after the Postgres reads but fails only on NetBox data (no
+// slagworks-production prefix, conflicting OOB reservations, a bad OOB prefix
+// or range set), so its error belongs under error_netbox; a Postgres read
+// failing in the same stretch still belongs under error_postgres.
+func TestDispatcherCountsFailedRebuildUnderFailingSystem(t *testing.T) {
+	cases := []struct {
+		name    string
+		setup   func(nb *fakeNetBox, fs *fakeStore) StoreReader
+		wantErr string
+		want    string
+	}{
+		{
+			name: "no slagworks-production prefix",
+			setup: func(nb *fakeNetBox, fs *fakeStore) StoreReader {
+				nb.prefixes = nil
+				return fs
+			},
+			wantErr: "no slagworks-production prefix",
+			want:    "error_netbox",
+		},
+		{
+			name: "two slagworks-oob prefixes",
+			setup: func(nb *fakeNetBox, fs *fakeStore) StoreReader {
+				nb.oobPrefixes = []netbox.Prefix{{ID: 1, Prefix: "10.1.0.0/22"}, {ID: 2, Prefix: "10.2.0.0/22"}}
+				return fs
+			},
+			wantErr: "expected exactly one slagworks-oob prefix",
+			want:    "error_netbox",
+		},
+		{
+			name: "image read fails",
+			setup: func(nb *fakeNetBox, fs *fakeStore) StoreReader {
+				return imagesFailStore{fs}
+			},
+			wantErr: "connection refused",
+			want:    "error_postgres",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, fs, nb := dispatcherFixture(t)
+			d := NewDispatcher(nb, tc.setup(nb, fs), &countingSink{})
+			d.SetMetrics(NewMetrics(prometheus.NewRegistry()))
+
+			_, err := d.rebuild(context.Background(), "pop3", 1)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("rebuild error = %v, want one containing %q", err, tc.wantErr)
+			}
+			for _, outcome := range []string{"success", "skipped_no_change", "error_netbox", "error_postgres"} {
+				want := 0.0
+				if outcome == tc.want {
+					want = 1
+				}
+				if got := testutil.ToFloat64(d.metrics.RebuildsTotal.WithLabelValues("pop3", outcome)); got != want {
+					t.Errorf("rebuilds_total{outcome=%s} = %v, want %v", outcome, got, want)
+				}
+			}
+		})
 	}
 }
 
