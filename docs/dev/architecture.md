@@ -302,9 +302,14 @@ when the initrd's kernel names shift (a card added or replaced) a row is
 renamed to follow its MAC and keeps its lag, IPs and cable. Setting a
 NIC's MAC is two writes (assign a MAC object, then mark it primary); a
 run that finds the MAC object already assigned but not primary marks it
-primary instead of creating another. That includes the protected `ipmi`
-row matching the BMC MAC, the one write reconcile makes to a protected
-row. On switches (device role `leaf`, `spine`,
+primary instead of creating another. The BMC, reported as a synthetic
+`mgmt_only` NIC named `ipmi`, reconciles onto the protected `mgmt_only`
+row carrying its MAC whatever that row is named (`ipmi0`, `bmc`), or else
+onto a MAC-less `mgmt_only` row named `ipmi` (a prior run's interface
+create whose MAC write failed). Setting that row's primary MAC when it has
+none is the one write reconcile makes to a protected row; an `ipmi` row
+carrying a MAC the BMC no longer reports fails the commission loudly for
+the operator to resolve. On switches (device role `leaf`, `spine`,
 `oob-switch`) interface names and the row set are operator-owned: the
 commission initrd's kernel names (`enp3s0npN`, `eno1`) are not the
 operational `swpN`/`eth0`, so reconcile only patches non-name fields of
