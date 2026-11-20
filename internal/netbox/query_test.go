@@ -247,6 +247,53 @@ func TestListSitePrefixesFiltersByTag(t *testing.T) {
 	}
 }
 
+// A whole-site config takes its fabric and OOB prefixes from
+// ListSitePrefixes, and it owns only the prefixes scoped to the site itself:
+// one scoped to a location inside the site belongs to a location-scoped
+// config. NetBox's ?site= filter is wider than that. It matches every prefix
+// whose scope lies in the site, location-scoped ones included, in address
+// order (observed on NetBox 4.6). The fake below answers the same way.
+//
+// Giving a location its own tagged prefixes is the first step of splitting a
+// whole-site site into cages, and it must leave the whole-site config alone.
+// When ListSitePrefixes passed the location's rows through, a second
+// slagworks-oob prefix failed the whole-site config's snapshot build, and a
+// location's slagworks-production prefix that sorted first became the
+// site's fabric DHCP subnet and gateway.
+func TestListSitePrefixesLeavesOutLocationScopedPrefixes(t *testing.T) {
+	inSite := []Prefix{
+		{ID: 2, Prefix: "10.0.2.0/24", ScopeType: "dcim.location", ScopeID: 50},
+		{ID: 1, Prefix: "10.0.4.0/22", ScopeType: "dcim.site", ScopeID: 1},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		out := []Prefix{}
+		if q.Get("site") == "site-a" && q.Get("tag") == "slagworks-production" {
+			for _, p := range inSite {
+				// NetBox also honors a scope_type filter; model it so the
+				// test pins the result, not how the client asks for it.
+				if st := q.Get("scope_type"); st == "" || st == p.ScopeType {
+					out = append(out, p)
+				}
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"count": len(out), "results": out})
+	}))
+	defer srv.Close()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Token: "t"})
+	got, err := c.ListSitePrefixes(context.Background(), "site-a", "slagworks-production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cidrs []string
+	for _, p := range got {
+		cidrs = append(cidrs, p.Prefix)
+	}
+	if !slices.Equal(cidrs, []string{"10.0.4.0/22"}) {
+		t.Fatalf("ListSitePrefixes = %v, want only the site-scoped 10.0.4.0/22", cidrs)
+	}
+}
+
 func TestGetSiteBySlugReturnsNilOnEmpty(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"count": 0, "results": []map[string]any{}})

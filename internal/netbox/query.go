@@ -232,13 +232,17 @@ func (c *Client) ListPowerOutletsForDevice(ctx context.Context, deviceID int) ([
 	return out, nil
 }
 
-// ListSitePrefixes returns prefixes for the given site tagged with the
-// given tag (e.g. "slagworks-production" or "slagworks-oob"). Used for
-// whole-site configs. NOTE: NetBox 4.x prefix scope is polymorphic, and
-// `?site=` matches ONLY prefixes whose scope is that site (scope_type
-// dcim.site) — it does NOT transitively include prefixes scoped to a
-// location under the site. Location-scoped configs must use
-// ListLocationPrefixes instead.
+// ListSitePrefixes returns the prefixes scoped to the given site itself
+// (scope_type dcim.site) and tagged with the given tag (e.g.
+// "slagworks-production" or "slagworks-oob"). Used for whole-site configs.
+//
+// NetBox 4.x prefix scope is polymorphic, and `?site=` matches every prefix
+// whose scope lies in the site: a prefix scoped to a location under the site
+// matches too (observed on NetBox 4.6). Those belong to location-scoped
+// configs (ListLocationPrefixes), so they are dropped here rather than handed
+// to a whole-site config. The check reads each row's scope_type instead of
+// adding a scope_type query filter, so it holds whatever the server's filter
+// semantics are.
 func (c *Client) ListSitePrefixes(ctx context.Context, siteSlug, tag string) ([]Prefix, error) {
 	q := url.Values{
 		"site":  []string{siteSlug},
@@ -249,7 +253,7 @@ func (c *Client) ListSitePrefixes(ctx context.Context, siteSlug, tag string) ([]
 	if err := c.List(ctx, "/api/ipam/prefixes/", q, &out); err != nil {
 		return nil, fmt.Errorf("list prefixes: %w", err)
 	}
-	return out, nil
+	return slices.DeleteFunc(out, func(p Prefix) bool { return p.ScopeType != "dcim.site" }), nil
 }
 
 // ListLocationPrefixes returns prefixes scoped to the given NetBox

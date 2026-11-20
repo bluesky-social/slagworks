@@ -2454,7 +2454,7 @@ func (s *Server) validateSiteConfigNetBox(c *echo.Context, cfg *model.SiteConfig
 		}
 		if len(prefixes) == 0 {
 			return nil, echo.NewHTTPError(http.StatusPreconditionFailed,
-				fmt.Sprintf("netbox site %q has no prefix tagged 'slagworks-production'; create one (with gateway_ip custom field) before site-config create", cfg.NetBoxSite))
+				fmt.Sprintf("netbox site %q has no prefix tagged 'slagworks-production' scoped to the site itself (one scoped to a location in the site belongs to a location-scoped config); create one (with gateway_ip custom field) before site-config create", cfg.NetBoxSite))
 		}
 	}
 

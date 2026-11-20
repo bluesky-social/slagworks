@@ -382,7 +382,10 @@ Fields:
 
 The subnet and gateway come from NetBox, not from this table: creating a
 site config requires a prefix tagged `slagworks-production` scoped to the
-site (or location). The DNS servers and lease time handed out on the
+site (or location). A whole-site config reads only the tagged prefixes
+scoped to the site itself, never ones scoped to a location inside it, so a
+location can be given its own `slagworks-production` and `slagworks-oob`
+prefixes while the whole-site config is still serving. The DNS servers and lease time handed out on the
 fabric leg come from that prefix's `dns_servers` and `dhcp_lease_seconds`
 custom fields, defaulting to `1.1.1.1` and 5 minutes; workers read them
 when their services start, so a change takes effect on restart. When

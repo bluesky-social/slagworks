@@ -258,10 +258,11 @@ func (d *Dispatcher) gatherAndBuild(ctx context.Context, slug string, outcome *s
 		return model.SiteConfig{}, model.SiteSnapshot{}, err
 	}
 
-	// Prefix discovery: whole-site configs read site-scoped prefixes;
-	// location-scoped configs read prefixes scoped to ANY location in the
-	// claimed subtree (NetBox 4.x polymorphic scope — `?site=` does NOT
-	// include location-scoped prefixes, and a single-location query would
+	// Prefix discovery: whole-site configs read site-scoped prefixes
+	// (ListSitePrefixes leaves out prefixes scoped to a location inside the
+	// site, which NetBox's `?site=` filter also matches; those belong to a
+	// location-scoped config). Location-scoped configs read prefixes scoped
+	// to ANY location in the claimed subtree (a single-location query would
 	// miss prefixes scoped to descendant locations that Scope.ClaimsPrefix
 	// would otherwise accept). Either way Build asserts a non-empty
 	// slagworks-production prefix and fails loudly if absent.
