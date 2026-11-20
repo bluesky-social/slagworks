@@ -59,7 +59,12 @@ request's `Authorization` header, never in the URL, and a bad token gets
 401 or 403 before the upgrade. An upgrade with no `Origin` header
 (`slagctl`) is accepted; a browser upgrade is accepted only from the API's
 own origin (its `Origin` host equals the request `Host`), and any other
-origin gets 403.
+origin gets 403. Each stored row (a log envelope, a cast event) goes out as
+one message as large as the row: a log envelope can run to megabytes, since
+a site worker's log batch carries up to 4 MiB, and a cast event of control
+bytes encodes to tens of KiB. `slagctl` reads up to `ws.MaxMessageBytes`
+(16 MiB); a client that keeps a smaller default read limit, such as
+coder/websocket's 32 KiB, is disconnected at the first larger row.
 
 ## Conventions
 

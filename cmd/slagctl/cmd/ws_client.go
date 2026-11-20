@@ -5,6 +5,8 @@ import (
 	"net/http"
 
 	"github.com/coder/websocket"
+
+	"github.com/bluesky-social/slagworks/internal/ws"
 )
 
 // streamDialOptions carries the operator token on a WebSocket upgrade in
@@ -24,6 +26,15 @@ func streamDialOptions(token string) *websocket.DialOptions {
 // with a token that later expires keeps running, but a reconnect after that
 // must present a refreshed one. An error getting the token is returned
 // unchanged.
+//
+// Global sends one message per stored row, and the row's size is set
+// upstream, not by coder/websocket's 32 KiB default read limit: a log
+// envelope arrives in a site-worker batch of up to ws.MaxMessageBytes/4,
+// and a cast event of control bytes encodes to several times its raw size.
+// A read over the limit closes the connection, so one large row would end
+// `machine logs` and stall every reconnecting watch at that row. The limit
+// is therefore ws.MaxMessageBytes, the largest message the site-worker link
+// carries.
 func dialStream(ctx context.Context, url string) (*websocket.Conn, error) {
 	token := ""
 	if apiClient != nil {
@@ -36,5 +47,9 @@ func dialStream(ctx context.Context, url string) (*websocket.Conn, error) {
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
-	return conn, err
+	if err != nil {
+		return nil, err
+	}
+	conn.SetReadLimit(ws.MaxMessageBytes)
+	return conn, nil
 }
