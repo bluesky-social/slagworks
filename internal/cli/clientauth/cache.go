@@ -3,7 +3,10 @@ package clientauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -14,34 +17,73 @@ import (
 	"github.com/bluesky-social/slagworks/internal/cli/userpath"
 )
 
-// Token cache layout: a single JSON file holding the full oauth2.Token
-// (access + refresh + expiry), 0600 in a 0700 dir. A sibling .lock file
-// serializes every change to the cache across concurrent invocations of the
-// CLI: a refresh (read, rotate, write back), a login's write and a logout's
-// delete (see lockCache). The path itself comes from userpath
+// Token cache layout: a single JSON file holding one session, the full
+// oauth2.Token (access + refresh + expiry) and the server, issuer and client
+// it was issued for, 0600 in a 0700 dir. A sibling .lock file serializes
+// every change to the cache across concurrent invocations of the CLI: a
+// refresh (read, rotate, write back), a login's write and a logout's delete
+// (see lockCache). The path itself comes from userpath
 // (~/.config/<AppName>/token.json on all platforms); read/write of the 0600
 // file go through userpath too.
 
-func readCache(path string) (*oauth2.Token, error) {
+// binding names what a session was issued for: the API it is the bearer for,
+// and the identity provider and client that minted it and refresh it.
+type binding struct {
+	API      string `json:"api"`
+	Issuer   string `json:"issuer"`
+	ClientID string `json:"client_id"`
+}
+
+// session is the content of the token cache. The token and its binding are
+// one file replaced by one rename, so no interleaving of invocations can
+// leave one server's token recorded as another's: whoever wrote the token
+// wrote its binding in the same step.
+type session struct {
+	binding
+	Token *oauth2.Token `json:"token"`
+}
+
+// readCache loads the cached session. A token whose response carried no
+// expires_in (RFC 6749 section 5.1 makes it optional) has a zero Expiry,
+// which oauth2.Token.Valid reads as "never expires": the access token would
+// be handed out after the API stopped accepting it and the refresh token
+// never used. When the access token is a JWT, its exp claim (which the API
+// enforces) fills that gap. Every check of a cached token's expiry reads it
+// here, so a token is stored as the provider sent it; an opaque access token
+// keeps the zero Expiry.
+func readCache(path string) (*session, error) {
 	b, err := userpath.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var tok oauth2.Token
-	if err := json.Unmarshal(b, &tok); err != nil {
+	var s session
+	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, fmt.Errorf("parsing token cache %s: %w", path, err)
 	}
-	return &tok, nil
+	if s.Token == nil {
+		return nil, fmt.Errorf("token cache %s holds no token", path)
+	}
+	if s.Token.Expiry.IsZero() {
+		// exp is a NumericDate, which RFC 7519 lets be fractional; any value
+		// present, even 0, is an expiry the API enforces.
+		var claims struct {
+			Exp *float64 `json:"exp"`
+		}
+		if decodeClaims(s.Token.AccessToken, &claims) == nil && claims.Exp != nil {
+			s.Token.Expiry = time.Unix(int64(*claims.Exp), 0)
+		}
+	}
+	return &s, nil
 }
 
-// writeCache atomically writes the token (temp file + rename), 0600, creating
-// the parent dir 0700 if needed.
-func writeCache(path string, tok *oauth2.Token) error {
+// writeCache atomically writes the session (temp file + rename), 0600,
+// creating the parent dir 0700 if needed.
+func writeCache(path string, s session) error {
 	// Persisting the OAuth token (incl. refresh token) to the local cache is
 	// the whole point — userpath.WriteFile lands it 0600 in a 0700 dir via a
 	// temp+rename. gosec flags the token fields as "secret pattern" but caching
 	// them locally is intended.
-	b, err := json.Marshal(tok) // #nosec G117 -- intentional local token cache, 0600
+	b, err := json.Marshal(s) // #nosec G117 -- intentional local token cache, 0600
 	if err != nil {
 		return err
 	}
@@ -81,15 +123,16 @@ func lockCache(ctx context.Context, path string) (unlock func(), err error) {
 	return func() { _ = lock.Unlock() }, nil
 }
 
-// storeToken replaces the cached token with a freshly obtained one (a login)
-// under the cache lock, so it lands after any refresh already in flight.
-func storeToken(ctx context.Context, path string, tok *oauth2.Token) error {
+// storeToken replaces the cached session with a freshly obtained one (a
+// login) under the cache lock, so it lands after any refresh already in
+// flight.
+func storeToken(ctx context.Context, path string, s session) error {
 	unlock, err := lockCache(ctx, path)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	return writeCache(path, tok)
+	return writeCache(path, s)
 }
 
 // removeToken deletes the cached token (a logout) under the cache lock, so a
@@ -118,23 +161,34 @@ func removeToken(ctx context.Context, path string) error {
 //
 // So Token() takes an exclusive flock, READS THE TOKEN FROM DISK INSIDE THE
 // LOCK (a pre-instantiated config.TokenSource would capture a stale token and
-// defeat the lock), refreshes only if expired, ABORTS the write on refresh
-// error (never corrupts the cache with a nil/empty token), and atomically
-// writes a successfully-rotated token back before unlocking.
+// defeat the lock), refreshes only if expired (or rejected), ABORTS the write
+// on refresh error (never corrupts the cache with a nil/empty token), and
+// atomically writes a successfully-rotated token back before unlocking.
+//
+// What it reads under the lock may be a session another invocation's login
+// just wrote for a different server. It hands out, and refreshes, only a
+// session bound to want, so that login's token never reaches this server and
+// its refresh token never reaches this server's identity provider.
 type persistingTokenSource struct {
 	ctx       context.Context
 	oc        *oauth2.Config
+	want      binding
 	cachePath string
+	// rejected is an access token the API refused, possibly while its expiry
+	// still says it is valid. Token refreshes when the cache still holds it;
+	// a cache holding any other valid token means another invocation already
+	// refreshed, and spending the refresh token again would be a waste.
+	rejected string
 }
 
-func newPersistingTokenSource(ctx context.Context, oc *oauth2.Config, cachePath string) *persistingTokenSource {
-	return &persistingTokenSource{ctx: ctx, oc: oc, cachePath: cachePath}
+func newPersistingTokenSource(ctx context.Context, oc *oauth2.Config, want binding, cachePath string) *persistingTokenSource {
+	return &persistingTokenSource{ctx: ctx, oc: oc, want: want, cachePath: cachePath}
 }
 
 func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
-	// Acquire the lock under the context: if the operator Ctrl-C's (or a
-	// timeout fires) while a concurrent invocation is holding the lock through
-	// a slow/hung refresh, we abort instead of blocking indefinitely.
+	// Acquire the lock under the context, so Ctrl-C (or a caller's deadline)
+	// aborts the wait. A concurrent invocation holding the lock through a
+	// slow refresh lets go within providerTimeout, when its refresh gives up.
 	unlock, err := lockCache(p.ctx, p.cachePath)
 	if err != nil {
 		return nil, err
@@ -144,25 +198,57 @@ func (p *persistingTokenSource) Token() (*oauth2.Token, error) {
 	// Read INSIDE the lock so a process that was waiting picks up whatever the
 	// previous holder just wrote.
 	cur, err := readCache(p.cachePath)
+	if errors.Is(err, fs.ErrNotExist) {
+		// A logout landed while this invocation waited for the lock.
+		return nil, fmt.Errorf("%w: no cached token", ErrLoginRequired)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("reading token cache under lock: %w", err)
 	}
-	if cur.Valid() {
-		return cur, nil // someone else already refreshed (or it never expired)
+	if cur.binding != p.want {
+		return nil, notSignedIn(p.want)
 	}
-	if cur.RefreshToken == "" {
-		return nil, fmt.Errorf("token expired and no refresh token; re-login required")
+	if cur.Token.Valid() && cur.Token.AccessToken != p.rejected {
+		return cur.Token, nil // someone else already refreshed (or it never expired)
+	}
+	if cur.Token.RefreshToken == "" {
+		return nil, fmt.Errorf("%w: the cached token expired and has no refresh token", ErrLoginRequired)
 	}
 
-	// Refresh from the on-disk token (NOT a pre-captured one).
-	refreshed, err := p.oc.TokenSource(p.ctx, cur).Token()
+	// Refresh from the on-disk refresh token (NOT a pre-captured one). The
+	// token handed to oauth2 carries only the refresh token: given a token
+	// that is still valid by its expiry, as a rejected one is, oauth2 would
+	// return it instead of refreshing.
+	refreshed, err := askProvider(p.ctx, p.want.Issuer, func(ctx context.Context) (*oauth2.Token, error) {
+		return p.oc.TokenSource(ctx, &oauth2.Token{RefreshToken: cur.Token.RefreshToken}).Token()
+	})
 	if err != nil {
 		// Do NOT touch the cache on failure — a revoked/expired/unreachable
 		// refresh must not overwrite the cache with a bad token.
-		return nil, fmt.Errorf("refreshing token (re-login may be required): %w", err)
+		if isNoAnswer(err) {
+			return nil, err
+		}
+		if refreshRefused(err) {
+			return nil, fmt.Errorf("%w: the identity provider refused the refresh token: %w", ErrLoginRequired, err)
+		}
+		return nil, fmt.Errorf("refreshing token: %w", err)
 	}
-	if err := writeCache(p.cachePath, refreshed); err != nil {
+	if err := writeCache(p.cachePath, session{binding: p.want, Token: refreshed}); err != nil {
 		return nil, fmt.Errorf("persisting refreshed token: %w", err)
 	}
 	return refreshed, nil
+}
+
+// refreshRefused reports whether a refresh failed because the identity
+// provider answered the grant with an OAuth error, which RFC 6749 section
+// 5.2 sends as 400 (invalid_grant for a revoked, expired or already-spent
+// refresh token) or 401 (invalid_client). Retrying the same refresh token
+// cannot succeed. Anything else (no answer, a 5xx, a 429) may be
+// transient.
+func refreshRefused(err error) bool {
+	var re *oauth2.RetrieveError
+	if !errors.As(err, &re) || re.Response == nil {
+		return false
+	}
+	return re.Response.StatusCode == http.StatusBadRequest || re.Response.StatusCode == http.StatusUnauthorized
 }

@@ -142,6 +142,11 @@ func fetchClientConfig(ctx context.Context, api string) (issuer, clientID string
 // they are used only for that server: pointing slagctl at another API must
 // never hand it this token, nor send the refresh token to an identity
 // provider that other server names. Any other server needs its own login.
+//
+// The saved config is written after the token, so the two can disagree (an
+// interactive login of an earlier command lands after a later `auth login`
+// elsewhere, or the config write fails). clientauth therefore checks the
+// API, issuer and client recorded with the token itself as well.
 func authConfig(api string) (clientauth.Config, error) {
 	saved, err := loadSavedConfig()
 	if err != nil {
@@ -152,10 +157,43 @@ func authConfig(api string) (clientauth.Config, error) {
 	}
 	return clientauth.Config{
 		AppName:      appName,
+		API:          api,
 		Issuer:       saved.OIDCIssuer,
 		ClientID:     saved.OIDCClientID,
 		LoopbackPort: oidcLoopbackPort,
 	}, nil
+}
+
+// bearerSource returns the access-token source for requests to api. Each
+// call re-reads the saved server and the token cache and refreshes an
+// expired access token with the refresh token (clientauth.CachedBearer);
+// it never starts an interactive login. Checking the saved server on every
+// call keeps authConfig's promise for the whole command, not just its
+// start: once `slagctl auth login --api <other>` has run in another
+// terminal, requests here fail instead of carrying the other server's
+// token. The server is checked again after the cache is read, because a
+// login writes its token before the saved server. A request that reads the
+// cache in the instant between those two writes is refused by clientauth,
+// which checks the server recorded with the token itself.
+// Errors that only a new login clears match clientauth.ErrLoginRequired.
+func bearerSource(api string) func(context.Context) (string, error) {
+	return func(ctx context.Context) (string, error) {
+		cfg, err := authConfig(api)
+		if err != nil {
+			return "", fmt.Errorf("%w: %w", clientauth.ErrLoginRequired, err)
+		}
+		token, err := clientauth.CachedBearer(ctx, cfg)
+		if errors.Is(err, clientauth.ErrLoginRequired) {
+			return "", fmt.Errorf("%w\n  run `slagctl auth login`", err)
+		}
+		if err != nil {
+			return "", err
+		}
+		if _, err := authConfig(api); err != nil {
+			return "", fmt.Errorf("%w: %w", clientauth.ErrLoginRequired, err)
+		}
+		return token, nil
+	}
 }
 
 // tokenCacheConfig is enough to find the cached token (logout, whoami)

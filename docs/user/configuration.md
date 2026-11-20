@@ -321,7 +321,11 @@ and `slagctl auth login` saves the answer next to the API URL. An
 operator therefore configures one value, the API URL.
 
 - The issuer must be reachable from the operator's laptop; the OpenID
-  configuration is fetched from it.
+  configuration is fetched from it. slagctl gives up on any request the
+  issuer does not answer within 30 seconds (discovery, a token refresh,
+  the code exchange, the device-authorization request) with an error
+  that names the issuer; an unanswered refresh does not fall back to a
+  login.
 - slagctl is a public client using PKCE, and the client ID is global's
   OIDC audience.
 - **`SLAGWORKS_OIDC_ISSUER`** and **`SLAGWORKS_OIDC_CLIENT_ID`**, when
@@ -330,11 +334,20 @@ operator therefore configures one value, the API URL.
 - The cached token is bound to the server of the last login. A command
   aimed at another server (`--api`, `SLAGWORKS_API`) is refused until
   you `slagctl auth login --api` there, so a token is never sent to a
-  server it was not issued for.
+  server it was not issued for. The token cache records the server,
+  identity provider and client each token was issued for, and slagctl
+  checks that record too, so this holds even when two slagctl
+  invocations sign in to different servers at the same time: a command
+  then reports that you are not signed in to its server rather than
+  using, refreshing or replacing the other server's session.
 - The loopback redirect uses a fixed port (`8765`). This port must
   be registered with the IdP as an allowed redirect URI. If a local
   browser flow is not available, `slagctl auth login --device`
-  uses the OIDC device-authorization grant instead.
+  uses the OIDC device-authorization grant instead. That needs the
+  IdP to serve the page where the code is entered (Authentik serves
+  it only when the brand has a device-code flow); when the page
+  answers 404 or 410, the login stops at once and says so instead of
+  waiting for the code to expire.
 
 Cached tokens land at
 `$XDG_CONFIG_HOME/slagctl/token.json` (usually
@@ -536,6 +549,10 @@ example files are installed mode 0640, group `slagworks`.
 - **AWS region for Secrets Manager** — `us-east-2`.
 - **OIDC loopback redirect port** for `slagctl auth login` — fixed at
   `8765`.
+- **Identity-provider request timeout** for slagctl — 30 seconds per
+  request (`internal/cli/clientauth/flows.go`, `providerTimeout`). The
+  browser callback waits 5 minutes; device-approval polling lasts as
+  long as the device code the provider issued.
 - **Operation timeouts** — a pending operation fails after 24 hours, a
   claimed or running one after 30 minutes, a deploy waiting for phone-home
   after 30 minutes in that phase, and a claim with no progress after 2

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -16,13 +17,79 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// providerTimeout bounds each round trip with the identity provider:
+// discovery, a token refresh, the authorization-code exchange and the
+// device-authorization request. go-oidc and oauth2 send them with
+// http.DefaultClient, which has no timeout, and a CLI command's context has
+// no deadline, so without this bound a provider that accepts the connection
+// and never answers hangs the command, and a refresh holds the token-cache
+// lock while it does, queuing every other invocation behind it. 30s matches
+// the slagctl API client. The interactive waits are not round trips and keep
+// their own limits: the browser callback (5 minutes) and device-approval
+// polling (the device code's lifetime, which oauth2 enforces). It is a
+// variable only so tests can shorten it.
+var providerTimeout = 30 * time.Second
+
+// noAnswerError reports a round trip with the identity provider that
+// providerTimeout cut off. Its message says what happened and what to do, so
+// callers return it as is rather than under their step-specific hints
+// (re-login, is the device flow enabled), which do not apply to it.
+type noAnswerError struct {
+	issuer string
+	after  time.Duration
+	err    error
+}
+
+func (e *noAnswerError) Error() string {
+	return fmt.Sprintf("the identity provider %s did not answer within %s (%v)\n  check that it is up and reachable, then retry", e.issuer, e.after, e.err)
+}
+
+func (e *noAnswerError) Unwrap() error { return e.err }
+
+func isNoAnswer(err error) bool {
+	_, ok := errors.AsType[*noAnswerError](err)
+	return ok
+}
+
+// askProvider makes one round trip with the identity provider at issuer,
+// bounded by providerTimeout. Two bounds are needed:
+//
+//   - a context deadline over the whole call, which also covers the retry
+//     oauth2 makes with the other client-auth style when a token request
+//     fails, so the call cannot take twice the timeout;
+//   - an HTTP client with the same timeout, which go-oidc and oauth2 take
+//     from the context, for oauth2's device-authorization request, which
+//     ignores the context.
+//
+// Like net/http's own client timeout, it decides that the provider did not
+// answer by the clock rather than by the error: the libraries format some
+// errors with %v, dropping context.DeadlineExceeded. When ctx itself ends
+// first (Ctrl-C, a caller's own deadline), the call's error is returned
+// unchanged.
+func askProvider[T any](ctx context.Context, issuer string, call func(context.Context) (T, error)) (T, error) {
+	deadline := time.Now().Add(providerTimeout)
+	callCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	callCtx = context.WithValue(callCtx, oauth2.HTTPClient, &http.Client{Timeout: providerTimeout})
+	v, err := call(callCtx)
+	if err != nil && ctx.Err() == nil && !time.Now().Before(deadline) {
+		return v, &noAnswerError{issuer: issuer, after: providerTimeout, err: err}
+	}
+	return v, err
+}
+
 // oauthConfig builds the oauth2.Config from OIDC discovery. It sets the device
 // endpoint manually: go-oidc's provider.Endpoint() only fills AuthURL/TokenURL,
 // NOT the device endpoint, which must be pulled from the discovery doc via
 // provider.Claims.
 func oauthConfig(ctx context.Context, cfg Config) (*oauth2.Config, error) {
-	provider, err := oidc.NewProvider(ctx, cfg.Issuer)
-	if err != nil {
+	provider, err := askProvider(ctx, cfg.Issuer, func(ctx context.Context) (*oidc.Provider, error) {
+		return oidc.NewProvider(ctx, cfg.Issuer)
+	})
+	switch {
+	case isNoAnswer(err):
+		return nil, err
+	case err != nil:
 		return nil, fmt.Errorf("OIDC discovery against %s: %w", cfg.Issuer, err)
 	}
 	ep := provider.Endpoint()
@@ -141,8 +208,13 @@ func loginLoopback(ctx context.Context, cfg Config, oc *oauth2.Config) (*oauth2.
 		if res.err != nil {
 			return nil, res.err
 		}
-		tok, err := oc.Exchange(ctx, res.code, oauth2.VerifierOption(verifier))
-		if err != nil {
+		tok, err := askProvider(ctx, cfg.Issuer, func(ctx context.Context) (*oauth2.Token, error) {
+			return oc.Exchange(ctx, res.code, oauth2.VerifierOption(verifier))
+		})
+		switch {
+		case isNoAnswer(err):
+			return nil, err
+		case err != nil:
 			return nil, fmt.Errorf("exchanging code: %w", err)
 		}
 		return tok, nil
@@ -151,19 +223,32 @@ func loginLoopback(ctx context.Context, cfg Config, oc *oauth2.Config) (*oauth2.
 	}
 }
 
-// loginDevice runs the device-authorization grant: request a code, print the
-// URL + user code, poll until approved.
+// loginDevice runs the device-authorization grant: request a code, check the
+// verification page exists, print the URL + user code, poll until approved.
 //
 // Some providers serve the device grant only when it is explicitly enabled
-// (Authentik needs a brand-level device-code flow). Without it this path
-// returns the provider's error; loopback is the working default.
+// (Authentik needs a brand-level device-code flow). Without it the device
+// endpoint may refuse the request, or it may issue a code while the
+// verification page it names answers 404 (Authentik without the brand flow,
+// or a proxy in front of the provider that does not route the page). Polling
+// in the second case can only end when the code expires, so the page is
+// checked first. Every such failure names loopback, the working default.
 func loginDevice(ctx context.Context, cfg Config, oc *oauth2.Config) (*oauth2.Token, error) {
+	wayOut := fmt.Sprintf("log in without --device (`%s auth login`)", cfg.AppName)
 	if oc.Endpoint.DeviceAuthURL == "" {
-		return nil, fmt.Errorf("device flow unavailable: issuer advertises no device endpoint; log in without --device")
+		return nil, fmt.Errorf("the identity provider %s advertises no device-code endpoint; %s", cfg.Issuer, wayOut)
 	}
-	resp, err := oc.DeviceAuth(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("device authorization request: %w (is the device-code flow enabled on the identity provider?)", err)
+	resp, err := askProvider(ctx, cfg.Issuer, func(ctx context.Context) (*oauth2.DeviceAuthResponse, error) {
+		return oc.DeviceAuth(ctx)
+	})
+	switch {
+	case isNoAnswer(err):
+		return nil, err
+	case err != nil:
+		return nil, fmt.Errorf("device authorization request to %s: %w\n  the device-code flow may not be enabled on the identity provider; %s", oc.Endpoint.DeviceAuthURL, err, wayOut)
+	}
+	if status := devicePageMissing(ctx, resp.VerificationURI); status != "" {
+		return nil, fmt.Errorf("the identity provider %s issued a device code, but its device page %s answers %s, so the code cannot be entered there; %s, or ask the identity provider's administrator to serve that page", cfg.Issuer, resp.VerificationURI, status, wayOut)
 	}
 	if resp.VerificationURIComplete != "" {
 		_, _ = fmt.Fprintf(cfg.stderr(), "To authenticate, open:\n  %s\n", resp.VerificationURIComplete)
@@ -175,6 +260,37 @@ func loginDevice(ctx context.Context, cfg Config, oc *oauth2.Config) (*oauth2.To
 		return nil, fmt.Errorf("waiting for device approval: %w", err)
 	}
 	return tok, nil
+}
+
+// devicePageTimeout bounds the check that the device page exists.
+const devicePageTimeout = 10 * time.Second
+
+// devicePageMissing GETs the device page the provider named, following
+// redirects, and returns the final status line when it is 404 or 410: the
+// page does not exist, so no operator can enter the code. Every other outcome
+// returns "" and the flow goes ahead: a page that turns away scripted clients
+// (403, a bot challenge) or that this host cannot reach may still open in the
+// operator's browser on another device. It checks verification_uri, not
+// verification_uri_complete, so the probe does not carry the user code.
+func devicePageMissing(ctx context.Context, page string) string {
+	if page == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, devicePageTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, page, nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		return resp.Status
+	}
+	return ""
 }
 
 func randState() (string, error) {

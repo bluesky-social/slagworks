@@ -393,7 +393,10 @@ and tails structured log envelopes scoped to this machine. Envelopes
 flow from agents (deploy/commission), site workers, and global itself;
 one trace_id correlates the full lifecycle of an op. Deploy logs are a
 subset of this stream. By default it backfills the last --since window
-(10m if unset) and exits; pass -f to follow live after backfill.
+(10m if unset) and exits; pass -f to follow live after backfill. A
+follow whose connection drops (a proxy restart, an idle timeout)
+reconnects and resumes after the last line shown, with a [reconnect]
+line on stderr.
 
 With --sol it instead streams the machine's BMC SOL (serial console)
 byte feed from /api/v1/console/stream — raw serial output rather than

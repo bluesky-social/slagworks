@@ -301,7 +301,11 @@ recent active operation.
 
 - On a TTY: launches the three-pane deploy TUI (`cmd/slagctl/tui/`) —
   phase spine on the right, structured envelope stream on the left,
-  SOL passthrough at the bottom.
+  SOL passthrough at the bottom. When the console stream drops (a
+  proxy or API restart, an idle timeout on a quiet console) or cannot
+  connect, the SOL pane keeps its last screen, its title reads
+  `⚠ reconnecting`, and it redials until the stream is back and the
+  screen is redrawn.
 - On a non-TTY: falls back to a flat line-based log stream (`--plain`
   forces this on a TTY too and writes the lines to stdout): the op's
   structured log envelopes from `/api/v1/logs/stream`, in the
@@ -309,6 +313,13 @@ recent active operation.
   operation completes, non-zero if it fails or `--timeout` passes first.
   `machine deploy -w` and `machine commission -w` take this path when
   stderr is not a terminal (CI, pipes).
+
+Either way the watch refreshes the access token as it expires, so it can
+outlast the token's lifetime. If the token can no longer be refreshed
+(the identity provider refused the refresh token, or another terminal
+logged out or signed in to a different server), the watch stops with an
+error that says to run `slagctl auth login`; the operation itself is not
+affected.
 
 Flags: `--timeout <dur>` (default 30m), `--hold` (keep TUI open on
 completion even under CI recording), `--no-hold` (tear down
@@ -346,7 +357,13 @@ sources. By default this backfills the last window (`--since`, default
 
 Flags:
 
-- `-f, --follow` — live-tail after backfill.
+- `-f, --follow` — live-tail after backfill. When the connection drops
+  (a proxy restart, the load balancer's idle timeout, a global restart)
+  it prints a `[reconnect]` line on stderr, redials with backoff up to
+  30s, and resumes after the last line shown, so nothing repeats or goes
+  missing. It exits instead when the first connection fails, the server
+  reports an error, or a redial is refused with a status below 500 (an
+  expired login).
 - `--since <dur>` — backfill window (`5m`, `1h`, RFC3339 timestamp).
   Widen for historical operations; the default is deliberately small.
 - `--trace <uuid>` — filter to one trace ID.

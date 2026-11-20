@@ -3,15 +3,16 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
-	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"golang.org/x/term"
 
 	"github.com/bluesky-social/slagworks/cmd/slagctl/tui"
+	"github.com/bluesky-social/slagworks/internal/cli/clientauth"
 	"github.com/bluesky-social/slagworks/internal/model"
 	"github.com/bluesky-social/slagworks/internal/slogkit"
 	"github.com/bluesky-social/slagworks/internal/ws"
@@ -28,7 +29,7 @@ func errOperationFailed(opID string) error {
 // existing WS endpoints and dispatches `machine deploy/commission -w` and
 // `operation watch` into the one 3-pane model (plan D8 — the legacy watchModel
 // is deleted). The TUI package owns rendering + reduction; this file owns the
-// network and the slagctl globals (apiURL/apiToken).
+// network and the slagctl globals (apiURL/apiClient).
 
 // runDeployTUI is the entry point for an interactive -w / `operation watch`.
 // It fetches the op once (for type + claimed_by backfill), then drives the TUI
@@ -56,6 +57,11 @@ func runDeployTUI(ctx context.Context, opID string, holdFlag, noHoldFlag bool) e
 
 	machine := machineLabel(ctx, machineID)
 	resolveWorker := workerResolver(ctx)
+	// A sign-in that only a new login can restore ends the watch, with the
+	// error naming `slagctl auth login`, instead of the watch polling
+	// silently until --timeout (stopOnLoginRequired).
+	ctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
 	cfg := tui.RunConfig{
 		OpType:        op.Type,
 		Machine:       machine,
@@ -67,12 +73,15 @@ func runDeployTUI(ctx context.Context, opID string, holdFlag, noHoldFlag bool) e
 		Loc:           time.Local,
 		Console:       consoleSource(machineID),
 		Logs:          logSource(machineID, opID, op.CreatedAt),
-		Poll:          opPoller(opID),
+		Poll:          stopOnLoginRequired(opPoller(opID), stop),
 		Interactive:   interactiveStderr(),
 		Hold:          holdFlag,
 		NoHold:        noHoldFlag,
 	}
 	result, err := tui.Run(ctx, cfg)
+	if cause := context.Cause(ctx); errors.Is(cause, clientauth.ErrLoginRequired) {
+		return fmt.Errorf("stopped watching operation %s: %w", opID, cause)
+	}
 	if err != nil {
 		return err
 	}
@@ -132,98 +141,193 @@ func formatDur(d time.Duration) string {
 // fragment). The live-edge callback fires after the first idle gap (the stream
 // has no explicit marker — a pause in frames means the snapshot+backlog drained,
 // per console_stream.go's caught-up gate).
+//
+// Per the tui.ConsoleSource contract it redials until ctx is done, or until no
+// access token can be had without a new login. The proxy in
+// front of the API drops WebSockets without a close frame on every rollout, a
+// load balancer drops a console that stays quiet past its idle timeout, and an
+// API restart drops them all; none of those should freeze the pane for the rest
+// of the watch. Every failure is retried, a refused handshake included: this
+// client cannot tell a proxy's answer mid-rollout from the API's own, giving
+// up would strand the pane again, and the reconnect banner keeps a persistent
+// failure (an expired token, a deleted machine) visible at the cost of one
+// request per consoleRedialMax. The one failure it does not retry is
+// clientauth.ErrLoginRequired from the dial's token fetch: no request reached
+// the proxy or the API, every further attempt would fail the same way, and
+// each would ask the identity provider to refresh a token it already refused.
+// It returns that error with the banner left up; the watch itself ends through
+// its op-row poll. Each redial asks for a fresh snapshot, so the screen is
+// whole again as soon as the stream is back.
 func consoleSource(machineID string) tui.ConsoleSource {
 	if machineID == "" {
 		return nil
 	}
-	return func(ctx context.Context, onBytes func([]byte, bool), onLiveEdge func()) error {
-		url, err := buildConsoleStreamURL(apiURL, machineID, "" /*tail*/, false /*fromStart*/, true /*follow*/, true /*snapshot*/)
-		if err != nil {
-			return err
-		}
-		conn, resp, err := websocket.Dial(ctx, url, streamDialOptions(apiToken))
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-		}
-		if err != nil {
-			return err
-		}
-		defer conn.CloseNow() //nolint:errcheck
-
-		// Read in a goroutine feeding a channel. We must NOT use a per-read
-		// context deadline for live-edge detection: coder/websocket
-		// permanently closes the connection when a Read context is cancelled
-		// or times out (CWE-664), which would kill the stream right after the
-		// backfill drained. Instead the reader always reads on the parent ctx,
-		// and the select-loop below detects the backfill lull with a timer
-		// that never touches the connection.
-		type frame struct {
-			raw []byte
-			err error
-		}
-		frames := make(chan frame, 64)
-		go func() {
-			for {
-				_, raw, err := conn.Read(ctx)
-				select {
-				case frames <- frame{raw, err}:
-				case <-ctx.Done():
-					return
-				}
-				if err != nil {
-					return
-				}
-			}
-		}()
-
-		// Live-edge detection: the cast backfill arrives as a fast burst, then
-		// the server polls pg every ~250ms (console_stream.go's caught-up
-		// gate). A gap longer than that between frames means the backfill
-		// drained and we're at the live edge — fire onLiveEdge once so the
-		// model drops the catch-up placeholder.
-		const liveEdgeGap = 600 * time.Millisecond
-		liveEdgeFired := false
-		lull := time.NewTimer(liveEdgeGap)
-		defer lull.Stop()
-		fireLiveEdge := func() {
-			if !liveEdgeFired {
-				liveEdgeFired = true
-				onLiveEdge()
-			}
-		}
+	return func(ctx context.Context, onBytes func([]byte, bool), onLiveEdge func(), onReconnecting func(bool)) error {
+		relay := &consoleRelay{machineID: machineID, onBytes: onBytes, onLiveEdge: onLiveEdge}
+		reconnecting := false
+		wait := consoleRedialMin
 		for {
+			var connectedAt time.Time
+			// Every end of a connection but a lost sign-in is retried
+			// below; the banner is what the operator sees.
+			err := relay.stream(ctx, func() {
+				connectedAt = time.Now()
+				if reconnecting {
+					reconnecting = false
+					onReconnecting(false)
+				}
+			})
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !reconnecting {
+				reconnecting = true
+				onReconnecting(true)
+			}
+			if errors.Is(err, clientauth.ErrLoginRequired) {
+				return err
+			}
+			// A connection that held up for a while was healthy: start the
+			// next wait from the bottom. One that failed fast (a refused
+			// handshake, a server that errors right after the upgrade) keeps
+			// doubling it.
+			if !connectedAt.IsZero() && time.Since(connectedAt) >= consoleRedialMax {
+				wait = consoleRedialMin
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-lull.C:
-				fireLiveEdge()
-			case f := <-frames:
-				if f.err != nil {
-					return f.err
-				}
-				if !liveEdgeFired {
-					lull.Reset(liveEdgeGap)
-				}
-				// First frame is the asciicast header ([version,...] won't
-				// parse as the [t,"o",data] event tuple) — skipped by the kind
-				// check.
-				var ev [3]any
-				if json.Unmarshal(f.raw, &ev) != nil {
-					continue
-				}
-				if kind, _ := ev[1].(string); kind == "o" {
-					if data, ok := ev[2].(string); ok {
-						onBytes([]byte(data), !liveEdgeFired)
-					}
-				}
+			case <-time.After(wait):
 			}
+			wait = min(2*wait, consoleRedialMax)
+		}
+	}
+}
+
+// consoleRedialMin and consoleRedialMax bound consoleSource's wait between
+// redials. No jitter: the clients are a handful of operators' watches, not a
+// fleet that could stampede the API after a restart.
+const (
+	consoleRedialMin = time.Second
+	consoleRedialMax = 10 * time.Second
+)
+
+// termReset is RIS (ESC c), the full terminal reset. The snapshot a redial
+// starts with is drawn for a fresh terminal, but the pane's emulator still
+// holds whatever the dropped connection left behind: SGR attributes, a scroll
+// region, the alternate screen, a line-drawing charset, or an escape sequence
+// the drop cut in half. Leading the snapshot with RIS gives it the terminal it
+// was drawn for.
+const termReset = "\x1bc"
+
+// consoleRelay is the state a consoleSource keeps across its connections.
+type consoleRelay struct {
+	machineID  string
+	onBytes    func([]byte, bool)
+	onLiveEdge func()
+
+	liveEdgeFired bool // onLiveEdge fires once per source, not once per connection
+	delivered     bool // output has reached onBytes, so the consumer's terminal is no longer fresh
+}
+
+// stream runs one console connection until it ends, calling onConnected once
+// the handshake succeeds. It returns the reason the connection ended, or
+// ctx.Err().
+func (r *consoleRelay) stream(ctx context.Context, onConnected func()) error {
+	url, err := buildConsoleStreamURL(apiURL, r.machineID, "" /*tail*/, false /*fromStart*/, true /*follow*/, true /*snapshot*/)
+	if err != nil {
+		return err
+	}
+	conn, err := dialStream(ctx, url)
+	if err != nil {
+		return err
+	}
+	defer conn.CloseNow() //nolint:errcheck
+	onConnected()
+
+	// Read in a goroutine feeding a channel. We must NOT use a per-read
+	// context deadline for live-edge detection: coder/websocket
+	// permanently closes the connection when a Read context is cancelled
+	// or times out (CWE-664), which would kill the stream right after the
+	// backfill drained. Instead the reader always reads on the parent ctx,
+	// and the select-loop below detects the backfill lull with a timer
+	// that never touches the connection. The reader exits after handing
+	// over its first error, which is also when this function returns.
+	type frame struct {
+		raw []byte
+		err error
+	}
+	frames := make(chan frame, 64)
+	go func() {
+		for {
+			_, raw, err := conn.Read(ctx)
+			select {
+			case frames <- frame{raw, err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Live-edge detection: the snapshot arrives first, then the server polls
+	// pg every ~250ms (console_stream.go's caught-up gate). A gap longer than
+	// that between frames means this connection's backfill drained and it is
+	// at the live edge. The first time any connection gets there, fire
+	// onLiveEdge so the model drops the catch-up placeholder.
+	const liveEdgeGap = 600 * time.Millisecond
+	atLiveEdge := false
+	lull := time.NewTimer(liveEdgeGap)
+	defer lull.Stop()
+	needReset := r.delivered
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-lull.C:
+			atLiveEdge = true
+			if !r.liveEdgeFired {
+				r.liveEdgeFired = true
+				r.onLiveEdge()
+			}
+		case f := <-frames:
+			if f.err != nil {
+				return f.err
+			}
+			if !atLiveEdge {
+				lull.Reset(liveEdgeGap)
+			}
+			// First frame is the asciicast header ([version,...] won't
+			// parse as the [t,"o",data] event tuple) — skipped by the kind
+			// check.
+			var ev [3]any
+			if json.Unmarshal(f.raw, &ev) != nil {
+				continue
+			}
+			kind, _ := ev[1].(string)
+			data, ok := ev[2].(string)
+			if kind != "o" || !ok {
+				continue
+			}
+			if needReset {
+				data = termReset + data
+				needReset = false
+			}
+			r.delivered = true
+			r.onBytes([]byte(data), !atLiveEdge)
 		}
 	}
 }
 
 // logSource streams control-plane log envelopes for the op, reconnecting with
 // the cursor (plan D4). It subscribes excluding SOL (D3) — phases ride these
-// envelopes, and the D6 global lifecycle envelopes carry claim/terminal.
+// envelopes, and the D6 global lifecycle envelopes carry claim/terminal. It
+// stops reconnecting, returning the error, when no access token can be had
+// without a new login (clientauth.ErrLoginRequired): every further attempt
+// would fail the same way, and would ask the identity provider once a second
+// to refresh a token it already refused.
 func logSource(machineID, opID string, since time.Time) tui.LogSource {
 	return func(ctx context.Context, onEnvelope func(int64, slogkit.Envelope)) error {
 		var lastSeen int64
@@ -232,8 +336,8 @@ func logSource(machineID, opID string, since time.Time) tui.LogSource {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if err == nil {
-				return nil
+			if err == nil || errors.Is(err, clientauth.ErrLoginRequired) {
+				return err
 			}
 			// Transient drop: reconnect from the cursor after a short backoff.
 			select {
@@ -253,10 +357,7 @@ func streamLogEnvelopes(ctx context.Context, machineID, opID string, since time.
 	if err != nil {
 		return err
 	}
-	conn, resp, err := websocket.Dial(ctx, streamURL, streamDialOptions(apiToken))
-	if resp != nil && resp.Body != nil {
-		_ = resp.Body.Close()
-	}
+	conn, err := dialStream(ctx, streamURL)
 	if err != nil {
 		return err
 	}
@@ -314,6 +415,25 @@ func opPoller(opID string) tui.OpPoller {
 			return false, false, "", nil
 		}
 		return true, op.Status == model.OpFailed, opFailureReason(op), nil
+	}
+}
+
+// stopOnLoginRequired wraps the TUI's op-row poll so a poll that fails with
+// clientauth.ErrLoginRequired cancels the watch, with that error as the
+// cause: tui.Run's program is bound to the context and exits, and
+// runDeployTUI returns the cause. The TUI otherwise ignores poll errors,
+// which is right for a transient failure but would leave a watch whose
+// sign-in is gone polling silently until --timeout. The poll stops once
+// the op is terminal, so it cannot end a finished watch held on screen.
+// (logSource stops reconnecting on the same error; the poll sees it within
+// one interval.)
+func stopOnLoginRequired(poll tui.OpPoller, stop context.CancelCauseFunc) tui.OpPoller {
+	return func(ctx context.Context) (terminal, failed bool, reason string, err error) {
+		terminal, failed, reason, err = poll(ctx)
+		if errors.Is(err, clientauth.ErrLoginRequired) {
+			stop(err)
+		}
+		return terminal, failed, reason, err
 	}
 }
 

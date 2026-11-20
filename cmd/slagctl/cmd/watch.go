@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
+
+	"github.com/bluesky-social/slagworks/internal/cli/clientauth"
 )
 
 const watchInterval = 3 * time.Second
@@ -17,7 +20,11 @@ const watchInterval = 3 * time.Second
 // watchable wraps a list command to add a -w/--watch flag.
 // When -w is active, it captures the command's output and re-runs it every 3s
 // using a bubbletea alt-screen model (no flicker). The command's own RunE needs
-// no knowledge of watch mode.
+// no knowledge of watch mode. A failed run is shown and retried on the next
+// tick, except one that only a new login can fix
+// (clientauth.ErrLoginRequired), which ends the watch with that error:
+// retrying it would ask the identity provider every 3s, for as long as the
+// watch stays open, to refresh a token it already refused.
 func watchable(cmd *cobra.Command) *cobra.Command {
 	var watch bool
 	original := cmd.RunE
@@ -39,8 +46,14 @@ func watchable(cmd *cobra.Command) *cobra.Command {
 		}
 		m := newListWatchModel(fetch)
 		p := tea.NewProgram(m, tea.WithContext(c.Context()))
-		_, err := p.Run()
-		return err
+		final, err := p.Run()
+		if err != nil {
+			return err
+		}
+		if fm, ok := final.(listWatchModel); ok && fm.signInErr != nil {
+			return fm.signInErr
+		}
+		return nil
 	}
 	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "refresh every 3s")
 	return cmd
@@ -50,6 +63,9 @@ func watchable(cmd *cobra.Command) *cobra.Command {
 func watchPlainList(ctx interface{ Done() <-chan struct{} }, fetch func() (string, error)) error {
 	for {
 		content, err := fetch()
+		if errors.Is(err, clientauth.ErrLoginRequired) {
+			return err
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		} else {
@@ -66,10 +82,11 @@ func watchPlainList(ctx interface{ Done() <-chan struct{} }, fetch func() (strin
 // --- Bubble Tea model ---
 
 type listWatchModel struct {
-	fetch    func() (string, error)
-	content  string
-	fetchErr error
-	updated  time.Time
+	fetch     func() (string, error)
+	content   string
+	fetchErr  error
+	signInErr error // a fetch error only a new login fixes; ends the watch
+	updated   time.Time
 }
 
 type listFetchedMsg struct {
@@ -99,6 +116,10 @@ func (m listWatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.fetchErr = nil
 		return m, tea.Tick(watchInterval, func(time.Time) tea.Msg { return listTickMsg{} })
 	case listFetchErrMsg:
+		if errors.Is(msg.err, clientauth.ErrLoginRequired) {
+			m.signInErr = msg.err
+			return m, tea.Quit
+		}
 		m.fetchErr = msg.err
 		return m, tea.Tick(watchInterval, func(time.Time) tea.Msg { return listTickMsg{} })
 	case listTickMsg:

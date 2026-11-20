@@ -789,17 +789,25 @@ func TestModel_TerminalStateIsUnambiguous(t *testing.T) {
 }
 
 // TestModel_ReconnectBanner: a console reconnect toggles the box title without
-// disturbing the rest of the layout.
+// disturbing the rest of the layout. The toggle is not machine activity, so it
+// leaves "last update" alone: a quiet console behind a load balancer idle
+// timeout drops and redials every few minutes on a host doing nothing.
 func TestModel_ReconnectBanner(t *testing.T) {
-	m := newTestModel(fixedClock(at(time.Second)))
+	clockT := at(100 * time.Second)
+	m := newTestModel(func() time.Time { return clockT })
+	m = send(m, logEnvelopeMsg{id: 1, env: envAt("dhcp_ack", at(60*time.Second))})
 	m = send(m, consoleBackfillDoneMsg{})
 	m = send(m, consoleReconnectMsg{reconnecting: true})
 	if !strings.Contains(viewText(m), "reconnecting") {
 		t.Errorf("reconnect banner missing:\n%s", viewText(m))
 	}
+	clockT = at(110 * time.Second)
 	m = send(m, consoleReconnectMsg{reconnecting: false})
 	if strings.Contains(viewText(m), "reconnecting") {
 		t.Errorf("reconnect banner should clear:\n%s", viewText(m))
+	}
+	if ago, ok := m.frameInput().lastUpdateAgo(); !ok || ago != 50*time.Second {
+		t.Errorf("reconnect toggles must not reset staleness: last update %s ago (ok=%v), want 50s from the last envelope", ago, ok)
 	}
 }
 

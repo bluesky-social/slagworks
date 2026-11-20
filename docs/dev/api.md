@@ -36,7 +36,7 @@ The Auth column in the tables below uses these classes:
 |---|---|
 | `read`, `admin` | OIDC bearer token: `Authorization: Bearer <JWT>`, on WebSocket upgrades too. Verified against `SLAGWORKS_OIDC_ISSUER`, `SLAGWORKS_OIDC_AUDIENCE` and the JWKS (`SLAGWORKS_OIDC_JWKS_URL`, default `<issuer>/jwks/`); the token must carry at least one of `SLAGWORKS_OIDC_REQUIRED_GROUPS` (required; global refuses to start without one). 401 for a missing, malformed, invalid or expired token; 403 for a valid token outside the required groups. |
 | `creds` | As `read`, and when `SLAGWORKS_OIDC_CREDENTIAL_GROUPS` is set the token must also carry at least one of those groups; otherwise 403 with a message naming that setting (the body echoes no group names; the refusal is logged at Info with the subject and both group lists). Unset, the same as `read`. |
-| `worker` | Per-worker token minted by `POST /api/v1/site-workers`, passed as `Authorization: Bearer <token>` on the WebSocket upgrade, never in the URL (a token in the query is ignored). Checked against `site_workers.token_hash` (SHA-256); a missing or bad token gets 401 before the upgrade. |
+| `worker` | Per-worker token minted by `POST /api/v1/site-workers`, passed as `Authorization: Bearer <token>` on the WebSocket upgrade, never in the URL (a token in the query is ignored). Checked against `site_workers.token_hash` (SHA-256); a missing or bad token gets 401 before the upgrade, and global logs a warning with the caller's `remote_ip`, the cause and the remedy (never the token). |
 | `hmac` | `X-Hook-Signature` header: hex HMAC-SHA512 of the body keyed with `SLAGWORKS_WEBHOOK_SECRET`; a missing or wrong signature gets 403. When that secret is empty every delivery gets 503 and nothing is processed. |
 | `none` | No authentication. |
 
@@ -64,6 +64,13 @@ every 30 seconds, so a stream with nothing new to send still carries
 traffic through a proxy's idle timeout. An unanswered ping does not end the
 stream: a client that has stopped reading is still connected. The stream
 ends when the client closes or drops the connection or a write fails.
+
+Each stored row (a log envelope, a cast event) goes out as
+one message as large as the row: a log envelope can run to megabytes, since
+a site worker's log batch carries up to 4 MiB, and a cast event of control
+bytes encodes to tens of KiB. `slagctl` reads up to `ws.MaxMessageBytes`
+(16 MiB); a client that keeps a smaller default read limit, such as
+coder/websocket's 32 KiB, is disconnected at the first larger row.
 
 ## Conventions
 

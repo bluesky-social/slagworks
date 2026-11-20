@@ -97,7 +97,7 @@ func TestTokenCache_Property_ConcurrentInvocations(t *testing.T) {
 		// Operator actions go through the public entry points (auth login's
 		// WriteCachedToken, auth logout's Logout), so the lock they take is
 		// the one exercised.
-		app := Config{AppName: fmt.Sprintf("tokprop-%d", cases)}
+		app := Config{AppName: fmt.Sprintf("tokprop-%d", cases), API: testBinding.API, Issuer: testBinding.Issuer, ClientID: testBinding.ClientID}
 		path, err := defaultTokenPath(app.AppName)
 		if err != nil {
 			t.Fatal(err)
@@ -116,7 +116,7 @@ func TestTokenCache_Property_ConcurrentInvocations(t *testing.T) {
 			return &oauth2.Token{AccessToken: fmt.Sprintf("f%d/at0", family), RefreshToken: fmt.Sprintf("f%d/rt0", family),
 				TokenType: "Bearer", Expiry: exp}
 		}
-		if err := writeCache(path, newFamily(true)); err != nil {
+		if err := writeCache(path, testSession(newFamily(true))); err != nil {
 			t.Fatal(err)
 		}
 		externallyBroken := false // a corruption/truncation makes later refresh errors legitimate
@@ -138,7 +138,7 @@ func TestTokenCache_Property_ConcurrentInvocations(t *testing.T) {
 			results := make([]res, st.refreshers)
 			brokenAtStart := externallyBroken
 			expiredAtStart := false
-			if cur, err := readCache(path); err == nil && !cur.Valid() {
+			if cur, err := readCache(path); err == nil && !cur.Token.Valid() {
 				expiredAtStart = true
 			}
 			p.mu.Lock()
@@ -150,7 +150,7 @@ func TestTokenCache_Property_ConcurrentInvocations(t *testing.T) {
 					defer wg.Done()
 					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer cancel()
-					tok, err := newPersistingTokenSource(ctx, p.config(), path).Token()
+					tok, err := newPersistingTokenSource(ctx, p.config(), testBinding, path).Token()
 					results[i] = res{tok, err}
 				}(i)
 			}
@@ -181,8 +181,8 @@ func TestTokenCache_Property_ConcurrentInvocations(t *testing.T) {
 						t.Fatal(err)
 					}
 					if cur, err := readCache(path); err == nil {
-						cur.Expiry = time.Now().Add(-time.Minute)
-						_ = writeCache(path, cur)
+						cur.Token.Expiry = time.Now().Add(-time.Minute)
+						_ = writeCache(path, *cur)
 					}
 					_ = lk.Unlock()
 				case "corrupt":
@@ -250,13 +250,13 @@ func TestTokenCache_Property_ConcurrentInvocations(t *testing.T) {
 					t.Fatalf("step %d: cache unreadable after login: %v", si, err)
 				}
 				want := strings.SplitN(loginTok.RefreshToken, "/", 2)[0]
-				if got := strings.SplitN(onDisk.RefreshToken, "/", 2)[0]; got != want {
+				if got := strings.SplitN(onDisk.Token.RefreshToken, "/", 2)[0]; got != want {
 					t.Fatalf("step %d: after login the cache holds session %q, want the new login's %q", si, got, want)
 				}
 			}
 			// Re-seed so later steps have something to work with.
 			if _, err := os.Stat(path); err != nil {
-				_ = writeCache(path, newFamily(rapid.Bool().Draw(t, fmt.Sprintf("reseedExpired%d", si))))
+				_ = writeCache(path, testSession(newFamily(rapid.Bool().Draw(t, fmt.Sprintf("reseedExpired%d", si)))))
 				externallyBroken = false
 			}
 		}
