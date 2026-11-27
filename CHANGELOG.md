@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.1](https://github.com/bluesky-social/slagworks/compare/v0.7.0...v0.7.1) (2026-11-27)
+
+
+### Bug Fixes
+
+* **deps:** update postgres:18-alpine docker digest to 0115267 ([#199](https://github.com/bluesky-social/slagworks/issues/199)) ([8ff6f63](https://github.com/bluesky-social/slagworks/commit/8ff6f63697a45869c100ac9e15db24193eecf22c))
+* **deps:** update redis:8-alpine docker digest to 5af8010 ([#201](https://github.com/bluesky-social/slagworks/issues/201)) ([f5040a3](https://github.com/bluesky-social/slagworks/commit/f5040a3eabb549332fc7c7cab086d95e8be32cbe))
+
 ## [0.7.0](https://github.com/bluesky-social/slagworks/compare/v0.6.2...v0.7.0) (2026-11-20)
 
 
