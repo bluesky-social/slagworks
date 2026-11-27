@@ -5,16 +5,19 @@ package secretsmanager
 import (
 	"context"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager/schemas"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
+	smithy "github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 )
 
 // Creates a new secret. A secret can be a password, a set of credentials such as
 // a user name and password, an OAuth token, or other secret information that you
 // store in an encrypted form in Secrets Manager. The secret also includes the
-// connection information to access a database or other service, which Secrets
-// Manager doesn't encrypt. A secret in Secrets Manager consists of both the
-// protected secret data and the important information needed to manage the secret.
+// connection information to access a database or other service. Secrets Manager
+// does not encrypt this connection information. A secret in Secrets Manager
+// consists of both the encrypted secret versions and the metadata that Secrets
+// Manager uses to manage the secret.
 //
 // For secrets that use managed rotation, you need to create the secret through
 // the managing service. For more information, see [Secrets Manager secrets managed by other Amazon Web Services services].
@@ -23,7 +26,7 @@ import (
 //
 // To create a secret, you can provide the secret value to be encrypted in either
 // the SecretString parameter or the SecretBinary parameter, but not both. If you
-// include SecretString or SecretBinary then Secrets Manager creates an initial
+// include SecretString or SecretBinary , then Secrets Manager creates an initial
 // secret version and automatically attaches the staging label AWSCURRENT to it.
 //
 // For database credentials you want to rotate, for Secrets Manager to be able to
@@ -34,12 +37,16 @@ import (
 // Services managed key aws/secretsmanager . If this key doesn't already exist in
 // your account, then Secrets Manager creates it for you automatically. All users
 // and roles in the Amazon Web Services account automatically have access to use
-// aws/secretsmanager . Creating aws/secretsmanager can result in a one-time
-// significant delay in returning the result.
+// aws/secretsmanager . Creating aws/secretsmanager can result in a one-time delay
+// to complete the secret creation.
 //
 // If the secret is in a different Amazon Web Services account from the
 // credentials calling the API, then you can't use aws/secretsmanager to encrypt
 // the secret, and you must create and use a customer managed KMS key.
+//
+// To create a cross-account replica secret, include CrossAccountPrimaryARN . The
+// replica must use a customer managed KMS key, and can't include AddReplicaRegions
+// , Description , SecretBinary , SecretString , or Type .
 //
 // Secrets Manager generates a CloudTrail log entry when you call this action. Do
 // not include sensitive information in request parameters except SecretBinary or
@@ -47,8 +54,9 @@ import (
 //
 // Required permissions: secretsmanager:CreateSecret . If you include tags in the
 // secret, you also need secretsmanager:TagResource . To add replica Regions, you
-// must also have secretsmanager:ReplicateSecretToRegions . For more information,
-// see [IAM policy actions for Secrets Manager]and [Authentication and access control in Secrets Manager].
+// must also have secretsmanager:ReplicateSecretToRegions . To create a
+// cross-account replica secret, you must also have
+// secretsmanager:PutResourcePolicy permissions. For more information, see [IAM policy actions for Secrets Manager] and [Authentication and access control in Secrets Manager].
 //
 // To encrypt the secret with a KMS key other than aws/secretsmanager , you need
 // kms:GenerateDataKey and kms:Decrypt permission to the key.
@@ -130,6 +138,14 @@ type CreateSecretInput struct {
 	//
 	// [UUID-type]: https://wikipedia.org/wiki/Universally_unique_identifier
 	ClientRequestToken *string
+
+	// The ARN of a primary secret in another Amazon Web Services account. Include
+	// this field to create a cross-account replica secret that receives replicated
+	// data from that primary secret. The primary secret must be in the same Amazon Web
+	// Services Region and partition as the replica, and you must specify a customer
+	// managed KMS key in KmsKeyId . You can't include SecretString , SecretBinary ,
+	// Description , AddReplicaRegions , or Type .
+	CrossAccountPrimaryARN *string
 
 	// The description of the secret.
 	Description *string
@@ -220,6 +236,48 @@ type CreateSecretInput struct {
 	noSmithyDocumentSerde
 }
 
+func (v *CreateSecretInput) Serialize(s smithy.ShapeSerializer) {
+	s.WriteStruct(schemas.CreateSecretRequest)
+	v.SerializeMembers(s)
+	s.CloseStruct()
+}
+
+func (v *CreateSecretInput) SerializeMembers(s smithy.ShapeSerializer) {
+	if v.AddReplicaRegions != nil {
+		serializeAddReplicaRegionListType(s, schemas.CreateSecretRequest_AddReplicaRegions, v.AddReplicaRegions)
+	}
+	if v.ClientRequestToken != nil {
+		s.WriteString(schemas.CreateSecretRequest_ClientRequestToken, *v.ClientRequestToken)
+	}
+	if v.CrossAccountPrimaryARN != nil {
+		s.WriteString(schemas.CreateSecretRequest_CrossAccountPrimaryARN, *v.CrossAccountPrimaryARN)
+	}
+	if v.Description != nil {
+		s.WriteString(schemas.CreateSecretRequest_Description, *v.Description)
+	}
+	if v.ForceOverwriteReplicaSecret != false {
+		s.WriteBool(schemas.CreateSecretRequest_ForceOverwriteReplicaSecret, v.ForceOverwriteReplicaSecret)
+	}
+	if v.KmsKeyId != nil {
+		s.WriteString(schemas.CreateSecretRequest_KmsKeyId, *v.KmsKeyId)
+	}
+	if v.Name != nil {
+		s.WriteString(schemas.CreateSecretRequest_Name, *v.Name)
+	}
+	if v.SecretBinary != nil {
+		s.WriteBlob(schemas.CreateSecretRequest_SecretBinary, v.SecretBinary)
+	}
+	if v.SecretString != nil {
+		s.WriteString(schemas.CreateSecretRequest_SecretString, *v.SecretString)
+	}
+	if v.Tags != nil {
+		serializeTagListType(s, schemas.CreateSecretRequest_Tags, v.Tags)
+	}
+	if v.Type != nil {
+		s.WriteString(schemas.CreateSecretRequest_Type, *v.Type)
+	}
+}
+
 type CreateSecretOutput struct {
 
 	// The ARN of the new secret. The ARN includes the name of the secret followed by
@@ -250,13 +308,49 @@ type CreateSecretOutput struct {
 	noSmithyDocumentSerde
 }
 
+func (v *CreateSecretOutput) Serialize(s smithy.ShapeSerializer) {
+	s.WriteStruct(schemas.CreateSecretResponse)
+	v.SerializeMembers(s)
+	s.CloseStruct()
+}
+
+func (v *CreateSecretOutput) SerializeMembers(s smithy.ShapeSerializer) {
+	if v.ARN != nil {
+		s.WriteString(schemas.CreateSecretResponse_ARN, *v.ARN)
+	}
+	if v.Name != nil {
+		s.WriteString(schemas.CreateSecretResponse_Name, *v.Name)
+	}
+	if v.ReplicationStatus != nil {
+		serializeReplicationStatusListType(s, schemas.CreateSecretResponse_ReplicationStatus, v.ReplicationStatus)
+	}
+	if v.VersionId != nil {
+		s.WriteString(schemas.CreateSecretResponse_VersionId, *v.VersionId)
+	}
+}
+func (v *CreateSecretOutput) Deserialize(d smithy.ShapeDeserializer) error {
+	return smithy.ReadStruct(d, schemas.CreateSecretResponse, func(s *smithy.Schema) error {
+		switch s {
+		case schemas.CreateSecretResponse_ARN:
+			v.ARN = new(string)
+			return d.ReadString(schemas.CreateSecretResponse_ARN, v.ARN)
+		case schemas.CreateSecretResponse_Name:
+			v.Name = new(string)
+			return d.ReadString(schemas.CreateSecretResponse_Name, v.Name)
+		case schemas.CreateSecretResponse_ReplicationStatus:
+			return deserializeReplicationStatusListType(d, schemas.CreateSecretResponse_ReplicationStatus, &v.ReplicationStatus)
+		case schemas.CreateSecretResponse_VersionId:
+			v.VersionId = new(string)
+			return d.ReadString(schemas.CreateSecretResponse_VersionId, v.VersionId)
+		}
+		return nil
+	})
+}
 func (c *Client) addOperationCreateSecretMiddlewares(stack *middleware.Stack, options Options) (err error) {
-	err = stack.Serialize.Add(&awsAwsjson11_serializeOpCreateSecret{}, middleware.After)
-	if err != nil {
+	if err := stack.Serialize.Add(&serializeRequestMiddleware{options: &options, operationSchema: smithy.NewOperationSchema(schemas.CreateSecret, schemas.CreateSecretRequest, schemas.CreateSecretResponse)}, middleware.After); err != nil {
 		return err
 	}
-	err = stack.Deserialize.Add(&awsAwsjson11_deserializeOpCreateSecret{}, middleware.After)
-	if err != nil {
+	if err := stack.Deserialize.Add(&deserializeResponseMiddleware{options: &options, operationSchema: smithy.NewOperationSchema(schemas.CreateSecret, schemas.CreateSecretRequest, schemas.CreateSecretResponse), output: &CreateSecretOutput{}}, middleware.After); err != nil {
 		return err
 	}
 
